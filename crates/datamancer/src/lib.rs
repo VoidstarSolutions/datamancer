@@ -1,10 +1,7 @@
 pub mod alpaca;
-pub mod commands;
-mod data;
-pub mod env;
 mod streaming_client;
 mod subscription;
-use crate::{commands::Command, env::Env};
+use supermodel::{commands::Command, environment::Env};
 
 use alpaca::alpaca_streaming_client::{AlpacaStreamingClient, PricingSubscription};
 use redis::{aio::MultiplexedConnection, Client};
@@ -17,19 +14,16 @@ pub struct Datamancer {
 
 impl Datamancer {
     pub async fn initialize_datamancer() -> Datamancer {
-        let env = Env::from_env();
+        let env = Env::from_env(true);
         // Allows you to pass along context (i.e., trace IDs) across services
         println!(
             "Attempting to connect to redis instance at: {}",
-            env.redis_url
+            &env.redis_url
         );
-        let client = redis::Client::open(env.redis_url).unwrap();
+        let client = redis::Client::open(env.redis_url.as_ref()).unwrap();
         println!("Connected to redis instance");
-        let _alpaca_crypto_client = AlpacaStreamingClient::connect(
-            alpaca::AccountType::Paper,
-            alpaca::alpaca_streaming_client::Feed::SIP,
-        )
-        .await;
+        let _alpaca_crypto_client =
+            AlpacaStreamingClient::connect(&env, alpaca::alpaca_streaming_client::Feed::SIP).await;
         Datamancer {
             client,
             _alpaca_crypto_client,
@@ -37,6 +31,13 @@ impl Datamancer {
     }
 
     pub async fn run(&self) {
+        tokio::spawn(async move {
+            loop {
+                if let Ok(message) = result {
+                    sink.send(message).await.unwrap();
+                }
+            }
+        });
         let mut pubsub_conn = self
             .client
             .get_async_connection()
@@ -64,10 +65,10 @@ impl Datamancer {
 async fn process_command(mut connection: MultiplexedConnection, command: &str) -> bool {
     let command: Command = serde_json::from_str(command).unwrap();
     match command {
-        Command::ShutDown => return false,
-        Command::Subscribe(sub) => subscription::subscribe(&mut connection, sub).await,
-        Command::Unsubscribe(sub) => subscription::unsubscribe(&mut connection, sub).await,
-        Command::ListSubscriptions => subscription::list(&connection).await,
+        Command::DataShutDown => return false,
+        Command::DataSub(sub) => subscription::subscribe(&mut connection, sub).await,
+        Command::DataUnsub(sub) => subscription::unsubscribe(&mut connection, sub).await,
+        Command::DataListSub => subscription::list(&connection).await,
     }
     true
 }
