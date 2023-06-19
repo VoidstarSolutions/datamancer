@@ -1,4 +1,4 @@
-use crate::alpaca::AccountType;
+use crate::alpaca::Request;
 use futures::{future, Stream};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::{
@@ -89,7 +89,7 @@ impl StreamingClient {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    pub fn send(&self, request: &str) {
+    pub fn send(&self, request: Request) {
         if let Some(channel) = &self.send_channel {
             let request_string = serde_json::to_string(&request).unwrap();
             println!("Sending: {}", request_string);

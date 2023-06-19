@@ -1,10 +1,13 @@
-use crate::{
-    alpaca::{AccountType, Request},
-    streaming_client::StreamingClient,
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
 };
+
+use crate::{alpaca::Request, streaming_client::StreamingClient};
 use futures::StreamExt;
-use futures_util::Stream;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
+use spinners::{Spinner, Spinners};
 use supermodel::environment::Env;
 
 use super::SubscriptionList;
@@ -24,6 +27,16 @@ pub enum Feed {
     SIP,
 }
 
+#[derive(PartialEq)]
+pub enum StreamingClientState {
+    Error,
+    NotConnected,
+    Connecting,
+    Connected,
+    Authenticating,
+    Authenticated,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ControlMessage {
@@ -31,17 +44,14 @@ pub enum ControlMessage {
     Authenticated,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename = "lowercase", tag = "code")]
+#[derive(Clone, Debug, Serialize_repr, Deserialize_repr)]
+#[repr(u16)]
 pub enum Error {
-    #[serde(rename = "400")]
-    InvalidSyntax,
-    #[serde(rename = "401")]
-    NotAuthenticated,
-    #[serde(rename = "402")]
-    AuthFailed,
-    #[serde(rename = "403")]
-    AlreadyAuthorized,
+    InvalidSyntax = 400,
+    NotAuthenticated = 401,
+    AuthFailed = 402,
+    AlreadyAuthorized = 403,
+    AuthTimeout = 404,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -97,7 +107,7 @@ pub enum StreamMessage {
     Control { msg: ControlMessage },
 
     #[serde(rename = "error")]
-    Error(Error),
+    Error { code: Error, msg: String },
 
     #[serde(rename = "subscription")]
     Subscription(SubscriptionList),
@@ -109,15 +119,18 @@ pub enum StreamMessage {
 }
 
 pub struct PricingSubscription {
+    client_state: Arc<Mutex<StreamingClientState>>,
     streaming_client: StreamingClient,
-    _data_stream: Box<dyn Stream<Item = Vec<StreamMessage>>>,
 }
 
 impl PricingSubscription {
     pub fn subscribe(&mut self, subscriptions: SubscriptionList) {
         let request = Request::Subscribe(subscriptions);
-        let serialized = serde_json::to_string(&request).unwrap();
-        self.streaming_client.send(&serialized);
+        self.streaming_client.send(request);
+    }
+    pub fn unsubscribe(&mut self, subscriptions: SubscriptionList) {
+        let request = Request::Unsubscribe(subscriptions);
+        self.streaming_client.send(request);
     }
     pub fn shutdown(&mut self) {
         self.streaming_client.shutdown();
@@ -135,10 +148,49 @@ impl AlpacaStreamingClient {
         };
         println!("Connecting to {}", url);
         let mut streaming_client = StreamingClient::new(environment, &url);
-        let inner_stream = streaming_client.connect().await.map(move |msg| {
+        let mut inner_stream = streaming_client.connect().await.map(move |msg| {
             let messages: Vec<StreamMessage> = serde_json::from_str(&msg).unwrap();
             messages
         });
+        let client_state = Arc::new(Mutex::new(StreamingClientState::NotConnected));
+        let thread_state = client_state.clone();
+        tokio::spawn(async move {
+            while let Some(result) = inner_stream.next().await {
+                result.iter().for_each(|msg| {
+                    println!("Received message: {:?}", msg);
+                    match msg {
+                        StreamMessage::Control { msg } => match msg {
+                            ControlMessage::Connected => {
+                                println!("Connected to {}", url);
+                                *thread_state.lock().unwrap() = StreamingClientState::Connected;
+                            }
+                            ControlMessage::Authenticated => {
+                                println!("Authenticated to {}", url);
+                                *thread_state.lock().unwrap() = StreamingClientState::Authenticated;
+                            }
+                        },
+                        StreamMessage::Error { code, msg } => {
+                            println!("Error: {:?} {}", code, msg);
+                        }
+                        StreamMessage::Subscription(subscriptions) => {
+                            println!("Subscribed to {:?}", subscriptions);
+                        }
+                        StreamMessage::Trade(trade) => {
+                            println!("Trade: {:?}", trade);
+                        }
+                        StreamMessage::Quote(quote) => {
+                            println!("Quote: {:?}", quote);
+                        }
+                    }
+                });
+            }
+        });
+        let mut sp = Spinner::new(Spinners::Aesthetic, "Waiting for connection".into());
+        while *client_state.lock().unwrap() == StreamingClientState::NotConnected {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        sp.stop_with_message("Websocket Connected".into());
+
         let auth_request = Request::AuthMessage {
             key: streaming_client.env.alpaca_key_id.as_ref().unwrap().clone(),
             secret: streaming_client
@@ -148,12 +200,17 @@ impl AlpacaStreamingClient {
                 .unwrap()
                 .clone(),
         };
-        let serialized = serde_json::to_string(&auth_request).unwrap();
-        streaming_client.send(&serialized);
+        streaming_client.send(auth_request);
+        *client_state.lock().unwrap() = StreamingClientState::Authenticating;
+        let mut sp = Spinner::new(Spinners::Aesthetic, "Waiting for auth response".into());
+        while *client_state.lock().unwrap() == StreamingClientState::Authenticating {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        sp.stop_with_message("Authenticated".into());
 
         PricingSubscription {
+            client_state,
             streaming_client,
-            _data_stream: Box::new(inner_stream),
         }
     }
 }
