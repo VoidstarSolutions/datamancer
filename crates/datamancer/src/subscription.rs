@@ -1,12 +1,9 @@
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use supermodel::commands::{Subscription, SubscriptionError};
 
-use crate::alpaca::{
-    alpaca_streaming_client::{AlpacaStreamingClient, PricingSubscription},
-    SubscriptionList,
-};
+use crate::alpaca::{alpaca_streaming_client::PricingSubscription, SubscriptionList};
 
-async fn subscription_exists(
+async fn check_subscription_exists(
     connection: &mut MultiplexedConnection,
     subscription: &Subscription,
 ) -> bool {
@@ -29,28 +26,36 @@ pub async fn subscribe(
     subscription: Subscription,
     data_client: &mut PricingSubscription,
 ) -> Result<(), SubscriptionError> {
-    if subscription_exists(connection, &subscription).await {
+    if check_subscription_exists(connection, &subscription).await {
         return Err(SubscriptionError::SubscriptionExists);
-    } else {
-        let res: Result<(), redis::RedisError> = connection
-            .set(
-                format!(
-                    "subscriptions:{:?}:{}",
-                    &subscription.provider, &subscription.symbol
-                ),
-                true,
-            )
-            .await;
-        if res.is_err() {
-            return Err(SubscriptionError::DatabaseError);
-        }
+    } else if !subscribe_database(connection, &subscription).await {
+        return Err(SubscriptionError::DatabaseError);
     }
+    subscribe_data_broker(&subscription, data_client);
+    Ok(())
+}
+async fn subscribe_database(
+    connection: &mut MultiplexedConnection,
+    subscription: &Subscription,
+) -> bool {
+    let res: Result<(), redis::RedisError> = connection
+        .set(
+            format!(
+                "subscriptions:{:?}:{}",
+                &subscription.provider, &subscription.symbol
+            ),
+            true,
+        )
+        .await;
+    res.is_ok()
+}
+
+fn subscribe_data_broker(subscription: &Subscription, data_client: &mut PricingSubscription) {
     let subscriptions = SubscriptionList::new()
         .add_bars(&subscription.symbol)
         .add_quotes(&subscription.symbol)
         .add_trades(&subscription.symbol);
     data_client.subscribe(subscriptions);
-    Ok(())
 }
 
 pub async fn unsubscribe(
@@ -58,7 +63,7 @@ pub async fn unsubscribe(
     sub: Subscription,
     data_client: &mut PricingSubscription,
 ) -> Result<(), SubscriptionError> {
-    if subscription_exists(connection, &sub).await {
+    if check_subscription_exists(connection, &sub).await {
         let _: () = connection
             .del(format!("subscriptions:{:?}:{}", &sub.provider, &sub.symbol))
             .await

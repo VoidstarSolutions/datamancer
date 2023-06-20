@@ -119,7 +119,6 @@ pub enum StreamMessage {
 }
 
 pub struct PricingSubscription {
-    client_state: Arc<Mutex<StreamingClientState>>,
     streaming_client: StreamingClient,
 }
 
@@ -189,7 +188,7 @@ impl AlpacaStreamingClient {
         while *client_state.lock().unwrap() == StreamingClientState::NotConnected {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        sp.stop_with_message("Websocket Connected".into());
+        sp.stop_with_message("Websocket Connected\n".into());
 
         let auth_request = Request::AuthMessage {
             key: streaming_client.env.alpaca_key_id.as_ref().unwrap().clone(),
@@ -206,12 +205,9 @@ impl AlpacaStreamingClient {
         while *client_state.lock().unwrap() == StreamingClientState::Authenticating {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        sp.stop_with_message("Authenticated".into());
+        sp.stop_with_message("Authenticated\n".into());
 
-        PricingSubscription {
-            client_state,
-            streaming_client,
-        }
+        PricingSubscription { streaming_client }
     }
 }
 

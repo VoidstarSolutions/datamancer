@@ -7,12 +7,13 @@ use supermodel::{
 };
 
 use alpaca::alpaca_streaming_client::{AlpacaStreamingClient, PricingSubscription};
-use redis::{aio::MultiplexedConnection, AsyncCommands, Client, Commands};
+use redis::{aio::MultiplexedConnection, Client, Commands};
 use tokio_stream::StreamExt;
 
 pub struct Datamancer {
     client: Client,
     alpaca_crypto_client: PricingSubscription,
+    run: bool,
 }
 
 impl Datamancer {
@@ -28,6 +29,7 @@ impl Datamancer {
         let alpaca_crypto_client =
             AlpacaStreamingClient::connect(&env, alpaca::alpaca_streaming_client::Feed::SIP).await;
         Datamancer {
+            run: true,
             client,
             alpaca_crypto_client,
         }
@@ -47,8 +49,7 @@ impl Datamancer {
             .get_multiplexed_tokio_connection()
             .await
             .unwrap();
-        let mut run = true;
-        while run {
+        while self.run {
             if let Some(message) = pubsub_stream.next().await {
                 let connection_clone = connection.clone();
                 let msg: String = message.get_payload().unwrap();
@@ -70,7 +71,10 @@ impl Datamancer {
     ) -> Result<(), SubscriptionError> {
         let command: Command = serde_json::from_str(command).unwrap();
         match command {
-            Command::DataShutDown => return Ok(()),
+            Command::DataShutDown => {
+                self.run = false;
+                Ok(())
+            }
             Command::DataSub(sub) => {
                 subscription::subscribe(&mut connection, sub, &mut self.alpaca_crypto_client).await
             }

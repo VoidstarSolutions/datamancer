@@ -79,6 +79,12 @@ impl SubscriptionList {
     }
 }
 
+impl Default for SubscriptionList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Streaming Authentication Message
 #[derive(Serialize)]
 #[serde(tag = "action")]
