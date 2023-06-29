@@ -53,7 +53,23 @@ pub enum Error {
     AlreadyAuthorized = 403,
     AuthTimeout = 404,
 }
-
+#[derive(Clone, Debug, Deserialize)]
+pub struct Bar {
+    #[serde(rename = "S")]
+    pub symbol: String,
+    #[serde(rename = "o")]
+    pub open_price: f64,
+    #[serde(rename = "h")]
+    pub high_price: f64,
+    #[serde(rename = "l")]
+    pub low_price: f64,
+    #[serde(rename = "c")]
+    pub close_price: f64,
+    #[serde(rename = "v")]
+    pub volume: f64,
+    #[serde(rename = "t")]
+    pub timestamp: String,
+}
 #[derive(Clone, Debug, Deserialize)]
 pub struct Quote {
     #[serde(rename = "S")]
@@ -116,6 +132,12 @@ pub enum StreamMessage {
     Trade(Trade),
     #[serde(rename = "q")]
     Quote(Quote),
+    #[serde(rename = "b")]
+    MinuteBar(Bar),
+    #[serde(rename = "u")]
+    MinuteUpdateBar(Bar),
+    #[serde(rename = "d")]
+    DailyBar(Bar),
 }
 
 pub struct PricingSubscription {
@@ -153,33 +175,42 @@ impl AlpacaStreamingClient {
         });
         let client_state = Arc::new(Mutex::new(StreamingClientState::NotConnected));
         let thread_state = client_state.clone();
+        let client = redis::Client::open(environment.redis_url.as_ref())
+            .unwrap()
+            .get_async_connection()
+            .await;
+
         tokio::spawn(async move {
             while let Some(result) = inner_stream.next().await {
-                result.iter().for_each(|msg| {
-                    println!("Received message: {:?}", msg);
-                    match msg {
-                        StreamMessage::Control { msg } => match msg {
-                            ControlMessage::Connected => {
-                                println!("Connected to {}", url);
-                                *thread_state.lock().unwrap() = StreamingClientState::Connected;
-                            }
-                            ControlMessage::Authenticated => {
-                                println!("Authenticated to {}", url);
-                                *thread_state.lock().unwrap() = StreamingClientState::Authenticated;
-                            }
-                        },
-                        StreamMessage::Error { code, msg } => {
-                            println!("Error: {:?} {}", code, msg);
+                result.iter().for_each(|msg| match msg {
+                    StreamMessage::Control { msg } => match msg {
+                        ControlMessage::Connected => {
+                            *thread_state.lock().unwrap() = StreamingClientState::Connected;
                         }
-                        StreamMessage::Subscription(subscriptions) => {
-                            println!("Subscribed to {:?}", subscriptions);
+                        ControlMessage::Authenticated => {
+                            *thread_state.lock().unwrap() = StreamingClientState::Authenticated;
                         }
-                        StreamMessage::Trade(trade) => {
-                            println!("Trade: {:?}", trade);
-                        }
-                        StreamMessage::Quote(quote) => {
-                            println!("Quote: {:?}", quote);
-                        }
+                    },
+                    StreamMessage::Error { code, msg } => {
+                        println!("Error: {:?} {}", code, msg);
+                    }
+                    StreamMessage::Subscription(subscriptions) => {
+                        println!("Subscribed to {:?}", subscriptions);
+                    }
+                    StreamMessage::Trade(trade) => {
+                        println!("Trade: {:?}", trade);
+                    }
+                    StreamMessage::Quote(quote) => {
+                        println!("Quote: {:?}", quote);
+                    }
+                    StreamMessage::MinuteBar(bar) => {
+                        println!("MinuteBar: {:?}", bar);
+                    }
+                    StreamMessage::MinuteUpdateBar(bar) => {
+                        println!("MinuteUpdateBar: {:?}", bar);
+                    }
+                    StreamMessage::DailyBar(bar) => {
+                        println!("DailyBar: {:?}", bar);
                     }
                 });
             }

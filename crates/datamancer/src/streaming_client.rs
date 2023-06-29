@@ -92,7 +92,6 @@ impl StreamingClient {
     pub fn send(&self, request: Request) {
         if let Some(channel) = &self.send_channel {
             let request_string = serde_json::to_string(&request).unwrap();
-            println!("Sending: {}", request_string);
             let message = Message::Text(request_string);
             channel.send(message).unwrap();
         }
