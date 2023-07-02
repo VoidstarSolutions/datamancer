@@ -1,17 +1,18 @@
 pub mod alpaca;
 mod streaming_client;
 mod subscription;
+use apca::data;
+use intercom::Intercom;
 use supermodel::{
     commands::{Command, SubscriptionError},
     environment::Env,
 };
 
 use alpaca::alpaca_streaming_client::{AlpacaStreamingClient, PricingSubscription};
-use redis::{aio::MultiplexedConnection, Client, Commands};
 use tokio_stream::StreamExt;
 
 pub struct Datamancer {
-    client: Client,
+    intercom: Intercom,
     alpaca_crypto_client: PricingSubscription,
     run: bool,
 }
@@ -25,50 +26,33 @@ impl Datamancer {
             &env.redis_url
         );
         let client = redis::Client::open(env.redis_url.as_ref()).unwrap();
-        println!("Connected to redis instance");
+        let mut intercom = Intercom::initialize(&env.redis_url).await.unwrap();
+
         let alpaca_crypto_client =
             AlpacaStreamingClient::connect(&env, alpaca::alpaca_streaming_client::Feed::SIP).await;
+
         Datamancer {
             run: true,
-            client,
+            intercom,
             alpaca_crypto_client,
         }
     }
 
     pub async fn run(&mut self) {
-        let mut pubsub_conn = self
-            .client
-            .get_async_connection()
-            .await
-            .unwrap()
-            .into_pubsub();
-        pubsub_conn.subscribe("commander").await.unwrap();
-        let mut pubsub_stream = pubsub_conn.on_message();
-        let connection = self
-            .client
-            .get_multiplexed_tokio_connection()
-            .await
-            .unwrap();
+        let mut listener = self.intercom.get_listener().await.unwrap();
+        let mut pubsub_stream = listener.listen();
         while self.run {
             if let Some(message) = pubsub_stream.next().await {
-                let connection_clone = connection.clone();
-                let msg: String = message.get_payload().unwrap();
-                let result = self.process_command(connection_clone, &msg).await;
+                let message = message.unwrap();
+                let result = self.process_command(&message.content).await;
                 let serialized = serde_json::to_string(&result).unwrap();
-                let _: () = self
-                    .client
-                    .get_connection()
-                    .unwrap()
-                    .publish("commanded", serialized)
-                    .unwrap();
+                self.intercom.send("cmd_rsp", &serialized).await.unwrap();
+            } else {
+                break;
             }
         }
     }
-    async fn process_command(
-        &mut self,
-        mut connection: MultiplexedConnection,
-        command: &str,
-    ) -> Result<(), SubscriptionError> {
+    async fn process_command(&mut self, command: &str) -> Result<(), SubscriptionError> {
         let command: Command = serde_json::from_str(command).unwrap();
         match command {
             Command::DataShutDown => {
@@ -76,11 +60,12 @@ impl Datamancer {
                 Ok(())
             }
             Command::DataSub(sub) => {
-                subscription::subscribe(&mut connection, sub, &mut self.alpaca_crypto_client).await
+                let data_con = self.intercom.get_data_con().await.unwrap();
+                subscription::subscribe(&mut data_con, sub, &mut self.alpaca_crypto_client).await
             }
             Command::DataUnsub(sub) => {
-                subscription::unsubscribe(&mut connection, sub, &mut self.alpaca_crypto_client)
-                    .await
+                let data_con = self.intercom.get_data_con().await.unwrap();
+                subscription::unsubscribe(&mut data_con, sub, &mut self.alpaca_crypto_client).await
             }
             Command::DataListSub => subscription::list(&connection).await,
         }

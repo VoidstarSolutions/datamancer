@@ -1,20 +1,15 @@
+use intercom::data_con::DataCon;
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use supermodel::commands::{Subscription, SubscriptionError};
 
 use crate::alpaca::{alpaca_streaming_client::PricingSubscription, SubscriptionList};
 
-async fn check_subscription_exists(
-    connection: &mut MultiplexedConnection,
-    subscription: &Subscription,
-) -> bool {
-    let result: u64 = connection
-        .exists(format!(
-            "subscriptions:{:?}:{}",
-            &subscription.provider, &subscription.symbol
-        ))
-        .await
-        .unwrap();
-    result == 1
+async fn check_subscription_exists(connection: &mut DataCon, subscription: &Subscription) -> bool {
+    let subscription_key = format!(
+        "subscriptions:{:?}:{}",
+        &subscription.provider, &subscription.symbol
+    );
+    connection.exists(subscription_key).await.unwrap()
 }
 
 pub async fn list(_connection: &MultiplexedConnection) -> Result<(), SubscriptionError> {
@@ -22,7 +17,7 @@ pub async fn list(_connection: &MultiplexedConnection) -> Result<(), Subscriptio
 }
 
 pub async fn subscribe(
-    connection: &mut MultiplexedConnection,
+    connection: &mut DataCon,
     subscription: Subscription,
     data_client: &mut PricingSubscription,
 ) -> Result<(), SubscriptionError> {
@@ -34,10 +29,11 @@ pub async fn subscribe(
     subscribe_data_broker(&subscription, data_client);
     Ok(())
 }
-async fn subscribe_database(
-    connection: &mut MultiplexedConnection,
-    subscription: &Subscription,
-) -> bool {
+async fn subscribe_database(connection: &mut DataCon, subscription: &Subscription) -> bool {
+    let subscription_key = format!(
+        "subscriptions:{:?}:{}",
+        &subscription.provider, &subscription.symbol
+    );
     let res: Result<(), redis::RedisError> = connection
         .set(
             format!(
@@ -59,7 +55,7 @@ fn subscribe_data_broker(subscription: &Subscription, data_client: &mut PricingS
 }
 
 pub async fn unsubscribe(
-    connection: &mut MultiplexedConnection,
+    connection: &mut DataCon,
     sub: Subscription,
     data_client: &mut PricingSubscription,
 ) -> Result<(), SubscriptionError> {

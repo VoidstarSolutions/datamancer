@@ -20,6 +20,7 @@ tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.19", features = ["native-tls"] }
 url = "2.4"
 
+intercom = { path = "../intercom" }
 supermodel = { path = "../supermodel" }
 
 [dev-dependencies]
