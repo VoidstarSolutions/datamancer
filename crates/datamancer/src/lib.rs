@@ -25,8 +25,13 @@ impl Datamancer {
             "Attempting to connect to redis instance at: {}",
             &env.redis_url
         );
-        let client = redis::Client::open(env.redis_url.as_ref()).unwrap();
-        let mut intercom = Intercom::initialize(&env.redis_url).await.unwrap();
+        let intercom = Intercom::initialize(
+            &env.redis_url,
+            env.redis_username.clone(),
+            env.redis_password.clone(),
+        )
+        .await
+        .unwrap();
 
         let alpaca_crypto_client =
             AlpacaStreamingClient::connect(&env, alpaca::alpaca_streaming_client::Feed::SIP).await;
@@ -40,6 +45,7 @@ impl Datamancer {
 
     pub async fn run(&mut self) {
         let mut listener = self.intercom.get_listener().await.unwrap();
+        listener.subscribe("cmd").await.unwrap();
         let mut pubsub_stream = listener.listen();
         while self.run {
             if let Some(message) = pubsub_stream.next().await {
@@ -60,14 +66,17 @@ impl Datamancer {
                 Ok(())
             }
             Command::DataSub(sub) => {
-                let data_con = self.intercom.get_data_con().await.unwrap();
+                let mut data_con = self.intercom.get_data_con().await.unwrap();
                 subscription::subscribe(&mut data_con, sub, &mut self.alpaca_crypto_client).await
             }
             Command::DataUnsub(sub) => {
-                let data_con = self.intercom.get_data_con().await.unwrap();
+                let mut data_con = self.intercom.get_data_con().await.unwrap();
                 subscription::unsubscribe(&mut data_con, sub, &mut self.alpaca_crypto_client).await
             }
-            Command::DataListSub => subscription::list(&connection).await,
+            Command::DataListSub => {
+                let data_con = self.intercom.get_data_con().await.unwrap();
+                subscription::list(&data_con).await
+            }
         }
     }
 }

@@ -12,7 +12,7 @@ async fn check_subscription_exists(connection: &mut DataCon, subscription: &Subs
     connection.exists(subscription_key).await.unwrap()
 }
 
-pub async fn list(_connection: &MultiplexedConnection) -> Result<(), SubscriptionError> {
+pub async fn list(_connection: &DataCon) -> Result<(), SubscriptionError> {
     Ok(())
 }
 
@@ -34,16 +34,11 @@ async fn subscribe_database(connection: &mut DataCon, subscription: &Subscriptio
         "subscriptions:{:?}:{}",
         &subscription.provider, &subscription.symbol
     );
-    let res: Result<(), redis::RedisError> = connection
-        .set(
-            format!(
-                "subscriptions:{:?}:{}",
-                &subscription.provider, &subscription.symbol
-            ),
-            true,
-        )
-        .await;
-    res.is_ok()
+    connection
+        .set(subscription_key, "true".to_string())
+        .await
+        .unwrap();
+    return true;
 }
 
 fn subscribe_data_broker(subscription: &Subscription, data_client: &mut PricingSubscription) {
