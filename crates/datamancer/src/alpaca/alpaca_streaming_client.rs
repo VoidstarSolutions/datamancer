@@ -1,10 +1,12 @@
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{alpaca::Request, streaming_client::StreamingClient};
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use intercom::tx::TX;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use spinners::{Spinner, Spinners};
@@ -53,7 +55,7 @@ pub enum Error {
     AlreadyAuthorized = 403,
     AuthTimeout = 404,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Bar {
     #[serde(rename = "S")]
     pub symbol: String,
@@ -70,7 +72,7 @@ pub struct Bar {
     #[serde(rename = "t")]
     pub timestamp: String,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Quote {
     #[serde(rename = "S")]
     pub symbol: String,
@@ -94,7 +96,7 @@ pub struct Quote {
     pub tape: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Trade {
     #[serde(rename = "S")]
     pub symbol: String,
@@ -162,7 +164,11 @@ impl PricingSubscription {
 pub struct AlpacaStreamingClient {}
 
 impl AlpacaStreamingClient {
-    pub async fn connect(environment: &Env, feed: Feed) -> PricingSubscription {
+    pub async fn connect(
+        environment: &Env,
+        feed: Feed,
+        mut transmitter: TX,
+    ) -> PricingSubscription {
         let url = match feed {
             Feed::IEX => MARKET_DATA_STREAM_HOST.to_string(), /*+ "/iex"*/
             Feed::SIP => MARKET_DATA_STREAM_HOST.to_string(), /*+ "/sip"*/
@@ -182,37 +188,67 @@ impl AlpacaStreamingClient {
 
         tokio::spawn(async move {
             while let Some(result) = inner_stream.next().await {
-                result.iter().for_each(|msg| match msg {
-                    StreamMessage::Control { msg } => match msg {
-                        ControlMessage::Connected => {
-                            *thread_state.lock().unwrap() = StreamingClientState::Connected;
+                let start = Instant::now();
+
+                for msg in result.iter() {
+                    match msg {
+                        StreamMessage::Control { msg } => match msg {
+                            ControlMessage::Connected => {
+                                *thread_state.lock().unwrap() = StreamingClientState::Connected;
+                            }
+                            ControlMessage::Authenticated => {
+                                *thread_state.lock().unwrap() = StreamingClientState::Authenticated;
+                            }
+                        },
+                        StreamMessage::Error { code, msg } => {
+                            println!("Error: {:?} {}", code, msg);
                         }
-                        ControlMessage::Authenticated => {
-                            *thread_state.lock().unwrap() = StreamingClientState::Authenticated;
+                        StreamMessage::Subscription(subscriptions) => {
+                            println!("Subscribed to {:?}", subscriptions);
                         }
-                    },
-                    StreamMessage::Error { code, msg } => {
-                        println!("Error: {:?} {}", code, msg);
+                        StreamMessage::Trade(trade) => {
+                            let serialized_trade = serde_json::to_string(&trade).unwrap();
+                            transmitter.send("trade", &serialized_trade).await.unwrap();
+                        }
+                        StreamMessage::Quote(quote) => {
+                            let quote = supermodel::data::quote::Quote {
+                                symbol: quote.symbol.clone(),
+                                ask_price: quote.ask_price,
+                                ask_size: quote.ask_size,
+                                bid_price: quote.bid_price,
+                                bid_size: quote.bid_size,
+                                timestamp: DateTime::parse_from_rfc3339(&quote.timestamp)
+                                    .unwrap()
+                                    .with_timezone(&Utc),
+                            };
+
+                            let serialized_quote = serde_json::to_string(&quote).unwrap();
+                            transmitter.send("quote", &serialized_quote).await.unwrap();
+                            println!("Time to publish quote: {:?}", start.elapsed());
+                        }
+                        StreamMessage::MinuteBar(bar) => {
+                            let serialized_bar = serde_json::to_string(&bar).unwrap();
+                            transmitter
+                                .send("minute_bar", &serialized_bar)
+                                .await
+                                .unwrap();
+                        }
+                        StreamMessage::MinuteUpdateBar(bar) => {
+                            let serialized_bar = serde_json::to_string(&bar).unwrap();
+                            transmitter
+                                .send("minute_update_bar", &serialized_bar)
+                                .await
+                                .unwrap();
+                        }
+                        StreamMessage::DailyBar(bar) => {
+                            let serialized_bar = serde_json::to_string(&bar).unwrap();
+                            transmitter
+                                .send("daily_bar", &serialized_bar)
+                                .await
+                                .unwrap();
+                        }
                     }
-                    StreamMessage::Subscription(subscriptions) => {
-                        println!("Subscribed to {:?}", subscriptions);
-                    }
-                    StreamMessage::Trade(trade) => {
-                        println!("Trade: {:?}", trade);
-                    }
-                    StreamMessage::Quote(quote) => {
-                        println!("Quote: {:?}", quote);
-                    }
-                    StreamMessage::MinuteBar(bar) => {
-                        println!("MinuteBar: {:?}", bar);
-                    }
-                    StreamMessage::MinuteUpdateBar(bar) => {
-                        println!("MinuteUpdateBar: {:?}", bar);
-                    }
-                    StreamMessage::DailyBar(bar) => {
-                        println!("DailyBar: {:?}", bar);
-                    }
-                });
+                }
             }
         });
         let mut sp = Spinner::new(Spinners::Aesthetic, "Waiting for connection".into());
@@ -245,7 +281,7 @@ impl AlpacaStreamingClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alpaca::AccountType;
+    use intercom::Intercom;
     use serial_test::parallel;
 
     /// Check that we can decode a response containing no bars correctly.
@@ -253,7 +289,9 @@ mod tests {
     #[parallel]
     async fn ensure_connection() {
         let env = Env::from_env(true);
-        let mut subscription = AlpacaStreamingClient::connect(&env, Feed::SIP).await;
+        let intercom = Intercom::initialize(&env).await.unwrap();
+        let transmitter = intercom.get_transmitter().await.unwrap();
+        let mut subscription = AlpacaStreamingClient::connect(&env, Feed::SIP, transmitter).await;
         subscription.shutdown();
     }
 }

@@ -69,7 +69,6 @@ impl StreamingClient {
                     *(shutdown.lock().unwrap()) = true;
                 }
                 Message::Text(value) => {
-                    println!("{}", value);
                     return future::ready(Some(value));
                 }
                 Message::Binary(value) => {

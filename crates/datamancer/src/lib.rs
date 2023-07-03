@@ -1,7 +1,6 @@
 pub mod alpaca;
 mod streaming_client;
 mod subscription;
-use apca::data;
 use intercom::Intercom;
 use supermodel::{
     commands::{Command, SubscriptionError},
@@ -25,16 +24,15 @@ impl Datamancer {
             "Attempting to connect to redis instance at: {}",
             &env.redis_url
         );
-        let intercom = Intercom::initialize(
-            &env.redis_url,
-            env.redis_username.clone(),
-            env.redis_password.clone(),
-        )
-        .await
-        .unwrap();
+        let intercom = Intercom::initialize(&env).await.unwrap();
+        let transmitter = intercom.get_transmitter().await.unwrap();
 
-        let alpaca_crypto_client =
-            AlpacaStreamingClient::connect(&env, alpaca::alpaca_streaming_client::Feed::SIP).await;
+        let alpaca_crypto_client = AlpacaStreamingClient::connect(
+            &env,
+            alpaca::alpaca_streaming_client::Feed::SIP,
+            transmitter,
+        )
+        .await;
 
         Datamancer {
             run: true,
@@ -45,6 +43,7 @@ impl Datamancer {
 
     pub async fn run(&mut self) {
         let mut listener = self.intercom.get_listener().await.unwrap();
+        let mut transmitter = self.intercom.get_transmitter().await.unwrap();
         listener.subscribe("cmd").await.unwrap();
         let mut pubsub_stream = listener.listen();
         while self.run {
@@ -52,12 +51,13 @@ impl Datamancer {
                 let message = message.unwrap();
                 let result = self.process_command(&message.content).await;
                 let serialized = serde_json::to_string(&result).unwrap();
-                self.intercom.send("cmd_rsp", &serialized).await.unwrap();
+                transmitter.send("cmd_rsp", &serialized).await.unwrap();
             } else {
                 break;
             }
         }
     }
+
     async fn process_command(&mut self, command: &str) -> Result<(), SubscriptionError> {
         let command: Command = serde_json::from_str(command).unwrap();
         match command {
