@@ -6,8 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.3", features = ["derive"] }
 futures-util = { version = "0.3", features = ["sink", "std"] }
 redis = { version = "0.23", features = ["aio", "tokio-comp"] }
 futures = "0.3"

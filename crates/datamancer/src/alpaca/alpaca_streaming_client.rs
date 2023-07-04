@@ -6,7 +6,7 @@ use std::{
 use crate::{alpaca::Request, streaming_client::StreamingClient};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use intercom::tx::TX;
+use intercom::{data_con::DataCon, tx::TX};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use spinners::{Spinner, Spinners};
@@ -142,8 +142,10 @@ pub enum StreamMessage {
     DailyBar(Bar),
 }
 
+#[derive(Debug)]
 pub struct PricingSubscription {
     streaming_client: StreamingClient,
+    pub active_subscriptions: Arc<Mutex<SubscriptionList>>,
 }
 
 impl PricingSubscription {
@@ -167,6 +169,7 @@ impl AlpacaStreamingClient {
     pub async fn connect(
         environment: &Env,
         feed: Feed,
+        mut data_con: DataCon,
         mut transmitter: TX,
     ) -> PricingSubscription {
         let url = match feed {
@@ -174,6 +177,13 @@ impl AlpacaStreamingClient {
             Feed::SIP => MARKET_DATA_STREAM_HOST.to_string(), /*+ "/sip"*/
         };
         println!("Connecting to {}", url);
+        let active_subscriptions = Arc::from(Mutex::from(SubscriptionList {
+            trades: None,
+            quotes: None,
+            bars: None,
+            news: None,
+        }));
+        let sub_ref = active_subscriptions.clone();
         let mut streaming_client = StreamingClient::new(environment, &url);
         let mut inner_stream = streaming_client.connect().await.map(move |msg| {
             let messages: Vec<StreamMessage> = serde_json::from_str(&msg).unwrap();
@@ -181,10 +191,6 @@ impl AlpacaStreamingClient {
         });
         let client_state = Arc::new(Mutex::new(StreamingClientState::NotConnected));
         let thread_state = client_state.clone();
-        let client = redis::Client::open(environment.redis_url.as_ref())
-            .unwrap()
-            .get_async_connection()
-            .await;
 
         tokio::spawn(async move {
             while let Some(result) = inner_stream.next().await {
@@ -204,7 +210,10 @@ impl AlpacaStreamingClient {
                             println!("Error: {:?} {}", code, msg);
                         }
                         StreamMessage::Subscription(subscriptions) => {
-                            println!("Subscribed to {:?}", subscriptions);
+                            *sub_ref.lock().unwrap() = subscriptions.clone();
+                            let subscription_key = "subscriptions:AlpacaCrypto".to_string();
+                            let serialized = serde_json::to_string(&subscriptions).unwrap();
+                            data_con.set(subscription_key, serialized).await.unwrap();
                         }
                         StreamMessage::Trade(trade) => {
                             let serialized_trade = serde_json::to_string(&trade).unwrap();
@@ -274,14 +283,17 @@ impl AlpacaStreamingClient {
         }
         sp.stop_with_message("Authenticated\n".into());
 
-        PricingSubscription { streaming_client }
+        PricingSubscription {
+            streaming_client,
+            active_subscriptions,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intercom::Intercom;
+    use intercom::{data_con, Intercom};
     use serial_test::parallel;
 
     /// Check that we can decode a response containing no bars correctly.
@@ -289,9 +301,11 @@ mod tests {
     #[parallel]
     async fn ensure_connection() {
         let env = Env::from_env(true);
-        let intercom = Intercom::initialize(&env).await.unwrap();
+        let mut intercom = Intercom::initialize(&env).await.unwrap();
+        let data_con = intercom.get_data_con().await.unwrap();
         let transmitter = intercom.get_transmitter().await.unwrap();
-        let mut subscription = AlpacaStreamingClient::connect(&env, Feed::SIP, transmitter).await;
+        let mut subscription =
+            AlpacaStreamingClient::connect(&env, Feed::SIP, data_con, transmitter).await;
         subscription.shutdown();
     }
 }
