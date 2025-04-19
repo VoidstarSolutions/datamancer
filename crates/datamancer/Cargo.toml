@@ -1,0 +1,15 @@
+[package]
+name = "datamancer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+figment = { version = "0.10", features = ["env", "toml"] }
+oxidized_alpaca = { path = "../oxidized-alpaca" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-std", "rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
