@@ -20,6 +20,7 @@
 //!   upstream sources (dyn-dispatched at the cold boundary; per-message
 //!   decode loops stay monomorphic inside each provider), and [`TapLog`],
 //!   [`HistoricalCache`], [`ReplaySource`] for the persistence layer.
+//! - [`Datamancer`] / [`Session`] — orchestrator and session handle.
 
 #![forbid(unsafe_code)]
 
@@ -27,6 +28,7 @@ mod error;
 mod event;
 mod instrument;
 mod price;
+mod session;
 pub mod traits;
 
 pub use error::{Error, Result};
@@ -36,6 +38,10 @@ pub use event::{
 };
 pub use instrument::Instrument;
 pub use price::Price;
+pub use session::{
+    Datamancer, DatamancerBuilder, EventStream, LiveConfig, ReconnectPolicy, ReplayConfig,
+    ReplaySourceSpec, Session, StitchConfig,
+};
 pub use traits::{
     CacheCoverage, CacheKey, HistoricalCache, HistoryRequest, LiveHandle, Provider, ReplayRequest,
     ReplaySource, TapLog,
