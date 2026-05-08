@@ -1,9 +1,10 @@
 [package]
-name = "datamancer"
+name = "datamancer-core"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-datamancer-core = { path = "../datamancer-core" }
+async-trait = "0.1"
 futures = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -24,15 +24,12 @@
 
 use std::sync::Arc;
 
+use datamancer_core::{
+    Error, EventKind, HistoricalCache, Instrument, MarketEvent, Provider, Result, Subscription,
+    TapLog, Timestamp,
+};
 use futures::stream::Stream;
 use tokio::sync::mpsc;
-
-use crate::{
-    error::{Error, Result},
-    event::{MarketEvent, Subscription, Timestamp},
-    instrument::Instrument,
-    traits::{HistoricalCache, Provider, TapLog},
-};
 
 /// Top-level entry point. Owns provider instances and optional persistence,
 /// then hands them to per-session controllers.
@@ -283,7 +280,7 @@ pub struct ReconnectPolicy {
 pub struct ReplayConfig {
     pub source: ReplaySourceSpec,
     pub instruments: Vec<Instrument>,
-    pub kinds: Vec<crate::EventKind>,
+    pub kinds: Vec<EventKind>,
     pub from: Timestamp,
     pub to: Timestamp,
 }

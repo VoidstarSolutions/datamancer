@@ -8,9 +8,9 @@
 //! from.
 //!
 //! See `README.md` in this crate for the design rationale and intended scope.
-//! This module exposes the public type surface; per-provider integrations and
-//! storage backends live in sibling crates (or, for now, behind the
-//! [`Provider`], [`TapLog`], and [`HistoricalCache`] traits).
+//! Provider and storage implementations live in sibling crates and depend on
+//! [`datamancer-core`](datamancer_core) — the types and trait surface this
+//! crate re-exports — without pulling in the session orchestrator below.
 //!
 //! # Layering
 //!
@@ -24,25 +24,15 @@
 
 #![forbid(unsafe_code)]
 
-mod error;
-mod event;
-mod instrument;
-mod price;
 mod session;
-pub mod traits;
 
-pub use error::{Error, Result};
-pub use event::{
-    Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, MarketEvent, Quote, Seq,
-    Subscription, Timestamp, Trade,
+pub use datamancer_core::traits;
+pub use datamancer_core::{
+    Bar, BarInterval, CacheCoverage, CacheKey, Control, ControlKind, Error, EventKind, GapSpan,
+    HistoricalCache, HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, Quote,
+    ReplayRequest, ReplaySource, Result, Seq, Subscription, TapLog, Timestamp, Trade,
 };
-pub use instrument::Instrument;
-pub use price::Price;
 pub use session::{
     Datamancer, DatamancerBuilder, EventStream, LiveConfig, ReconnectPolicy, ReplayConfig,
     ReplaySourceSpec, Session, StitchConfig,
-};
-pub use traits::{
-    CacheCoverage, CacheKey, HistoricalCache, HistoryRequest, LiveHandle, Provider, ReplayRequest,
-    ReplaySource, TapLog,
 };
