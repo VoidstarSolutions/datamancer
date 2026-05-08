@@ -54,16 +54,6 @@ pub enum AlpacaStreamFeed {
     Test,
 }
 
-impl AlpacaStreamFeed {
-    fn into_oxa(self) -> oxidized_alpaca::StreamingFeed {
-        match self {
-            AlpacaStreamFeed::Iex => oxidized_alpaca::StreamingFeed::IEX,
-            AlpacaStreamFeed::Sip => oxidized_alpaca::StreamingFeed::SIP,
-            AlpacaStreamFeed::DelayedSip => oxidized_alpaca::StreamingFeed::DelayedSip,
-            AlpacaStreamFeed::Test => oxidized_alpaca::StreamingFeed::Test,
-        }
-    }
-}
 
 /// Configuration for [`AlpacaProvider`].
 #[derive(Clone, Debug)]
@@ -682,7 +672,7 @@ mod tests {
                 assert_eq!(t.instrument.symbol(), "AAPL");
                 assert_eq!(t.size, 100);
                 assert_eq!(t.price, Price::from_f64_round(150.10));
-                assert_eq!(t.source_ts.0, 1704209400_123456789);
+                assert_eq!(t.source_ts.0, 1_704_209_400_123_456_789);
             }
             other => panic!("expected Trade, got {other:?}"),
         }

@@ -443,14 +443,13 @@ impl SurrealCache {
         let table = Self::table_for(key.kind);
         let provider = key.provider.clone();
         let symbol = key.instrument.symbol().to_string();
-        let q = format!(
-            "SELECT count() AS n FROM type::table($tbl) \
-             WHERE provider = $prov AND symbol = $sym \
-             AND source_ts >= $from AND source_ts < $to GROUP ALL"
-        );
         let mut response = self
             .db
-            .query(q)
+            .query(
+                "SELECT count() AS n FROM type::table($tbl) \
+                 WHERE provider = $prov AND symbol = $sym \
+                 AND source_ts >= $from AND source_ts < $to GROUP ALL",
+            )
             .bind(("tbl", table.to_string()))
             .bind(("prov", provider))
             .bind(("sym", symbol))

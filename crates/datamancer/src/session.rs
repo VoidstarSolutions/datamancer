@@ -388,11 +388,6 @@ pub struct EventStream {
     rx: mpsc::Receiver<MarketEvent>,
 }
 
-impl EventStream {
-    pub(crate) fn new(rx: mpsc::Receiver<MarketEvent>) -> Self {
-        Self { rx }
-    }
-}
 
 impl Stream for EventStream {
     type Item = MarketEvent;
@@ -783,9 +778,7 @@ async fn route_subscribe(
             .expect("by_provider id was just produced from handles");
         let scoped = Subscription::new(sub.instrument.clone(), kinds);
         let guard = named.handle.lock().await;
-        let handle = guard
-            .as_ref()
-            .ok_or_else(|| Error::SessionClosed)?;
+        let handle = guard.as_ref().ok_or(Error::SessionClosed)?;
         if add {
             handle.subscribe(scoped).await?;
         } else {
