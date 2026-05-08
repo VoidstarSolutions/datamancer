@@ -24,7 +24,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod providers;
 mod session;
+pub mod storage;
 
 pub use datamancer_core::traits;
 pub use datamancer_core::{

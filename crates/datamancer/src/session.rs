@@ -275,6 +275,16 @@ pub struct ReconnectPolicy {
     pub jitter: bool,
 }
 
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            initial_backoff_ms: 500,
+            max_backoff_ms: 30_000,
+            jitter: true,
+        }
+    }
+}
+
 /// Configuration for [`Datamancer::replay`].
 #[derive(Debug, Clone)]
 pub struct ReplayConfig {
