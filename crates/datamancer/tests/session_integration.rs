@@ -1,5 +1,10 @@
-//! End-to-end Session tests using a fake provider and the real Surreal
-//! cache. Exercises live, replay, and stitched paths plus seam gap.
+//! End-to-end Session tests using a fake provider. Exercises historical and
+//! live scopes against the new per-(instrument, kind) Session surface.
+//!
+//! The stitched-with-backfill seam is currently stubbed in the controller
+//! (it emits a placeholder Gap rather than running the resume primitive),
+//! so a corresponding test for that path is deferred until the resume
+//! primitive lands alongside the registry.
 
 #![cfg(feature = "storage-surreal")]
 
@@ -8,11 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use datamancer::storage::{SurrealCache, SurrealCacheConfig};
 use datamancer::{
-    Bar, BarInterval, CacheKey, ControlKind, Datamancer, EventKind, HistoricalCache, Instrument,
-    LiveConfig, LiveHandle, MarketEvent, Price, Provider, ReplayConfig, ReplaySourceSpec, Result,
-    Seq, StitchConfig, Subscription, Timestamp, Trade,
+    Bar, BarInterval, ControlKind, Datamancer, EventKind, Instrument, LiveHandle, MarketEvent,
+    Price, Provider, Result, Scope, Seq, Timestamp, Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -25,6 +28,7 @@ use tokio::sync::{Mutex, mpsc};
 #[derive(Default)]
 struct FakeProviderState {
     sink: Option<mpsc::Sender<MarketEvent>>,
+    history: Vec<MarketEvent>,
 }
 
 struct FakeProvider {
@@ -57,11 +61,15 @@ struct FakeController {
 }
 
 impl FakeController {
-    async fn push(&self, ev: MarketEvent) {
+    async fn push_live(&self, ev: MarketEvent) {
         let guard = self.state.lock().await;
         if let Some(sink) = guard.sink.as_ref() {
             let _ = sink.send(ev).await;
         }
+    }
+
+    async fn set_history(&self, events: Vec<MarketEvent>) {
+        self.state.lock().await.history = events;
     }
 }
 
@@ -73,10 +81,7 @@ impl Provider for FakeProvider {
     fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
         true
     }
-    async fn start_live(
-        &self,
-        sink: mpsc::Sender<MarketEvent>,
-    ) -> Result<Box<dyn LiveHandle>> {
+    async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
         let mut guard = self.state.lock().await;
         guard.sink = Some(sink);
         Ok(Box::new(FakeLiveHandle {
@@ -87,8 +92,14 @@ impl Provider for FakeProvider {
     async fn fetch_history(
         &self,
         _request: HistoryRequest,
-        _sink: mpsc::Sender<MarketEvent>,
+        sink: mpsc::Sender<MarketEvent>,
     ) -> Result<()> {
+        let history = self.state.lock().await.history.clone();
+        for ev in history {
+            if sink.send(ev).await.is_err() {
+                break;
+            }
+        }
         Ok(())
     }
 }
@@ -100,10 +111,10 @@ struct FakeLiveHandle {
 
 #[async_trait]
 impl LiveHandle for FakeLiveHandle {
-    async fn subscribe(&self, _sub: Subscription) -> Result<()> {
+    async fn subscribe(&self, _instrument: Instrument, _kind: EventKind) -> Result<()> {
         Ok(())
     }
-    async fn unsubscribe(&self, _sub: Subscription) -> Result<()> {
+    async fn unsubscribe(&self, _instrument: Instrument, _kind: EventKind) -> Result<()> {
         Ok(())
     }
     async fn close(self: Box<Self>) -> Result<()> {
@@ -151,24 +162,21 @@ fn bar(symbol: &str, ts: i64, close: f64) -> MarketEvent {
 #[tokio::test]
 async fn live_session_assigns_monotonic_seq_and_passes_events_through() {
     let (provider, ctrl) = FakeProvider::new("fake");
-    let dm = Datamancer::builder()
-        .provider_arc(provider)
-        .build()
-        .unwrap();
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
     let mut session = dm
-        .live(LiveConfig {
-            initial_subscriptions: vec![Subscription::new("AAPL", [EventKind::Trade])],
-            buffer_size: 64,
-            ..Default::default()
-        })
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
         .await
         .unwrap();
     let mut events = session.take_events().unwrap();
 
-    // Push three trades with strictly increasing source_ts.
-    ctrl.push(trade("AAPL", 100, 1.0)).await;
-    ctrl.push(trade("AAPL", 200, 2.0)).await;
-    ctrl.push(trade("AAPL", 300, 3.0)).await;
+    ctrl.push_live(trade("AAPL", 100, 1.0)).await;
+    ctrl.push_live(trade("AAPL", 200, 2.0)).await;
+    ctrl.push_live(trade("AAPL", 300, 3.0)).await;
 
     let mut got = Vec::new();
     for _ in 0..3 {
@@ -190,34 +198,26 @@ async fn live_session_assigns_monotonic_seq_and_passes_events_through() {
 }
 
 #[tokio::test]
-async fn replay_from_surreal_cache_streams_in_order() {
-    // Seed a Surreal cache with three bars for AAPL.
-    let cache = Arc::new(SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap());
-    let key = CacheKey {
-        provider: "fake".to_string(),
-        instrument: Instrument::new("AAPL"),
-        kind: EventKind::Bar(BarInterval::OneMinute),
-        from: Timestamp(0),
-        to: Timestamp(1000),
-    };
-    let events = vec![bar("AAPL", 100, 10.0), bar("AAPL", 200, 11.0), bar("AAPL", 300, 12.0)];
-    cache.store(&key, &events).await.unwrap();
-
-    let (provider, _ctrl) = FakeProvider::new("fake");
-    let dm = Datamancer::builder()
-        .provider_arc(provider)
-        .historical_cache_arc(cache)
-        .build()
-        .unwrap();
+async fn historical_session_streams_provider_fetch_in_order() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_history(vec![
+        bar("AAPL", 100, 10.0),
+        bar("AAPL", 200, 11.0),
+        bar("AAPL", 300, 12.0),
+    ])
+    .await;
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
 
     let mut session = dm
-        .replay(ReplayConfig {
-            source: ReplaySourceSpec::HistoricalCache,
-            instruments: vec![Instrument::new("AAPL")],
-            kinds: vec![EventKind::Bar(BarInterval::OneMinute)],
-            from: Timestamp(0),
-            to: Timestamp(1000),
-        })
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            false,
+        )
         .await
         .unwrap();
 
@@ -236,104 +236,100 @@ async fn replay_from_surreal_cache_streams_in_order() {
     assert_eq!(bars[0].source_ts.0, 100);
     assert_eq!(bars[1].source_ts.0, 200);
     assert_eq!(bars[2].source_ts.0, 300);
-    // Replay sessions reject subscribe.
-    assert!(
-        session
-            .subscribe(Subscription::new("MSFT", [EventKind::Trade]))
-            .await
-            .is_err()
-    );
-    let _ = session.close().await;
+    // seq is session-monotonic per (instrument, kind).
+    assert_eq!(bars[0].seq.0, 0);
+    assert_eq!(bars[1].seq.0, 1);
+    assert_eq!(bars[2].seq.0, 2);
 }
 
 #[tokio::test]
-async fn stitched_session_emits_seam_gap_then_live_events() {
-    // Cache holds backfill events ending at ts=200; first live event is at
-    // ts=500, so the controller should emit a Gap with span [200, 500).
-    let cache = Arc::new(SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap());
-    let key = CacheKey {
-        provider: "fake".to_string(),
-        instrument: Instrument::new("AAPL"),
-        kind: EventKind::Trade,
-        from: Timestamp(0),
-        to: Timestamp(300),
-    };
-    cache
-        .store(&key, &[trade("AAPL", 100, 1.0), trade("AAPL", 200, 2.0)])
-        .await
-        .unwrap();
-
+async fn live_with_backfill_emits_placeholder_seam_gap() {
+    // The resume primitive isn't wired up yet; the controller emits a Gap
+    // covering [backfill_from, now) so the placeholder is observable.
+    // Replace this test with a real seam test once the resume primitive
+    // lands (it should replay from persistence and only fall back to a Gap
+    // when persistence can't cover the span).
     let (provider, ctrl) = FakeProvider::new("fake");
-    let dm = Datamancer::builder()
-        .provider_arc(provider)
-        .historical_cache_arc(cache)
-        .build()
-        .unwrap();
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
 
     let mut session = dm
-        .stitched(StitchConfig {
-            backfill: ReplayConfig {
-                source: ReplaySourceSpec::HistoricalCache,
-                instruments: vec![Instrument::new("AAPL")],
-                kinds: vec![EventKind::Trade],
-                from: Timestamp(0),
-                to: Timestamp(300),
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: Some(Timestamp(1_000)),
             },
-            live: LiveConfig {
-                initial_subscriptions: vec![Subscription::new("AAPL", [EventKind::Trade])],
-                buffer_size: 64,
-                ..Default::default()
-            },
-        })
+            false,
+        )
         .await
         .unwrap();
-
     let mut stream = session.take_events().unwrap();
 
-    // The first two events should be the backfilled trades.
-    let mut ts_seq = Vec::new();
-    for _ in 0..2 {
-        let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
-            .await
-            .unwrap()
-            .unwrap();
-        match ev {
-            MarketEvent::Trade(t) => ts_seq.push(t.source_ts.0),
-            other => panic!("expected Trade in backfill, got {other:?}"),
-        }
-    }
-    assert_eq!(ts_seq, vec![100, 200]);
-
-    // Now push a live trade at ts=500 — controller should emit Gap then the trade.
-    ctrl.push(trade("AAPL", 500, 5.0)).await;
-
-    // The next event should be the seam Gap (well-formed control entry).
-    let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
         .unwrap()
         .unwrap();
-    match next {
+    match first {
         MarketEvent::Control(c) => match c.kind {
-            ControlKind::Gap { provider, span, instrument } => {
-                assert_eq!(provider, "fake");
+            ControlKind::Gap { instrument, span, .. } => {
                 assert_eq!(instrument.symbol(), "AAPL");
-                assert_eq!(span.from_source_ts.0, 200);
-                assert_eq!(span.to_source_ts.0, 500);
+                assert_eq!(span.from_source_ts.0, 1_000);
             }
             other => panic!("expected Gap control, got {other:?}"),
         },
         other => panic!("expected Control, got {other:?}"),
     }
 
-    // Then the live trade.
+    // After the placeholder gap, live events flow normally.
+    ctrl.push_live(trade("AAPL", 5_000, 1.0)).await;
     let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
         .unwrap()
         .unwrap();
     match next {
-        MarketEvent::Trade(t) => assert_eq!(t.source_ts.0, 500),
+        MarketEvent::Trade(t) => assert_eq!(t.source_ts.0, 5_000),
         other => panic!("expected live Trade, got {other:?}"),
     }
 
     let _ = session.close().await;
+}
+
+#[tokio::test]
+async fn persist_true_without_persistence_layer_errors() {
+    let (provider, _ctrl) = FakeProvider::new("fake");
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
+    match dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            true, // persist
+        )
+        .await
+    {
+        Err(datamancer::Error::PersistenceRequired) => {}
+        Err(other) => panic!("expected PersistenceRequired, got {other:?}"),
+        Ok(_) => panic!("expected PersistenceRequired, got Ok"),
+    }
+}
+
+#[tokio::test]
+async fn take_events_twice_concurrently_errors() {
+    let (provider, _ctrl) = FakeProvider::new("fake");
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
+    let mut session = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
+        .await
+        .unwrap();
+    let _stream = session.take_events().unwrap();
+    match session.take_events() {
+        Err(datamancer::Error::EventsAlreadyTaken) => {}
+        Err(other) => panic!("expected EventsAlreadyTaken, got {other:?}"),
+        Ok(_) => panic!("expected EventsAlreadyTaken, got Ok"),
+    }
 }

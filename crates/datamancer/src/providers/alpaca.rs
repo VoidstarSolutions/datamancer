@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     BarInterval, Control, ControlKind, Error, EventKind, GapSpan, HistoryRequest, Instrument,
-    LiveHandle, MarketEvent, Price, Provider, Result, Seq, Subscription, Timestamp, Trade,
+    LiveHandle, MarketEvent, Price, Provider, Result, Seq, Timestamp, Trade,
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
@@ -145,8 +145,8 @@ impl Provider for AlpacaProvider {
 
 #[derive(Debug)]
 enum LiveCommand {
-    Subscribe(Subscription, oneshot::Sender<Result<()>>),
-    Unsubscribe(Subscription, oneshot::Sender<Result<()>>),
+    Subscribe(Instrument, EventKind, oneshot::Sender<Result<()>>),
+    Unsubscribe(Instrument, EventKind, oneshot::Sender<Result<()>>),
     Close(oneshot::Sender<()>),
 }
 
@@ -162,34 +162,28 @@ struct AlpacaLiveHandle {
 
 #[async_trait]
 impl LiveHandle for AlpacaLiveHandle {
-    async fn subscribe(&self, sub: Subscription) -> Result<()> {
+    async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(LiveCommand::Subscribe(sub.clone(), tx))
+            .send(LiveCommand::Subscribe(instrument.clone(), kind, tx))
             .await
             .map_err(|_| Error::SessionClosed)?;
         let res = rx.await.map_err(|_| Error::SessionClosed)?;
         if res.is_ok() {
-            let mut active = self.active.lock().await;
-            for kind in &sub.kinds {
-                active.insert((sub.instrument.clone(), *kind));
-            }
+            self.active.lock().await.insert((instrument, kind));
         }
         res
     }
 
-    async fn unsubscribe(&self, sub: Subscription) -> Result<()> {
+    async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(LiveCommand::Unsubscribe(sub.clone(), tx))
+            .send(LiveCommand::Unsubscribe(instrument.clone(), kind, tx))
             .await
             .map_err(|_| Error::SessionClosed)?;
         let res = rx.await.map_err(|_| Error::SessionClosed)?;
         if res.is_ok() {
-            let mut active = self.active.lock().await;
-            for kind in &sub.kinds {
-                active.remove(&(sub.instrument.clone(), *kind));
-            }
+            self.active.lock().await.remove(&(instrument, kind));
         }
         res
     }
@@ -278,9 +272,9 @@ async fn run_streaming_task(
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(LiveCommand::Subscribe(sub, ack)) => {
+                        Some(LiveCommand::Subscribe(instrument, kind, ack)) => {
                             let mut list = active.lock().await;
-                            apply_to_list(&mut list, &sub, true);
+                            apply_pair_to_list(&mut list, &instrument, kind, true);
                             let snapshot = list.clone();
                             drop(list);
                             let res = client
@@ -296,7 +290,8 @@ async fn run_streaming_task(
                                     &sink,
                                     ControlKind::SubscriptionChanged {
                                         provider: PROVIDER_ID.to_string(),
-                                        subscription: sub,
+                                        instrument,
+                                        kind,
                                         active: true,
                                     },
                                 )
@@ -304,14 +299,14 @@ async fn run_streaming_task(
                             }
                             let _ = ack.send(res);
                         }
-                        Some(LiveCommand::Unsubscribe(sub, ack)) => {
+                        Some(LiveCommand::Unsubscribe(instrument, kind, ack)) => {
                             let mut list = active.lock().await;
-                            apply_to_list(&mut list, &sub, false);
+                            apply_pair_to_list(&mut list, &instrument, kind, false);
                             drop(list);
-                            // Build a list containing only the kinds being removed; that's
+                            // Build a list containing only the pair being removed; that's
                             // what the Alpaca API expects in remove_subscriptions.
                             let mut removal = StockSubscriptionList::new();
-                            apply_to_list(&mut removal, &sub, true);
+                            apply_pair_to_list(&mut removal, &instrument, kind, true);
                             let res = client
                                 .remove_subscriptions(&removal)
                                 .await
@@ -325,7 +320,8 @@ async fn run_streaming_task(
                                     &sink,
                                     ControlKind::SubscriptionChanged {
                                         provider: PROVIDER_ID.to_string(),
-                                        subscription: sub,
+                                        instrument,
+                                        kind,
                                         active: false,
                                     },
                                 )
@@ -404,7 +400,8 @@ async fn sleep_with_jitter(
                     let _ = ack.send(());
                     false
                 }
-                Some(LiveCommand::Subscribe(_, ack)) | Some(LiveCommand::Unsubscribe(_, ack)) => {
+                Some(LiveCommand::Subscribe(_, _, ack))
+                | Some(LiveCommand::Unsubscribe(_, _, ack)) => {
                     let _ = ack.send(Err(Error::Provider {
                         provider: PROVIDER_ID.to_string(),
                         message: "provider is reconnecting".to_string(),
@@ -424,19 +421,20 @@ fn is_empty(list: &StockSubscriptionList) -> bool {
         && list.trades.as_ref().is_none_or(|v| v.is_empty())
 }
 
-fn apply_to_list(list: &mut StockSubscriptionList, sub: &Subscription, add: bool) {
-    let symbol = sub.instrument.symbol().to_string();
-    for kind in &sub.kinds {
-        match kind {
-            EventKind::Trade => mutate_field(&mut list.trades, &symbol, add),
-            EventKind::Quote => mutate_field(&mut list.quotes, &symbol, add),
-            EventKind::Bar(BarInterval::OneMinute) => mutate_field(&mut list.bars, &symbol, add),
-            EventKind::Bar(BarInterval::OneDay) => {
-                mutate_field(&mut list.daily_bars, &symbol, add)
-            }
-            // Unsupported intervals were rejected by `supports`; ignore here.
-            EventKind::Bar(_) => {}
-        }
+fn apply_pair_to_list(
+    list: &mut StockSubscriptionList,
+    instrument: &Instrument,
+    kind: EventKind,
+    add: bool,
+) {
+    let symbol = instrument.symbol().to_string();
+    match kind {
+        EventKind::Trade => mutate_field(&mut list.trades, &symbol, add),
+        EventKind::Quote => mutate_field(&mut list.quotes, &symbol, add),
+        EventKind::Bar(BarInterval::OneMinute) => mutate_field(&mut list.bars, &symbol, add),
+        EventKind::Bar(BarInterval::OneDay) => mutate_field(&mut list.daily_bars, &symbol, add),
+        // Unsupported intervals were rejected by `supports`; ignore here.
+        EventKind::Bar(_) => {}
     }
 }
 
@@ -744,14 +742,13 @@ mod tests {
     #[test]
     fn subscription_list_apply_add_remove() {
         let mut list = StockSubscriptionList::new();
-        let sub = Subscription::new(
-            "AAPL",
-            [EventKind::Trade, EventKind::Bar(BarInterval::OneMinute)],
-        );
-        apply_to_list(&mut list, &sub, true);
+        let aapl = Instrument::new("AAPL");
+        apply_pair_to_list(&mut list, &aapl, EventKind::Trade, true);
+        apply_pair_to_list(&mut list, &aapl, EventKind::Bar(BarInterval::OneMinute), true);
         assert_eq!(list.trades.as_deref(), Some(&["AAPL".to_string()][..]));
         assert_eq!(list.bars.as_deref(), Some(&["AAPL".to_string()][..]));
-        apply_to_list(&mut list, &sub, false);
+        apply_pair_to_list(&mut list, &aapl, EventKind::Trade, false);
+        apply_pair_to_list(&mut list, &aapl, EventKind::Bar(BarInterval::OneMinute), false);
         assert!(list.trades.is_none());
         assert!(list.bars.is_none());
     }

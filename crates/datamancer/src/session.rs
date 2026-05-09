@@ -1,43 +1,77 @@
 //! Sessions and the top-level [`Datamancer`] orchestrator.
 //!
-//! A session is the unit of consumption. Three constructors —
-//! [`Datamancer::live`], [`Datamancer::replay`], [`Datamancer::stitched`] —
-//! all return the same [`Session`] type, so consumers don't have to change
-//! shape based on the data origin.
+//! A session is the unit of consumption. Each session is scoped to exactly
+//! one `(instrument, kind)` pair and one [`Scope`] — bounded historical, pure
+//! live, or live with a historical backfill. Construction is eager: provider
+//! subscription / fetch starts immediately so the session begins capturing
+//! events even if the consumer hasn't taken the [`EventStream`] yet.
 //!
-//! # Internal shape
+//! # Lifecycle
 //!
-//! Each session is backed by a controller task that owns:
+//! Emission is gated by the lifetime of the [`EventStream`]. The consumer
+//! takes the stream once with [`Session::take_events`], holds it while they
+//! want events delivered, and drops it when they're done. After a drop, the
+//! stream can be re-taken on the same session — datamancer uses the resume
+//! primitive (query persistence for everything since `last_emitted_source_ts`,
+//! emit a [`ControlKind::Gap`] for what's missing, then continue live) so the
+//! consumer's view stays continuous.
 //!
-//! - the live [`LiveHandle`]s (none for replay),
-//! - a single internal `mpsc::Receiver<MarketEvent>` fed by every provider
-//!   sink and, for replay/stitched, the replay forwarder,
-//! - a typed command receiver from the public [`Session`] handle.
+//! Recording (write-through to persistence) is a separate axis. It defaults
+//! to whatever was passed at construction and can be toggled at runtime via
+//! [`Session::set_persisting`].
 //!
-//! The controller drains the internal receiver, assigns a session-monotonic
-//! [`Seq`] to every event, optionally tees to the configured [`TapLog`], and
-//! forwards into the consumer's output [`mpsc::Receiver<MarketEvent>`] which
-//! [`EventStream`] wraps.
+//! # Auto-cleanup
 //!
-//! # Hot-path discipline
+//! A session is alive as long as at least one of these is true:
 //!
-//! Each provider task pushes into its own concrete `mpsc::Sender<MarketEvent>`,
-//! avoiding dyn dispatch on the per-message decode loop. The controller reads
-//! from concrete `Receiver`s, tags each event with a session-monotonic
-//! [`Seq`](crate::Seq), and forwards into the consumer-facing channel. The
-//! only remaining dyn calls are at session construction (one per provider)
-//! and at subscription-mutation time.
+//! - An [`EventStream`] is currently held by the consumer (emitting), or
+//! - `persist=true` AND there is pending work
+//!   (live scope: always; historical scope: fetch in progress).
+//!
+//! When neither holds, the session terminates automatically and removes
+//! itself from the live-session registry. Explicit [`Session::close`] is
+//! still available for forced termination.
+//!
+//! # Status
+//!
+//! This is the captured-API-shape stage. Several internals are explicitly
+//! stubbed and marked with TODO:
+//!
+//! - **Resume primitive.** Re-take after drop, and the historical→live seam
+//!   on stitched sessions, currently emit a single Gap rather than
+//!   replaying-from-persistence. The mechanism is identical for both callers
+//!   and lands in the next iteration alongside the registry.
+//! - **Write-through persistence.** `persist=true` is accepted at
+//!   construction but events are not yet written to TapLog or
+//!   HistoricalCache. Wiring lands when the resume primitive does.
+//! - **Live-session registry.** The `LiveSessionConflict` rule is documented
+//!   but not enforced; the registry is the immediate next step after this
+//!   surface lands.
 
 use std::sync::Arc;
 
 use datamancer_core::{
-    Bar, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache, Instrument, LiveHandle,
-    MarketEvent, Provider, Quote, ReplayRequest, ReplaySource, Result, Seq, Subscription, TapLog,
-    Timestamp, Trade,
+    Bar, Control, ControlKind, Error, EventKind, HistoricalCache, HistoryRequest, Instrument,
+    LiveHandle, MarketEvent, Provider, Quote, Result, Seq, TapLog, Timestamp, Trade,
 };
-use futures::StreamExt;
 use futures::stream::Stream;
 use tokio::sync::{Mutex, mpsc, oneshot};
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// What data a session covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Bounded source-time range. The session's stream completes when `to`
+    /// is reached.
+    Historical { from: Timestamp, to: Timestamp },
+    /// Unbounded live subscription. With `backfill_from = Some(t)`, the
+    /// session fetches history from `t` up to the live edge and seams into
+    /// the live tail; with `None`, it starts purely from "now."
+    Live { backfill_from: Option<Timestamp> },
+}
 
 /// Top-level entry point. Owns provider instances and optional persistence,
 /// then hands them to per-session controllers.
@@ -53,6 +87,10 @@ struct DatamancerInner {
     providers: Vec<Arc<dyn Provider>>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
+    /// Per-instrument provider pinning. When a session is opened for an
+    /// instrument that appears here, the named provider is preferred over
+    /// the first-supports-it match.
+    instrument_provider: Vec<(Instrument, String)>,
 }
 
 impl Datamancer {
@@ -60,192 +98,79 @@ impl Datamancer {
         DatamancerBuilder::default()
     }
 
-    /// Open a live session against the configured providers.
-    pub async fn live(&self, cfg: LiveConfig) -> Result<Session> {
-        let buffer = effective_buffer(cfg.buffer_size);
-        let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(buffer);
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(32);
-        let (merge_tx, merge_rx) = mpsc::channel::<MarketEvent>(buffer);
-
-        let mut handles: Vec<NamedHandle> = Vec::with_capacity(self.inner.providers.len());
-        for p in &self.inner.providers {
-            let sink = merge_tx.clone();
-            let h = p.start_live(sink).await?;
-            handles.push(NamedHandle {
-                provider: p.clone(),
-                handle: Arc::new(Mutex::new(Some(h))),
-            });
+    /// Open a session for one `(instrument, kind)` pair.
+    ///
+    /// Eager: live subscription / historical fetch begins before this returns.
+    /// Errors fail-fast on:
+    ///
+    /// - [`Error::UnsupportedEventKind`] — no registered provider serves
+    ///   `(instrument, kind)`.
+    /// - [`Error::LiveSessionConflict`] — a live session for this pair is
+    ///   already active (Live scope only; multiple Historical sessions for
+    ///   the same pair are stateless reads and run concurrently).
+    /// - [`Error::PersistenceRequired`] — `persist=true` but no
+    ///   [`HistoricalCache`]/[`TapLog`] is configured.
+    pub async fn session(
+        &self,
+        instrument: Instrument,
+        kind: EventKind,
+        scope: Scope,
+        persist: bool,
+    ) -> Result<Session> {
+        if persist
+            && self.inner.historical_cache.is_none()
+            && self.inner.tap_log.is_none()
+        {
+            return Err(Error::PersistenceRequired);
         }
-        // Drop our local merge_tx — the controller keeps a clone via the
-        // sinks held inside the provider tasks. When all provider tasks
-        // close their sinks, the merge_rx closes and the controller exits.
-        drop(merge_tx);
 
-        // Apply initial subscriptions before starting the controller — that
-        // way the consumer sees a coherent ordering.
-        for sub in &cfg.initial_subscriptions {
-            route_subscribe(&handles, &cfg.instrument_provider, sub.clone(), true).await?;
-        }
+        let provider = self.route(&instrument, kind)?;
 
-        let controller = Controller::new(
-            SessionKind::Live,
-            handles,
-            self.inner.tap_log.clone(),
-            cfg.instrument_provider.clone(),
-        );
-        tokio::spawn(controller.run(merge_rx, cmd_rx, events_tx));
+        // TODO(registry): enforce LiveSessionConflict on Scope::Live.
 
-        Ok(Session {
+        let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(8);
+
+        let inner = Arc::new(SessionInner {
+            instrument: instrument.clone(),
+            kind,
+            scope,
+            events_holder: Mutex::new(SessionStreamSlot::Available(events_rx)),
+            persisting: std::sync::atomic::AtomicBool::new(persist),
             cmd_tx,
-            events: Some(EventStream { rx: events_rx }),
-            kind: SessionKind::Live,
-        })
-    }
+        });
 
-    /// Open a replay session over a previously-captured source.
-    pub async fn replay(&self, cfg: ReplayConfig) -> Result<Session> {
-        let buffer = effective_buffer(0);
-        let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(buffer);
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(32);
-        let (merge_tx, merge_rx) = mpsc::channel::<MarketEvent>(buffer);
+        // Provider tasks push raw events into `provider_tx`. The controller
+        // drains `provider_rx`, stamps seq, optionally tees to persistence,
+        // and forwards to the consumer-facing `events_tx`. Keeping these
+        // separate is what gives the controller a place to interpose.
+        let (provider_tx, provider_rx) = mpsc::channel::<MarketEvent>(default_buffer());
 
-        let source = self.open_replay_source(&cfg)?;
-        let request = ReplayRequest {
-            instruments: cfg.instruments.clone(),
-            kinds: cfg.kinds.clone(),
-            from: cfg.from,
-            to: cfg.to,
+        let controller = Controller {
+            inner: inner.clone(),
+            provider: provider.clone(),
+            tap_log: self.inner.tap_log.clone(),
+            historical_cache: self.inner.historical_cache.clone(),
+            events_tx,
+            next_seq: 0,
+            last_emitted_source_ts: None,
         };
-        let stream = source.open(request).await?;
-        spawn_replay_forwarder(stream, merge_tx);
 
-        let controller = Controller::new(SessionKind::Replay, Vec::new(), self.inner.tap_log.clone(), Vec::new());
-        tokio::spawn(controller.run(merge_rx, cmd_rx, events_tx));
-
-        Ok(Session {
-            cmd_tx,
-            events: Some(EventStream { rx: events_rx }),
-            kind: SessionKind::Replay,
-        })
-    }
-
-    /// Open a stitched session: backfill from the configured replay window,
-    /// then continue live. Any gap or overlap at the seam is reported in-band
-    /// as a `ControlKind::Gap` entry.
-    pub async fn stitched(&self, cfg: StitchConfig) -> Result<Session> {
-        let buffer = effective_buffer(cfg.live.buffer_size);
-        let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(buffer);
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(32);
-        // Live events go through merge_rx; backfill events go through their
-        // own channel so the controller can drain backfill in full before
-        // touching anything live — this is what gives stitching deterministic
-        // ordering even when live events start arriving before backfill ends.
-        let (merge_tx, merge_rx) = mpsc::channel::<MarketEvent>(buffer);
-        let (backfill_tx, backfill_rx) = mpsc::channel::<MarketEvent>(buffer);
-
-        let source = self.open_replay_source(&cfg.backfill)?;
-        let request = ReplayRequest {
-            instruments: cfg.backfill.instruments.clone(),
-            kinds: cfg.backfill.kinds.clone(),
-            from: cfg.backfill.from,
-            to: cfg.backfill.to,
-        };
-        let stream = source.open(request).await?;
-        spawn_replay_forwarder(stream, backfill_tx);
-
-        let mut handles: Vec<NamedHandle> = Vec::with_capacity(self.inner.providers.len());
-        for p in &self.inner.providers {
-            let sink = merge_tx.clone();
-            let h = p.start_live(sink).await?;
-            handles.push(NamedHandle {
-                provider: p.clone(),
-                handle: Arc::new(Mutex::new(Some(h))),
-            });
-        }
-        drop(merge_tx);
-
-        for sub in &cfg.live.initial_subscriptions {
-            route_subscribe(&handles, &cfg.live.instrument_provider, sub.clone(), true).await?;
-        }
-
-        let controller = Controller::new(
-            SessionKind::Stitched,
-            handles,
-            self.inner.tap_log.clone(),
-            cfg.live.instrument_provider.clone(),
-        );
-        tokio::spawn(controller.run_stitched(backfill_rx, merge_rx, cmd_rx, events_tx));
-
-        Ok(Session {
-            cmd_tx,
-            events: Some(EventStream { rx: events_rx }),
-            kind: SessionKind::Stitched,
-        })
-    }
-
-    fn open_replay_source(&self, cfg: &ReplayConfig) -> Result<Box<dyn ReplaySource>> {
-        match &cfg.source {
-            ReplaySourceSpec::TapLog => {
-                let log = self
-                    .inner
-                    .tap_log
-                    .as_ref()
-                    .ok_or_else(|| Error::Config("no TapLog configured".into()))?;
-                Ok(log.as_replay_source())
+        match scope {
+            Scope::Historical { from, to } => {
+                tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
             }
-            ReplaySourceSpec::HistoricalCache => {
-                let cache = self
-                    .inner
-                    .historical_cache
-                    .as_ref()
-                    .ok_or_else(|| Error::Config("no HistoricalCache configured".into()))?;
-                // The cache's as_replay_source needs a single CacheKey. For
-                // multi-instrument/multi-kind requests, the controller would
-                // open multiple sources and merge — for now require the
-                // request to specify exactly one instrument/kind pair, which
-                // is the common research path.
-                let instrument = cfg
-                    .instruments
-                    .first()
-                    .ok_or_else(|| Error::Config("replay request needs at least one instrument".into()))?
-                    .clone();
-                let kind = *cfg
-                    .kinds
-                    .first()
-                    .ok_or_else(|| Error::Config("replay request needs at least one event kind".into()))?;
-                let provider = self
-                    .inner
-                    .providers
-                    .iter()
-                    .find(|p| p.supports(&instrument, kind))
-                    .map(|p| p.id().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                let key = datamancer_core::CacheKey {
-                    provider,
-                    instrument,
-                    kind,
-                    from: cfg.from,
-                    to: cfg.to,
-                };
-                Ok(cache.as_replay_source(key))
-            }
-            ReplaySourceSpec::Provider { id } => {
-                let _ = self
-                    .inner
-                    .providers
-                    .iter()
-                    .find(|p| p.id() == id)
-                    .ok_or_else(|| Error::UnknownProvider(id.clone()))?;
-                Err(Error::Config(
-                    "ReplaySourceSpec::Provider is not yet implemented; use HistoricalCache for now"
-                        .into(),
-                ))
+            Scope::Live { backfill_from } => {
+                let live = provider.start_live(provider_tx).await?;
+                live.subscribe(instrument.clone(), kind).await?;
+                tokio::spawn(controller.run_live(live, backfill_from, provider_rx, cmd_rx));
             }
         }
+
+        Ok(Session { inner })
     }
 
-    /// Look up a registered provider by id. Returns `Err(UnknownProvider)`
-    /// if no such provider was registered with the builder.
+    /// Look up a registered provider by id.
     pub fn provider(&self, id: &str) -> Result<&dyn Provider> {
         self.inner
             .providers
@@ -254,13 +179,44 @@ impl Datamancer {
             .map(|p| p.as_ref() as &dyn Provider)
             .ok_or_else(|| Error::UnknownProvider(id.to_string()))
     }
+
+    fn route(&self, instrument: &Instrument, kind: EventKind) -> Result<Arc<dyn Provider>> {
+        let pinned = self
+            .inner
+            .instrument_provider
+            .iter()
+            .find(|(i, _)| i == instrument)
+            .map(|(_, p)| p.as_str());
+
+        let candidate = if let Some(id) = pinned {
+            self.inner
+                .providers
+                .iter()
+                .find(|p| p.id() == id && p.supports(instrument, kind))
+        } else {
+            self.inner
+                .providers
+                .iter()
+                .find(|p| p.supports(instrument, kind))
+        };
+
+        candidate.cloned().ok_or_else(|| Error::UnsupportedEventKind {
+            kind,
+            instrument: instrument.clone(),
+        })
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Builder
+// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 pub struct DatamancerBuilder {
     providers: Vec<Arc<dyn Provider>>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
+    instrument_provider: Vec<(Instrument, String)>,
 }
 
 impl DatamancerBuilder {
@@ -271,30 +227,38 @@ impl DatamancerBuilder {
         self
     }
 
-    /// Register a provider held behind an `Arc`. Useful when the caller
-    /// keeps a reference for direct API calls (e.g. one-off historical
-    /// fetches) outside of a session.
+    /// Register a provider held behind an `Arc`. Useful when the caller keeps
+    /// a reference for direct API calls outside of a session.
     pub fn provider_arc(mut self, p: Arc<dyn Provider>) -> Self {
         self.providers.push(p);
         self
     }
 
-    /// Attach a tap log; every event a live session emits will be appended.
+    /// Pin `instrument` to a specific provider id. When more than one
+    /// registered provider supports the pair, the pinned one wins.
+    pub fn pin(mut self, instrument: Instrument, provider_id: impl Into<String>) -> Self {
+        self.instrument_provider
+            .push((instrument, provider_id.into()));
+        self
+    }
+
+    /// Attach a tap log; live events from sessions with `persist=true` will
+    /// be appended.
     pub fn tap_log(mut self, log: Box<dyn TapLog>) -> Self {
         self.tap_log = Some(Arc::from(log));
         self
     }
 
-    /// Attach a historical cache; `fetch_history` calls will read-through and
-    /// write-through this cache before hitting the upstream provider.
+    /// Attach a historical cache; historical fetches from sessions with
+    /// `persist=true` write-through this cache before returning to the
+    /// consumer.
     pub fn historical_cache(mut self, cache: Box<dyn HistoricalCache>) -> Self {
         self.historical_cache = Some(Arc::from(cache));
         self
     }
 
     /// Same as [`historical_cache`](Self::historical_cache) but accepts an
-    /// already-shared `Arc` so the cache can be queried from outside the
-    /// session in addition to the controller.
+    /// already-shared `Arc`.
     pub fn historical_cache_arc(mut self, cache: Arc<dyn HistoricalCache>) -> Self {
         self.historical_cache = Some(cache);
         self
@@ -311,6 +275,7 @@ impl DatamancerBuilder {
                 providers: self.providers,
                 tap_log: self.tap_log,
                 historical_cache: self.historical_cache,
+                instrument_provider: self.instrument_provider,
             }),
         })
     }
@@ -320,74 +285,100 @@ impl DatamancerBuilder {
 // Session handle
 // ---------------------------------------------------------------------------
 
-/// A consumer-facing handle to a running session.
+/// A handle to a running session. Single-owner; not `Clone`.
 pub struct Session {
-    cmd_tx: mpsc::Sender<SessionCommand>,
-    events: Option<EventStream>,
-    kind: SessionKind,
+    inner: Arc<SessionInner>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionKind {
-    Live,
-    Replay,
-    Stitched,
+struct SessionInner {
+    instrument: Instrument,
+    kind: EventKind,
+    scope: Scope,
+    /// Holder for the consumer-facing receiver. Available when no stream is
+    /// held; Taken when a stream is currently outstanding.
+    events_holder: Mutex<SessionStreamSlot>,
+    persisting: std::sync::atomic::AtomicBool,
+    cmd_tx: mpsc::Sender<SessionCommand>,
+}
+
+enum SessionStreamSlot {
+    Available(mpsc::Receiver<MarketEvent>),
+    Taken,
 }
 
 impl Session {
-    /// Take the event stream. Can only be called once per session.
+    /// Take the event stream. Errors with [`Error::EventsAlreadyTaken`] if a
+    /// previous [`EventStream`] is still held; once that one is dropped, this
+    /// can be called again.
+    ///
+    /// Each new take goes through the resume primitive: query persistence for
+    /// `(last_emitted_source_ts, now]`, replay what's there, emit a
+    /// [`ControlKind::Gap`] for what isn't (or the entire silence if
+    /// `persist=false`), then continue live.
     pub fn take_events(&mut self) -> Result<EventStream> {
-        self.events.take().ok_or(Error::EventsAlreadyTaken)
+        let mut slot = self
+            .inner
+            .events_holder
+            .try_lock()
+            .map_err(|_| Error::EventsAlreadyTaken)?;
+        match std::mem::replace(&mut *slot, SessionStreamSlot::Taken) {
+            SessionStreamSlot::Available(rx) => Ok(EventStream { rx }),
+            SessionStreamSlot::Taken => {
+                *slot = SessionStreamSlot::Taken;
+                Err(Error::EventsAlreadyTaken)
+            }
+        }
     }
 
-    pub async fn subscribe(&self, sub: Subscription) -> Result<()> {
-        if matches!(self.kind, SessionKind::Replay) {
-            return Err(Error::Config(
-                "replay sessions fix subscriptions at construction".into(),
-            ));
-        }
+    /// Toggle persistence at runtime. False stops future writes; events
+    /// already in flight to persistence still flush.
+    ///
+    /// Errors if no persistence layer is configured on the parent
+    /// [`Datamancer`].
+    pub async fn set_persisting(&self, on: bool) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCommand::Subscribe(sub, tx))
+        self.inner
+            .cmd_tx
+            .send(SessionCommand::SetPersisting(on, tx))
             .await
             .map_err(|_| Error::SessionClosed)?;
         rx.await.map_err(|_| Error::SessionClosed)?
     }
 
-    pub async fn unsubscribe(&self, sub: Subscription) -> Result<()> {
-        if matches!(self.kind, SessionKind::Replay) {
-            return Err(Error::Config(
-                "replay sessions fix subscriptions at construction".into(),
-            ));
-        }
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCommand::Unsubscribe(sub, tx))
-            .await
-            .map_err(|_| Error::SessionClosed)?;
-        rx.await.map_err(|_| Error::SessionClosed)?
-    }
-
+    /// Explicit termination. Auto-cleanup also handles natural-completion
+    /// cases (historical fetch exhausted, or live + stream-dropped +
+    /// persist=false).
     pub async fn close(self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(SessionCommand::Close(tx)).await;
+        let _ = self.inner.cmd_tx.send(SessionCommand::Close(tx)).await;
         let _ = rx.await;
         Ok(())
     }
+
+    pub fn instrument(&self) -> &Instrument {
+        &self.inner.instrument
+    }
+
+    pub fn kind(&self) -> EventKind {
+        self.inner.kind
+    }
+
+    pub fn scope(&self) -> Scope {
+        self.inner.scope
+    }
+
+    pub fn is_persisting(&self) -> bool {
+        self.inner
+            .persisting
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
-#[derive(Debug)]
-enum SessionCommand {
-    Subscribe(Subscription, oneshot::Sender<Result<()>>),
-    Unsubscribe(Subscription, oneshot::Sender<Result<()>>),
-    Close(oneshot::Sender<()>),
-}
-
-/// The session's output stream.
+/// The session's output stream. Drop it to stop emission; re-take from the
+/// owning [`Session`] if you want events again.
 pub struct EventStream {
     rx: mpsc::Receiver<MarketEvent>,
 }
-
 
 impl Stream for EventStream {
     type Item = MarketEvent;
@@ -400,17 +391,258 @@ impl Stream for EventStream {
     }
 }
 
+#[derive(Debug)]
+enum SessionCommand {
+    SetPersisting(bool, oneshot::Sender<Result<()>>),
+    Close(oneshot::Sender<()>),
+}
+
 // ---------------------------------------------------------------------------
-// Configuration
+// Controller
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
-pub struct LiveConfig {
-    pub initial_subscriptions: Vec<Subscription>,
-    pub instrument_provider: Vec<(Instrument, String)>,
-    pub reconnect: Option<ReconnectPolicy>,
-    pub buffer_size: usize,
+fn default_buffer() -> usize {
+    1024
 }
+
+struct Controller {
+    inner: Arc<SessionInner>,
+    provider: Arc<dyn Provider>,
+    tap_log: Option<Arc<dyn TapLog>>,
+    historical_cache: Option<Arc<dyn HistoricalCache>>,
+    events_tx: mpsc::Sender<MarketEvent>,
+    next_seq: u64,
+    /// Source-ts of the last data event handed to the consumer's stream. Used
+    /// by the resume primitive on stream re-take and at the historical→live
+    /// seam.
+    last_emitted_source_ts: Option<Timestamp>,
+}
+
+impl Controller {
+    /// Historical scope: spawn the provider's fetch, forward events as they
+    /// arrive, exit when fetch completes and the stream is drained or
+    /// dropped.
+    async fn run_historical(
+        mut self,
+        from: Timestamp,
+        to: Timestamp,
+        provider_tx: mpsc::Sender<MarketEvent>,
+        mut provider_rx: mpsc::Receiver<MarketEvent>,
+        mut cmd_rx: mpsc::Receiver<SessionCommand>,
+    ) {
+        let provider = self.provider.clone();
+        let request = HistoryRequest {
+            instrument: self.inner.instrument.clone(),
+            kind: self.inner.kind,
+            from,
+            to,
+        };
+        // Spawn the fetch with `provider_tx` so it owns the only producer
+        // side; when the fetch returns, the channel closes and `recv` yields
+        // `None`, signalling exhaustion to the loop below.
+        let fetch_task =
+            tokio::spawn(async move { provider.fetch_history(request, provider_tx).await });
+
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    if !self.handle_command(cmd).await {
+                        fetch_task.abort();
+                        return;
+                    }
+                }
+                ev = provider_rx.recv() => {
+                    match ev {
+                        Some(ev) => self.forward(ev).await,
+                        None => break, // fetch exhausted
+                    }
+                }
+            }
+        }
+
+        // Fetch is done. Wait for the consumer to finish draining (or drop)
+        // the stream, then auto-close.
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    if !self.handle_command(cmd).await {
+                        return;
+                    }
+                }
+                _ = self.events_tx.closed() => break,
+            }
+        }
+        self.shutdown().await;
+    }
+
+    /// Live scope: subscribe (already done by the caller), drain provider
+    /// events through the seq/forward pipeline, honor commands, auto-close
+    /// when the consumer drops the stream and we're not persisting.
+    /// Backfill seam is stubbed — see module-level TODO.
+    async fn run_live(
+        mut self,
+        live: Box<dyn LiveHandle>,
+        backfill_from: Option<Timestamp>,
+        mut provider_rx: mpsc::Receiver<MarketEvent>,
+        mut cmd_rx: mpsc::Receiver<SessionCommand>,
+    ) {
+        if let Some(from) = backfill_from {
+            // TODO(resume-primitive): kick off historical fetch from `from`
+            // to live-edge, bridge the seam (extend fetch to first live
+            // source_ts; emit ControlKind::Gap only if the provider can't
+            // reach). For now we surface a Gap span [from, now) so the
+            // placeholder is visible to consumers; live events follow.
+            let now = wall_clock_ts();
+            let gap = MarketEvent::Control(Control {
+                source_ts: now,
+                rx_ts: now,
+                seq: Seq(0),
+                kind: ControlKind::Gap {
+                    provider: self.provider.id().to_string(),
+                    instrument: self.inner.instrument.clone(),
+                    span: datamancer_core::GapSpan {
+                        from_source_ts: from,
+                        to_source_ts: now,
+                    },
+                },
+            });
+            self.forward(gap).await;
+        }
+
+        let live = Arc::new(Mutex::new(Some(live)));
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    if !self.handle_command(cmd).await {
+                        if let Some(h) = live.lock().await.take() {
+                            let _ = h.unsubscribe(self.inner.instrument.clone(), self.inner.kind).await;
+                            let _ = h.close().await;
+                        }
+                        return;
+                    }
+                }
+                ev = provider_rx.recv() => {
+                    match ev {
+                        Some(ev) => self.forward(ev).await,
+                        None => {
+                            // Provider task exited unexpectedly.
+                            self.shutdown().await;
+                            return;
+                        }
+                    }
+                }
+                _ = self.events_tx.closed() => {
+                    // Consumer dropped the stream.
+                    // TODO(persistence): when write-through lands, keep
+                    // running while persist=true so recording-only mode is
+                    // observable. Today, no write-through means there's
+                    // nothing useful to do without an emitting consumer.
+                    if let Some(h) = live.lock().await.take() {
+                        let _ = h.unsubscribe(self.inner.instrument.clone(), self.inner.kind).await;
+                        let _ = h.close().await;
+                    }
+                    self.shutdown().await;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Stamp `seq`, optionally tee to TapLog (TODO), forward to the consumer
+    /// stream when held. Updates `last_emitted_source_ts` on data events.
+    async fn forward(&mut self, ev: MarketEvent) {
+        let stamped = self.assign_seq(ev);
+        if let Some(ts) = source_ts(&stamped)
+            && matches!(
+                stamped,
+                MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)
+            )
+        {
+            self.last_emitted_source_ts = Some(ts);
+        }
+        // TODO(persistence): tee to TapLog / HistoricalCache when persist=true.
+        let _ = self.events_tx.send(stamped).await;
+    }
+
+    fn assign_seq(&mut self, ev: MarketEvent) -> MarketEvent {
+        let seq = Seq(self.next_seq);
+        self.next_seq += 1;
+        match ev {
+            MarketEvent::Trade(t) => MarketEvent::Trade(Trade { seq, ..t }),
+            MarketEvent::Quote(q) => MarketEvent::Quote(Quote { seq, ..q }),
+            MarketEvent::Bar(b) => MarketEvent::Bar(Bar { seq, ..b }),
+            MarketEvent::Control(c) => MarketEvent::Control(Control { seq, ..c }),
+            other => other,
+        }
+    }
+
+    /// Returns false if the controller should exit.
+    async fn handle_command(&self, cmd: Option<SessionCommand>) -> bool {
+        match cmd {
+            Some(SessionCommand::SetPersisting(on, ack)) => {
+                let res = self.apply_persisting(on);
+                let _ = ack.send(res);
+                true
+            }
+            Some(SessionCommand::Close(ack)) => {
+                self.shutdown().await;
+                let _ = ack.send(());
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn apply_persisting(&self, on: bool) -> Result<()> {
+        if on && self.tap_log.is_none() && self.historical_cache.is_none() {
+            return Err(Error::PersistenceRequired);
+        }
+        self.inner
+            .persisting
+            .store(on, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    async fn shutdown(&self) {
+        let now = wall_clock_ts();
+        let _ = self
+            .events_tx
+            .send(MarketEvent::Control(Control {
+                source_ts: now,
+                rx_ts: now,
+                seq: Seq(self.next_seq),
+                kind: ControlKind::SessionClosing,
+            }))
+            .await;
+        if let Some(log) = &self.tap_log {
+            let _ = log.flush().await;
+        }
+    }
+}
+
+fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
+    match ev {
+        MarketEvent::Trade(t) => Some(t.source_ts),
+        MarketEvent::Quote(q) => Some(q.source_ts),
+        MarketEvent::Bar(b) => Some(b.source_ts),
+        MarketEvent::Control(c) => Some(c.source_ts),
+        _ => None,
+    }
+}
+
+fn wall_clock_ts() -> Timestamp {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    Timestamp(nanos)
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect policy (carried through from the previous shape; consumed by the
+// Alpaca provider's streaming task).
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub struct ReconnectPolicy {
@@ -428,376 +660,3 @@ impl Default for ReconnectPolicy {
         }
     }
 }
-
-#[derive(Debug, Clone)]
-pub struct ReplayConfig {
-    pub source: ReplaySourceSpec,
-    pub instruments: Vec<Instrument>,
-    pub kinds: Vec<EventKind>,
-    pub from: Timestamp,
-    pub to: Timestamp,
-}
-
-#[derive(Debug, Clone)]
-pub enum ReplaySourceSpec {
-    TapLog,
-    HistoricalCache,
-    Provider { id: String },
-}
-
-#[derive(Debug, Clone)]
-pub struct StitchConfig {
-    pub backfill: ReplayConfig,
-    pub live: LiveConfig,
-}
-
-// ---------------------------------------------------------------------------
-// Controller and helpers
-// ---------------------------------------------------------------------------
-
-fn effective_buffer(requested: usize) -> usize {
-    if requested == 0 { 1024 } else { requested }
-}
-
-#[derive(Clone)]
-struct NamedHandle {
-    provider: Arc<dyn Provider>,
-    handle: Arc<Mutex<Option<Box<dyn LiveHandle>>>>,
-}
-
-struct Controller {
-    kind: SessionKind,
-    handles: Vec<NamedHandle>,
-    tap_log: Option<Arc<dyn TapLog>>,
-    instrument_provider: Vec<(Instrument, String)>,
-    /// Session-monotonic sequence counter.
-    next_seq: u64,
-    /// For stitched sessions: last source-ts seen in the backfill stream
-    /// (used to detect a gap when live takes over).
-    last_backfill_ts: Option<Timestamp>,
-    /// Whether we've already emitted (or decided not to emit) a seam-Gap
-    /// for the stitched session.
-    stitched_seam_handled: bool,
-}
-
-impl Controller {
-    fn new(
-        kind: SessionKind,
-        handles: Vec<NamedHandle>,
-        tap_log: Option<Arc<dyn TapLog>>,
-        instrument_provider: Vec<(Instrument, String)>,
-    ) -> Self {
-        Self {
-            kind,
-            handles,
-            tap_log,
-            instrument_provider,
-            next_seq: 0,
-            last_backfill_ts: None,
-            stitched_seam_handled: false,
-        }
-    }
-
-    /// Live and replay sessions share this loop: drain `merge_rx`, assign
-    /// seq, optionally tee, forward.
-    async fn run(
-        mut self,
-        mut merge_rx: mpsc::Receiver<MarketEvent>,
-        mut cmd_rx: mpsc::Receiver<SessionCommand>,
-        events_tx: mpsc::Sender<MarketEvent>,
-    ) {
-        let mut sealed_seam: Option<Timestamp> = None;
-        loop {
-            tokio::select! {
-                cmd = cmd_rx.recv() => {
-                    if !self.handle_command(cmd, &events_tx).await {
-                        return;
-                    }
-                }
-                ev = merge_rx.recv() => {
-                    let Some(ev) = ev else { return };
-                    self.handle_live_or_replay_event(ev, &mut sealed_seam, &events_tx).await;
-                }
-            }
-        }
-    }
-
-    /// Stitched sessions: phase 1 drains backfill in full, phase 2 switches
-    /// to live with optional seam-gap insertion.
-    async fn run_stitched(
-        mut self,
-        mut backfill_rx: mpsc::Receiver<MarketEvent>,
-        mut merge_rx: mpsc::Receiver<MarketEvent>,
-        mut cmd_rx: mpsc::Receiver<SessionCommand>,
-        events_tx: mpsc::Sender<MarketEvent>,
-    ) {
-        // Phase 1: backfill. Concurrently honor commands so the consumer can
-        // close the session early; live events accumulate in `merge_rx`'s
-        // buffer untouched.
-        loop {
-            tokio::select! {
-                biased;
-                cmd = cmd_rx.recv() => {
-                    if !self.handle_command(cmd, &events_tx).await {
-                        return;
-                    }
-                }
-                ev = backfill_rx.recv() => {
-                    match ev {
-                        Some(ev) => self.handle_backfill_event(ev, &events_tx).await,
-                        None => break, // backfill exhausted
-                    }
-                }
-            }
-        }
-
-        let mut sealed_seam: Option<Timestamp> = self.last_backfill_ts;
-
-        // Phase 2: live.
-        loop {
-            tokio::select! {
-                cmd = cmd_rx.recv() => {
-                    if !self.handle_command(cmd, &events_tx).await {
-                        return;
-                    }
-                }
-                ev = merge_rx.recv() => {
-                    let Some(ev) = ev else { return };
-                    self.handle_live_or_replay_event(ev, &mut sealed_seam, &events_tx).await;
-                }
-            }
-        }
-    }
-
-    /// Returns false if the controller should exit.
-    async fn handle_command(
-        &self,
-        cmd: Option<SessionCommand>,
-        events_tx: &mpsc::Sender<MarketEvent>,
-    ) -> bool {
-        match cmd {
-            Some(SessionCommand::Subscribe(sub, ack)) => {
-                let res =
-                    route_subscribe(&self.handles, &self.instrument_provider, sub, true).await;
-                let _ = ack.send(res);
-                true
-            }
-            Some(SessionCommand::Unsubscribe(sub, ack)) => {
-                let res =
-                    route_subscribe(&self.handles, &self.instrument_provider, sub, false).await;
-                let _ = ack.send(res);
-                true
-            }
-            Some(SessionCommand::Close(ack)) => {
-                self.shutdown(events_tx).await;
-                let _ = ack.send(());
-                false
-            }
-            None => {
-                self.shutdown(events_tx).await;
-                false
-            }
-        }
-    }
-
-    async fn handle_backfill_event(&mut self, ev: MarketEvent, events_tx: &mpsc::Sender<MarketEvent>) {
-        if let Some(ts) = source_ts(&ev)
-            && self.last_backfill_ts.map(|prev| ts > prev).unwrap_or(true)
-        {
-            self.last_backfill_ts = Some(ts);
-        }
-        let stamped = self.assign_seq(ev);
-        self.tee_to_log(&stamped).await;
-        let _ = events_tx.send(stamped).await;
-    }
-
-    async fn handle_live_or_replay_event(
-        &mut self,
-        ev: MarketEvent,
-        sealed_seam: &mut Option<Timestamp>,
-        events_tx: &mpsc::Sender<MarketEvent>,
-    ) {
-        // Stitched: insert a seam Gap on the very first live event if its
-        // source_ts is past last_backfill_ts. We only do this once.
-        if matches!(self.kind, SessionKind::Stitched) && !self.stitched_seam_handled {
-            let live_ts = source_ts(&ev);
-            if let (Some(seam), Some(now)) = (*sealed_seam, live_ts)
-                && now.0 > seam.0
-            {
-                let gap_ev = self.build_gap_control(seam, now, &ev);
-                let stamped = self.assign_seq(gap_ev);
-                self.tee_to_log(&stamped).await;
-                let _ = events_tx.send(stamped).await;
-            }
-            self.stitched_seam_handled = true;
-            *sealed_seam = None;
-        }
-        let stamped = self.assign_seq(ev);
-        self.tee_to_log(&stamped).await;
-        let _ = events_tx.send(stamped).await;
-    }
-
-    fn build_gap_control(
-        &self,
-        from: Timestamp,
-        to: Timestamp,
-        first_live: &MarketEvent,
-    ) -> MarketEvent {
-        let provider = first_live_provider_id(&self.handles).unwrap_or_else(|| "unknown".into());
-        let instrument = event_instrument(first_live).unwrap_or_else(|| Instrument::new("unknown"));
-        MarketEvent::Control(Control {
-            source_ts: to,
-            rx_ts: to,
-            seq: Seq(0),
-            kind: ControlKind::Gap {
-                provider,
-                instrument,
-                span: GapSpan {
-                    from_source_ts: from,
-                    to_source_ts: to,
-                },
-            },
-        })
-    }
-
-    fn assign_seq(&mut self, ev: MarketEvent) -> MarketEvent {
-        let seq = Seq(self.next_seq);
-        self.next_seq += 1;
-        match ev {
-            MarketEvent::Trade(t) => MarketEvent::Trade(Trade { seq, ..t }),
-            MarketEvent::Quote(q) => MarketEvent::Quote(Quote { seq, ..q }),
-            MarketEvent::Bar(b) => MarketEvent::Bar(Bar { seq, ..b }),
-            MarketEvent::Control(c) => MarketEvent::Control(Control { seq, ..c }),
-            other => other,
-        }
-    }
-
-    async fn tee_to_log(&self, ev: &MarketEvent) {
-        if let Some(log) = &self.tap_log {
-            let _ = log.append(ev).await;
-        }
-    }
-
-    async fn shutdown(&self, events_tx: &mpsc::Sender<MarketEvent>) {
-        let now = wall_clock_ts();
-        let _ = events_tx
-            .send(MarketEvent::Control(Control {
-                source_ts: now,
-                rx_ts: now,
-                seq: Seq(self.next_seq),
-                kind: ControlKind::SessionClosing,
-            }))
-            .await;
-        for h in &self.handles {
-            let mut guard = h.handle.lock().await;
-            if let Some(handle) = guard.take() {
-                let _ = handle.close().await;
-            }
-        }
-        if let Some(log) = &self.tap_log {
-            let _ = log.flush().await;
-        }
-    }
-}
-
-fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
-    match ev {
-        MarketEvent::Trade(t) => Some(t.source_ts),
-        MarketEvent::Quote(q) => Some(q.source_ts),
-        MarketEvent::Bar(b) => Some(b.source_ts),
-        MarketEvent::Control(c) => Some(c.source_ts),
-        _ => None,
-    }
-}
-
-fn event_instrument(ev: &MarketEvent) -> Option<Instrument> {
-    match ev {
-        MarketEvent::Trade(t) => Some(t.instrument.clone()),
-        MarketEvent::Quote(q) => Some(q.instrument.clone()),
-        MarketEvent::Bar(b) => Some(b.instrument.clone()),
-        _ => None,
-    }
-}
-
-fn first_live_provider_id(handles: &[NamedHandle]) -> Option<String> {
-    handles.first().map(|h| h.provider.id().to_string())
-}
-
-fn wall_clock_ts() -> Timestamp {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
-    Timestamp(nanos)
-}
-
-async fn route_subscribe(
-    handles: &[NamedHandle],
-    pinning: &[(Instrument, String)],
-    sub: Subscription,
-    add: bool,
-) -> Result<()> {
-    if handles.is_empty() {
-        return Err(Error::Config("no providers registered".into()));
-    }
-    // Group sub.kinds by which provider serves them.
-    use std::collections::HashMap;
-    let mut by_provider: HashMap<String, Vec<EventKind>> = HashMap::new();
-    let pinned = pinning
-        .iter()
-        .find(|(i, _)| *i == sub.instrument)
-        .map(|(_, p)| p.as_str());
-
-    for kind in &sub.kinds {
-        let chosen = if let Some(id) = pinned {
-            handles
-                .iter()
-                .find(|h| h.provider.id() == id && h.provider.supports(&sub.instrument, *kind))
-        } else {
-            handles
-                .iter()
-                .find(|h| h.provider.supports(&sub.instrument, *kind))
-        };
-        let Some(named) = chosen else {
-            return Err(Error::UnsupportedEventKind {
-                kind: *kind,
-                instrument: sub.instrument.clone(),
-            });
-        };
-        by_provider
-            .entry(named.provider.id().to_string())
-            .or_default()
-            .push(*kind);
-    }
-
-    for (pid, kinds) in by_provider {
-        let named = handles
-            .iter()
-            .find(|h| h.provider.id() == pid)
-            .expect("by_provider id was just produced from handles");
-        let scoped = Subscription::new(sub.instrument.clone(), kinds);
-        let guard = named.handle.lock().await;
-        let handle = guard.as_ref().ok_or(Error::SessionClosed)?;
-        if add {
-            handle.subscribe(scoped).await?;
-        } else {
-            handle.unsubscribe(scoped).await?;
-        }
-    }
-    Ok(())
-}
-
-fn spawn_replay_forwarder(
-    mut stream: futures::stream::BoxStream<'static, MarketEvent>,
-    sink: mpsc::Sender<MarketEvent>,
-) {
-    tokio::spawn(async move {
-        while let Some(ev) = stream.next().await {
-            if sink.send(ev).await.is_err() {
-                return;
-            }
-        }
-    });
-}
-

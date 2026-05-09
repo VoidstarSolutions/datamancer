@@ -32,9 +32,6 @@ pub use datamancer_core::traits;
 pub use datamancer_core::{
     Bar, BarInterval, CacheCoverage, CacheKey, Control, ControlKind, Error, EventKind, GapSpan,
     HistoricalCache, HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, Quote,
-    ReplayRequest, ReplaySource, Result, Seq, Subscription, TapLog, Timestamp, Trade,
+    ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
 };
-pub use session::{
-    Datamancer, DatamancerBuilder, EventStream, LiveConfig, ReconnectPolicy, ReplayConfig,
-    ReplaySourceSpec, Session, StitchConfig,
-};
+pub use session::{Datamancer, DatamancerBuilder, EventStream, ReconnectPolicy, Scope, Session};

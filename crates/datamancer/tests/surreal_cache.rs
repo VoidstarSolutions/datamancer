@@ -6,11 +6,9 @@
 
 #![cfg(feature = "storage-surreal")]
 
-use std::collections::BTreeSet;
-
 use datamancer::{
     Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache, Instrument, MarketEvent,
-    Price, Seq, Subscription, Timestamp, Trade,
+    Price, Seq, Timestamp, Trade,
 };
 use datamancer::storage::{SurrealCache, SurrealCacheConfig};
 use datamancer_core::ReplayRequest;
@@ -193,11 +191,10 @@ async fn embedded_round_trip_persists_to_disk() {
     assert_eq!(coverage.event_count, 2);
 }
 
-// Sanity: Subscription is a re-export from the public API and works via
-// Instrument::From — make sure we didn't accidentally break the reexports.
+// Sanity: the public re-exports we lean on stay in place after the API
+// reshape — Instrument constructs from a &str and EventKind is reachable.
 #[test]
 fn reexports_are_consistent() {
-    let mut kinds = BTreeSet::new();
-    kinds.insert(EventKind::Trade);
-    let _sub = Subscription::new("AAPL", kinds);
+    let _inst: Instrument = Instrument::new("AAPL");
+    let _kind: EventKind = EventKind::Trade;
 }
