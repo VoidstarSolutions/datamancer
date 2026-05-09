@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     error::Result,
-    event::{EventKind, MarketEvent, Subscription, Timestamp},
+    event::{EventKind, MarketEvent, Timestamp},
     instrument::Instrument,
 };
 
@@ -53,15 +53,20 @@ pub trait Provider: Send + Sync + 'static {
 
 /// A handle to a running live provider session. Subscription mutation and
 /// shutdown go through this handle.
+///
+/// In datamancer's session model each session is scoped to a single
+/// `(instrument, kind)` pair, so the subscription primitives operate on one
+/// pair at a time. Provider implementations may multiplex multiple pairs over
+/// a single underlying connection.
 #[async_trait]
 pub trait LiveHandle: Send + Sync {
-    /// Activate `sub` against the live session. Should return once the
-    /// provider has acknowledged the change (or surfaces the result via a
-    /// `ControlKind::SubscriptionChanged` entry on the event sink).
-    async fn subscribe(&self, sub: Subscription) -> Result<()>;
+    /// Activate `(instrument, kind)` against the live session. Should return
+    /// once the provider has acknowledged the change (or surfaces the result
+    /// via a `ControlKind::SubscriptionChanged` entry on the event sink).
+    async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()>;
 
-    /// Deactivate `sub`. Symmetric with `subscribe`.
-    async fn unsubscribe(&self, sub: Subscription) -> Result<()>;
+    /// Deactivate `(instrument, kind)`. Symmetric with `subscribe`.
+    async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()>;
 
     /// Tear down the live connection. Implementations should drop the event
     /// sink after final teardown so the consuming session sees a clean EOF.

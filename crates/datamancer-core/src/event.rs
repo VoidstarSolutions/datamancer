@@ -4,8 +4,6 @@
 //! cover live and historical market data plus in-band [`Control`] entries for
 //! connectivity, subscription state, and gap reporting.
 
-use std::collections::BTreeSet;
-
 use crate::{Instrument, Price};
 
 /// A monotonically-increasing identifier assigned by datamancer at receipt.
@@ -43,25 +41,6 @@ pub enum EventKind {
     Trade,
     Quote,
     Bar(BarInterval),
-}
-
-/// A single subscription request: one instrument, one or more event kinds.
-///
-/// Subscriptions accumulate in the session; adding the same instrument with a
-/// new kind extends the existing subscription rather than duplicating it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Subscription {
-    pub instrument: Instrument,
-    pub kinds: BTreeSet<EventKind>,
-}
-
-impl Subscription {
-    pub fn new(instrument: impl Into<Instrument>, kinds: impl IntoIterator<Item = EventKind>) -> Self {
-        Self {
-            instrument: instrument.into(),
-            kinds: kinds.into_iter().collect(),
-        }
-    }
 }
 
 /// The unified output stream entry.
@@ -151,11 +130,22 @@ pub enum ControlKind {
     ProviderConnected { provider: String },
     /// Provider connection lost; a reconnect attempt is scheduled or in flight.
     ProviderDisconnected { provider: String, reason: String },
-    /// Subscription state changed (acknowledged by the provider).
-    SubscriptionChanged { provider: String, subscription: Subscription, active: bool },
+    /// Subscription state changed (acknowledged by the provider). Each
+    /// session subscribes to exactly one `(instrument, kind)` pair, so the
+    /// notification carries the same shape.
+    SubscriptionChanged {
+        provider: String,
+        instrument: Instrument,
+        kind: EventKind,
+        active: bool,
+    },
     /// Datamancer detected a gap in a provider's stream (sequence break,
     /// dropped messages, or a reconnect with missed window).
-    Gap { provider: String, instrument: Instrument, span: GapSpan },
+    Gap {
+        provider: String,
+        instrument: Instrument,
+        span: GapSpan,
+    },
     /// A non-fatal provider error worth surfacing to the consumer.
     ProviderError { provider: String, message: String },
     /// The session is closing in response to an explicit `close()`.
