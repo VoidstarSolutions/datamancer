@@ -103,6 +103,7 @@ enum HubSlot {
 }
 
 impl AlpacaCryptoProvider {
+    #[must_use]
     pub fn new(cfg: AlpacaCryptoProviderConfig) -> Self {
         Self {
             cfg,
@@ -137,8 +138,9 @@ impl Provider for AlpacaCryptoProvider {
 
     fn supports(&self, _instrument: &Instrument, kind: EventKind) -> bool {
         match kind {
-            EventKind::Trade | EventKind::Quote => true,
-            EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
+            EventKind::Trade
+            | EventKind::Quote
+            | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
             EventKind::Bar(_) => false,
         }
     }
@@ -257,6 +259,10 @@ impl LiveHandle for SharedLiveHandle {
 // Hub task
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-pass connect / authenticate / subscribe / dispatch / reconnect state machine; extraction would obscure the linear lifecycle"
+)]
 async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receiver<HubCommand>) {
     let mut routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>> = HashMap::new();
     let mut subs = CryptoSubscriptionList::new();
@@ -462,13 +468,12 @@ async fn sleep_with_jitter(
     *backoff_ms = (*backoff_ms * 2).min(policy.max_backoff_ms);
 
     tokio::select! {
-        _ = tokio::time::sleep(delay) => true,
+        () = tokio::time::sleep(delay) => true,
         cmd = cmd_rx.recv() => {
             match cmd {
                 // While disconnected, fail subscribe/unsubscribe immediately so
                 // sessions see a clear error rather than stalling.
-                Some(HubCommand::Subscribe { ack, .. })
-                | Some(HubCommand::Unsubscribe { ack, .. }) => {
+                Some(HubCommand::Subscribe { ack, .. } | HubCommand::Unsubscribe { ack, .. }) => {
                     let _ = ack.send(Err(Error::Provider {
                         provider: PROVIDER_ID.to_string(),
                         message: "provider is reconnecting".to_string(),
@@ -486,12 +491,12 @@ async fn sleep_with_jitter(
 }
 
 fn is_empty(list: &CryptoSubscriptionList) -> bool {
-    list.bars.as_ref().is_none_or(|v| v.is_empty())
-        && list.daily_bars.as_ref().is_none_or(|v| v.is_empty())
-        && list.updated_bars.as_ref().is_none_or(|v| v.is_empty())
-        && list.quotes.as_ref().is_none_or(|v| v.is_empty())
-        && list.trades.as_ref().is_none_or(|v| v.is_empty())
-        && list.orderbooks.as_ref().is_none_or(|v| v.is_empty())
+    list.bars.as_ref().is_none_or(Vec::is_empty)
+        && list.daily_bars.as_ref().is_none_or(Vec::is_empty)
+        && list.updated_bars.as_ref().is_none_or(Vec::is_empty)
+        && list.quotes.as_ref().is_none_or(Vec::is_empty)
+        && list.trades.as_ref().is_none_or(Vec::is_empty)
+        && list.orderbooks.as_ref().is_none_or(Vec::is_empty)
 }
 
 fn apply_pair_to_list(
@@ -555,10 +560,14 @@ async fn broadcast_control_to(sink: Option<&mpsc::Sender<MarketEvent>>, kind: Co
 }
 
 fn wall_clock_ts() -> Timestamp {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i64 nanos since epoch representable until year 2262"
+        )]
+        let n = d.as_nanos() as i64;
+        n
+    });
     Timestamp(nanos)
 }
 
@@ -571,14 +580,15 @@ pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEv
     match msg {
         CryptoStreamMessage::Trade(t) => vec![MarketEvent::Trade(translate_trade(&t, rx))],
         CryptoStreamMessage::Quote(q) => vec![MarketEvent::Quote(translate_quote(&q, rx))],
-        CryptoStreamMessage::Bar(b) => {
-            vec![MarketEvent::Bar(translate_bar(&b, BarInterval::OneMinute, rx))]
+        CryptoStreamMessage::Bar(b) | CryptoStreamMessage::UpdatedBar(b) => {
+            vec![MarketEvent::Bar(translate_bar(
+                &b,
+                BarInterval::OneMinute,
+                rx,
+            ))]
         }
         CryptoStreamMessage::DailyBar(b) => {
             vec![MarketEvent::Bar(translate_bar(&b, BarInterval::OneDay, rx))]
-        }
-        CryptoStreamMessage::UpdatedBar(b) => {
-            vec![MarketEvent::Bar(translate_bar(&b, BarInterval::OneMinute, rx))]
         }
         CryptoStreamMessage::Error(err) => vec![MarketEvent::Control(Control {
             source_ts: rx,
@@ -596,14 +606,13 @@ pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEv
 }
 
 fn translate_trade(t: &CryptoTrade, rx: Timestamp) -> Trade {
-    let size = (t.size.max(0.0)).round() as u64;
     Trade {
         instrument: Instrument::new(&t.symbol),
         source_ts: chrono_to_ts(t.timestamp),
         rx_ts: rx,
         seq: Seq(0),
         price: Price::from_f64_round(t.price),
-        size,
+        size: super::f64_to_u64_saturating(t.size.round()),
     }
 }
 
@@ -614,9 +623,9 @@ fn translate_quote(q: &CryptoQuote, rx: Timestamp) -> Quote {
         rx_ts: rx,
         seq: Seq(0),
         bid: Price::from_f64_round(q.bid_price),
-        bid_size: (q.bid_size.max(0.0)).round() as u64,
+        bid_size: super::f64_to_u64_saturating(q.bid_size.round()),
         ask: Price::from_f64_round(q.ask_price),
-        ask_size: (q.ask_size.max(0.0)).round() as u64,
+        ask_size: super::f64_to_u64_saturating(q.ask_size.round()),
     }
 }
 
@@ -631,7 +640,7 @@ fn translate_bar(b: &CryptoBar, interval: BarInterval, rx: Timestamp) -> Bar {
         high: Price::from_f64_round(b.high),
         low: Price::from_f64_round(b.low),
         close: Price::from_f64_round(b.close),
-        volume: (b.volume.max(0.0)).round() as u64,
+        volume: super::f64_to_u64_saturating(b.volume.round()),
     }
 }
 

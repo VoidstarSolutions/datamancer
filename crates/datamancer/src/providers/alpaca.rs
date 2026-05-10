@@ -20,11 +20,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use datamancer_core::{
-    BarInterval, Control, ControlKind, Error, EventKind, GapSpan, HistoryRequest, Instrument,
-    LiveHandle, MarketEvent, Price, Provider, Result, Seq, Timestamp, Trade,
-};
 use datamancer_core::{Bar, Quote};
+use datamancer_core::{
+    BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest, Instrument, LiveHandle,
+    MarketEvent, Price, Provider, Result, Seq, Timestamp, Trade,
+};
 use oxidized_alpaca::{
     AccountType, MarketDataClient, StreamingFeed,
     restful::market_data::TimeFrame,
@@ -53,7 +53,6 @@ pub enum AlpacaStreamFeed {
     /// Test feed — synthetic messages, available outside market hours.
     Test,
 }
-
 
 /// Configuration for [`AlpacaProvider`].
 #[derive(Clone, Debug)]
@@ -87,12 +86,14 @@ impl AlpacaProvider {
     /// Construct without eagerly initializing the REST client. Use this when
     /// only live streaming is needed and credentials are loaded later, or in
     /// tests where the env vars are not set.
+    #[must_use]
     pub fn new(cfg: AlpacaProviderConfig) -> Self {
         let rest = MarketDataClient::new(cfg.account_type).ok();
         Self { cfg, rest }
     }
 
     /// Construct with an explicit REST client. Useful in tests.
+    #[must_use]
     pub fn with_rest(cfg: AlpacaProviderConfig, rest: MarketDataClient) -> Self {
         Self {
             cfg,
@@ -109,8 +110,9 @@ impl Provider for AlpacaProvider {
 
     fn supports(&self, _instrument: &Instrument, kind: EventKind) -> bool {
         match kind {
-            EventKind::Trade | EventKind::Quote => true,
-            EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
+            EventKind::Trade
+            | EventKind::Quote
+            | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
             EventKind::Bar(_) => false,
         }
     }
@@ -203,13 +205,18 @@ impl LiveHandle for AlpacaLiveHandle {
 // Streaming task
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-pass connect / authenticate / subscribe / dispatch / reconnect state machine; extraction would obscure the linear lifecycle"
+)]
 async fn run_streaming_task(
     cfg: AlpacaProviderConfig,
     sink: mpsc::Sender<MarketEvent>,
     mut cmd_rx: mpsc::Receiver<LiveCommand>,
 ) {
     // Authoritative subscription state, applied to every fresh client.
-    let active: Arc<Mutex<StockSubscriptionList>> = Arc::new(Mutex::new(StockSubscriptionList::new()));
+    let active: Arc<Mutex<StockSubscriptionList>> =
+        Arc::new(Mutex::new(StockSubscriptionList::new()));
     let mut backoff = cfg.reconnect.initial_backoff_ms;
 
     'outer: loop {
@@ -407,7 +414,7 @@ async fn sleep_with_jitter(
     *backoff_ms = (*backoff_ms * 2).min(policy.max_backoff_ms);
 
     tokio::select! {
-        _ = tokio::time::sleep(delay) => true,
+        () = tokio::time::sleep(delay) => true,
         cmd = cmd_rx.recv() => {
             match cmd {
                 Some(LiveCommand::Close(ack)) => {
@@ -416,8 +423,7 @@ async fn sleep_with_jitter(
                     let _ = ack.send(());
                     false
                 }
-                Some(LiveCommand::Subscribe(_, _, ack))
-                | Some(LiveCommand::Unsubscribe(_, _, ack)) => {
+                Some(LiveCommand::Subscribe(_, _, ack) | LiveCommand::Unsubscribe(_, _, ack)) => {
                     let _ = ack.send(Err(Error::Provider {
                         provider: PROVIDER_ID.to_string(),
                         message: "provider is reconnecting".to_string(),
@@ -431,10 +437,10 @@ async fn sleep_with_jitter(
 }
 
 fn is_empty(list: &StockSubscriptionList) -> bool {
-    list.bars.as_ref().is_none_or(|v| v.is_empty())
-        && list.daily_bars.as_ref().is_none_or(|v| v.is_empty())
-        && list.quotes.as_ref().is_none_or(|v| v.is_empty())
-        && list.trades.as_ref().is_none_or(|v| v.is_empty())
+    list.bars.as_ref().is_none_or(Vec::is_empty)
+        && list.daily_bars.as_ref().is_none_or(Vec::is_empty)
+        && list.quotes.as_ref().is_none_or(Vec::is_empty)
+        && list.trades.as_ref().is_none_or(Vec::is_empty)
 }
 
 fn apply_pair_to_list(
@@ -480,10 +486,14 @@ async fn emit_control(sink: &mpsc::Sender<MarketEvent>, kind: ControlKind) {
 }
 
 fn wall_clock_ts() -> Timestamp {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i64 nanos since epoch representable until year 2262"
+        )]
+        let n = d.as_nanos() as i64;
+        n
+    });
     Timestamp(nanos)
 }
 
@@ -500,12 +510,20 @@ pub(crate) fn translate_stock_message(msg: StockStreamMessage) -> Vec<MarketEven
     match msg {
         StockStreamMessage::Trade(t) => vec![MarketEvent::Trade(translate_trade(&t, rx))],
         StockStreamMessage::Quote(q) => vec![MarketEvent::Quote(translate_quote(&q, rx))],
-        StockStreamMessage::Bar(b) => vec![MarketEvent::Bar(translate_bar(&b, BarInterval::OneMinute, rx))],
+        StockStreamMessage::Bar(b) => vec![MarketEvent::Bar(translate_bar(
+            &b,
+            BarInterval::OneMinute,
+            rx,
+        ))],
         StockStreamMessage::DailyBar(b) => {
             vec![MarketEvent::Bar(translate_bar(&b, BarInterval::OneDay, rx))]
         }
         StockStreamMessage::UpdatedBar(b) => {
-            vec![MarketEvent::Bar(translate_bar(&b, BarInterval::OneMinute, rx))]
+            vec![MarketEvent::Bar(translate_bar(
+                &b,
+                BarInterval::OneMinute,
+                rx,
+            ))]
         }
         StockStreamMessage::Error(err) => vec![MarketEvent::Control(Control {
             source_ts: rx,
@@ -529,7 +547,7 @@ fn translate_trade(t: &StockTrade, rx: Timestamp) -> Trade {
         rx_ts: rx,
         seq: Seq(0),
         price: Price::from_f64_round(t.price),
-        size: t.size as u64,
+        size: super::f64_to_u64_saturating(t.size),
     }
 }
 
@@ -540,9 +558,9 @@ fn translate_quote(q: &StockQuote, rx: Timestamp) -> Quote {
         rx_ts: rx,
         seq: Seq(0),
         bid: Price::from_f64_round(q.bid_price),
-        bid_size: q.bid_size as u64,
+        bid_size: super::f64_to_u64_saturating(q.bid_size),
         ask: Price::from_f64_round(q.ask_price),
-        ask_size: q.ask_size as u64,
+        ask_size: super::f64_to_u64_saturating(q.ask_size),
     }
 }
 
@@ -557,7 +575,7 @@ fn translate_bar(b: &StockBar, interval: BarInterval, rx: Timestamp) -> Bar {
         high: Price::from_f64_round(b.high),
         low: Price::from_f64_round(b.low),
         close: Price::from_f64_round(b.close),
-        volume: b.volume.max(0) as u64,
+        volume: b.volume.max(0).cast_unsigned(),
     }
 }
 
@@ -601,7 +619,7 @@ async fn fetch_history_via(
                     rx_ts: rx,
                     seq: Seq(0),
                     price: Price::from_f64_round(t.price),
-                    size: t.size as u64,
+                    size: u64::from(t.size),
                 };
                 if sink.send(MarketEvent::Trade(trade)).await.is_err() {
                     return Ok(());
@@ -661,14 +679,6 @@ async fn fetch_history_via(
         }
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-fn _gap_span_from(_a: Timestamp, _b: Timestamp) -> GapSpan {
-    GapSpan {
-        from_source_ts: _a,
-        to_source_ts: _b,
-    }
 }
 
 #[cfg(test)]
@@ -760,11 +770,21 @@ mod tests {
         let mut list = StockSubscriptionList::new();
         let aapl = Instrument::new("AAPL");
         apply_pair_to_list(&mut list, &aapl, EventKind::Trade, true);
-        apply_pair_to_list(&mut list, &aapl, EventKind::Bar(BarInterval::OneMinute), true);
+        apply_pair_to_list(
+            &mut list,
+            &aapl,
+            EventKind::Bar(BarInterval::OneMinute),
+            true,
+        );
         assert_eq!(list.trades.as_deref(), Some(&["AAPL".to_string()][..]));
         assert_eq!(list.bars.as_deref(), Some(&["AAPL".to_string()][..]));
         apply_pair_to_list(&mut list, &aapl, EventKind::Trade, false);
-        apply_pair_to_list(&mut list, &aapl, EventKind::Bar(BarInterval::OneMinute), false);
+        apply_pair_to_list(
+            &mut list,
+            &aapl,
+            EventKind::Bar(BarInterval::OneMinute),
+            false,
+        );
         assert!(list.trades.is_none());
         assert!(list.bars.is_none());
     }

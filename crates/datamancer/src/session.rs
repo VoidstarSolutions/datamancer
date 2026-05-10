@@ -46,8 +46,8 @@
 //!   the receiver to the slot on `EventStream` drop), and stitched sessions
 //!   will replay through the gap.
 //! - **Write-through persistence.** `persist=true` is accepted at
-//!   construction but events are not yet written to TapLog or
-//!   HistoricalCache. Wiring lands when the resume primitive does.
+//!   construction but events are not yet written to `TapLog` or
+//!   `HistoricalCache`. Wiring lands when the resume primitive does.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -104,6 +104,7 @@ type LiveSessionRegistry =
     Arc<std::sync::Mutex<HashMap<(Instrument, EventKind), Weak<RegistrySentinel>>>>;
 
 impl Datamancer {
+    #[must_use]
     pub fn builder() -> DatamancerBuilder {
         DatamancerBuilder::default()
     }
@@ -111,8 +112,10 @@ impl Datamancer {
     /// Open a session for one `(instrument, kind)` pair.
     ///
     /// Eager: live subscription / historical fetch begins before this returns.
-    /// Errors fail-fast on:
     ///
+    /// # Errors
+    ///
+    /// Fail-fast on:
     /// - [`Error::UnsupportedEventKind`] — no registered provider serves
     ///   `(instrument, kind)`.
     /// - [`Error::LiveSessionConflict`] — a live session for this pair is
@@ -120,6 +123,11 @@ impl Datamancer {
     ///   the same pair are stateless reads and run concurrently).
     /// - [`Error::PersistenceRequired`] — `persist=true` but no
     ///   [`HistoricalCache`]/[`TapLog`] is configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal live-session registry mutex is poisoned —
+    /// indicates a prior panic inside a registry-holding code path.
     pub async fn session(
         &self,
         instrument: Instrument,
@@ -127,10 +135,7 @@ impl Datamancer {
         scope: Scope,
         persist: bool,
     ) -> Result<Session> {
-        if persist
-            && self.inner.historical_cache.is_none()
-            && self.inner.tap_log.is_none()
-        {
+        if persist && self.inner.historical_cache.is_none() && self.inner.tap_log.is_none() {
             return Err(Error::PersistenceRequired);
         }
 
@@ -213,6 +218,11 @@ impl Datamancer {
     }
 
     /// Look up a registered provider by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::UnknownProvider` if no provider with that id is
+    /// registered.
     pub fn provider(&self, id: &str) -> Result<&dyn Provider> {
         self.inner
             .providers
@@ -242,10 +252,12 @@ impl Datamancer {
                 .find(|p| p.supports(instrument, kind))
         };
 
-        candidate.cloned().ok_or_else(|| Error::UnsupportedEventKind {
-            kind,
-            instrument: instrument.clone(),
-        })
+        candidate
+            .cloned()
+            .ok_or_else(|| Error::UnsupportedEventKind {
+                kind,
+                instrument: instrument.clone(),
+            })
     }
 }
 
@@ -264,6 +276,7 @@ pub struct DatamancerBuilder {
 impl DatamancerBuilder {
     /// Register a provider. Provider ids must be unique within a Datamancer
     /// instance; conflicts surface from [`build`](Self::build).
+    #[must_use]
     pub fn provider(mut self, p: Box<dyn Provider>) -> Self {
         self.providers.push(Arc::from(p));
         self
@@ -271,6 +284,7 @@ impl DatamancerBuilder {
 
     /// Register a provider held behind an `Arc`. Useful when the caller keeps
     /// a reference for direct API calls outside of a session.
+    #[must_use]
     pub fn provider_arc(mut self, p: Arc<dyn Provider>) -> Self {
         self.providers.push(p);
         self
@@ -278,6 +292,7 @@ impl DatamancerBuilder {
 
     /// Pin `instrument` to a specific provider id. When more than one
     /// registered provider supports the pair, the pinned one wins.
+    #[must_use]
     pub fn pin(mut self, instrument: Instrument, provider_id: impl Into<String>) -> Self {
         self.instrument_provider
             .push((instrument, provider_id.into()));
@@ -286,6 +301,7 @@ impl DatamancerBuilder {
 
     /// Attach a tap log; live events from sessions with `persist=true` will
     /// be appended.
+    #[must_use]
     pub fn tap_log(mut self, log: Box<dyn TapLog>) -> Self {
         self.tap_log = Some(Arc::from(log));
         self
@@ -294,6 +310,7 @@ impl DatamancerBuilder {
     /// Attach a historical cache; historical fetches from sessions with
     /// `persist=true` write-through this cache before returning to the
     /// consumer.
+    #[must_use]
     pub fn historical_cache(mut self, cache: Box<dyn HistoricalCache>) -> Self {
         self.historical_cache = Some(Arc::from(cache));
         self
@@ -301,16 +318,26 @@ impl DatamancerBuilder {
 
     /// Same as [`historical_cache`](Self::historical_cache) but accepts an
     /// already-shared `Arc`.
+    #[must_use]
     pub fn historical_cache_arc(mut self, cache: Arc<dyn HistoricalCache>) -> Self {
         self.historical_cache = Some(cache);
         self
     }
 
+    /// Finalize the builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Config` if two registered providers share an id.
     pub fn build(self) -> Result<Datamancer> {
         let mut ids: Vec<&str> = self.providers.iter().map(|p| p.id()).collect();
-        ids.sort();
-        if let Some(dup) = ids.windows(2).find(|w| w[0] == w[1]) {
-            return Err(Error::Config(format!("duplicate provider id: {}", dup[0])));
+        ids.sort_unstable();
+        for window in ids.windows(2) {
+            if let [a, b] = window
+                && a == b
+            {
+                return Err(Error::Config(format!("duplicate provider id: {a}")));
+            }
         }
         Ok(Datamancer {
             inner: Arc::new(DatamancerInner {
@@ -371,6 +398,11 @@ impl Session {
     /// `(last_emitted_source_ts, now]`, replay what's there, emit a
     /// [`ControlKind::Gap`] for what isn't (or the entire silence if
     /// `persist=false`), then continue live.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::EventsAlreadyTaken` if the stream has already been
+    /// taken from this session.
     pub fn take_events(&mut self) -> Result<EventStream> {
         let mut slot = self
             .inner
@@ -394,8 +426,11 @@ impl Session {
     /// Toggle persistence at runtime. False stops future writes; events
     /// already in flight to persistence still flush.
     ///
-    /// Errors if no persistence layer is configured on the parent
-    /// [`Datamancer`].
+    /// # Errors
+    ///
+    /// Returns `Error::PersistenceRequired` if no persistence layer is
+    /// configured on the parent [`Datamancer`]; `Error::SessionClosed` if
+    /// the controller has shut down.
     pub async fn set_persisting(&self, on: bool) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.inner
@@ -409,6 +444,11 @@ impl Session {
     /// Explicit termination. Auto-cleanup also handles natural-completion
     /// cases (historical fetch exhausted, or live + stream-dropped +
     /// persist=false).
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; the `Result` shape is reserved for future
+    /// flush-error reporting from persistence sinks.
     pub async fn close(self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let _ = self.inner.cmd_tx.send(SessionCommand::Close(tx)).await;
@@ -416,18 +456,22 @@ impl Session {
         Ok(())
     }
 
+    #[must_use]
     pub fn instrument(&self) -> &Instrument {
         &self.inner.instrument
     }
 
+    #[must_use]
     pub fn kind(&self) -> EventKind {
         self.inner.kind
     }
 
+    #[must_use]
     pub fn scope(&self) -> Scope {
         self.inner.scope
     }
 
+    #[must_use]
     pub fn is_persisting(&self) -> bool {
         self.inner
             .persisting
@@ -541,7 +585,7 @@ impl Controller {
                         return;
                     }
                 }
-                _ = self.events_tx.closed() => break,
+                () = self.events_tx.closed() => break,
             }
         }
         self.shutdown().await;
@@ -594,16 +638,14 @@ impl Controller {
                     }
                 }
                 ev = provider_rx.recv() => {
-                    match ev {
-                        Some(ev) => self.forward(ev).await,
-                        None => {
-                            // Provider task exited unexpectedly.
-                            self.shutdown().await;
-                            return;
-                        }
-                    }
+                    let Some(ev) = ev else {
+                        // Provider task exited unexpectedly.
+                        self.shutdown().await;
+                        return;
+                    };
+                    self.forward(ev).await;
                 }
-                _ = self.events_tx.closed() => {
+                () = self.events_tx.closed() => {
                     // Consumer dropped the stream.
                     // TODO(persistence): when write-through lands, keep
                     // running while persist=true so recording-only mode is
@@ -620,7 +662,7 @@ impl Controller {
         }
     }
 
-    /// Stamp `seq`, optionally tee to TapLog (TODO), forward to the consumer
+    /// Stamp `seq`, optionally tee to `TapLog` (TODO), forward to the consumer
     /// stream when held. Updates `last_emitted_source_ts` on data events.
     async fn forward(&mut self, ev: MarketEvent) {
         let stamped = self.assign_seq(ev);
@@ -736,10 +778,14 @@ fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
 
 fn wall_clock_ts() -> Timestamp {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i64 nanos since epoch representable until year 2262"
+        )]
+        let n = d.as_nanos() as i64;
+        n
+    });
     Timestamp(nanos)
 }
 

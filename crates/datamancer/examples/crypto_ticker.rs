@@ -70,7 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .session(
                     Instrument::new(*sym),
                     kind,
-                    Scope::Live { backfill_from: None },
+                    Scope::Live {
+                        backfill_from: None,
+                    },
                     false,
                 )
                 .await?;
@@ -150,16 +152,23 @@ fn render_table(state: &HashMap<String, Ticker>) {
     println!("{}\x1b[K", "-".repeat(78));
     for sym in SYMBOLS {
         let t = state.get(*sym).copied().unwrap_or_default();
-        let last = t.last_trade.map(price_to_f64).map(fmt_price).unwrap_or_else(|| "-".into());
-        let bid = t.bid.map(price_to_f64).map(fmt_price).unwrap_or_else(|| "-".into());
-        let ask = t.ask.map(price_to_f64).map(fmt_price).unwrap_or_else(|| "-".into());
+        let last = t
+            .last_trade
+            .map(price_to_f64)
+            .map_or_else(|| "-".into(), fmt_price);
+        let bid = t
+            .bid
+            .map(price_to_f64)
+            .map_or_else(|| "-".into(), fmt_price);
+        let ask = t
+            .ask
+            .map(price_to_f64)
+            .map_or_else(|| "-".into(), fmt_price);
         let spread = match (t.bid, t.ask) {
             (Some(b), Some(a)) => fmt_price(price_to_f64(a) - price_to_f64(b)),
             _ => "-".into(),
         };
-        let updated = latest_ts(&t)
-            .map(format_local_time)
-            .unwrap_or_else(|| "-".into());
+        let updated = latest_ts(&t).map_or_else(|| "-".into(), format_local_time);
         println!("{sym:<10} {last:>14} {bid:>14} {ask:>14} {spread:>10} {updated:>12}\x1b[K");
     }
 }
@@ -178,7 +187,7 @@ fn fmt_price(v: f64) -> String {
     } else {
         4
     };
-    let formatted = format!("{v:.*}", frac);
+    let formatted = format!("{v:.frac$}");
     let (int_part, frac_part) = match formatted.split_once('.') {
         Some((i, f)) => (i, Some(f)),
         None => (formatted.as_str(), None),
@@ -224,7 +233,8 @@ fn latest_ts(t: &Ticker) -> Option<Timestamp> {
 
 fn format_local_time(ts: Timestamp) -> String {
     let secs = ts.0 / 1_000_000_000;
-    let nanos = (ts.0 % 1_000_000_000) as u32;
+    // rem_euclid guarantees the result is in [0, 1_000_000_000), which fits u32.
+    let nanos = u32::try_from(ts.0.rem_euclid(1_000_000_000)).unwrap_or(0);
     let dt: DateTime<Utc> = match Utc.timestamp_opt(secs, nanos) {
         chrono::LocalResult::Single(d) => d,
         _ => return "-".into(),

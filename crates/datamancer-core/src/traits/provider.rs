@@ -48,7 +48,11 @@ pub trait Provider: Send + Sync + 'static {
     /// Fetch a bounded historical range, pushing events into `sink` in
     /// source-timestamp order. Returns once the range is exhausted; pagination
     /// and rate-limit handling are the provider's responsibility.
-    async fn fetch_history(&self, request: HistoryRequest, sink: mpsc::Sender<MarketEvent>) -> Result<()>;
+    async fn fetch_history(
+        &self,
+        request: HistoryRequest,
+        sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()>;
 }
 
 /// A handle to a running live provider session. Subscription mutation and

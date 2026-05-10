@@ -1,16 +1,16 @@
 //! Integration tests for the Surreal-backed [`HistoricalCache`].
 //!
 //! Uses the in-memory engine so the suite stays self-contained and fast.
-//! A separate `embedded_round_trip` test exercises the on-disk SurrealKV
+//! A separate `embedded_round_trip` test exercises the on-disk `SurrealKV`
 //! engine against a tempdir to confirm the persistent path actually works.
 
 #![cfg(feature = "storage-surreal")]
 
+use datamancer::storage::{SurrealCache, SurrealCacheConfig};
 use datamancer::{
     Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache, Instrument, MarketEvent,
     Price, Seq, Timestamp, Trade,
 };
-use datamancer::storage::{SurrealCache, SurrealCacheConfig};
 use datamancer_core::ReplayRequest;
 use futures::StreamExt;
 
@@ -54,14 +54,18 @@ fn key(kind: EventKind, from: i64, to: i64) -> CacheKey {
 
 #[tokio::test]
 async fn lookup_returns_none_for_empty_cache() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap();
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
     let k = key(EventKind::Trade, 0, 1_000_000);
     assert!(cache.lookup(&k).await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn store_then_replay_round_trip_preserves_order_and_values() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap();
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
     let k = key(EventKind::Trade, 100, 400);
     let events = vec![
         trade("AAPL", 100, 150.10, 1),
@@ -103,7 +107,9 @@ async fn store_then_replay_round_trip_preserves_order_and_values() {
 
 #[tokio::test]
 async fn gaps_reports_uncovered_subranges() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap();
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
     // First, ingest events for [100, 200) and [300, 400).
     let k1 = key(EventKind::Bar(BarInterval::OneMinute), 100, 200);
     cache
@@ -137,10 +143,7 @@ async fn gaps_reports_uncovered_subranges() {
 
     // After a backfill of [200,300), the middle gap closes.
     let k3 = key(EventKind::Bar(BarInterval::OneMinute), 200, 300);
-    cache
-        .store(&k3, &[bar("AAPL", 250, 1.75)])
-        .await
-        .unwrap();
+    cache.store(&k3, &[bar("AAPL", 250, 1.75)]).await.unwrap();
     let gaps = cache.gaps(&probe).await.unwrap();
     assert_eq!(
         gaps,
@@ -159,7 +162,9 @@ async fn gaps_reports_uncovered_subranges() {
 
 #[tokio::test]
 async fn fully_covered_range_reports_no_gaps() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap();
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
     let k = key(EventKind::Trade, 0, 1000);
     cache
         .store(&k, &[trade("AAPL", 0, 1.0, 1), trade("AAPL", 999, 1.0, 1)])
@@ -177,7 +182,10 @@ async fn embedded_round_trip_persists_to_disk() {
     let cache = SurrealCache::open(cfg.clone()).await.unwrap();
     let k = key(EventKind::Trade, 0, 100);
     cache
-        .store(&k, &[trade("AAPL", 10, 50.0, 1), trade("AAPL", 50, 51.0, 2)])
+        .store(
+            &k,
+            &[trade("AAPL", 10, 50.0, 1), trade("AAPL", 50, 51.0, 2)],
+        )
         .await
         .unwrap();
     drop(cache);
@@ -209,6 +217,7 @@ async fn embedded_round_trip_persists_to_disk() {
 // reshape — Instrument constructs from a &str and EventKind is reachable.
 #[test]
 fn reexports_are_consistent() {
-    let _inst: Instrument = Instrument::new("AAPL");
-    let _kind: EventKind = EventKind::Trade;
+    let inst: Instrument = Instrument::new("AAPL");
+    let kind: EventKind = EventKind::Trade;
+    let _ = (inst, kind);
 }

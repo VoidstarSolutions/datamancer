@@ -2,12 +2,13 @@
 //!
 //! # Backend choice
 //!
-//! Default is **SurrealKV**, SurrealDB's own native Rust storage engine.
-//! Compared to RocksDB it has no C++ build dependency (so the workspace
+//! Default is **`SurrealKV`**, `SurrealDB`'s own native Rust storage engine.
+//! Compared to `RocksDB` it has no C++ build dependency (so the workspace
 //! builds cleanly on any platform without extra system libraries) and is
-//! purpose-built for the same record-id range scans we use here. RocksDB is
-//! only marginally more battle-tested for our access pattern and the build
-//! cost isn't worth it. Tests use **Mem** (in-process, ephemeral) for speed.
+//! purpose-built for the same record-id range scans we use here. `RocksDB`
+//! is only marginally more battle-tested for our access pattern and the
+//! build cost isn't worth it. Tests use **Mem** (in-process, ephemeral) for
+//! speed.
 //!
 //! # Schema
 //!
@@ -60,9 +61,9 @@ use surrealdb::{Surreal, engine::local::Db, types::SurrealValue};
 pub enum SurrealCacheConfig {
     /// In-process, ephemeral. Good for tests.
     Memory,
-    /// Embedded SurrealKV at `path`. Created if absent.
+    /// Embedded `SurrealKV` at `path`. Created if absent.
     Embedded { path: std::path::PathBuf },
-    /// Remote SurrealDB at the given URL. Wired through the `any` engine if
+    /// Remote `SurrealDB` at the given URL. Wired through the `any` engine if
     /// the consumer enables that surrealdb feature; for now we keep the
     /// runtime restricted to embedded mode.
     Remote { url: String },
@@ -84,15 +85,23 @@ pub struct SurrealCache {
 
 impl SurrealCache {
     /// Open the cache, creating tables on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Storage` if the underlying `SurrealDB` engine fails
+    /// to open, the namespace/database statement fails, or initial table
+    /// creation fails.
     pub async fn open(cfg: SurrealCacheConfig) -> Result<Self> {
         let db: Surreal<Db> = match cfg {
             SurrealCacheConfig::Memory => Surreal::new::<surrealdb::engine::local::Mem>(())
                 .await
                 .map_err(map_err)?,
             SurrealCacheConfig::Embedded { path } => {
-                Surreal::new::<surrealdb::engine::local::SurrealKv>(path.to_string_lossy().into_owned())
-                    .await
-                    .map_err(map_err)?
+                Surreal::new::<surrealdb::engine::local::SurrealKv>(
+                    path.to_string_lossy().into_owned(),
+                )
+                .await
+                .map_err(map_err)?
             }
             SurrealCacheConfig::Remote { .. } => {
                 return Err(Error::Storage(
@@ -154,6 +163,10 @@ impl SurrealCache {
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "owned err matches `.map_err(map_err)` callsite ergonomics — borrowing here would force closures at every callsite"
+)]
 fn map_err(err: surrealdb::Error) -> Error {
     Error::Storage(format!("surrealdb: {err}"))
 }
@@ -240,11 +253,7 @@ impl CoverageDoc {
         for &(a, b) in &self.segments {
             let lo = a.max(from);
             let hi = b.min(to);
-            if lo < hi
-                && best
-                    .map(|(_, prev_hi)| hi - lo > prev_hi - best.unwrap().0)
-                    .unwrap_or(true)
-            {
+            if lo < hi && best.is_none_or(|(prev_lo, prev_hi)| hi - lo > prev_hi - prev_lo) {
                 best = Some((lo, hi));
             }
         }
@@ -287,11 +296,7 @@ impl CoverageDoc {
 impl HistoricalCache for SurrealCache {
     async fn lookup(&self, key: &CacheKey) -> Result<Option<CacheCoverage>> {
         let id = Self::coverage_id(key);
-        let doc: Option<CoverageDoc> = self
-            .db
-            .select(("coverage", id))
-            .await
-            .map_err(map_err)?;
+        let doc: Option<CoverageDoc> = self.db.select(("coverage", id)).await.map_err(map_err)?;
         let Some(doc) = doc else { return Ok(None) };
         let Some((from, to)) = doc.intersect(key.from.0, key.to.0) else {
             return Ok(None);
@@ -322,7 +327,6 @@ impl HistoricalCache for SurrealCache {
                 MarketEvent::Trade(t) => Some(t.source_ts.0),
                 MarketEvent::Quote(q) => Some(q.source_ts.0),
                 MarketEvent::Bar(b) => Some(b.source_ts.0),
-                MarketEvent::Control(_) => None,
                 _ => None,
             };
             let Some(ts) = ts else { continue };
@@ -384,7 +388,6 @@ impl HistoricalCache for SurrealCache {
                         .await
                         .map_err(map_err)?;
                 }
-                MarketEvent::Control(_) => continue,
                 _ => continue,
             }
             stored += 1;
@@ -402,11 +405,7 @@ impl HistoricalCache for SurrealCache {
 
     async fn gaps(&self, key: &CacheKey) -> Result<Vec<GapSpan>> {
         let id = Self::coverage_id(key);
-        let doc: Option<CoverageDoc> = self
-            .db
-            .select(("coverage", id))
-            .await
-            .map_err(map_err)?;
+        let doc: Option<CoverageDoc> = self.db.select(("coverage", id)).await.map_err(map_err)?;
         let doc = doc.unwrap_or_default();
         Ok(doc
             .gaps_within(key.from.0, key.to.0)
@@ -470,7 +469,7 @@ impl SurrealCache {
             .await
             .map_err(map_err)?;
         let rows: Vec<CountRow> = response.take(0).map_err(map_err)?;
-        Ok(rows.first().map(|r| r.n).unwrap_or(0))
+        Ok(rows.first().map_or(0, |r| r.n))
     }
 }
 
@@ -490,6 +489,10 @@ struct SurrealReplaySource {
 
 #[async_trait]
 impl ReplaySource for SurrealReplaySource {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear query/decode/merge pipeline kept inline; extraction would obscure the per-kind handling"
+    )]
     async fn open(&self, request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
         let provider = self.key.provider.clone();
         let kind = self.key.kind;
