@@ -294,7 +294,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                     },
                 )
                 .await;
-                if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx, &routes).await {
+                if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
                     return;
                 }
                 continue 'outer;
@@ -411,7 +411,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                             )
                             .await;
                             drop(client);
-                            if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx, &routes).await {
+                            if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
                                 return;
                             }
                             continue 'outer;
@@ -453,7 +453,6 @@ async fn sleep_with_jitter(
     backoff_ms: &mut u64,
     policy: &ReconnectPolicy,
     cmd_rx: &mut mpsc::Receiver<HubCommand>,
-    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
 ) -> bool {
     let delay = Duration::from_millis(*backoff_ms);
     *backoff_ms = (*backoff_ms * 2).min(policy.max_backoff_ms);
@@ -473,11 +472,8 @@ async fn sleep_with_jitter(
                     true
                 }
                 None => {
-                    broadcast_control(
-                        routes,
-                        ControlKind::SessionClosing,
-                    )
-                    .await;
+                    // SessionClosing is emitted by Controller::shutdown for each
+                    // session; the hub serves all of them and shouldn't double-emit.
                     false
                 }
             }

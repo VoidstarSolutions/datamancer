@@ -243,7 +243,7 @@ async fn run_streaming_task(
                     },
                 )
                 .await;
-                if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx, &sink).await {
+                if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
                     return;
                 }
                 continue 'outer;
@@ -342,11 +342,8 @@ async fn run_streaming_task(
                         }
                         Some(LiveCommand::Close(ack)) => {
                             let _ = client.shut_down().await;
-                            emit_control(
-                                &sink,
-                                ControlKind::SessionClosing,
-                            )
-                            .await;
+                            // SessionClosing is emitted by Controller::shutdown;
+                            // don't double-emit here.
                             let _ = ack.send(());
                             return;
                         }
@@ -379,7 +376,7 @@ async fn run_streaming_task(
                             .await;
                             // Drop the client and reconnect.
                             drop(client);
-                            if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx, &sink).await {
+                            if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
                                 return;
                             }
                             continue 'outer;
@@ -397,7 +394,6 @@ async fn sleep_with_jitter(
     backoff_ms: &mut u64,
     policy: &ReconnectPolicy,
     cmd_rx: &mut mpsc::Receiver<LiveCommand>,
-    sink: &mpsc::Sender<MarketEvent>,
 ) -> bool {
     let delay = Duration::from_millis(*backoff_ms);
     *backoff_ms = (*backoff_ms * 2).min(policy.max_backoff_ms);
@@ -407,7 +403,8 @@ async fn sleep_with_jitter(
         cmd = cmd_rx.recv() => {
             match cmd {
                 Some(LiveCommand::Close(ack)) => {
-                    emit_control(sink, ControlKind::SessionClosing).await;
+                    // SessionClosing is emitted by Controller::shutdown;
+                    // don't double-emit here.
                     let _ = ack.send(());
                     false
                 }
