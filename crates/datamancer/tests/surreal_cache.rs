@@ -182,11 +182,25 @@ async fn embedded_round_trip_persists_to_disk() {
         .unwrap();
     drop(cache);
     // SurrealKV's lock is released on drop, but the spawned engine task
-    // holding it needs a tick to finish unwinding.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    // Reopen and confirm the data is still there.
-    let cache = SurrealCache::open(cfg).await.unwrap();
+    // holding it needs a tick to finish unwinding. A fixed sleep here is
+    // flaky on slow CI; poll `open` until the lock clears, capped at
+    // ~5 s total. On any error we just retry — by the deadline we either
+    // succeed or surface the most recent error so the failure mode is
+    // diagnosable.
+    let cache = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match SurrealCache::open(cfg.clone()).await {
+                Ok(c) => break c,
+                Err(e) if std::time::Instant::now() >= deadline => {
+                    panic!("embedded reopen never succeeded within 5s: {e}");
+                }
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    };
     let coverage = cache.lookup(&k).await.unwrap().expect("coverage");
     assert_eq!(coverage.event_count, 2);
 }
