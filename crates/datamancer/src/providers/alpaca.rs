@@ -26,7 +26,7 @@ use datamancer_core::{
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
-    AccountType, MarketDataClient,
+    AccountType, MarketDataClient, StreamingFeed,
     restful::market_data::TimeFrame,
     streaming::{
         StockBar, StockQuote, StockStreamMessage, StockSubscriptionList, StockTrade,
@@ -213,14 +213,13 @@ async fn run_streaming_task(
     let mut backoff = cfg.reconnect.initial_backoff_ms;
 
     'outer: loop {
-        let connect_result = match cfg.stream_feed {
-            AlpacaStreamFeed::Iex => StreamingStockClient::new_iex_client(cfg.account_type).await,
-            AlpacaStreamFeed::Sip => StreamingStockClient::new_sip_client(cfg.account_type).await,
-            AlpacaStreamFeed::DelayedSip => {
-                StreamingStockClient::new_delayed_sip_client(cfg.account_type).await
-            }
-            AlpacaStreamFeed::Test => StreamingStockClient::new_test_client(cfg.account_type).await,
+        let feed = match cfg.stream_feed {
+            AlpacaStreamFeed::Iex => StreamingFeed::IEX,
+            AlpacaStreamFeed::Sip => StreamingFeed::SIP,
+            AlpacaStreamFeed::DelayedSip => StreamingFeed::DelayedSip,
+            AlpacaStreamFeed::Test => StreamingFeed::Test,
         };
+        let connect_result = StreamingStockClient::new(cfg.account_type, feed).await;
 
         let mut client = match connect_result {
             Ok(client) => {
@@ -626,11 +625,11 @@ async fn fetch_history_via(
                         instrument: request.instrument.clone(),
                     });
                 }
-                BarInterval::OneMinute => TimeFrame::OneMinute,
-                BarInterval::FiveMinute => TimeFrame::FiveMinute,
-                BarInterval::FifteenMinute => TimeFrame::FifteenMinute,
-                BarInterval::OneHour => TimeFrame::OneHour,
-                BarInterval::OneDay => TimeFrame::OneDay,
+                BarInterval::OneMinute => TimeFrame::ONE_MINUTE,
+                BarInterval::FiveMinute => TimeFrame::FIVE_MINUTES,
+                BarInterval::FifteenMinute => TimeFrame::FIFTEEN_MINUTES,
+                BarInterval::OneHour => TimeFrame::ONE_HOUR,
+                BarInterval::OneDay => TimeFrame::ONE_DAY,
             };
             let bars = rest
                 .stock_bars(symbol, timeframe)
@@ -653,7 +652,7 @@ async fn fetch_history_via(
                     high: Price::from_f64_round(b.high),
                     low: Price::from_f64_round(b.low),
                     close: Price::from_f64_round(b.close),
-                    volume: b.volume as u64,
+                    volume: b.volume,
                 };
                 if sink.send(MarketEvent::Bar(bar)).await.is_err() {
                     return Ok(());

@@ -40,7 +40,7 @@ use datamancer_core::{
     LiveHandle, MarketEvent, Price, Provider, Quote, Result, Seq, Timestamp, Trade,
 };
 use oxidized_alpaca::{
-    AccountType,
+    AccountType, CryptoFeed,
     streaming::{
         CryptoBar, CryptoQuote, CryptoStreamMessage, CryptoSubscriptionList, CryptoTrade,
         StreamingCryptoClient,
@@ -263,15 +263,12 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
     let mut backoff = cfg.reconnect.initial_backoff_ms;
 
     'outer: loop {
-        let connect_result = match cfg.venue {
-            AlpacaCryptoVenue::Us => StreamingCryptoClient::new_us(cfg.account_type).await,
-            AlpacaCryptoVenue::UsKraken => {
-                StreamingCryptoClient::new_us_kraken(cfg.account_type).await
-            }
-            AlpacaCryptoVenue::EuKraken => {
-                StreamingCryptoClient::new_eu_kraken(cfg.account_type).await
-            }
+        let feed = match cfg.venue {
+            AlpacaCryptoVenue::Us => CryptoFeed::Us,
+            AlpacaCryptoVenue::UsKraken => CryptoFeed::UsKraken,
+            AlpacaCryptoVenue::EuKraken => CryptoFeed::EuKraken,
         };
+        let connect_result = StreamingCryptoClient::new(cfg.account_type, feed).await;
 
         let mut client = match connect_result {
             Ok(client) => {
