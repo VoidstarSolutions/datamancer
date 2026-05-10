@@ -11,19 +11,31 @@
 //!
 //! # Schema
 //!
-//! Three families of tables, one per kind, partitioned at the record-id
-//! prefix so range scans are bounded:
+//! Tables are declared `SCHEMALESS` so the `SurrealValue`-derived row
+//! structs in this module round-trip directly. There's one table per kind:
 //!
-//! - `trades:[provider, symbol, ts]` → `{ price, size, source_ts, rx_ts }`
-//! - `quotes:[provider, symbol, ts]` → `{ bid, bid_size, ask, ask_size, … }`
-//! - `bars_<interval>:[provider, symbol, ts]` → `{ o, h, l, c, v, … }`
+//! - `trades` — `{ provider, symbol, source_ts, rx_ts, price_raw, size }`
+//! - `quotes` — `{ provider, symbol, source_ts, rx_ts, bid_raw, bid_size,
+//!   ask_raw, ask_size }`
+//! - `bars_1s`, `bars_1m`, `bars_5m`, `bars_15m`, `bars_1h`, `bars_1d`
+//!   — one table per supported [`BarInterval`]; OHLCV columns plus the
+//!   common `provider`, `symbol`, `source_ts`, `rx_ts`.
 //!
-//! `ts` is the source-timestamp in nanoseconds (the same `i64` as
-//! [`Timestamp`]). The `[provider, symbol, ts]` tuple gives a natural
-//! ordering for SurrealDB's record-id range queries: a `from..to` scan with
-//! a fixed `[provider, symbol]` prefix returns the events for one
-//! instrument in source order. This is the time-series read pattern the
-//! cache is built around.
+//! Each row's record id is the string `"{provider}|{symbol}|{ts:020}"` — the
+//! 20-digit zero-padded `source_ts` (nanoseconds since epoch as `i64`)
+//! ensures that lexicographic ordering on the record id matches
+//! source-time ordering. The id is doing two jobs: it gives upserts a
+//! natural primary key (re-ingest of the same `(provider, symbol, ts)`
+//! overwrites rather than duplicates), and it groups rows for one
+//! instrument together on disk.
+//!
+//! Reads use plain `SELECT … FROM <table> WHERE provider = $prov AND
+//! symbol = $sym AND source_ts >= $from AND source_ts < $to
+//! ORDER BY source_ts ASC` — half-open range filter on the indexed
+//! `source_ts` column. The tables are SCHEMALESS so no indices are defined
+//! today; this is fine for the test/dev access pattern but a follow-up
+//! should consider explicit indices on `(provider, symbol, source_ts)`
+//! if range scans get heavy.
 //!
 //! Coverage of stored ranges is recorded in a per-key `coverage` table —
 //! one document per `(provider, symbol, kind)` holding a list of merged,
