@@ -5,6 +5,10 @@
 
 #[cfg(feature = "provider-alpaca")]
 pub mod alpaca;
+#[cfg(feature = "provider-alpaca")]
+pub mod alpaca_crypto;
 
 #[cfg(feature = "provider-alpaca")]
 pub use alpaca::{AlpacaProvider, AlpacaProviderConfig, AlpacaStreamFeed};
+#[cfg(feature = "provider-alpaca")]
+pub use alpaca_crypto::{AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue};
