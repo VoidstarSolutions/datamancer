@@ -103,6 +103,7 @@ enum HubSlot {
 }
 
 impl AlpacaCryptoProvider {
+    #[must_use]
     pub fn new(cfg: AlpacaCryptoProviderConfig) -> Self {
         Self {
             cfg,
@@ -137,8 +138,9 @@ impl Provider for AlpacaCryptoProvider {
 
     fn supports(&self, _instrument: &Instrument, kind: EventKind) -> bool {
         match kind {
-            EventKind::Trade | EventKind::Quote => true,
-            EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
+            EventKind::Trade
+            | EventKind::Quote
+            | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
             EventKind::Bar(_) => false,
         }
     }
@@ -462,13 +464,12 @@ async fn sleep_with_jitter(
     *backoff_ms = (*backoff_ms * 2).min(policy.max_backoff_ms);
 
     tokio::select! {
-        _ = tokio::time::sleep(delay) => true,
+        () = tokio::time::sleep(delay) => true,
         cmd = cmd_rx.recv() => {
             match cmd {
                 // While disconnected, fail subscribe/unsubscribe immediately so
                 // sessions see a clear error rather than stalling.
-                Some(HubCommand::Subscribe { ack, .. })
-                | Some(HubCommand::Unsubscribe { ack, .. }) => {
+                Some(HubCommand::Subscribe { ack, .. } | HubCommand::Unsubscribe { ack, .. }) => {
                     let _ = ack.send(Err(Error::Provider {
                         provider: PROVIDER_ID.to_string(),
                         message: "provider is reconnecting".to_string(),
@@ -486,12 +487,12 @@ async fn sleep_with_jitter(
 }
 
 fn is_empty(list: &CryptoSubscriptionList) -> bool {
-    list.bars.as_ref().is_none_or(|v| v.is_empty())
-        && list.daily_bars.as_ref().is_none_or(|v| v.is_empty())
-        && list.updated_bars.as_ref().is_none_or(|v| v.is_empty())
-        && list.quotes.as_ref().is_none_or(|v| v.is_empty())
-        && list.trades.as_ref().is_none_or(|v| v.is_empty())
-        && list.orderbooks.as_ref().is_none_or(|v| v.is_empty())
+    list.bars.as_ref().is_none_or(Vec::is_empty)
+        && list.daily_bars.as_ref().is_none_or(Vec::is_empty)
+        && list.updated_bars.as_ref().is_none_or(Vec::is_empty)
+        && list.quotes.as_ref().is_none_or(Vec::is_empty)
+        && list.trades.as_ref().is_none_or(Vec::is_empty)
+        && list.orderbooks.as_ref().is_none_or(Vec::is_empty)
 }
 
 fn apply_pair_to_list(
@@ -557,8 +558,7 @@ async fn broadcast_control_to(sink: Option<&mpsc::Sender<MarketEvent>>, kind: Co
 fn wall_clock_ts() -> Timestamp {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos() as i64);
     Timestamp(nanos)
 }
 
@@ -571,14 +571,15 @@ pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEv
     match msg {
         CryptoStreamMessage::Trade(t) => vec![MarketEvent::Trade(translate_trade(&t, rx))],
         CryptoStreamMessage::Quote(q) => vec![MarketEvent::Quote(translate_quote(&q, rx))],
-        CryptoStreamMessage::Bar(b) => {
-            vec![MarketEvent::Bar(translate_bar(&b, BarInterval::OneMinute, rx))]
+        CryptoStreamMessage::Bar(b) | CryptoStreamMessage::UpdatedBar(b) => {
+            vec![MarketEvent::Bar(translate_bar(
+                &b,
+                BarInterval::OneMinute,
+                rx,
+            ))]
         }
         CryptoStreamMessage::DailyBar(b) => {
             vec![MarketEvent::Bar(translate_bar(&b, BarInterval::OneDay, rx))]
-        }
-        CryptoStreamMessage::UpdatedBar(b) => {
-            vec![MarketEvent::Bar(translate_bar(&b, BarInterval::OneMinute, rx))]
         }
         CryptoStreamMessage::Error(err) => vec![MarketEvent::Control(Control {
             source_ts: rx,

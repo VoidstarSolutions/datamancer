@@ -2,6 +2,7 @@
 name = "datamancer"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [features]
 default = ["provider-alpaca", "storage-surreal"]
@@ -33,3 +34,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [[example]]
 name = "crypto_ticker"
 required-features = ["provider-alpaca"]
+
+[lints]
+workspace = true
