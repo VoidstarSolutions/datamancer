@@ -360,23 +360,29 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                                     provider: PROVIDER_ID.to_string(),
                                     message: format!("remove_subscriptions: {}", error_chain(&e)),
                                 });
-                            // Drop the route after the upstream call so any
-                            // tail events still in flight are routable.
-                            let removed = routes.remove(&(instrument.clone(), kind));
-                            if let Some(sink) = removed.as_ref() {
-                                let _ = sink
-                                    .send(MarketEvent::Control(Control {
-                                        source_ts: wall_clock_ts(),
-                                        rx_ts: wall_clock_ts(),
-                                        seq: Seq(0),
-                                        kind: ControlKind::SubscriptionChanged {
-                                            provider: PROVIDER_ID.to_string(),
-                                            instrument: instrument.clone(),
-                                            kind,
-                                            active: false,
-                                        },
-                                    }))
-                                    .await;
+                            if res.is_ok() {
+                                // Drop the route after the upstream ack so any
+                                // tail events still in flight are routable.
+                                let removed = routes.remove(&(instrument.clone(), kind));
+                                if let Some(sink) = removed.as_ref() {
+                                    let _ = sink
+                                        .send(MarketEvent::Control(Control {
+                                            source_ts: wall_clock_ts(),
+                                            rx_ts: wall_clock_ts(),
+                                            seq: Seq(0),
+                                            kind: ControlKind::SubscriptionChanged {
+                                                provider: PROVIDER_ID.to_string(),
+                                                instrument: instrument.clone(),
+                                                kind,
+                                                active: false,
+                                            },
+                                        }))
+                                        .await;
+                                }
+                            } else {
+                                // Roll back the local subs so reconnect re-applies
+                                // this pair (the upstream view of it is still active).
+                                apply_pair_to_list(&mut subs, &instrument, kind, true);
                             }
                             let _ = ack.send(res);
                         }

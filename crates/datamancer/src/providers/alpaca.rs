@@ -296,6 +296,11 @@ async fn run_streaming_task(
                                     },
                                 )
                                 .await;
+                            } else {
+                                // Roll back so reconnect doesn't keep trying to apply a
+                                // subscription the server rejected.
+                                let mut list = active.lock().await;
+                                apply_pair_to_list(&mut list, &instrument, kind, false);
                             }
                             let _ = ack.send(res);
                         }
@@ -326,6 +331,12 @@ async fn run_streaming_task(
                                     },
                                 )
                                 .await;
+                            } else {
+                                // Roll back so the upstream server's view stays consistent
+                                // with ours: the pair is still streaming, so we should still
+                                // include it on reconnect.
+                                let mut list = active.lock().await;
+                                apply_pair_to_list(&mut list, &instrument, kind, true);
                             }
                             let _ = ack.send(res);
                         }
