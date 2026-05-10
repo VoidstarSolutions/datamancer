@@ -2,8 +2,8 @@
 //! invoke explicitly with `cargo test --test alpaca_real -- --ignored`.
 //!
 //! These tests require Alpaca credentials in the environment:
-//!   ALPACA_PAPER_API_KEY_ID
-//!   ALPACA_PAPER_API_SECRET_KEY
+//!   `ALPACA_PAPER_API_KEY_ID`
+//!   `ALPACA_PAPER_API_SECRET_KEY`
 //!
 //! They use the synthetic `Test` streaming feed (available outside market
 //! hours) so the assertions don't depend on market state.
@@ -18,7 +18,7 @@ use futures::StreamExt;
 use oxidized_alpaca::AccountType;
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires real Alpaca credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
 async fn live_test_feed_yields_an_event() {
     let provider = AlpacaProvider::new(AlpacaProviderConfig {
         account_type: AccountType::Paper,
@@ -33,7 +33,9 @@ async fn live_test_feed_yields_an_event() {
         .session(
             Instrument::new("FAKEPACA"),
             EventKind::Trade,
-            Scope::Live { backfill_from: None },
+            Scope::Live {
+                backfill_from: None,
+            },
             false,
         )
         .await
@@ -49,7 +51,10 @@ async fn live_test_feed_yields_an_event() {
     eprintln!("first event: {ev:?}");
     assert!(matches!(
         ev,
-        MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_) | MarketEvent::Control(_)
+        MarketEvent::Trade(_)
+            | MarketEvent::Quote(_)
+            | MarketEvent::Bar(_)
+            | MarketEvent::Control(_)
     ));
     let _ = session.close().await;
 }
@@ -59,7 +64,7 @@ async fn live_test_feed_yields_an_event() {
 /// pipeline (websocket → translation → seq assignment → output stream) is
 /// delivering decoded data, not just connectivity controls.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires real Alpaca credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
 async fn live_test_feed_delivers_a_trade() {
     let provider = AlpacaProvider::new(AlpacaProviderConfig {
         account_type: AccountType::Paper,
@@ -74,7 +79,9 @@ async fn live_test_feed_delivers_a_trade() {
         .session(
             Instrument::new("FAKEPACA"),
             EventKind::Trade,
-            Scope::Live { backfill_from: None },
+            Scope::Live {
+                backfill_from: None,
+            },
             false,
         )
         .await
@@ -84,7 +91,7 @@ async fn live_test_feed_delivers_a_trade() {
 
     // Allow up to 60s overall for at least one Trade. The test feed emits
     // synthetic FAKEPACA trades roughly once per second, so this is generous.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     let mut control_count: usize = 0;
     let mut last_seq: Option<u64> = None;
 
