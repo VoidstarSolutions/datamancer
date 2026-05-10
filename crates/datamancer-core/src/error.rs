@@ -30,8 +30,8 @@ pub enum Error {
     },
 
     /// The requested session configuration requires a persistence layer
-    /// (HistoricalCache and/or TapLog) but none is configured on the
-    /// Datamancer instance.
+    /// (`HistoricalCache` and/or `TapLog`) but none is configured on the
+    /// `Datamancer` instance.
     #[error("this configuration requires persistence but none is configured")]
     PersistenceRequired,
 
@@ -40,7 +40,7 @@ pub enum Error {
     SessionClosed,
 
     /// The session's event stream has already been taken and is still live.
-    /// After the previous EventStream is dropped, take_events can be called
+    /// After the previous `EventStream` is dropped, `take_events` can be called
     /// again.
     #[error("event stream is currently held by another consumer")]
     EventsAlreadyTaken,

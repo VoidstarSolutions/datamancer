@@ -22,6 +22,7 @@ impl Instrument {
 
     /// The underlying symbol string. Stable for as long as the instrument
     /// exists; do not assume any particular grammar across providers.
+    #[must_use]
     pub fn symbol(&self) -> &str {
         &self.0
     }

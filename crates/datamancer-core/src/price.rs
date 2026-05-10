@@ -22,11 +22,13 @@ impl Price {
     pub const ZERO: Self = Self(0);
 
     /// Construct from raw internal units.
+    #[must_use]
     pub const fn from_raw(units: i64) -> Self {
         Self(units)
     }
 
     /// Construct from whole currency units. `from_units(150)` is `$150.00`.
+    #[must_use]
     pub const fn from_units(units: i64) -> Self {
         Self(units * Self::SCALE)
     }
@@ -35,16 +37,29 @@ impl Price {
     ///
     /// Lossy by definition; use only for fixtures, tests, or initial parsing
     /// where the source representation is itself `f64`.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "lossy by contract — entire purpose of this constructor"
+    )]
     pub fn from_f64_round(value: f64) -> Self {
         Self((value * Self::SCALE as f64).round() as i64)
     }
 
     /// Lossy conversion to `f64` for display or external interchange.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "lossy by contract — entire purpose of this conversion"
+    )]
     pub fn to_f64(self) -> f64 {
         self.0 as f64 / Self::SCALE as f64
     }
 
     /// Raw internal units.
+    #[must_use]
     pub const fn raw(self) -> i64 {
         self.0
     }

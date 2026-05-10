@@ -66,6 +66,11 @@ impl MarketEvent {
     /// The session-monotonic ordering field. `None` for control events that
     /// do not occupy a sequence slot (none currently — reserved for future
     /// metadata-only entries).
+    #[must_use]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "Option is forward-compat: future metadata-only control entries will return None"
+    )]
     pub fn seq(&self) -> Option<Seq> {
         match self {
             MarketEvent::Trade(t) => Some(t.seq),
