@@ -314,6 +314,184 @@ async fn persist_true_without_persistence_layer_errors() {
 }
 
 #[tokio::test]
+async fn live_session_conflict_rejects_second_live_session_for_same_pair() {
+    let (provider, _ctrl) = FakeProvider::new("fake");
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
+
+    // First Live session reserves the (AAPL, Trade) registry slot.
+    let _first = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Second Live session for the same pair is rejected.
+    match dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
+        .await
+    {
+        Err(datamancer::Error::LiveSessionConflict { instrument, kind }) => {
+            assert_eq!(instrument.symbol(), "AAPL");
+            assert_eq!(kind, EventKind::Trade);
+        }
+        Err(other) => panic!("expected LiveSessionConflict, got {other:?}"),
+        Ok(_) => panic!("expected LiveSessionConflict, got Ok"),
+    }
+}
+
+#[tokio::test]
+async fn live_session_conflict_clears_when_first_is_dropped() {
+    let (provider, _ctrl) = FakeProvider::new("fake");
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
+
+    let first = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
+        .await
+        .unwrap();
+    drop(first);
+
+    // After drop the registry slot is free and a new Live session opens.
+    let _second = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn live_session_conflict_clears_when_first_is_closed() {
+    let (provider, _ctrl) = FakeProvider::new("fake");
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
+
+    let first = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
+        .await
+        .unwrap();
+    first.close().await.unwrap();
+
+    let _second = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn historical_sessions_for_same_pair_are_concurrent() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_history(vec![
+        bar("AAPL", 100, 10.0),
+        bar("AAPL", 200, 11.0),
+    ])
+    .await;
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
+
+    // Two concurrent Historical sessions for the same pair both succeed and
+    // each independently receive the full fake history.
+    let mut a = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let mut b = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+    let mut sa = a.take_events().unwrap();
+    let mut sb = b.take_events().unwrap();
+    for stream in [&mut sa, &mut sb] {
+        let mut tss = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap();
+            match ev {
+                MarketEvent::Bar(b) => tss.push(b.source_ts.0),
+                other => panic!("expected Bar, got {other:?}"),
+            }
+        }
+        assert_eq!(tss, vec![100, 200]);
+    }
+}
+
+#[tokio::test]
+async fn historical_and_live_sessions_for_same_pair_coexist() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_history(vec![bar("AAPL", 100, 10.0)]).await;
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
+
+    // Historical and Live for the same pair share no registry slot — different
+    // EventKind for one (Bar vs Trade) and even same-kind would be allowed
+    // since Historical doesn't participate in the registry.
+    let _hist = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let _live = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
+        .await
+        .unwrap();
+    drop(ctrl);
+}
+
+#[tokio::test]
 async fn take_events_twice_concurrently_errors() {
     let (provider, _ctrl) = FakeProvider::new("fake");
     let dm = Datamancer::builder().provider_arc(provider).build().unwrap();

@@ -44,11 +44,9 @@
 //! - **Write-through persistence.** `persist=true` is accepted at
 //!   construction but events are not yet written to TapLog or
 //!   HistoricalCache. Wiring lands when the resume primitive does.
-//! - **Live-session registry.** The `LiveSessionConflict` rule is documented
-//!   but not enforced; the registry is the immediate next step after this
-//!   surface lands.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 use datamancer_core::{
     Bar, Control, ControlKind, Error, EventKind, HistoricalCache, HistoryRequest, Instrument,
@@ -91,7 +89,15 @@ struct DatamancerInner {
     /// instrument that appears here, the named provider is preferred over
     /// the first-supports-it match.
     instrument_provider: Vec<(Instrument, String)>,
+    /// Live-session registry: at most one live session may be active per
+    /// `(instrument, kind)` pair. Each live `Session` holds an `Arc` to a
+    /// [`RegistrySentinel`]; the map keeps a `Weak` so a stale entry can be
+    /// distinguished from a live one via `strong_count()`.
+    live_sessions: LiveSessionRegistry,
 }
+
+type LiveSessionRegistry =
+    Arc<std::sync::Mutex<HashMap<(Instrument, EventKind), Weak<RegistrySentinel>>>>;
 
 impl Datamancer {
     pub fn builder() -> DatamancerBuilder {
@@ -126,7 +132,35 @@ impl Datamancer {
 
         let provider = self.route(&instrument, kind)?;
 
-        // TODO(registry): enforce LiveSessionConflict on Scope::Live.
+        // Probe-and-reserve the live-session registry slot. Only `Scope::Live`
+        // participates: concurrent historical fetches for the same pair are
+        // stateless reads with no conflict. The lock is held across probe and
+        // insert so two concurrent `session()` calls can't both reserve.
+        let registry_anchor = if matches!(scope, Scope::Live { .. }) {
+            let key = (instrument.clone(), kind);
+            let mut map = self
+                .inner
+                .live_sessions
+                .lock()
+                .expect("live-session registry mutex poisoned");
+            if let Some(weak) = map.get(&key)
+                && weak.strong_count() > 0
+            {
+                return Err(Error::LiveSessionConflict { instrument, kind });
+            }
+            let anchor = Arc::new(RegistrySentinel {
+                registry: self.inner.live_sessions.clone(),
+                key: key.clone(),
+            });
+            map.insert(key, Arc::downgrade(&anchor));
+            // Drop the guard before any await: if `provider.start_live()` /
+            // `live.subscribe()` below errors, the local `anchor` drops as the
+            // function returns and `RegistrySentinel::drop` clears the entry.
+            drop(map);
+            Some(anchor)
+        } else {
+            None
+        };
 
         let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(8);
@@ -167,7 +201,10 @@ impl Datamancer {
             }
         }
 
-        Ok(Session { inner })
+        Ok(Session {
+            inner,
+            _registry_anchor: registry_anchor,
+        })
     }
 
     /// Look up a registered provider by id.
@@ -276,6 +313,7 @@ impl DatamancerBuilder {
                 tap_log: self.tap_log,
                 historical_cache: self.historical_cache,
                 instrument_provider: self.instrument_provider,
+                live_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
         })
     }
@@ -288,6 +326,11 @@ impl DatamancerBuilder {
 /// A handle to a running session. Single-owner; not `Clone`.
 pub struct Session {
     inner: Arc<SessionInner>,
+    /// Keeps the live-session registry slot occupied for the lifetime of this
+    /// `Session`. `None` for `Scope::Historical` (no registry participation).
+    /// On drop, [`RegistrySentinel::drop`] clears the slot if no successor has
+    /// taken it.
+    _registry_anchor: Option<Arc<RegistrySentinel>>,
 }
 
 struct SessionInner {
@@ -616,6 +659,38 @@ impl Controller {
             .await;
         if let Some(log) = &self.tap_log {
             let _ = log.flush().await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live-session registry sentinel
+// ---------------------------------------------------------------------------
+
+/// Holds a live-session registry slot for one `(instrument, kind)` pair.
+///
+/// Each `Session` opened with `Scope::Live` owns an `Arc<RegistrySentinel>`;
+/// the registry stores a `Weak<RegistrySentinel>` so a stale entry can be
+/// distinguished from a live one. When the owning `Session` drops, the last
+/// `Arc` drops, this `Drop` fires, and the slot is cleared.
+struct RegistrySentinel {
+    registry: LiveSessionRegistry,
+    key: (Instrument, EventKind),
+}
+
+impl Drop for RegistrySentinel {
+    fn drop(&mut self) {
+        // By the time this fires, the strong count for *this* allocation is 0.
+        // If `weak.strong_count() == 0` the entry is still ours (no successor
+        // has registered); remove it. If a successor has replaced our entry,
+        // its sentinel is a different allocation with strong_count >= 1 and we
+        // leave it alone. Poisoned-lock is benign — a stale entry is replaced
+        // by the next `session()` call which sees `strong_count() == 0`.
+        if let Ok(mut map) = self.registry.lock()
+            && let Some(weak) = map.get(&self.key)
+            && weak.strong_count() == 0
+        {
+            map.remove(&self.key);
         }
     }
 }
