@@ -492,6 +492,60 @@ async fn historical_and_live_sessions_for_same_pair_coexist() {
 }
 
 #[tokio::test]
+async fn take_events_after_drop_returns_already_taken() {
+    // Captures the documented single-shot semantics: dropping the EventStream
+    // does not return the receiver to the slot, so re-take fails. When the
+    // resume primitive lands this test should flip to assert successful re-take.
+    let (provider, _ctrl) = FakeProvider::new("fake");
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
+    let mut session = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Trade,
+            Scope::Live { backfill_from: None },
+            false,
+        )
+        .await
+        .unwrap();
+    let stream = session.take_events().unwrap();
+    drop(stream);
+    match session.take_events() {
+        Err(datamancer::Error::EventsAlreadyTaken) => {}
+        Err(other) => panic!("expected EventsAlreadyTaken, got {other:?}"),
+        Ok(_) => panic!("expected EventsAlreadyTaken, got Ok"),
+    }
+}
+
+#[tokio::test]
+async fn historical_session_with_no_consumer_terminates() {
+    // Regression for the run_historical hang: if the consumer never calls
+    // take_events, the controller used to wait on events_tx.closed() forever
+    // because the receiver is still parked in events_holder. After the fix,
+    // close() returns promptly even though the stream was never taken.
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_history(vec![bar("AAPL", 100, 10.0), bar("AAPL", 200, 11.0)])
+        .await;
+    let dm = Datamancer::builder().provider_arc(provider).build().unwrap();
+    let session = dm
+        .session(
+            Instrument::new("AAPL"),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    // Don't call take_events. Closing should return promptly.
+    tokio::time::timeout(Duration::from_secs(2), session.close())
+        .await
+        .expect("close should return promptly when stream was never taken")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn take_events_twice_concurrently_errors() {
     let (provider, _ctrl) = FakeProvider::new("fake");
     let dm = Datamancer::builder().provider_arc(provider).build().unwrap();

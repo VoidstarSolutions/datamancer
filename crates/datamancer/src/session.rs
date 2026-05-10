@@ -8,13 +8,15 @@
 //!
 //! # Lifecycle
 //!
-//! Emission is gated by the lifetime of the [`EventStream`]. The consumer
-//! takes the stream once with [`Session::take_events`], holds it while they
-//! want events delivered, and drops it when they're done. After a drop, the
-//! stream can be re-taken on the same session — datamancer uses the resume
-//! primitive (query persistence for everything since `last_emitted_source_ts`,
-//! emit a [`ControlKind::Gap`] for what's missing, then continue live) so the
-//! consumer's view stays continuous.
+//! [`Session::take_events`] is **single-shot** in this iteration. The first
+//! call hands the consumer the [`EventStream`]; subsequent calls return
+//! [`Error::EventsAlreadyTaken`] whether or not the stream is still alive.
+//! Re-take after drop, plus the historical→live backfill seam, both depend
+//! on the resume primitive (query persistence for everything since
+//! `last_emitted_source_ts`, emit a [`ControlKind::Gap`] for what's missing,
+//! then continue live). Until that lands, dropping a Live session's stream
+//! tears the session down; if you want to keep events flowing, hold the
+//! stream.
 //!
 //! Recording (write-through to persistence) is a separate axis. It defaults
 //! to whatever was passed at construction and can be toggled at runtime via
@@ -22,25 +24,27 @@
 //!
 //! # Auto-cleanup
 //!
-//! A session is alive as long as at least one of these is true:
+//! - **Live**: alive while the [`EventStream`] is held. Once the consumer
+//!   drops it, the session unsubscribes upstream and shuts down.
+//! - **Historical**: alive while the fetch is running. After the fetch
+//!   completes the controller waits for the held stream to drain (or drop)
+//!   and then shuts down. If the consumer never took the stream, the
+//!   session terminates immediately when the fetch finishes — there's
+//!   nobody to drain to.
 //!
-//! - An [`EventStream`] is currently held by the consumer (emitting), or
-//! - `persist=true` AND there is pending work
-//!   (live scope: always; historical scope: fetch in progress).
-//!
-//! When neither holds, the session terminates automatically and removes
-//! itself from the live-session registry. Explicit [`Session::close`] is
-//! still available for forced termination.
+//! Explicit [`Session::close`] is always available for forced termination.
 //!
 //! # Status
 //!
 //! This is the captured-API-shape stage. Several internals are explicitly
 //! stubbed and marked with TODO:
 //!
-//! - **Resume primitive.** Re-take after drop, and the historical→live seam
-//!   on stitched sessions, currently emit a single Gap rather than
-//!   replaying-from-persistence. The mechanism is identical for both callers
-//!   and lands in the next iteration alongside the registry.
+//! - **Resume primitive.** Re-take after drop and the historical→live seam
+//!   on stitched sessions both currently surface a single placeholder Gap
+//!   rather than replaying-from-persistence. Once the resume primitive
+//!   lands, [`Session::take_events`] will accept multiple calls (returning
+//!   the receiver to the slot on `EventStream` drop), and stitched sessions
+//!   will replay through the gap.
 //! - **Write-through persistence.** `persist=true` is accepted at
 //!   construction but events are not yet written to TapLog or
 //!   HistoricalCache. Wiring lands when the resume primitive does.
@@ -171,6 +175,7 @@ impl Datamancer {
             scope,
             events_holder: Mutex::new(SessionStreamSlot::Available(events_rx)),
             persisting: std::sync::atomic::AtomicBool::new(persist),
+            stream_taken: std::sync::atomic::AtomicBool::new(false),
             cmd_tx,
         });
 
@@ -341,6 +346,11 @@ struct SessionInner {
     /// held; Taken when a stream is currently outstanding.
     events_holder: Mutex<SessionStreamSlot>,
     persisting: std::sync::atomic::AtomicBool,
+    /// Set to true the first (and only) time `take_events` succeeds. The
+    /// historical controller reads it after fetch completion: if the consumer
+    /// never took the stream, there's nobody to drain to and the session
+    /// shuts down immediately rather than hanging on `events_tx.closed()`.
+    stream_taken: std::sync::atomic::AtomicBool,
     cmd_tx: mpsc::Sender<SessionCommand>,
 }
 
@@ -350,11 +360,14 @@ enum SessionStreamSlot {
 }
 
 impl Session {
-    /// Take the event stream. Errors with [`Error::EventsAlreadyTaken`] if a
-    /// previous [`EventStream`] is still held; once that one is dropped, this
-    /// can be called again.
+    /// Take the event stream. **Single-shot in this iteration**: the first
+    /// call returns the stream; every subsequent call returns
+    /// [`Error::EventsAlreadyTaken`], whether or not the original stream is
+    /// still alive.
     ///
-    /// Each new take goes through the resume primitive: query persistence for
+    /// Re-take after drop is gated on the resume primitive landing (see the
+    /// module-level `# Status`). Once it does, this method will accept
+    /// multiple calls — each new take will query persistence for
     /// `(last_emitted_source_ts, now]`, replay what's there, emit a
     /// [`ControlKind::Gap`] for what isn't (or the entire silence if
     /// `persist=false`), then continue live.
@@ -365,7 +378,12 @@ impl Session {
             .try_lock()
             .map_err(|_| Error::EventsAlreadyTaken)?;
         match std::mem::replace(&mut *slot, SessionStreamSlot::Taken) {
-            SessionStreamSlot::Available(rx) => Ok(EventStream { rx }),
+            SessionStreamSlot::Available(rx) => {
+                self.inner
+                    .stream_taken
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Ok(EventStream { rx })
+            }
             SessionStreamSlot::Taken => {
                 *slot = SessionStreamSlot::Taken;
                 Err(Error::EventsAlreadyTaken)
@@ -503,8 +521,19 @@ impl Controller {
             }
         }
 
-        // Fetch is done. Wait for the consumer to finish draining (or drop)
-        // the stream, then auto-close.
+        // Fetch is done. If the consumer never took the stream, the receiver
+        // is parked in `events_holder` (Slot::Available) and `events_tx.closed()`
+        // would never fire — so we'd hang forever. Shut down immediately in
+        // that case. Otherwise wait for the held stream to drain (or drop)
+        // and then auto-close.
+        if !self
+            .inner
+            .stream_taken
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.shutdown().await;
+            return;
+        }
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
