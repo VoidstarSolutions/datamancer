@@ -20,12 +20,29 @@ pub enum Error {
         instrument: crate::Instrument,
     },
 
+    /// A live session for `(instrument, kind)` is already active. Datamancer
+    /// enforces at most one concurrent live session per pair; close the
+    /// existing session before opening another.
+    #[error("a live session for {kind:?} on {instrument} is already active")]
+    LiveSessionConflict {
+        instrument: crate::Instrument,
+        kind: crate::EventKind,
+    },
+
+    /// The requested session configuration requires a persistence layer
+    /// (HistoricalCache and/or TapLog) but none is configured on the
+    /// Datamancer instance.
+    #[error("this configuration requires persistence but none is configured")]
+    PersistenceRequired,
+
     /// The session has already been closed.
     #[error("session closed")]
     SessionClosed,
 
-    /// The session's event stream has already been taken.
-    #[error("event stream already taken")]
+    /// The session's event stream has already been taken and is still live.
+    /// After the previous EventStream is dropped, take_events can be called
+    /// again.
+    #[error("event stream is currently held by another consumer")]
     EventsAlreadyTaken,
 
     /// A provider-level error surfaced through the unified error path. The

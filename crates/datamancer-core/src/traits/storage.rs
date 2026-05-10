@@ -19,7 +19,7 @@ use futures::stream::BoxStream;
 
 use crate::{
     error::Result,
-    event::{EventKind, MarketEvent, Seq, Timestamp},
+    event::{EventKind, GapSpan, MarketEvent, Seq, Timestamp},
     instrument::Instrument,
 };
 
@@ -53,6 +53,42 @@ pub trait HistoricalCache: Send + Sync {
     /// Store a batch of events under `key`. Implementations may merge with
     /// existing coverage.
     async fn store(&self, key: &CacheKey, events: &[MarketEvent]) -> Result<()>;
+
+    /// Enumerate the source-timestamp gaps within `key`'s requested range
+    /// that the cache does not yet cover. Returned spans are non-overlapping
+    /// and ordered by `from_source_ts`. Empty result means the requested
+    /// range is fully covered.
+    ///
+    /// Default implementation derives a coarse answer from
+    /// [`HistoricalCache::lookup`]: it reports the leading and trailing
+    /// uncovered fringes of the requested range. Backends that track
+    /// internal gaps (multi-segment coverage) should override this to
+    /// surface mid-range holes that `lookup` cannot.
+    async fn gaps(&self, key: &CacheKey) -> Result<Vec<GapSpan>> {
+        let coverage = self.lookup(key).await?;
+        let mut spans = Vec::new();
+        match coverage {
+            None => spans.push(GapSpan {
+                from_source_ts: key.from,
+                to_source_ts: key.to,
+            }),
+            Some(c) => {
+                if key.from < c.from {
+                    spans.push(GapSpan {
+                        from_source_ts: key.from,
+                        to_source_ts: c.from,
+                    });
+                }
+                if c.to < key.to {
+                    spans.push(GapSpan {
+                        from_source_ts: c.to,
+                        to_source_ts: key.to,
+                    });
+                }
+            }
+        }
+        Ok(spans)
+    }
 
     /// Open the cached range for `key` as a replay source.
     fn as_replay_source(&self, key: CacheKey) -> Box<dyn ReplaySource>;

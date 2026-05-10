@@ -20,8 +20,8 @@ pub mod traits;
 
 pub use error::{Error, Result};
 pub use event::{
-    Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, MarketEvent, Quote, Seq,
-    Subscription, Timestamp, Trade,
+    Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, MarketEvent, Quote, Seq, Timestamp,
+    Trade,
 };
 pub use instrument::Instrument;
 pub use price::Price;
