@@ -27,7 +27,7 @@ use datamancer_core::{
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
     AccountType, MarketDataClient,
-    restful::market_data::stock::TimeFrame,
+    restful::market_data::TimeFrame,
     streaming::{
         StockBar, StockQuote, StockStreamMessage, StockSubscriptionList, StockTrade,
         StreamingStockClient,
