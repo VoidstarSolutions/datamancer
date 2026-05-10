@@ -205,6 +205,10 @@ impl LiveHandle for AlpacaLiveHandle {
 // Streaming task
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-pass connect / authenticate / subscribe / dispatch / reconnect state machine; extraction would obscure the linear lifecycle"
+)]
 async fn run_streaming_task(
     cfg: AlpacaProviderConfig,
     sink: mpsc::Sender<MarketEvent>,
@@ -482,9 +486,14 @@ async fn emit_control(sink: &mpsc::Sender<MarketEvent>, kind: ControlKind) {
 }
 
 fn wall_clock_ts() -> Timestamp {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i64 nanos since epoch representable until year 2262"
+        )]
+        let n = d.as_nanos() as i64;
+        n
+    });
     Timestamp(nanos)
 }
 
@@ -538,7 +547,7 @@ fn translate_trade(t: &StockTrade, rx: Timestamp) -> Trade {
         rx_ts: rx,
         seq: Seq(0),
         price: Price::from_f64_round(t.price),
-        size: t.size as u64,
+        size: super::f64_to_u64_saturating(t.size),
     }
 }
 
@@ -549,9 +558,9 @@ fn translate_quote(q: &StockQuote, rx: Timestamp) -> Quote {
         rx_ts: rx,
         seq: Seq(0),
         bid: Price::from_f64_round(q.bid_price),
-        bid_size: q.bid_size as u64,
+        bid_size: super::f64_to_u64_saturating(q.bid_size),
         ask: Price::from_f64_round(q.ask_price),
-        ask_size: q.ask_size as u64,
+        ask_size: super::f64_to_u64_saturating(q.ask_size),
     }
 }
 

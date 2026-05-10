@@ -489,6 +489,10 @@ struct SurrealReplaySource {
 
 #[async_trait]
 impl ReplaySource for SurrealReplaySource {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear query/decode/merge pipeline kept inline; extraction would obscure the per-kind handling"
+    )]
     async fn open(&self, request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
         let provider = self.key.provider.clone();
         let kind = self.key.kind;

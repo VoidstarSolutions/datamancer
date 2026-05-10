@@ -778,9 +778,14 @@ fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
 
 fn wall_clock_ts() -> Timestamp {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i64 nanos since epoch representable until year 2262"
+        )]
+        let n = d.as_nanos() as i64;
+        n
+    });
     Timestamp(nanos)
 }
 

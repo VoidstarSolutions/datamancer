@@ -259,6 +259,10 @@ impl LiveHandle for SharedLiveHandle {
 // Hub task
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-pass connect / authenticate / subscribe / dispatch / reconnect state machine; extraction would obscure the linear lifecycle"
+)]
 async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receiver<HubCommand>) {
     let mut routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>> = HashMap::new();
     let mut subs = CryptoSubscriptionList::new();
@@ -556,9 +560,14 @@ async fn broadcast_control_to(sink: Option<&mpsc::Sender<MarketEvent>>, kind: Co
 }
 
 fn wall_clock_ts() -> Timestamp {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i64 nanos since epoch representable until year 2262"
+        )]
+        let n = d.as_nanos() as i64;
+        n
+    });
     Timestamp(nanos)
 }
 
@@ -597,14 +606,13 @@ pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEv
 }
 
 fn translate_trade(t: &CryptoTrade, rx: Timestamp) -> Trade {
-    let size = (t.size.max(0.0)).round() as u64;
     Trade {
         instrument: Instrument::new(&t.symbol),
         source_ts: chrono_to_ts(t.timestamp),
         rx_ts: rx,
         seq: Seq(0),
         price: Price::from_f64_round(t.price),
-        size,
+        size: super::f64_to_u64_saturating(t.size.round()),
     }
 }
 
@@ -615,9 +623,9 @@ fn translate_quote(q: &CryptoQuote, rx: Timestamp) -> Quote {
         rx_ts: rx,
         seq: Seq(0),
         bid: Price::from_f64_round(q.bid_price),
-        bid_size: (q.bid_size.max(0.0)).round() as u64,
+        bid_size: super::f64_to_u64_saturating(q.bid_size.round()),
         ask: Price::from_f64_round(q.ask_price),
-        ask_size: (q.ask_size.max(0.0)).round() as u64,
+        ask_size: super::f64_to_u64_saturating(q.ask_size.round()),
     }
 }
 
@@ -632,7 +640,7 @@ fn translate_bar(b: &CryptoBar, interval: BarInterval, rx: Timestamp) -> Bar {
         high: Price::from_f64_round(b.high),
         low: Price::from_f64_round(b.low),
         close: Price::from_f64_round(b.close),
-        volume: (b.volume.max(0.0)).round() as u64,
+        volume: super::f64_to_u64_saturating(b.volume.round()),
     }
 }
 
