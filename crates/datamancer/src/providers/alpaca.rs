@@ -395,7 +395,16 @@ async fn sleep_with_jitter(
     policy: &ReconnectPolicy,
     cmd_rx: &mut mpsc::Receiver<LiveCommand>,
 ) -> bool {
-    let delay = Duration::from_millis(*backoff_ms);
+    // Full jitter: pick a sleep uniformly in [0, backoff_ms]. With many
+    // sessions reconnecting after a shared upstream blip this avoids
+    // synchronized retry storms; without it every session retries on the
+    // same exponential ladder.
+    let delay_ms = if policy.jitter {
+        fastrand::u64(0..=*backoff_ms)
+    } else {
+        *backoff_ms
+    };
+    let delay = Duration::from_millis(delay_ms);
     *backoff_ms = (*backoff_ms * 2).min(policy.max_backoff_ms);
 
     tokio::select! {

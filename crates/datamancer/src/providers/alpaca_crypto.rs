@@ -454,7 +454,14 @@ async fn sleep_with_jitter(
     policy: &ReconnectPolicy,
     cmd_rx: &mut mpsc::Receiver<HubCommand>,
 ) -> bool {
-    let delay = Duration::from_millis(*backoff_ms);
+    // Full jitter: pick a sleep uniformly in [0, backoff_ms]. See the stock
+    // provider's sleep_with_jitter for the rationale.
+    let delay_ms = if policy.jitter {
+        fastrand::u64(0..=*backoff_ms)
+    } else {
+        *backoff_ms
+    };
+    let delay = Duration::from_millis(delay_ms);
     *backoff_ms = (*backoff_ms * 2).min(policy.max_backoff_ms);
 
     tokio::select! {
