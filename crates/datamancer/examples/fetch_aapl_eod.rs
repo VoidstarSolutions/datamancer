@@ -1,14 +1,21 @@
 //! Fetch the trailing year of AAPL end-of-day bars from Alpaca, replay
-//! them through `citadel_core::pf::ColumnBuilder` with a `$2 box,
-//! 3-reversal, anchor=first-price` configuration, and materialise the
-//! result as a real-world validation vector at
-//! `vectors/assets/pf_column_builder/aapl_one_year_eod.json`.
+//! them through `citadel_core::pf::ColumnBuilder` under three box-size
+//! configurations, and materialise the result as real-world validation
+//! vectors under `vectors/assets/pf_column_builder/`.
 //!
-//! This is the first real-data test vector. The five existing fixtures
-//! are tiny scenario stubs (≤7 ticks each); AAPL EOD over a year drops
-//! ~252 ticks through the column builder and locks in the
-//! `ColumnDelta` sequence the analysis emits — a much bigger surface
-//! for catching regressions in the engine.
+//! Three variants are emitted from a single fetch so they share the
+//! same trading-day window — only the box size differs:
+//!
+//! - `aapl_one_year_eod.json`         — `$2 box, 3-reversal`. Coarse;
+//!   ~31 columns over the year, the "what does P&F look like in
+//!   practice" baseline.
+//! - `aapl_one_year_eod_1usd_box.json` — `$1 box, 3-reversal`. Finer;
+//!   roughly doubles the column count and exercises tighter
+//!   reversals.
+//! - `aapl_one_year_eod_50cent_box.json` — `$0.50 box, 3-reversal`.
+//!   Finest; pushes the renderer and the engine with the most columns
+//!   and the densest delta stream we can plausibly defend for a
+//!   $200-ish stock.
 //!
 //! Requires `ALPACA_PAPER_API_KEY_ID` / `ALPACA_PAPER_API_SECRET_KEY`
 //! (paper) or `ALPACA_LIVE_*` (live) in the environment. Defaults to
@@ -18,9 +25,8 @@
 //! cargo run --example fetch_aapl_eod -p datamancer
 //! ```
 //!
-//! Re-running the example overwrites the JSON file, so committing it
-//! freezes the snapshot. To refresh against fresh data, delete the
-//! file and re-run.
+//! Re-running the example overwrites the JSON files, so committing
+//! them freezes the snapshot. To refresh against fresh data, re-run.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,7 +47,53 @@ use tokio::sync::mpsc;
 /// hardcoded `InstrumentId(1)` the server uses in v0.
 const INSTRUMENT_ID: InstrumentId = InstrumentId(1);
 
-const VECTOR_ID: &str = "pf.column_builder.aapl_one_year_eod";
+/// Per-vector configuration emitted from a single fetch. Each entry
+/// produces one JSON asset file using the shared tick stream and the
+/// listed box size; reversal stays at 3 and anchor at first-price
+/// across all variants so the only knob that changes is grain.
+struct BoxConfig {
+    /// `Price::from_raw` value for the box size, in nanos of a dollar.
+    box_size_nanos: i64,
+    /// Stable [`VectorId`] for this variant.
+    vector_id: &'static str,
+    /// On-disk filename under `vectors/assets/pf_column_builder/`.
+    filename: &'static str,
+    /// Short human-readable label for the panel.
+    name: &'static str,
+    /// Long-form description embedded in the vector envelope.
+    description: &'static str,
+}
+
+const CONFIGS: &[BoxConfig] = &[
+    BoxConfig {
+        box_size_nanos: 2_000_000_000,
+        vector_id: "pf.column_builder.aapl_one_year_eod",
+        filename: "aapl_one_year_eod.json",
+        name: "AAPL one-year end-of-day ($2 box)",
+        description: "Trailing year of AAPL daily close prices replayed through ColumnBuilder with a $2 \
+             box, 3-reversal chart anchored at the first observed price. The coarse baseline \
+             real-data vector — ~31 columns over the year, representative of textbook P&F \
+             practice on a ~$200 stock.",
+    },
+    BoxConfig {
+        box_size_nanos: 1_000_000_000,
+        vector_id: "pf.column_builder.aapl_one_year_eod_1usd_box",
+        filename: "aapl_one_year_eod_1usd_box.json",
+        name: "AAPL one-year end-of-day ($1 box)",
+        description: "Same trading-day window and reversal threshold as the baseline AAPL vector, but \
+             with a $1 box. Roughly doubles the column count and exercises tighter reversal \
+             behaviour.",
+    },
+    BoxConfig {
+        box_size_nanos: 500_000_000,
+        vector_id: "pf.column_builder.aapl_one_year_eod_50cent_box",
+        filename: "aapl_one_year_eod_50cent_box.json",
+        name: "AAPL one-year end-of-day ($0.50 box)",
+        description: "Finest-grain AAPL EOD variant: $0.50 box, 3-reversal. Designed to push the \
+             renderer and the engine with the densest delta stream we can defend for a $200 \
+             stock — many columns, frequent reversals.",
+    },
+];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -108,15 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("fetched {} bars", bars.len());
 
-    // P&F params chosen for AAPL's ~$200 price level: $2 box ≈ 1%,
-    // 3-reversal is the textbook default, anchor at the first observed
-    // price keeps the box grid stable.
-    let params = PfParams {
-        box_size: BoxSize(citadel_core::Price::from_units(2)),
-        reversal: Reversal(3),
-        anchor: Anchor::FirstPrice,
-    };
-
+    // Build the canonical tick stream once. Each variant clones it
+    // into its own envelope so the on-disk JSON is self-contained.
     let ticks: Vec<Tick> = bars
         .into_iter()
         .map(|(source_ts, close)| Tick {
@@ -131,38 +176,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let mut actor = Actor::new(INSTRUMENT_ID, ColumnBuilder::new(params));
-    for tick in &ticks {
-        actor.ingest(tick);
-    }
-    let expected = actor.outputs().to_vec();
-    println!("ColumnBuilder emitted {} column deltas", expected.len());
-
-    let envelope = LoadedPfVector::from_file(PfVectorFile {
-        id: VectorId::from_static(VECTOR_ID),
-        name: "AAPL one-year end-of-day".to_string(),
-        description:
-            "Trailing year of AAPL daily close prices replayed through ColumnBuilder with \
-             a $2 box, 3-reversal chart anchored at the first observed price. The first \
-             real-data validation vector; size and price range are representative of a \
-             liquid US equity at the ~$200 level."
-                .to_string(),
-        target: citadel_core::AnalysisKind::PfColumnBuilder,
-        params,
-        ticks,
-        expected,
-    })
-    .to_file();
-
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let assets_dir = manifest_dir.join("../vectors/assets/pf_column_builder");
     std::fs::create_dir_all(&assets_dir)?;
-    let out_path = assets_dir.join("aapl_one_year_eod.json");
-    let mut bytes = serde_json::to_string_pretty(&envelope)?.into_bytes();
-    bytes.push(b'\n');
-    std::fs::write(&out_path, bytes)?;
-    println!("wrote {}", out_path.display());
+
+    for config in CONFIGS {
+        let params = PfParams {
+            box_size: BoxSize(citadel_core::Price::from_raw(config.box_size_nanos)),
+            reversal: Reversal(3),
+            anchor: Anchor::FirstPrice,
+        };
+
+        let mut actor = Actor::new(INSTRUMENT_ID, ColumnBuilder::new(params));
+        for tick in &ticks {
+            actor.ingest(tick);
+        }
+        let expected = actor.outputs().to_vec();
+
+        let envelope = LoadedPfVector::from_file(PfVectorFile {
+            id: VectorId::from_static(config.vector_id),
+            name: config.name.to_string(),
+            description: config.description.to_string(),
+            target: citadel_core::AnalysisKind::PfColumnBuilder,
+            params,
+            ticks: ticks.clone(),
+            expected,
+        })
+        .to_file();
+
+        let out_path = assets_dir.join(config.filename);
+        let mut bytes = serde_json::to_string_pretty(&envelope)?.into_bytes();
+        bytes.push(b'\n');
+        std::fs::write(&out_path, bytes)?;
+        println!(
+            "wrote {} ({} column deltas)",
+            out_path.display(),
+            envelope.expected.len(),
+        );
+    }
 
     Ok(())
 }
