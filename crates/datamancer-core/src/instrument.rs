@@ -8,13 +8,16 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Stable identifier for a market-data provider.
 ///
 /// Matches the value returned by [`crate::Provider::id`]. The `Cow`
 /// representation keeps the common case — a static provider constant such as
 /// `"alpaca"` — zero-allocation while still supporting runtime-constructed
 /// ids for multi-tenant deployments and test fakes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ProviderId(Cow<'static, str>);
 
 impl ProviderId {
@@ -60,7 +63,7 @@ impl From<String> for ProviderId {
 /// `#[non_exhaustive]` so adding `Forex`, `Future`, `Option`, etc. later is
 /// a non-breaking extension for downstream `match` arms that opt in.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AssetClass {
     Equity,
     Etf,
@@ -84,7 +87,7 @@ impl fmt::Display for AssetClass {
 /// that share a ticker; the same crypto pair on multiple venues), and engine
 /// code that holds an `Instrument` should be able to round-trip back to the
 /// right provider without an external lookup.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Instrument {
     provider: ProviderId,
     asset_class: AssetClass,

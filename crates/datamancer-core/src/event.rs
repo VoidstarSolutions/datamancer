@@ -4,6 +4,8 @@
 //! cover live and historical market data plus in-band [`Control`] entries for
 //! connectivity, subscription state, and gap reporting.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Instrument, Price};
 
 /// A monotonically-increasing identifier assigned by datamancer at receipt.
@@ -20,11 +22,12 @@ pub struct Seq(pub u64);
 ///
 /// Used for both `source_ts` (provider-reported) and `rx_ts` (wall-clock at
 /// receipt). The two roles are documented on each event variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Timestamp(pub i64);
 
 /// Bar interval. Skeletal — extended as additional intervals become first-class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BarInterval {
     OneSecond,
     OneMinute,
