@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use datamancer::{
-    Bar, BarInterval, ControlKind, Datamancer, EventKind, Instrument, LiveHandle, MarketEvent,
-    Price, Provider, Result, Scope, Seq, Timestamp, Trade,
+    AssetClass, Bar, BarInterval, ControlKind, Datamancer, EventKind, Instrument, LiveHandle,
+    MarketEvent, Price, Provider, ProviderId, Result, Scope, Seq, Timestamp, Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -129,9 +129,16 @@ impl LiveHandle for FakeLiveHandle {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Construct an `Instrument` matching the `FakeProvider("fake")` used
+/// throughout this suite. Tests can name a symbol without re-spelling the
+/// full qualifying tuple at every callsite.
+fn inst(symbol: &str) -> Instrument {
+    Instrument::new(ProviderId::from_static("fake"), AssetClass::Equity, symbol)
+}
+
 fn trade(symbol: &str, ts: i64, price: f64) -> MarketEvent {
     MarketEvent::Trade(Trade {
-        instrument: Instrument::new(symbol),
+        instrument: inst(symbol),
         source_ts: Timestamp(ts),
         rx_ts: Timestamp(ts),
         seq: Seq(0),
@@ -142,7 +149,7 @@ fn trade(symbol: &str, ts: i64, price: f64) -> MarketEvent {
 
 fn bar(symbol: &str, ts: i64, close: f64) -> MarketEvent {
     MarketEvent::Bar(Bar {
-        instrument: Instrument::new(symbol),
+        instrument: inst(symbol),
         interval: BarInterval::OneMinute,
         source_ts: Timestamp(ts),
         rx_ts: Timestamp(ts),
@@ -168,7 +175,7 @@ async fn live_session_assigns_monotonic_seq_and_passes_events_through() {
         .unwrap();
     let mut session = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -218,7 +225,7 @@ async fn historical_session_streams_provider_fetch_in_order() {
 
     let mut session = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Bar(BarInterval::OneMinute),
             Scope::Historical {
                 from: Timestamp(0),
@@ -265,7 +272,7 @@ async fn live_with_backfill_emits_placeholder_seam_gap() {
 
     let mut session = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: Some(Timestamp(1_000)),
@@ -316,7 +323,7 @@ async fn persist_true_without_persistence_layer_errors() {
         .unwrap();
     match dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -342,7 +349,7 @@ async fn live_session_conflict_rejects_second_live_session_for_same_pair() {
     // First Live session reserves the (AAPL, Trade) registry slot.
     let _first = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -355,7 +362,7 @@ async fn live_session_conflict_rejects_second_live_session_for_same_pair() {
     // Second Live session for the same pair is rejected.
     match dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -383,7 +390,7 @@ async fn live_session_conflict_clears_when_first_is_dropped() {
 
     let first = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -397,7 +404,7 @@ async fn live_session_conflict_clears_when_first_is_dropped() {
     // After drop the registry slot is free and a new Live session opens.
     let _second = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -418,7 +425,7 @@ async fn live_session_conflict_clears_when_first_is_closed() {
 
     let first = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -431,7 +438,7 @@ async fn live_session_conflict_clears_when_first_is_closed() {
 
     let _second = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -456,7 +463,7 @@ async fn historical_sessions_for_same_pair_are_concurrent() {
     // each independently receive the full fake history.
     let mut a = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Bar(BarInterval::OneMinute),
             Scope::Historical {
                 from: Timestamp(0),
@@ -468,7 +475,7 @@ async fn historical_sessions_for_same_pair_are_concurrent() {
         .unwrap();
     let mut b = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Bar(BarInterval::OneMinute),
             Scope::Historical {
                 from: Timestamp(0),
@@ -511,7 +518,7 @@ async fn historical_and_live_sessions_for_same_pair_coexist() {
     // since Historical doesn't participate in the registry.
     let _hist = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Bar(BarInterval::OneMinute),
             Scope::Historical {
                 from: Timestamp(0),
@@ -523,7 +530,7 @@ async fn historical_and_live_sessions_for_same_pair_coexist() {
         .unwrap();
     let _live = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -547,7 +554,7 @@ async fn take_events_after_drop_returns_already_taken() {
         .unwrap();
     let mut session = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -580,7 +587,7 @@ async fn historical_session_with_no_consumer_terminates() {
         .unwrap();
     let session = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Bar(BarInterval::OneMinute),
             Scope::Historical {
                 from: Timestamp(0),
@@ -606,7 +613,7 @@ async fn take_events_twice_concurrently_errors() {
         .unwrap();
     let mut session = dm
         .session(
-            Instrument::new("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,

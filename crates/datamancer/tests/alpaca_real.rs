@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use datamancer::providers::{AlpacaProvider, AlpacaProviderConfig, AlpacaStreamFeed};
-use datamancer::{Datamancer, EventKind, Instrument, MarketEvent, Scope};
+use datamancer::{AssetClass, Datamancer, EventKind, Instrument, MarketEvent, ProviderId, Scope};
 use futures::StreamExt;
 use oxidized_alpaca::AccountType;
 
@@ -31,7 +31,11 @@ async fn live_test_feed_yields_an_event() {
         .unwrap();
     let mut session = dm
         .session(
-            Instrument::new("FAKEPACA"),
+            Instrument::new(
+                ProviderId::from_static("alpaca"),
+                AssetClass::Equity,
+                "FAKEPACA",
+            ),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -77,7 +81,11 @@ async fn live_test_feed_delivers_a_trade() {
         .unwrap();
     let mut session = dm
         .session(
-            Instrument::new("FAKEPACA"),
+            Instrument::new(
+                ProviderId::from_static("alpaca"),
+                AssetClass::Equity,
+                "FAKEPACA",
+            ),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,

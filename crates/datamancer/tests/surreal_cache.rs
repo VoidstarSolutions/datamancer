@@ -8,17 +8,23 @@
 
 use datamancer::storage::{SurrealCache, SurrealCacheConfig};
 use datamancer::{
-    Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache, Instrument, MarketEvent,
-    Price, Seq, Timestamp, Trade,
+    AssetClass, Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache, Instrument,
+    MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
 };
 use datamancer_core::ReplayRequest;
 use futures::StreamExt;
 
-const PROVIDER: &str = "alpaca";
+fn inst(symbol: &str) -> Instrument {
+    Instrument::new(
+        ProviderId::from_static("alpaca"),
+        AssetClass::Equity,
+        symbol,
+    )
+}
 
 fn trade(symbol: &str, ts: i64, price: f64, size: u64) -> MarketEvent {
     MarketEvent::Trade(Trade {
-        instrument: Instrument::new(symbol),
+        instrument: inst(symbol),
         source_ts: Timestamp(ts),
         rx_ts: Timestamp(ts),
         seq: Seq(0),
@@ -29,7 +35,7 @@ fn trade(symbol: &str, ts: i64, price: f64, size: u64) -> MarketEvent {
 
 fn bar(symbol: &str, ts: i64, close: f64) -> MarketEvent {
     MarketEvent::Bar(Bar {
-        instrument: Instrument::new(symbol),
+        instrument: inst(symbol),
         interval: BarInterval::OneMinute,
         source_ts: Timestamp(ts),
         rx_ts: Timestamp(ts),
@@ -44,8 +50,7 @@ fn bar(symbol: &str, ts: i64, close: f64) -> MarketEvent {
 
 fn key(kind: EventKind, from: i64, to: i64) -> CacheKey {
     CacheKey {
-        provider: PROVIDER.to_string(),
-        instrument: Instrument::new("AAPL"),
+        instrument: inst("AAPL"),
         kind,
         from: Timestamp(from),
         to: Timestamp(to),
@@ -81,7 +86,7 @@ async fn store_then_replay_round_trip_preserves_order_and_values() {
 
     let source = cache.as_replay_source(k.clone());
     let request = ReplayRequest {
-        instruments: vec![Instrument::new("AAPL")],
+        instruments: vec![inst("AAPL")],
         kinds: vec![EventKind::Trade],
         from: Timestamp(100),
         to: Timestamp(400),
@@ -217,7 +222,7 @@ async fn embedded_round_trip_persists_to_disk() {
 // reshape — Instrument constructs from a &str and EventKind is reachable.
 #[test]
 fn reexports_are_consistent() {
-    let inst: Instrument = Instrument::new("AAPL");
+    let i: Instrument = inst("AAPL");
     let kind: EventKind = EventKind::Trade;
-    let _ = (inst, kind);
+    let _ = (i, kind);
 }

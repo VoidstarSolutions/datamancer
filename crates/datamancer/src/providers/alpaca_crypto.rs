@@ -36,8 +36,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    Bar, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest, Instrument,
-    LiveHandle, MarketEvent, Price, Provider, Quote, Result, Seq, Timestamp, Trade,
+    AssetClass, Bar, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest,
+    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quote, Result, Seq,
+    Timestamp, Trade,
 };
 use oxidized_alpaca::{
     AccountType, CryptoFeed,
@@ -53,6 +54,17 @@ use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca crypto provider.
 pub const PROVIDER_ID: &str = "alpaca-crypto";
+
+/// Construct an `Instrument` rooted at this provider. Crypto pairs always
+/// land as [`AssetClass::Crypto`]; the decoder doesn't need a catalog
+/// roundtrip to disambiguate.
+fn provider_instrument(symbol: impl Into<String>) -> Instrument {
+    Instrument::new(
+        ProviderId::from_static(PROVIDER_ID),
+        AssetClass::Crypto,
+        symbol,
+    )
+}
 
 /// Which Alpaca crypto venue to stream from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -607,7 +619,7 @@ pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEv
 
 fn translate_trade(t: &CryptoTrade, rx: Timestamp) -> Trade {
     Trade {
-        instrument: Instrument::new(&t.symbol),
+        instrument: provider_instrument(&t.symbol),
         source_ts: chrono_to_ts(t.timestamp),
         rx_ts: rx,
         seq: Seq(0),
@@ -618,7 +630,7 @@ fn translate_trade(t: &CryptoTrade, rx: Timestamp) -> Trade {
 
 fn translate_quote(q: &CryptoQuote, rx: Timestamp) -> Quote {
     Quote {
-        instrument: Instrument::new(&q.symbol),
+        instrument: provider_instrument(&q.symbol),
         source_ts: chrono_to_ts(q.timestamp),
         rx_ts: rx,
         seq: Seq(0),
@@ -631,7 +643,7 @@ fn translate_quote(q: &CryptoQuote, rx: Timestamp) -> Quote {
 
 fn translate_bar(b: &CryptoBar, interval: BarInterval, rx: Timestamp) -> Bar {
     Bar {
-        instrument: Instrument::new(&b.symbol),
+        instrument: provider_instrument(&b.symbol),
         interval,
         source_ts: chrono_to_ts(b.timestamp),
         rx_ts: rx,
@@ -700,7 +712,7 @@ mod tests {
     #[test]
     fn provider_supports_kinds() {
         let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig::default());
-        let inst = Instrument::new("BTC/USD");
+        let inst = provider_instrument("BTC/USD");
         assert!(p.supports(&inst, EventKind::Trade));
         assert!(p.supports(&inst, EventKind::Quote));
         assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneMinute)));
@@ -712,7 +724,7 @@ mod tests {
     fn event_route_key_matches_pair() {
         let now = Timestamp(1);
         let trade = MarketEvent::Trade(Trade {
-            instrument: Instrument::new("BTC/USD"),
+            instrument: provider_instrument("BTC/USD"),
             source_ts: now,
             rx_ts: now,
             seq: Seq(0),
@@ -721,11 +733,11 @@ mod tests {
         });
         assert_eq!(
             event_route_key(&trade),
-            Some((Instrument::new("BTC/USD"), EventKind::Trade))
+            Some((provider_instrument("BTC/USD"), EventKind::Trade))
         );
 
         let bar = MarketEvent::Bar(Bar {
-            instrument: Instrument::new("ETH/USD"),
+            instrument: provider_instrument("ETH/USD"),
             interval: BarInterval::OneMinute,
             source_ts: now,
             rx_ts: now,
@@ -739,7 +751,7 @@ mod tests {
         assert_eq!(
             event_route_key(&bar),
             Some((
-                Instrument::new("ETH/USD"),
+                provider_instrument("ETH/USD"),
                 EventKind::Bar(BarInterval::OneMinute)
             ))
         );

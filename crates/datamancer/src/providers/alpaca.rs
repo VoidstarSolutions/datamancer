@@ -20,11 +20,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use datamancer_core::{Bar, Quote};
 use datamancer_core::{
-    BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest, Instrument, LiveHandle,
-    MarketEvent, Price, Provider, Result, Seq, Timestamp, Trade,
+    AssetClass, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest, Instrument,
+    LiveHandle, MarketEvent, Price, Provider, ProviderId, Result, Seq, Timestamp, Trade,
 };
+use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
     AccountType, MarketDataClient, StreamingFeed,
     restful::market_data::TimeFrame,
@@ -40,6 +40,19 @@ use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca-backed provider.
 pub const PROVIDER_ID: &str = "alpaca";
+
+/// Construct an `Instrument` rooted at this provider. The streaming decoder
+/// only sees symbols, not the asset-class metadata Alpaca tracks on the REST
+/// `/v2/assets` surface; until that catalog is wired, decoded events default
+/// to [`AssetClass::Equity`]. Catalog-driven construction (ETFs, etc.) will
+/// override this at the boundary where the rich `Instrument` is built.
+fn provider_instrument(symbol: impl Into<String>) -> Instrument {
+    Instrument::new(
+        ProviderId::from_static(PROVIDER_ID),
+        AssetClass::Equity,
+        symbol,
+    )
+}
 
 /// Which Alpaca streaming endpoint to use for live data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,7 +555,7 @@ pub(crate) fn translate_stock_message(msg: StockStreamMessage) -> Vec<MarketEven
 
 fn translate_trade(t: &StockTrade, rx: Timestamp) -> Trade {
     Trade {
-        instrument: Instrument::new(&t.symbol),
+        instrument: provider_instrument(&t.symbol),
         source_ts: chrono_to_ts(t.timestamp),
         rx_ts: rx,
         seq: Seq(0),
@@ -553,7 +566,7 @@ fn translate_trade(t: &StockTrade, rx: Timestamp) -> Trade {
 
 fn translate_quote(q: &StockQuote, rx: Timestamp) -> Quote {
     Quote {
-        instrument: Instrument::new(&q.symbol),
+        instrument: provider_instrument(&q.symbol),
         source_ts: chrono_to_ts(q.timestamp),
         rx_ts: rx,
         seq: Seq(0),
@@ -566,7 +579,7 @@ fn translate_quote(q: &StockQuote, rx: Timestamp) -> Quote {
 
 fn translate_bar(b: &StockBar, interval: BarInterval, rx: Timestamp) -> Bar {
     Bar {
-        instrument: Instrument::new(&b.symbol),
+        instrument: provider_instrument(&b.symbol),
         interval,
         source_ts: chrono_to_ts(b.timestamp),
         rx_ts: rx,
@@ -768,7 +781,7 @@ mod tests {
     #[test]
     fn subscription_list_apply_add_remove() {
         let mut list = StockSubscriptionList::new();
-        let aapl = Instrument::new("AAPL");
+        let aapl = provider_instrument("AAPL");
         apply_pair_to_list(&mut list, &aapl, EventKind::Trade, true);
         apply_pair_to_list(
             &mut list,
@@ -792,7 +805,7 @@ mod tests {
     #[test]
     fn provider_supports_kinds() {
         let p = AlpacaProvider::new(AlpacaProviderConfig::default());
-        let inst = Instrument::new("AAPL");
+        let inst = provider_instrument("AAPL");
         assert!(p.supports(&inst, EventKind::Trade));
         assert!(p.supports(&inst, EventKind::Quote));
         assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneMinute)));

@@ -103,10 +103,12 @@ pub trait ReplaySource: Send + Sync {
     async fn open(&self, request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>>;
 }
 
-/// Identifies one cached range.
+/// Identifies one cached range. The provider is carried inside
+/// [`Instrument`] (see [`Instrument::provider`]) so a `CacheKey` is fully
+/// self-describing — backends derive their row keys from the qualifying
+/// tuple inside `instrument` without an external lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
-    pub provider: String,
     pub instrument: Instrument,
     pub kind: EventKind,
     pub from: Timestamp,
