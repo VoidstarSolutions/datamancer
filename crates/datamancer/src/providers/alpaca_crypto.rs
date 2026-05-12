@@ -41,7 +41,10 @@ use datamancer_core::{
     Timestamp, Trade,
 };
 use oxidized_alpaca::{
-    AccountType, CryptoFeed,
+    AccountType, CryptoFeed, TradingClient,
+    restful::trading::assets::{
+        Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus,
+    },
     streaming::{
         CryptoBar, CryptoQuote, CryptoStreamMessage, CryptoSubscriptionList, CryptoTrade,
         StreamingCryptoClient,
@@ -64,6 +67,26 @@ fn provider_instrument(symbol: impl Into<String>) -> Instrument {
         AssetClass::Crypto,
         symbol,
     )
+}
+
+/// Translate Alpaca's `/v2/assets` crypto rows into the datamancer
+/// catalog. Pure function — no client, no I/O — so it can be exercised
+/// against canned JSON fixtures without credentials. Skips non-tradable
+/// rows and asset classes outside crypto (Alpaca's `Crypto` filter on the
+/// request side should already handle this, but the guard is cheap and
+/// defends against API drift).
+fn crypto_assets_to_instruments(assets: &[Asset]) -> Vec<Instrument> {
+    assets
+        .iter()
+        .filter(|a| a.tradable && matches!(a.class, AlpacaAssetClass::Crypto))
+        .map(|a| {
+            Instrument::new(
+                ProviderId::from_static(PROVIDER_ID),
+                AssetClass::Crypto,
+                a.symbol.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Which Alpaca crypto venue to stream from.
@@ -103,6 +126,10 @@ impl Default for AlpacaCryptoProviderConfig {
 pub struct AlpacaCryptoProvider {
     cfg: AlpacaCryptoProviderConfig,
     hub: Arc<Mutex<HubSlot>>,
+    /// Trading API client, used for the reference-data surface (crypto
+    /// asset catalog). `None` when credentials weren't available at
+    /// construction — `list_instruments` then surfaces a Provider error.
+    trading: Option<TradingClient>,
 }
 
 enum HubSlot {
@@ -117,9 +144,11 @@ enum HubSlot {
 impl AlpacaCryptoProvider {
     #[must_use]
     pub fn new(cfg: AlpacaCryptoProviderConfig) -> Self {
+        let trading = TradingClient::new(cfg.account_type).ok();
         Self {
             cfg,
             hub: Arc::new(Mutex::new(HubSlot::Idle)),
+            trading,
         }
     }
 
@@ -175,6 +204,24 @@ impl Provider for AlpacaCryptoProvider {
             provider: PROVIDER_ID.to_string(),
             message: "crypto historical fetch is not wired up in this provider".to_string(),
         })
+    }
+
+    async fn list_instruments(&self) -> Result<Vec<Instrument>> {
+        let trading = self.trading.as_ref().ok_or_else(|| Error::Provider {
+            provider: PROVIDER_ID.to_string(),
+            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        })?;
+        let assets = trading
+            .list_assets()
+            .status(AlpacaAssetStatus::Active)
+            .asset_class(AlpacaAssetClass::Crypto)
+            .execute()
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("list_assets: {e}"),
+            })?;
+        Ok(crypto_assets_to_instruments(&assets))
     }
 }
 
@@ -755,5 +802,39 @@ mod tests {
                 EventKind::Bar(BarInterval::OneMinute)
             ))
         );
+    }
+
+    #[test]
+    fn crypto_assets_to_instruments_filters_and_maps() {
+        let json = r#"[
+            {
+                "id":"1","class":"crypto","exchange":"CRYPTO","symbol":"BTC/USD",
+                "name":"Bitcoin","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"2","class":"crypto","exchange":"CRYPTO","symbol":"DOGE/USD",
+                "name":"Dogecoin","status":"active","tradable":false,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"3","class":"us_equity","exchange":"NASDAQ","symbol":"AAPL",
+                "name":"Apple Inc.","status":"active","tradable":true,
+                "marginable":true,"shortable":true,"easy_to_borrow":true,
+                "fractionable":true,"attributes":[]
+            }
+        ]"#;
+        let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
+        let instruments = crypto_assets_to_instruments(&assets);
+        // BTC/USD passes; DOGE/USD filtered (not tradable); AAPL filtered
+        // (wrong class — guards against API drift).
+        let symbols: Vec<&str> = instruments.iter().map(Instrument::symbol).collect();
+        assert_eq!(symbols, vec!["BTC/USD"]);
+        for i in &instruments {
+            assert_eq!(i.provider().as_str(), PROVIDER_ID);
+            assert_eq!(i.asset_class(), AssetClass::Crypto);
+        }
     }
 }

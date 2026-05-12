@@ -26,8 +26,11 @@ use datamancer_core::{
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
-    AccountType, MarketDataClient, StreamingFeed,
-    restful::market_data::TimeFrame,
+    AccountType, MarketDataClient, StreamingFeed, TradingClient,
+    restful::{
+        market_data::TimeFrame,
+        trading::assets::{Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus},
+    },
     streaming::{
         StockBar, StockQuote, StockStreamMessage, StockSubscriptionList, StockTrade,
         StreamingStockClient,
@@ -52,6 +55,35 @@ fn provider_instrument(symbol: impl Into<String>) -> Instrument {
         AssetClass::Equity,
         symbol,
     )
+}
+
+/// Translate Alpaca's `/v2/assets` rows into the datamancer instrument
+/// catalog. Pure function — no client, no I/O — so it can be exercised
+/// against canned JSON fixtures without credentials.
+///
+/// Filters to `tradable = true` and skips asset classes outside our v0
+/// taxonomy. Alpaca returns ETFs under [`AlpacaAssetClass::UsEquity`] with
+/// no explicit ETF flag on the row itself, so for now they land as
+/// [`AssetClass::Equity`]; a future revision can read the `attributes`
+/// vector (e.g. `"etp"`) to promote them to [`AssetClass::Etf`].
+fn assets_to_instruments(assets: &[Asset]) -> Vec<Instrument> {
+    assets
+        .iter()
+        .filter(|a| a.tradable)
+        .filter_map(|a| {
+            let asset_class = match a.class {
+                AlpacaAssetClass::UsEquity => AssetClass::Equity,
+                // Options and crypto-perp aren't part of v0's taxonomy;
+                // the dedicated crypto provider handles plain crypto.
+                _ => return None,
+            };
+            Some(Instrument::new(
+                ProviderId::from_static(PROVIDER_ID),
+                asset_class,
+                a.symbol.clone(),
+            ))
+        })
+        .collect()
 }
 
 /// Which Alpaca streaming endpoint to use for live data.
@@ -93,24 +125,32 @@ impl Default for AlpacaProviderConfig {
 pub struct AlpacaProvider {
     cfg: AlpacaProviderConfig,
     rest: Option<MarketDataClient>,
+    /// Trading API client, used for the reference-data surface (asset
+    /// catalog). `None` when credentials weren't available at construction
+    /// — `list_instruments` will surface a Provider error in that case.
+    trading: Option<TradingClient>,
 }
 
 impl AlpacaProvider {
-    /// Construct without eagerly initializing the REST client. Use this when
-    /// only live streaming is needed and credentials are loaded later, or in
-    /// tests where the env vars are not set.
+    /// Construct without eagerly initializing the REST clients. Use this
+    /// when only live streaming is needed and credentials are loaded later,
+    /// or in tests where the env vars are not set.
     #[must_use]
     pub fn new(cfg: AlpacaProviderConfig) -> Self {
         let rest = MarketDataClient::new(cfg.account_type).ok();
-        Self { cfg, rest }
+        let trading = TradingClient::new(cfg.account_type).ok();
+        Self { cfg, rest, trading }
     }
 
-    /// Construct with an explicit REST client. Useful in tests.
+    /// Construct with an explicit market-data REST client. Useful in tests.
+    /// The trading client is still resolved from the environment.
     #[must_use]
     pub fn with_rest(cfg: AlpacaProviderConfig, rest: MarketDataClient) -> Self {
+        let trading = TradingClient::new(cfg.account_type).ok();
         Self {
             cfg,
             rest: Some(rest),
+            trading,
         }
     }
 }
@@ -151,6 +191,28 @@ impl Provider for AlpacaProvider {
             message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
         })?;
         fetch_history_via(rest, request, sink).await
+    }
+
+    async fn list_instruments(&self) -> Result<Vec<Instrument>> {
+        let trading = self.trading.as_ref().ok_or_else(|| Error::Provider {
+            provider: PROVIDER_ID.to_string(),
+            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        })?;
+        // Filter at the API edge: status=Active + class=UsEquity is what
+        // Alpaca's `/v2/assets` understands; we still re-filter on
+        // `tradable` because inactive-but-listed rows occasionally slip
+        // through the status filter on the equity surface.
+        let assets = trading
+            .list_assets()
+            .status(AlpacaAssetStatus::Active)
+            .asset_class(AlpacaAssetClass::UsEquity)
+            .execute()
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("list_assets: {e}"),
+            })?;
+        Ok(assets_to_instruments(&assets))
     }
 }
 
@@ -811,5 +873,46 @@ mod tests {
         assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneMinute)));
         assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneDay)));
         assert!(!p.supports(&inst, EventKind::Bar(BarInterval::FiveMinute)));
+    }
+
+    #[test]
+    fn assets_to_instruments_filters_and_maps() {
+        // Fixture mirrors Alpaca's `/v2/assets` JSON, including a row that
+        // must be filtered (non-tradable) and an asset class outside v0.
+        let json = r#"[
+            {
+                "id":"1","class":"us_equity","exchange":"NASDAQ","symbol":"AAPL",
+                "name":"Apple Inc.","status":"active","tradable":true,
+                "marginable":true,"shortable":true,"easy_to_borrow":true,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"2","class":"us_equity","exchange":"NYSE","symbol":"GE",
+                "name":"General Electric","status":"active","tradable":false,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":false,"attributes":[]
+            },
+            {
+                "id":"3","class":"us_option","exchange":"AMEX","symbol":"AAPL250117C00150000",
+                "name":"AAPL 2025 Call","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":false,"attributes":[]
+            },
+            {
+                "id":"4","class":"us_equity","exchange":"NYSEARCA","symbol":"SPY",
+                "name":"SPDR S&P 500 ETF","status":"active","tradable":true,
+                "marginable":true,"shortable":true,"easy_to_borrow":true,
+                "fractionable":true,"attributes":["etp"]
+            }
+        ]"#;
+        let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
+        let instruments = assets_to_instruments(&assets);
+        // AAPL and SPY pass; GE filtered (not tradable); option skipped.
+        let symbols: Vec<&str> = instruments.iter().map(Instrument::symbol).collect();
+        assert_eq!(symbols, vec!["AAPL", "SPY"]);
+        for i in &instruments {
+            assert_eq!(i.provider().as_str(), PROVIDER_ID);
+            assert_eq!(i.asset_class(), AssetClass::Equity);
+        }
     }
 }
