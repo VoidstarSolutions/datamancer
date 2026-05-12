@@ -568,8 +568,11 @@ impl Controller {
         // Fetch is done. If the consumer never took the stream, the receiver
         // is parked in `events_holder` (Slot::Available) and `events_tx.closed()`
         // would never fire — so we'd hang forever. Shut down immediately in
-        // that case. Otherwise wait for the held stream to drain (or drop)
-        // and then auto-close.
+        // that case. Otherwise tell the consumer the historical run has
+        // exhausted (so a `next().await` that's blocked waiting for more
+        // events resolves to a `SessionClosing` and the consumer can drop
+        // the stream), then wait for the held stream to drain or drop and
+        // auto-close.
         if !self
             .inner
             .stream_taken
@@ -578,6 +581,18 @@ impl Controller {
             self.shutdown().await;
             return;
         }
+        let now = wall_clock_ts();
+        let seq = Seq(self.next_seq);
+        self.next_seq += 1;
+        let _ = self
+            .events_tx
+            .send(MarketEvent::Control(Control {
+                source_ts: now,
+                rx_ts: now,
+                seq,
+                kind: ControlKind::SessionClosing,
+            }))
+            .await;
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
