@@ -36,11 +36,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    Bar, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest, Instrument,
-    LiveHandle, MarketEvent, Price, Provider, Quote, Result, Seq, Timestamp, Trade,
+    AssetClass, Bar, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest,
+    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quote, Result, Seq,
+    Timestamp, Trade,
 };
 use oxidized_alpaca::{
-    AccountType, CryptoFeed,
+    AccountType, CryptoFeed, TradingClient,
+    restful::trading::assets::{
+        Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus,
+    },
     streaming::{
         CryptoBar, CryptoQuote, CryptoStreamMessage, CryptoSubscriptionList, CryptoTrade,
         StreamingCryptoClient,
@@ -53,6 +57,37 @@ use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca crypto provider.
 pub const PROVIDER_ID: &str = "alpaca-crypto";
+
+/// Construct an `Instrument` rooted at this provider. Crypto pairs always
+/// land as [`AssetClass::Crypto`]; the decoder doesn't need a catalog
+/// roundtrip to disambiguate.
+fn provider_instrument(symbol: impl Into<String>) -> Instrument {
+    Instrument::new(
+        ProviderId::from_static(PROVIDER_ID),
+        AssetClass::Crypto,
+        symbol,
+    )
+}
+
+/// Translate Alpaca's `/v2/assets` crypto rows into the datamancer
+/// catalog. Pure function — no client, no I/O — so it can be exercised
+/// against canned JSON fixtures without credentials. Skips non-tradable
+/// rows and asset classes outside crypto (Alpaca's `Crypto` filter on the
+/// request side should already handle this, but the guard is cheap and
+/// defends against API drift).
+fn crypto_assets_to_instruments(assets: &[Asset]) -> Vec<Instrument> {
+    assets
+        .iter()
+        .filter(|a| a.tradable && matches!(a.class, AlpacaAssetClass::Crypto))
+        .map(|a| {
+            Instrument::new(
+                ProviderId::from_static(PROVIDER_ID),
+                AssetClass::Crypto,
+                a.symbol.clone(),
+            )
+        })
+        .collect()
+}
 
 /// Which Alpaca crypto venue to stream from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +126,10 @@ impl Default for AlpacaCryptoProviderConfig {
 pub struct AlpacaCryptoProvider {
     cfg: AlpacaCryptoProviderConfig,
     hub: Arc<Mutex<HubSlot>>,
+    /// Trading API client, used for the reference-data surface (crypto
+    /// asset catalog). `None` when credentials weren't available at
+    /// construction — `list_instruments` then surfaces a Provider error.
+    trading: Option<TradingClient>,
 }
 
 enum HubSlot {
@@ -105,9 +144,11 @@ enum HubSlot {
 impl AlpacaCryptoProvider {
     #[must_use]
     pub fn new(cfg: AlpacaCryptoProviderConfig) -> Self {
+        let trading = TradingClient::new(cfg.account_type).ok();
         Self {
             cfg,
             hub: Arc::new(Mutex::new(HubSlot::Idle)),
+            trading,
         }
     }
 
@@ -163,6 +204,24 @@ impl Provider for AlpacaCryptoProvider {
             provider: PROVIDER_ID.to_string(),
             message: "crypto historical fetch is not wired up in this provider".to_string(),
         })
+    }
+
+    async fn list_instruments(&self) -> Result<Vec<Instrument>> {
+        let trading = self.trading.as_ref().ok_or_else(|| Error::Provider {
+            provider: PROVIDER_ID.to_string(),
+            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        })?;
+        let assets = trading
+            .list_assets()
+            .status(AlpacaAssetStatus::Active)
+            .asset_class(AlpacaAssetClass::Crypto)
+            .execute()
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("list_assets: {e}"),
+            })?;
+        Ok(crypto_assets_to_instruments(&assets))
     }
 }
 
@@ -607,7 +666,7 @@ pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEv
 
 fn translate_trade(t: &CryptoTrade, rx: Timestamp) -> Trade {
     Trade {
-        instrument: Instrument::new(&t.symbol),
+        instrument: provider_instrument(&t.symbol),
         source_ts: chrono_to_ts(t.timestamp),
         rx_ts: rx,
         seq: Seq(0),
@@ -618,7 +677,7 @@ fn translate_trade(t: &CryptoTrade, rx: Timestamp) -> Trade {
 
 fn translate_quote(q: &CryptoQuote, rx: Timestamp) -> Quote {
     Quote {
-        instrument: Instrument::new(&q.symbol),
+        instrument: provider_instrument(&q.symbol),
         source_ts: chrono_to_ts(q.timestamp),
         rx_ts: rx,
         seq: Seq(0),
@@ -631,7 +690,7 @@ fn translate_quote(q: &CryptoQuote, rx: Timestamp) -> Quote {
 
 fn translate_bar(b: &CryptoBar, interval: BarInterval, rx: Timestamp) -> Bar {
     Bar {
-        instrument: Instrument::new(&b.symbol),
+        instrument: provider_instrument(&b.symbol),
         interval,
         source_ts: chrono_to_ts(b.timestamp),
         rx_ts: rx,
@@ -700,7 +759,7 @@ mod tests {
     #[test]
     fn provider_supports_kinds() {
         let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig::default());
-        let inst = Instrument::new("BTC/USD");
+        let inst = provider_instrument("BTC/USD");
         assert!(p.supports(&inst, EventKind::Trade));
         assert!(p.supports(&inst, EventKind::Quote));
         assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneMinute)));
@@ -712,7 +771,7 @@ mod tests {
     fn event_route_key_matches_pair() {
         let now = Timestamp(1);
         let trade = MarketEvent::Trade(Trade {
-            instrument: Instrument::new("BTC/USD"),
+            instrument: provider_instrument("BTC/USD"),
             source_ts: now,
             rx_ts: now,
             seq: Seq(0),
@@ -721,11 +780,11 @@ mod tests {
         });
         assert_eq!(
             event_route_key(&trade),
-            Some((Instrument::new("BTC/USD"), EventKind::Trade))
+            Some((provider_instrument("BTC/USD"), EventKind::Trade))
         );
 
         let bar = MarketEvent::Bar(Bar {
-            instrument: Instrument::new("ETH/USD"),
+            instrument: provider_instrument("ETH/USD"),
             interval: BarInterval::OneMinute,
             source_ts: now,
             rx_ts: now,
@@ -739,9 +798,43 @@ mod tests {
         assert_eq!(
             event_route_key(&bar),
             Some((
-                Instrument::new("ETH/USD"),
+                provider_instrument("ETH/USD"),
                 EventKind::Bar(BarInterval::OneMinute)
             ))
         );
+    }
+
+    #[test]
+    fn crypto_assets_to_instruments_filters_and_maps() {
+        let json = r#"[
+            {
+                "id":"1","class":"crypto","exchange":"CRYPTO","symbol":"BTC/USD",
+                "name":"Bitcoin","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"2","class":"crypto","exchange":"CRYPTO","symbol":"DOGE/USD",
+                "name":"Dogecoin","status":"active","tradable":false,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"3","class":"us_equity","exchange":"NASDAQ","symbol":"AAPL",
+                "name":"Apple Inc.","status":"active","tradable":true,
+                "marginable":true,"shortable":true,"easy_to_borrow":true,
+                "fractionable":true,"attributes":[]
+            }
+        ]"#;
+        let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
+        let instruments = crypto_assets_to_instruments(&assets);
+        // BTC/USD passes; DOGE/USD filtered (not tradable); AAPL filtered
+        // (wrong class — guards against API drift).
+        let symbols: Vec<&str> = instruments.iter().map(Instrument::symbol).collect();
+        assert_eq!(symbols, vec!["BTC/USD"]);
+        for i in &instruments {
+            assert_eq!(i.provider().as_str(), PROVIDER_ID);
+            assert_eq!(i.asset_class(), AssetClass::Crypto);
+        }
     }
 }

@@ -53,6 +53,30 @@ pub trait Provider: Send + Sync + 'static {
         request: HistoryRequest,
         sink: mpsc::Sender<MarketEvent>,
     ) -> Result<()>;
+
+    /// Enumerate the instruments this provider can serve.
+    ///
+    /// Powers the consumer-facing instrument catalog: the UI's instrument
+    /// picker, automated tests that need a real symbol list without
+    /// hard-coding one, and the multi-provider routing layer that wants to
+    /// know what's reachable before opening a session.
+    ///
+    /// Implementations should return only **tradable, currently active**
+    /// instruments — surfacing delisted, halted, or otherwise unavailable
+    /// rows would put symbols in the picker that fail at subscribe time.
+    /// Each returned [`Instrument`] must carry this provider's
+    /// [`crate::ProviderId`] in its `provider` field so the result is
+    /// safe to feed back into [`Self::supports`] or `Session` construction
+    /// without ambiguity.
+    ///
+    /// Default implementation returns an empty list — providers without a
+    /// reference-data surface (test fakes, replay-only sources) can leave
+    /// this alone. Network-backed providers should override it; the cold
+    /// boundary already pays for dynamic dispatch, so per-call overhead is
+    /// not a concern.
+    async fn list_instruments(&self) -> Result<Vec<Instrument>> {
+        Ok(Vec::new())
+    }
 }
 
 /// A handle to a running live provider session. Subscription mutation and

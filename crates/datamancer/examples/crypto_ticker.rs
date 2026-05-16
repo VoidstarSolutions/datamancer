@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use datamancer::{
-    ControlKind, Datamancer, EventKind, Instrument, MarketEvent, Price, Scope, Session, Timestamp,
+    AssetClass, ControlKind, Datamancer, EventKind, Instrument, MarketEvent, Price, ProviderId,
+    Scope, Session, Timestamp,
     providers::{AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue},
 };
 use futures::StreamExt;
@@ -68,7 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for kind in [EventKind::Trade, EventKind::Quote] {
             let mut session = dm
                 .session(
-                    Instrument::new(*sym),
+                    Instrument::new(
+                        ProviderId::from_static("alpaca-crypto"),
+                        AssetClass::Crypto,
+                        *sym,
+                    ),
                     kind,
                     Scope::Live {
                         backfill_from: None,

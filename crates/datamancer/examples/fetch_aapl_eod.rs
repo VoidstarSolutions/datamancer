@@ -38,7 +38,8 @@ use citadel_vectors::VectorId;
 use citadel_vectors::pf::{LoadedPfVector, PfVectorFile};
 use datamancer::providers::{AlpacaProvider, AlpacaProviderConfig};
 use datamancer::{
-    BarInterval, EventKind, HistoryRequest, Instrument, MarketEvent, Provider, Timestamp,
+    AssetClass, BarInterval, EventKind, HistoryRequest, Instrument, MarketEvent, Provider,
+    ProviderId, Timestamp,
 };
 use oxidized_alpaca::AccountType;
 use tokio::sync::mpsc;
@@ -126,7 +127,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, mut rx) = mpsc::channel::<MarketEvent>(512);
     let request = HistoryRequest {
-        instrument: Instrument::new("AAPL"),
+        instrument: Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        ),
         kind: EventKind::Bar(BarInterval::OneDay),
         from: Timestamp(from_ns),
         to: Timestamp(to_ns),

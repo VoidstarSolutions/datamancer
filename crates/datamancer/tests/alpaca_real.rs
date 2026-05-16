@@ -13,7 +13,9 @@
 use std::time::Duration;
 
 use datamancer::providers::{AlpacaProvider, AlpacaProviderConfig, AlpacaStreamFeed};
-use datamancer::{Datamancer, EventKind, Instrument, MarketEvent, Scope};
+use datamancer::{
+    AssetClass, Datamancer, EventKind, Instrument, MarketEvent, Provider, ProviderId, Scope,
+};
 use futures::StreamExt;
 use oxidized_alpaca::AccountType;
 
@@ -31,7 +33,11 @@ async fn live_test_feed_yields_an_event() {
         .unwrap();
     let mut session = dm
         .session(
-            Instrument::new("FAKEPACA"),
+            Instrument::new(
+                ProviderId::from_static("alpaca"),
+                AssetClass::Equity,
+                "FAKEPACA",
+            ),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -77,7 +83,11 @@ async fn live_test_feed_delivers_a_trade() {
         .unwrap();
     let mut session = dm
         .session(
-            Instrument::new("FAKEPACA"),
+            Instrument::new(
+                ProviderId::from_static("alpaca"),
+                AssetClass::Equity,
+                "FAKEPACA",
+            ),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -147,4 +157,39 @@ async fn live_test_feed_delivers_a_trade() {
     );
 
     let _ = session.close().await;
+}
+
+/// Reference-data smoke test: `list_instruments` against Alpaca's real
+/// `/v2/assets` surface. Doesn't open a session; just exercises the catalog
+/// path. Looks for a few well-known tickers that have been tradable on
+/// Alpaca for years (AAPL, MSFT, SPY) — these can vanish in theory but in
+/// practice are stable enough for a smoke check.
+#[tokio::test]
+#[ignore = "requires real Alpaca credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
+async fn list_instruments_returns_known_symbols() {
+    let provider = AlpacaProvider::new(AlpacaProviderConfig::default());
+    let instruments = provider
+        .list_instruments()
+        .await
+        .expect("list_instruments succeeds with real credentials");
+    eprintln!("alpaca returned {} tradable equities", instruments.len());
+    assert!(
+        instruments.len() > 1000,
+        "expected a sizable equity catalog, got {}",
+        instruments.len()
+    );
+    let symbols: std::collections::HashSet<&str> =
+        instruments.iter().map(Instrument::symbol).collect();
+    for expected in ["AAPL", "MSFT", "SPY"] {
+        assert!(
+            symbols.contains(expected),
+            "expected {expected} in the Alpaca equity catalog"
+        );
+    }
+    // Every returned instrument should be stamped with our provider id and
+    // (for the equity surface) the Equity asset class.
+    for i in &instruments {
+        assert_eq!(i.provider().as_str(), "alpaca");
+        assert_eq!(i.asset_class(), AssetClass::Equity);
+    }
 }

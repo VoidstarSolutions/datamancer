@@ -7,8 +7,12 @@ publish = false
 [dependencies]
 async-trait = "0.1"
 futures = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

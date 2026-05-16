@@ -156,7 +156,7 @@ impl SurrealCache {
     fn coverage_id(key: &CacheKey) -> String {
         format!(
             "{}|{}|{}",
-            key.provider,
+            key.instrument.provider(),
             key.instrument.symbol(),
             Self::table_for(key.kind)
         )
@@ -316,7 +316,7 @@ impl HistoricalCache for SurrealCache {
             return Ok(());
         }
         let table = Self::table_for(key.kind);
-        let provider = key.provider.clone();
+        let provider = key.instrument.provider().as_str().to_string();
         let symbol = key.instrument.symbol().to_string();
         let mut min_ts = i64::MAX;
         let mut max_ts = i64::MIN;
@@ -452,7 +452,7 @@ impl SurrealCache {
 
     async fn count_events_in(&self, key: &CacheKey, from: i64, to: i64) -> Result<u64> {
         let table = Self::table_for(key.kind);
-        let provider = key.provider.clone();
+        let provider = key.instrument.provider().as_str().to_string();
         let symbol = key.instrument.symbol().to_string();
         let mut response = self
             .db
@@ -494,7 +494,7 @@ impl ReplaySource for SurrealReplaySource {
         reason = "linear query/decode/merge pipeline kept inline; extraction would obscure the per-kind handling"
     )]
     async fn open(&self, request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
-        let provider = self.key.provider.clone();
+        let provider = self.key.instrument.provider().as_str().to_string();
         let kind = self.key.kind;
         // ReplayRequest may narrow the cache key; honor its from/to and
         // intersect with the original key. Also intersect instruments and
@@ -539,10 +539,11 @@ impl ReplaySource for SurrealReplaySource {
                     .map_err(map_err)?
                     .take(0)
                     .map_err(map_err)?;
+                let instrument = self.key.instrument.clone();
                 rows.into_iter()
                     .map(|r| {
                         MarketEvent::Trade(Trade {
-                            instrument: Instrument::new(r.symbol),
+                            instrument: instrument.clone(),
                             source_ts: Timestamp(r.source_ts),
                             rx_ts: Timestamp(r.rx_ts),
                             seq: Seq(0),
@@ -570,10 +571,11 @@ impl ReplaySource for SurrealReplaySource {
                     .map_err(map_err)?
                     .take(0)
                     .map_err(map_err)?;
+                let instrument = self.key.instrument.clone();
                 rows.into_iter()
                     .map(|r| {
                         MarketEvent::Quote(Quote {
-                            instrument: Instrument::new(r.symbol),
+                            instrument: instrument.clone(),
                             source_ts: Timestamp(r.source_ts),
                             rx_ts: Timestamp(r.rx_ts),
                             seq: Seq(0),
@@ -603,10 +605,11 @@ impl ReplaySource for SurrealReplaySource {
                     .map_err(map_err)?
                     .take(0)
                     .map_err(map_err)?;
+                let instrument = self.key.instrument.clone();
                 rows.into_iter()
                     .map(|r| {
                         MarketEvent::Bar(Bar {
-                            instrument: Instrument::new(r.symbol),
+                            instrument: instrument.clone(),
                             interval,
                             source_ts: Timestamp(r.source_ts),
                             rx_ts: Timestamp(r.rx_ts),

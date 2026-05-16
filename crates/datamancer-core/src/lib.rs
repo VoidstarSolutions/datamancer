@@ -23,7 +23,7 @@ pub use event::{
     Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, MarketEvent, Quote, Seq, Timestamp,
     Trade,
 };
-pub use instrument::Instrument;
+pub use instrument::{AssetClass, Instrument, ProviderId};
 pub use price::Price;
 pub use traits::{
     CacheCoverage, CacheKey, HistoricalCache, HistoryRequest, LiveHandle, Provider, ReplayRequest,
