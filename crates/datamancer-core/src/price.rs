@@ -1,10 +1,8 @@
 //! Fixed-point price representation used by every datamancer event.
 //!
-//! Datamancer is intended to be extractable as a standalone library, so it
-//! defines its own [`Price`] rather than depending on a consumer's type. The
-//! representation matches Citadel's convention (`i64` nanos of currency,
-//! `1e-9` resolution); consumers that need a different representation convert
-//! at their own boundary.
+//! Datamancer defines its own [`Price`] rather than depending on a consumer's
+//! type: `i64` nanos of currency, `1e-9` resolution. Consumers that need a
+//! different representation convert at their own boundary.
 
 /// A price in fixed-point units of `1e-9` of the quoted currency.
 ///

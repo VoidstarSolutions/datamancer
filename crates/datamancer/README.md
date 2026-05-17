@@ -4,9 +4,9 @@ A unified subscription and replay layer for financial market data. Datamancer ta
 
 ## Status and Scope
 
-Datamancer currently lives inside the Citadel workspace because the requirements for both are still co-evolving. Once it stabilizes, it is intended to be extracted into its own repository as an open-source project. Designing it as a self-contained library from the start — with a public API that makes sense without reference to Citadel's internals — is a deliberate constraint that shapes every decision in this document.
+Datamancer is an early-stage open-source library. The public API is still co-evolving with its first real consumers, and breaking changes should be expected until that surface stabilizes.
 
-At extraction (or sooner, if the boundaries become obvious from working code) datamancer is expected to become its own workspace, with provider integrations and persistence backends as sibling crates that can be combined à la carte: a consumer brings in `datamancer` plus the provider and persistence crates they actually need. Until that split is motivated by real coupling pain, datamancer remains a single crate and grows organically — picking trait boundaries now without working implementations to validate them is at least as likely to cause refactoring pain as deferring the split.
+The workspace currently holds two crates — `datamancer-core` (types and trait surface) and `datamancer` (the session orchestrator, plus provider and storage backends behind cargo features). Provider integrations and persistence backends are expected to split into their own sibling crates once the boundaries are obvious from working code; until that split is motivated by real coupling pain, they live in `datamancer` behind features and grow organically. Consumers bring in `datamancer` plus the providers and persistence backends they actually need.
 
 The first supported provider is Alpaca. Provider integration is meant to be additive: adding a second provider should not require changing any consumer code.
 
@@ -23,7 +23,7 @@ The first supported provider is Alpaca. Provider integration is meant to be addi
 
 ## What Datamancer Does Not Do
 
-- **Per-instrument demultiplexing.** Datamancer emits one ordered stream of events; if a consumer wants per-instrument streams (Citadel's engine router does), it demuxes downstream.
+- **Per-instrument demultiplexing.** Datamancer emits one ordered stream of events; consumers that want per-instrument streams demux downstream.
 - **Semantic enrichment.** No "join this trade with the most recent quote to compute the trade side." Datamancer surfaces the events; analysis on top of them belongs to consumers.
 - **Provider-side time reordering.** Events are emitted in the order they were received, not re-sorted by source timestamp. Consumers that need strict timestamp ordering buffer themselves.
 - **Throttled or wall-clock-paced replay.** Replay produces events as fast as the consumer drains. Modeling latency or simulating real-time pacing is a research-tool concern, not a data-layer one.
@@ -115,4 +115,4 @@ The session API is being kept free of design choices that would preclude transpa
 
 ## License
 
-To be determined at extraction time. While datamancer lives in the Citadel workspace it is covered by the workspace license; on extraction it will be released under a permissive open-source license.
+To be determined. Datamancer will be released under a permissive open-source license once one is selected.

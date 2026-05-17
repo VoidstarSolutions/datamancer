@@ -2584,8 +2584,8 @@ dependencies = [
 
 [[package]]
 name = "oxidized_alpaca"
-version = "0.0.5"
-source = "git+https://github.com/VoidstarSolutions/oxidized-alpaca?rev=47376d984b83e103f79e6b133d722eddb3163a60#47376d984b83e103f79e6b133d722eddb3163a60"
+version = "0.0.6"
+source = "git+https://github.com/VoidstarSolutions/oxidized-alpaca?branch=main#8bebeceef9f1d3515eb760a97aa902337f3ca824"
 dependencies = [
  "chrono",
  "futures",
