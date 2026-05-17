@@ -18,7 +18,7 @@ tokio = { workspace = true }
 tracing = "0.1"
 
 # provider-alpaca
-oxidized_alpaca = { git = "https://github.com/VoidstarSolutions/oxidized-alpaca", rev = "47376d984b83e103f79e6b133d722eddb3163a60", optional = true }
+oxidized_alpaca = { git = "https://github.com/VoidstarSolutions/oxidized-alpaca", branch = "main", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"], optional = true }
 
 # storage-surreal
