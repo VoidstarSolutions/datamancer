@@ -18,7 +18,7 @@ tokio = { workspace = true }
 tracing = "0.1"
 
 # provider-alpaca
-oxidized_alpaca = { git = "https://github.com/VoidstarSolutions/oxidized-alpaca", branch = "main", optional = true }
+oxidized_alpaca = { git = "https://github.com/VoidstarSolutions/oxidized-alpaca", rev = "47376d984b83e103f79e6b133d722eddb3163a60", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"], optional = true }
 
 # storage-surreal
@@ -26,19 +26,13 @@ surrealdb = { version = "3.0", optional = true, default-features = false, featur
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-citadel-core = { path = "../core" }
-citadel-vectors = { path = "../vectors" }
 serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "signal"] }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]
 name = "crypto_ticker"
-required-features = ["provider-alpaca"]
-
-[[example]]
-name = "fetch_aapl_eod"
 required-features = ["provider-alpaca"]
 
 [lints]
