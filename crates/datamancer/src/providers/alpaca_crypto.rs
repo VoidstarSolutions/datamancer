@@ -46,8 +46,8 @@ use oxidized_alpaca::{
         Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus,
     },
     streaming::{
-        CryptoBar, CryptoQuote, CryptoStreamMessage, CryptoSubscriptionList, CryptoTrade,
-        StreamingCryptoClient,
+        CryptoStreamMessage, CryptoSubscriptionList, StreamingCryptoClient,
+        messages::crypto::{CryptoBarEvent, CryptoQuoteEvent, CryptoTradeEvent},
     },
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -664,7 +664,7 @@ pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEv
     }
 }
 
-fn translate_trade(t: &CryptoTrade, rx: Timestamp) -> Trade {
+fn translate_trade(t: &CryptoTradeEvent, rx: Timestamp) -> Trade {
     Trade {
         instrument: provider_instrument(&t.symbol),
         source_ts: chrono_to_ts(t.timestamp),
@@ -675,7 +675,7 @@ fn translate_trade(t: &CryptoTrade, rx: Timestamp) -> Trade {
     }
 }
 
-fn translate_quote(q: &CryptoQuote, rx: Timestamp) -> Quote {
+fn translate_quote(q: &CryptoQuoteEvent, rx: Timestamp) -> Quote {
     Quote {
         instrument: provider_instrument(&q.symbol),
         source_ts: chrono_to_ts(q.timestamp),
@@ -688,7 +688,7 @@ fn translate_quote(q: &CryptoQuote, rx: Timestamp) -> Quote {
     }
 }
 
-fn translate_bar(b: &CryptoBar, interval: BarInterval, rx: Timestamp) -> Bar {
+fn translate_bar(b: &CryptoBarEvent, interval: BarInterval, rx: Timestamp) -> Bar {
     Bar {
         instrument: provider_instrument(&b.symbol),
         interval,

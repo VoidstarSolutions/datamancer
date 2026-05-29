@@ -32,8 +32,8 @@ use oxidized_alpaca::{
         trading::assets::{Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus},
     },
     streaming::{
-        StockBar, StockQuote, StockStreamMessage, StockSubscriptionList, StockTrade,
-        StreamingStockClient,
+        StockStreamMessage, StockSubscriptionList, StreamingStockClient,
+        messages::stock::{StockBar, StockQuoteEvent, StockTradeEvent},
     },
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -615,7 +615,7 @@ pub(crate) fn translate_stock_message(msg: StockStreamMessage) -> Vec<MarketEven
     }
 }
 
-fn translate_trade(t: &StockTrade, rx: Timestamp) -> Trade {
+fn translate_trade(t: &StockTradeEvent, rx: Timestamp) -> Trade {
     Trade {
         instrument: provider_instrument(&t.symbol),
         source_ts: chrono_to_ts(t.timestamp),
@@ -626,7 +626,7 @@ fn translate_trade(t: &StockTrade, rx: Timestamp) -> Trade {
     }
 }
 
-fn translate_quote(q: &StockQuote, rx: Timestamp) -> Quote {
+fn translate_quote(q: &StockQuoteEvent, rx: Timestamp) -> Quote {
     Quote {
         instrument: provider_instrument(&q.symbol),
         source_ts: chrono_to_ts(q.timestamp),
