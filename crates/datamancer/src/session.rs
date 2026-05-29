@@ -703,12 +703,15 @@ impl Controller {
     }
 
     /// Forward an in-band `Gap` control covering `[from, to)` for this
-    /// session's instrument. Goes through `forward()` so it gets a `seq`.
-    async fn emit_gap(&mut self, from: Timestamp, to: Timestamp) {
-        let now = wall_clock_ts();
+    /// session's instrument, stamped at `source_ts`. Goes through `forward()`
+    /// so it gets a `seq`. The caller chooses `source_ts`: the live backfill
+    /// seam uses the wall clock (the seam is "now"); historical paths pass an
+    /// in-range timestamp so the control stays ordered within the source-time
+    /// stream rather than jumping to wall-clock ahead of older events.
+    async fn emit_gap(&mut self, source_ts: Timestamp, from: Timestamp, to: Timestamp) {
         self.forward(MarketEvent::Control(Control {
-            source_ts: now,
-            rx_ts: now,
+            source_ts,
+            rx_ts: source_ts,
             seq: Seq(0),
             kind: ControlKind::Gap {
                 provider: self.provider.id().to_string(),
@@ -799,7 +802,9 @@ impl Controller {
                                 error = %e,
                                 "cache replay open failed; emitting gap for covered segment"
                             );
-                            self.emit_gap(f, t).await;
+                            // Stamp the gap at the segment start (in-range) so
+                            // it stays ordered ahead of later segments.
+                            self.emit_gap(f, f, t).await;
                             continue;
                         }
                     };
@@ -868,14 +873,22 @@ impl Controller {
                             }
                         }
                     } else {
-                        // Honest coverage: claim only the confirmed prefix
-                        // (+1 keeps the last received event inside the
-                        // half-open coverage); r.from if nothing arrived.
+                        // Honest coverage: claim only the confirmed prefix of
+                        // [f, t). +1 keeps the last received event inside the
+                        // half-open range; clamp to [f, t) so a provider that
+                        // over-delivers past `t` cannot over-claim coverage.
+                        // Only data-event timestamps count — a stray Control
+                        // would otherwise skew the prefix toward wall-clock.
                         let confirmed_to = batch
                             .iter()
-                            .filter_map(source_ts)
+                            .filter_map(|ev| match ev {
+                                MarketEvent::Trade(tr) => Some(tr.source_ts.0),
+                                MarketEvent::Quote(q) => Some(q.source_ts.0),
+                                MarketEvent::Bar(b) => Some(b.source_ts.0),
+                                _ => None,
+                            })
                             .max()
-                            .map_or(f, |m| Timestamp(m.0 + 1));
+                            .map_or(f, |m| Timestamp(m.saturating_add(1).clamp(f.0, t.0)));
                         if options.write_cache {
                             let store_key = CacheKey {
                                 instrument: instrument.clone(),
@@ -891,7 +904,10 @@ impl Controller {
                                 );
                             }
                         }
-                        self.emit_gap(confirmed_to, t).await;
+                        // Surface a gap only if part of [.., t) is still missing.
+                        if confirmed_to < t {
+                            self.emit_gap(confirmed_to, confirmed_to, t).await;
+                        }
                         break;
                     }
                 }
@@ -917,7 +933,7 @@ impl Controller {
             // For now surface a placeholder Gap [from, now) so consumers can
             // see the seam; live events follow.
             let now = wall_clock_ts();
-            self.emit_gap(from, now).await;
+            self.emit_gap(now, from, now).await;
         }
 
         let live = Arc::new(Mutex::new(Some(live)));
