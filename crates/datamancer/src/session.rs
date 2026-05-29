@@ -202,6 +202,7 @@ impl Datamancer {
         scope: Scope,
         options: PersistenceOptions,
     ) -> Result<Session> {
+        // tap_log write axis is deferred (later spec); only the cache is required here.
         if options.uses_cache() && self.inner.historical_cache.is_none() {
             return Err(Error::PersistenceRequired);
         }
@@ -366,7 +367,7 @@ impl DatamancerBuilder {
         self
     }
 
-    /// Attach a tap log; live events from sessions with `persist=true` will
+    /// Attach a tap log; live events from sessions configured to record will
     /// be appended.
     #[must_use]
     pub fn tap_log(mut self, log: Box<dyn TapLog>) -> Self {
@@ -375,8 +376,8 @@ impl DatamancerBuilder {
     }
 
     /// Attach a historical cache; historical fetches from sessions with
-    /// `persist=true` write-through this cache before returning to the
-    /// consumer.
+    /// `PersistenceOptions::write_cache` enabled (e.g. `PersistenceOptions::cached()`)
+    /// write-through this cache before returning to the consumer.
     #[must_use]
     pub fn historical_cache(mut self, cache: Box<dyn HistoricalCache>) -> Self {
         self.historical_cache = Some(Arc::from(cache));
@@ -464,7 +465,7 @@ impl Session {
     /// multiple calls — each new take will query persistence for
     /// `(last_emitted_source_ts, now]`, replay what's there, emit a
     /// [`ControlKind::Gap`] for what isn't (or the entire silence if
-    /// `persist=false`), then continue live.
+    /// `read_cache` is off), then continue live.
     ///
     /// # Errors
     ///
@@ -525,7 +526,7 @@ impl Session {
 
     /// Explicit termination. Auto-cleanup also handles natural-completion
     /// cases (historical fetch exhausted, or live + stream-dropped +
-    /// persist=false).
+    /// with no persistence configured).
     ///
     /// # Errors
     ///
