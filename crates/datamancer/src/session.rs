@@ -75,6 +75,73 @@ pub enum Scope {
     Live { backfill_from: Option<Timestamp> },
 }
 
+/// How a session interacts with the configured persistence layer.
+///
+/// The two cache axes compose into the full historical option space:
+///
+/// | `read_cache` | `write_cache` | mode      | behavior                                    |
+/// |--------------|---------------|-----------|---------------------------------------------|
+/// | `false`      | `false`       | ephemeral | always hit the provider, store nothing      |
+/// | `true`       | `true`        | cached    | serve covered ranges, fetch & store gaps    |
+/// | `true`       | `false`       | read-only | serve cache + fetch gaps, don't persist     |
+/// | `false`      | `true`        | refresh   | ignore coverage, re-fetch range, overwrite  |
+///
+/// `#[non_exhaustive]`: later work (tap log, resume) adds axes additively.
+/// Construct via the presets, or mutate the public fields on an owned value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct PersistenceOptions {
+    /// Historical scope: serve covered subranges from the cache and fetch only
+    /// the gaps. When false, always fetch the full range from the provider.
+    pub read_cache: bool,
+    /// Historical scope: write fetched gap data back to the cache.
+    pub write_cache: bool,
+}
+
+impl PersistenceOptions {
+    /// No persistence: always hit the provider, store nothing.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            read_cache: false,
+            write_cache: false,
+        }
+    }
+
+    /// Read-through cache: serve covered ranges, fetch and store only gaps.
+    #[must_use]
+    pub const fn cached() -> Self {
+        Self {
+            read_cache: true,
+            write_cache: true,
+        }
+    }
+
+    /// Serve from cache and fetch gaps for this run, but do not persist them.
+    #[must_use]
+    pub const fn read_only() -> Self {
+        Self {
+            read_cache: true,
+            write_cache: false,
+        }
+    }
+
+    /// Ignore cached coverage, re-fetch the whole range, overwrite the cache.
+    #[must_use]
+    pub const fn refresh() -> Self {
+        Self {
+            read_cache: false,
+            write_cache: true,
+        }
+    }
+
+    /// True if either axis touches the historical cache.
+    #[must_use]
+    pub const fn uses_cache(self) -> bool {
+        self.read_cache || self.write_cache
+    }
+}
+
 /// Top-level entry point. Owns provider instances and optional persistence,
 /// then hands them to per-session controllers.
 ///
@@ -823,5 +890,34 @@ impl Default for ReconnectPolicy {
             max_backoff_ms: 30_000,
             jitter: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod persistence_options_tests {
+    use super::PersistenceOptions;
+
+    #[test]
+    fn presets_compose_the_four_modes() {
+        assert_eq!(PersistenceOptions::none(), PersistenceOptions::default());
+        assert!(!PersistenceOptions::none().read_cache && !PersistenceOptions::none().write_cache);
+        assert!(
+            PersistenceOptions::cached().read_cache && PersistenceOptions::cached().write_cache
+        );
+        assert!(
+            PersistenceOptions::read_only().read_cache
+                && !PersistenceOptions::read_only().write_cache
+        );
+        assert!(
+            !PersistenceOptions::refresh().read_cache && PersistenceOptions::refresh().write_cache
+        );
+    }
+
+    #[test]
+    fn uses_cache_is_true_when_any_axis_set() {
+        assert!(!PersistenceOptions::none().uses_cache());
+        assert!(PersistenceOptions::cached().uses_cache());
+        assert!(PersistenceOptions::read_only().uses_cache());
+        assert!(PersistenceOptions::refresh().uses_cache());
     }
 }
