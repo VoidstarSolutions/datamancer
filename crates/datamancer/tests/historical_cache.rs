@@ -245,6 +245,9 @@ async fn fully_cached_serves_without_touching_provider() {
 
     let (bars, gaps) = drain(&mut session).await;
     assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 900]);
+    // seq is reassigned on the pure cache-replay branch (stored bars carry
+    // Seq(0)); pin it so a stored-seq passthrough regression is caught here too.
+    assert_eq!(bars.iter().map(|b| b.1).collect::<Vec<_>>(), vec![0, 1]);
     assert!(gaps.is_empty());
     assert!(
         fetched.lock().unwrap().is_empty(),
