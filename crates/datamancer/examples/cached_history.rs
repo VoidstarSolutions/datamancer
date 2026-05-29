@@ -45,7 +45,9 @@ impl SyntheticProvider {
                     instrument: instrument(symbol),
                     interval: BarInterval::OneDay,
                     source_ts: Timestamp(i * DAY_NS),
+                    // rx_ts collapses to source_ts in pure-historical replay.
                     rx_ts: Timestamp(i * DAY_NS),
+                    // Placeholder: datamancer assigns the real session seq at receipt.
                     seq: Seq(0),
                     open: Price::from_units(100 + i),
                     high: Price::from_units(101 + i),
