@@ -97,15 +97,53 @@ A `StitchConfig` is essentially a `ReplayConfig` for the backfill window plus a 
 
 `Instrument` is an opaque newtype wrapping a symbol string for now. Asset class, exchange, contract specification, and other structured fields will be added when there is a real cross-provider or non-equity use case driving them. Keeping the type opaque from day one means callers won't need to be revised when that growth happens.
 
-## Persistence (Future)
+## Persistence — Historical Cache
 
-When persistence lands, it will take three forms:
+Datamancer can back a historical session with a `HistoricalCache` (the bundled
+`SurrealCache` stores to SurrealKV on disk, or in-memory for tests). Caching is
+controlled per-session by `PersistenceOptions`:
 
-- **Live tap log** — append-only record of every event received in a live session, capturing both `rx_ts` and `seq` so that replay reproduces the engine's experience exactly.
-- **Historical fetch cache** — canonical store of historical data keyed by `(provider, instrument, granularity, range)`, so re-running a research job does not re-hit the provider.
-- **Local replay source** — `replay()` accepts either of the above as a source.
+| `read_cache` | `write_cache` | mode      | behavior                                        |
+|--------------|---------------|-----------|-------------------------------------------------|
+| `false`      | `false`       | ephemeral | always fetch from the provider, store nothing   |
+| `true`       | `true`        | cached    | serve covered ranges, fetch & store only gaps   |
+| `true`       | `false`       | read-only | serve cache + fetch gaps, don't persist them    |
+| `false`      | `true`        | refresh   | ignore coverage, re-fetch the range, overwrite  |
 
-The session API is being kept free of design choices that would preclude transparently teeing a live session to a tap log, or transparently serving a historical fetch from a local cache.
+```rust
+let dm = Datamancer::builder()
+    .provider_arc(provider)
+    .historical_cache(Box::new(SurrealCache::open(cfg).await?))
+    .build()?;
+
+let mut session = dm
+    .session(instrument, kind, scope, PersistenceOptions::cached())
+    .await?;
+```
+
+### How read-through works
+
+For a `cached()` historical session over `[from, to)`, the cache's `gaps()`
+report tiles the range into ordered, disjoint segments: covered subranges
+replay from disk; the uncovered gaps are fetched from the provider, forwarded
+to the consumer, and stored back. Because segments are emitted in time order,
+the merged stream is `source_ts`-ordered and `seq` is monotonic — requesting a
+year and later requesting ten years only ever fetches the missing nine.
+
+Coverage is recorded honestly: a range is "covered" only once its fetch
+completes. If a provider fetch fails partway, only the confirmed prefix is
+stored, an in-band `Control::Gap` marks the remainder, and a later request
+re-fetches what is still missing. An empty result over a successfully-fetched
+range is legitimately covered (markets close; symbols have an inception date).
+
+### Deferred
+
+Cache **volume** is not yet bounded — a very large fetch can fill the disk; no
+eviction or granularity policy exists. The live **tap log** and the
+**resume primitive** (replay-on-retake, historical→live backfill seam) are
+tracked separately and not yet wired.
+
+See `examples/cached_history.rs` for a runnable, credential-free demo.
 
 ## Non-goals
 
