@@ -454,9 +454,13 @@ async fn refresh_refetches_whole_range_despite_coverage() {
         .await
         .unwrap();
 
-    let (bars, _gaps) = drain(&mut session).await;
+    let (bars, gaps) = drain(&mut session).await;
     // Served from the provider (fresh), not the stale cached 500/99.0.
     assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 900]);
     // Whole range was re-fetched despite existing coverage.
     assert_eq!(*fetched.lock().unwrap(), vec![(0, 1000)]);
+    // Provider succeeded, so no gap is surfaced.
+    assert!(gaps.is_empty());
+    // write_cache=true: the refreshed data is persisted (full refresh cycle).
+    assert!(cache.lookup(&key(0, 1000)).await.unwrap().is_some());
 }
