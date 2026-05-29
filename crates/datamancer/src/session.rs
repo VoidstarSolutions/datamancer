@@ -53,9 +53,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use datamancer_core::{
-    Bar, Control, ControlKind, Error, EventKind, HistoricalCache, HistoryRequest, Instrument,
-    LiveHandle, MarketEvent, Provider, Quote, Result, Seq, TapLog, Timestamp, Trade,
+    Bar, CacheKey, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
+    HistoryRequest, Instrument, LiveHandle, MarketEvent, Provider, Quote, ReplayRequest, Result,
+    Seq, TapLog, Timestamp, Trade,
 };
+use futures::StreamExt;
 use futures::stream::Stream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -611,6 +613,21 @@ impl Controller {
         mut provider_rx: mpsc::Receiver<MarketEvent>,
         mut cmd_rx: mpsc::Receiver<SessionCommand>,
     ) {
+        let options = *self
+            .inner
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned");
+        if options.uses_cache() && self.historical_cache.is_some() {
+            // The cached read-through path runs its own per-gap channels; the
+            // default single-fetch plumbing is unused here.
+            drop(provider_tx);
+            drop(provider_rx);
+            self.run_historical_cached(from, to, options, &mut cmd_rx)
+                .await;
+            return;
+        }
+
         let provider = self.provider.clone();
         let request = HistoryRequest {
             instrument: self.inner.instrument.clone(),
@@ -641,14 +658,14 @@ impl Controller {
             }
         }
 
-        // Fetch is done. If the consumer never took the stream, the receiver
-        // is parked in `events_holder` (Slot::Available) and `events_tx.closed()`
-        // would never fire — so we'd hang forever. Shut down immediately in
-        // that case. Otherwise tell the consumer the historical run has
-        // exhausted (so a `next().await` that's blocked waiting for more
-        // events resolves to a `SessionClosing` and the consumer can drop
-        // the stream), then wait for the held stream to drain or drop and
-        // auto-close.
+        self.finish_historical(&mut cmd_rx).await;
+    }
+
+    /// Shared post-fetch handshake for historical scopes. If the consumer
+    /// never took the stream, shut down immediately (nobody to drain to).
+    /// Otherwise emit `SessionClosing`, then wait for the stream to drain or
+    /// drop and auto-close.
+    async fn finish_historical(&mut self, cmd_rx: &mut mpsc::Receiver<SessionCommand>) {
         if !self
             .inner
             .stream_taken
@@ -682,6 +699,180 @@ impl Controller {
         self.shutdown().await;
     }
 
+    /// Forward an in-band `Gap` control covering `[from, to)` for this
+    /// session's instrument. Goes through `forward()` so it gets a `seq`.
+    async fn emit_gap(&mut self, from: Timestamp, to: Timestamp) {
+        let now = wall_clock_ts();
+        self.forward(MarketEvent::Control(Control {
+            source_ts: now,
+            rx_ts: now,
+            seq: Seq(0),
+            kind: ControlKind::Gap {
+                provider: self.provider.id().to_string(),
+                instrument: self.inner.instrument.clone(),
+                span: GapSpan {
+                    from_source_ts: from,
+                    to_source_ts: to,
+                },
+            },
+        }))
+        .await;
+    }
+
+    /// Read-through historical fetch. Tiles `[from, to)` into covered/gap
+    /// segments (from `gaps()` when `read_cache`, else the whole range), then
+    /// streams them in order: covered segments replay from the cache, gap
+    /// segments fetch from the provider -- forwarded to the consumer and, when
+    /// `write_cache`, stored back. On a gap-fetch failure, only the confirmed
+    /// prefix is claimed, an in-band `Gap` is emitted for the remainder, and
+    /// the remaining segments are abandoned.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear per-segment dispatch kept inline; extraction would obscure the covered/gap handling symmetry"
+    )]
+    async fn run_historical_cached(
+        &mut self,
+        from: Timestamp,
+        to: Timestamp,
+        options: PersistenceOptions,
+        cmd_rx: &mut mpsc::Receiver<SessionCommand>,
+    ) {
+        let cache = self
+            .historical_cache
+            .clone()
+            .expect("cached path requires a historical cache");
+        let instrument = self.inner.instrument.clone();
+        let kind = self.inner.kind;
+        let plan_key = CacheKey {
+            instrument: instrument.clone(),
+            kind,
+            from,
+            to,
+        };
+
+        let whole = vec![GapSpan {
+            from_source_ts: from,
+            to_source_ts: to,
+        }];
+        let gaps = if options.read_cache {
+            cache.gaps(&plan_key).await.unwrap_or(whole)
+        } else {
+            whole
+        };
+        let segments = tile(from, to, &gaps);
+
+        for seg in segments {
+            match seg {
+                Segment::Covered { from: f, to: t } => {
+                    let source = cache.as_replay_source(CacheKey {
+                        instrument: instrument.clone(),
+                        kind,
+                        from: f,
+                        to: t,
+                    });
+                    let req = ReplayRequest {
+                        instruments: vec![instrument.clone()],
+                        kinds: vec![kind],
+                        from: f,
+                        to: t,
+                    };
+                    let Ok(mut stream) = source.open(req).await else {
+                        continue;
+                    };
+                    loop {
+                        tokio::select! {
+                            cmd = cmd_rx.recv() => {
+                                if !self.handle_command(cmd).await { return; }
+                            }
+                            ev = stream.next() => {
+                                match ev {
+                                    Some(ev) => self.forward(ev).await,
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                }
+                Segment::Gap { from: f, to: t } => {
+                    let (tx, mut rx) = mpsc::channel::<MarketEvent>(default_buffer());
+                    let provider = self.provider.clone();
+                    let request = HistoryRequest {
+                        instrument: instrument.clone(),
+                        kind,
+                        from: f,
+                        to: t,
+                    };
+                    let fetch_task =
+                        tokio::spawn(async move { provider.fetch_history(request, tx).await });
+
+                    let mut batch: Vec<MarketEvent> = Vec::new();
+                    loop {
+                        tokio::select! {
+                            cmd = cmd_rx.recv() => {
+                                if !self.handle_command(cmd).await {
+                                    fetch_task.abort();
+                                    return;
+                                }
+                            }
+                            ev = rx.recv() => {
+                                match ev {
+                                    Some(ev) => {
+                                        batch.push(ev.clone());
+                                        self.forward(ev).await;
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+
+                    let succeeded = matches!(fetch_task.await, Ok(Ok(())));
+                    if succeeded {
+                        if options.write_cache {
+                            let _ = cache
+                                .store(
+                                    &CacheKey {
+                                        instrument: instrument.clone(),
+                                        kind,
+                                        from: f,
+                                        to: t,
+                                    },
+                                    &batch,
+                                )
+                                .await;
+                        }
+                    } else {
+                        // Honest coverage: claim only the confirmed prefix
+                        // (+1 keeps the last received event inside the
+                        // half-open coverage); r.from if nothing arrived.
+                        let confirmed_to = batch
+                            .iter()
+                            .filter_map(source_ts)
+                            .max()
+                            .map_or(f, |m| Timestamp(m.0 + 1));
+                        if options.write_cache {
+                            let _ = cache
+                                .store(
+                                    &CacheKey {
+                                        instrument: instrument.clone(),
+                                        kind,
+                                        from: f,
+                                        to: confirmed_to,
+                                    },
+                                    &batch,
+                                )
+                                .await;
+                        }
+                        self.emit_gap(confirmed_to, t).await;
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.finish_historical(cmd_rx).await;
+    }
+
     /// Live scope: subscribe (already done by the caller), drain provider
     /// events through the seq/forward pipeline, honor commands, auto-close
     /// when the consumer drops the stream and we're not persisting.
@@ -694,26 +885,11 @@ impl Controller {
         mut cmd_rx: mpsc::Receiver<SessionCommand>,
     ) {
         if let Some(from) = backfill_from {
-            // TODO(resume-primitive): kick off historical fetch from `from`
-            // to live-edge, bridge the seam (extend fetch to first live
-            // source_ts; emit ControlKind::Gap only if the provider can't
-            // reach). For now we surface a Gap span [from, now) so the
-            // placeholder is visible to consumers; live events follow.
+            // TODO(resume-primitive): replay from persistence across the seam.
+            // For now surface a placeholder Gap [from, now) so consumers can
+            // see the seam; live events follow.
             let now = wall_clock_ts();
-            let gap = MarketEvent::Control(Control {
-                source_ts: now,
-                rx_ts: now,
-                seq: Seq(0),
-                kind: ControlKind::Gap {
-                    provider: self.provider.id().to_string(),
-                    instrument: self.inner.instrument.clone(),
-                    span: datamancer_core::GapSpan {
-                        from_source_ts: from,
-                        to_source_ts: now,
-                    },
-                },
-            });
-            self.forward(gap).await;
+            self.emit_gap(from, now).await;
         }
 
         let live = Arc::new(Mutex::new(Some(live)));
@@ -863,10 +1039,6 @@ impl Drop for RegistrySentinel {
 /// One slice of a requested historical range: either already in the cache
 /// (`Covered`) or not yet fetched (`Gap`). Half-open `[from, to)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "consumed by the read-through cache planner (upcoming task)"
-)]
 enum Segment {
     Covered { from: Timestamp, to: Timestamp },
     Gap { from: Timestamp, to: Timestamp },
@@ -876,10 +1048,6 @@ enum Segment {
 /// uncovered subranges (ordered, disjoint, within `[from, to)`) as reported by
 /// [`HistoricalCache::gaps`]; everything between them is covered. Zero-width
 /// pieces are never emitted.
-#[allow(
-    dead_code,
-    reason = "consumed by the read-through cache planner (upcoming task)"
-)]
 fn tile(from: Timestamp, to: Timestamp, gaps: &[datamancer_core::GapSpan]) -> Vec<Segment> {
     let mut out = Vec::with_capacity(gaps.len() * 2 + 1);
     let mut cursor = from;
