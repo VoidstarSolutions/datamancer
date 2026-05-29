@@ -20,7 +20,7 @@
 //!
 //! Recording (write-through to persistence) is a separate axis. It defaults
 //! to whatever was passed at construction and can be toggled at runtime via
-//! [`Session::set_persisting`].
+//! [`Session::set_persistence`].
 //!
 //! # Auto-cleanup
 //!
@@ -45,8 +45,8 @@
 //!   lands, [`Session::take_events`] will accept multiple calls (returning
 //!   the receiver to the slot on `EventStream` drop), and stitched sessions
 //!   will replay through the gap.
-//! - **Write-through persistence.** `persist=true` is accepted at
-//!   construction but events are not yet written to `TapLog` or
+//! - **Write-through persistence.** `PersistenceOptions::cached()` is
+//!   accepted at construction but events are not yet written to `TapLog` or
 //!   `HistoricalCache`. Wiring lands when the resume primitive does.
 
 use std::collections::HashMap;
@@ -188,8 +188,8 @@ impl Datamancer {
     /// - [`Error::LiveSessionConflict`] — a live session for this pair is
     ///   already active (Live scope only; multiple Historical sessions for
     ///   the same pair are stateless reads and run concurrently).
-    /// - [`Error::PersistenceRequired`] — `persist=true` but no
-    ///   [`HistoricalCache`]/[`TapLog`] is configured.
+    /// - [`Error::PersistenceRequired`] — `options` requires a cache but no
+    ///   [`HistoricalCache`] is configured.
     ///
     /// # Panics
     ///
@@ -200,9 +200,9 @@ impl Datamancer {
         instrument: Instrument,
         kind: EventKind,
         scope: Scope,
-        persist: bool,
+        options: PersistenceOptions,
     ) -> Result<Session> {
-        if persist && self.inner.historical_cache.is_none() && self.inner.tap_log.is_none() {
+        if options.uses_cache() && self.inner.historical_cache.is_none() {
             return Err(Error::PersistenceRequired);
         }
 
@@ -246,7 +246,7 @@ impl Datamancer {
             kind,
             scope,
             events_holder: Mutex::new(SessionStreamSlot::Available(events_rx)),
-            persisting: std::sync::atomic::AtomicBool::new(persist),
+            persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
             cmd_tx,
         });
@@ -439,7 +439,7 @@ struct SessionInner {
     /// Holder for the consumer-facing receiver. Available when no stream is
     /// held; Taken when a stream is currently outstanding.
     events_holder: Mutex<SessionStreamSlot>,
-    persisting: std::sync::atomic::AtomicBool,
+    persistence: std::sync::Mutex<PersistenceOptions>,
     /// Set to true the first (and only) time `take_events` succeeds. The
     /// historical controller reads it after fetch completion: if the consumer
     /// never took the stream, there's nobody to drain to and the session
@@ -490,22 +490,37 @@ impl Session {
         }
     }
 
-    /// Toggle persistence at runtime. False stops future writes; events
-    /// already in flight to persistence still flush.
+    /// Replace the persistence options at runtime. Affects future writes;
+    /// an in-flight historical fetch keeps the plan it started with.
     ///
     /// # Errors
     ///
-    /// Returns `Error::PersistenceRequired` if no persistence layer is
-    /// configured on the parent [`Datamancer`]; `Error::SessionClosed` if
-    /// the controller has shut down.
-    pub async fn set_persisting(&self, on: bool) -> Result<()> {
+    /// Returns `Error::PersistenceRequired` if the new options require a cache
+    /// that is not configured; `Error::SessionClosed` if the controller has
+    /// shut down.
+    pub async fn set_persistence(&self, options: PersistenceOptions) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .cmd_tx
-            .send(SessionCommand::SetPersisting(on, tx))
+            .send(SessionCommand::SetPersistence(options, tx))
             .await
             .map_err(|_| Error::SessionClosed)?;
         rx.await.map_err(|_| Error::SessionClosed)?
+    }
+
+    /// Returns the current persistence options for this session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persistence mutex is poisoned (indicates a prior panic
+    /// inside a persistence-holding code path).
+    #[must_use]
+    pub fn persistence(&self) -> PersistenceOptions {
+        *self
+            .inner
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned")
     }
 
     /// Explicit termination. Auto-cleanup also handles natural-completion
@@ -537,13 +552,6 @@ impl Session {
     pub fn scope(&self) -> Scope {
         self.inner.scope
     }
-
-    #[must_use]
-    pub fn is_persisting(&self) -> bool {
-        self.inner
-            .persisting
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
 }
 
 /// The session's output stream. Drop it to stop emission; re-take from the
@@ -565,7 +573,7 @@ impl Stream for EventStream {
 
 #[derive(Debug)]
 enum SessionCommand {
-    SetPersisting(bool, oneshot::Sender<Result<()>>),
+    SetPersistence(PersistenceOptions, oneshot::Sender<Result<()>>),
     Close(oneshot::Sender<()>),
 }
 
@@ -730,8 +738,9 @@ impl Controller {
                 () = self.events_tx.closed() => {
                     // Consumer dropped the stream.
                     // TODO(persistence): when write-through lands, keep
-                    // running while persist=true so recording-only mode is
-                    // observable. Today, no write-through means there's
+                    // running while persistence.write_cache is set so
+                    // recording-only mode is observable. Today, no
+                    // write-through means there's
                     // nothing useful to do without an emitting consumer.
                     if let Some(h) = live.lock().await.take() {
                         let _ = h.unsubscribe(self.inner.instrument.clone(), self.inner.kind).await;
@@ -756,7 +765,7 @@ impl Controller {
         {
             self.last_emitted_source_ts = Some(ts);
         }
-        // TODO(persistence): tee to TapLog / HistoricalCache when persist=true.
+        // TODO(persistence): tee to TapLog / HistoricalCache when persistence.uses_cache().
         let _ = self.events_tx.send(stamped).await;
     }
 
@@ -775,8 +784,8 @@ impl Controller {
     /// Returns false if the controller should exit.
     async fn handle_command(&self, cmd: Option<SessionCommand>) -> bool {
         match cmd {
-            Some(SessionCommand::SetPersisting(on, ack)) => {
-                let res = self.apply_persisting(on);
+            Some(SessionCommand::SetPersistence(options, ack)) => {
+                let res = self.apply_persistence(options);
                 let _ = ack.send(res);
                 true
             }
@@ -789,13 +798,15 @@ impl Controller {
         }
     }
 
-    fn apply_persisting(&self, on: bool) -> Result<()> {
-        if on && self.tap_log.is_none() && self.historical_cache.is_none() {
+    fn apply_persistence(&self, options: PersistenceOptions) -> Result<()> {
+        if options.uses_cache() && self.historical_cache.is_none() {
             return Err(Error::PersistenceRequired);
         }
-        self.inner
-            .persisting
-            .store(on, std::sync::atomic::Ordering::Release);
+        *self
+            .inner
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned") = options;
         Ok(())
     }
 
