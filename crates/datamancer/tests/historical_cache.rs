@@ -208,3 +208,99 @@ async fn cold_fetch_populates_cache_and_streams_in_order() {
     // Coverage now recorded.
     assert!(cache.lookup(&key(0, 1000)).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn fully_cached_serves_without_touching_provider() {
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    // Pre-populate the whole range.
+    cache
+        .store(&key(0, 1000), &[bar(100, 1.0), bar(900, 2.0)])
+        .await
+        .unwrap();
+
+    // Provider has no data and should never be asked.
+    let (provider, fetched) = RecordingProvider::new("rec", vec![]);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+
+    let mut session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+
+    let (bars, gaps) = drain(&mut session).await;
+    assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 900]);
+    assert!(gaps.is_empty());
+    assert!(
+        fetched.lock().unwrap().is_empty(),
+        "provider must not be asked"
+    );
+}
+
+#[tokio::test]
+async fn partial_overlap_fetches_only_the_gaps_and_merges_in_order() {
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    // Pre-cache the middle [300, 600).
+    cache
+        .store(&key(300, 600), &[bar(350, 5.0), bar(550, 6.0)])
+        .await
+        .unwrap();
+
+    // Provider serves the two flanking gaps.
+    let data = vec![bar(100, 1.0), bar(250, 2.0), bar(700, 7.0), bar(900, 9.0)];
+    let (provider, fetched) = RecordingProvider::new("rec", data);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+
+    let mut session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+
+    let (bars, gaps) = drain(&mut session).await;
+    // Cached (350,550) spliced with fetched (100,250,700,900), ordered.
+    assert_eq!(
+        bars.iter().map(|b| b.0).collect::<Vec<_>>(),
+        vec![100, 250, 350, 550, 700, 900]
+    );
+    // seq is contiguous across the covered+gap boundaries.
+    assert_eq!(
+        bars.iter().map(|b| b.1).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 5]
+    );
+    assert!(gaps.is_empty());
+    // Provider asked ONLY for the two gaps.
+    assert_eq!(*fetched.lock().unwrap(), vec![(0, 300), (600, 1000)]);
+    // The whole range is now covered.
+    assert!(cache.gaps(&key(0, 1000)).await.unwrap().is_empty());
+}
