@@ -860,6 +860,52 @@ impl Drop for RegistrySentinel {
     }
 }
 
+/// One slice of a requested historical range: either already in the cache
+/// (`Covered`) or not yet fetched (`Gap`). Half-open `[from, to)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "consumed by the read-through cache planner (upcoming task)"
+)]
+enum Segment {
+    Covered { from: Timestamp, to: Timestamp },
+    Gap { from: Timestamp, to: Timestamp },
+}
+
+/// Partition `[from, to)` into ordered, disjoint segments. `gaps` are the
+/// uncovered subranges (ordered, disjoint, within `[from, to)`) as reported by
+/// [`HistoricalCache::gaps`]; everything between them is covered. Zero-width
+/// pieces are never emitted.
+#[allow(
+    dead_code,
+    reason = "consumed by the read-through cache planner (upcoming task)"
+)]
+fn tile(from: Timestamp, to: Timestamp, gaps: &[datamancer_core::GapSpan]) -> Vec<Segment> {
+    let mut out = Vec::with_capacity(gaps.len() * 2 + 1);
+    let mut cursor = from;
+    for g in gaps {
+        let g_from = g.from_source_ts;
+        let g_to = g.to_source_ts;
+        if g_from > cursor {
+            out.push(Segment::Covered {
+                from: cursor,
+                to: g_from,
+            });
+        }
+        if g_to > g_from {
+            out.push(Segment::Gap {
+                from: g_from,
+                to: g_to,
+            });
+        }
+        cursor = cursor.max(g_to);
+    }
+    if cursor < to {
+        out.push(Segment::Covered { from: cursor, to });
+    }
+    out
+}
+
 fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
     match ev {
         MarketEvent::Trade(t) => Some(t.source_ts),
@@ -902,6 +948,74 @@ impl Default for ReconnectPolicy {
             max_backoff_ms: 30_000,
             jitter: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::{Segment, tile};
+    use datamancer_core::{GapSpan, Timestamp};
+
+    fn gap(a: i64, b: i64) -> GapSpan {
+        GapSpan {
+            from_source_ts: Timestamp(a),
+            to_source_ts: Timestamp(b),
+        }
+    }
+
+    fn segs(v: &[Segment]) -> Vec<(char, i64, i64)> {
+        v.iter()
+            .map(|s| match *s {
+                Segment::Covered { from, to } => ('C', from.0, to.0),
+                Segment::Gap { from, to } => ('G', from.0, to.0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_gaps_is_one_covered_segment() {
+        let t = tile(Timestamp(0), Timestamp(100), &[]);
+        assert_eq!(segs(&t), vec![('C', 0, 100)]);
+    }
+
+    #[test]
+    fn whole_range_gap_is_one_gap_segment() {
+        let t = tile(Timestamp(0), Timestamp(100), &[gap(0, 100)]);
+        assert_eq!(segs(&t), vec![('G', 0, 100)]);
+    }
+
+    #[test]
+    fn leading_trailing_and_middle_gaps_interleave() {
+        // covered [10,20) and [40,50); gaps [0,10),[20,40),[50,60)
+        let t = tile(
+            Timestamp(0),
+            Timestamp(60),
+            &[gap(0, 10), gap(20, 40), gap(50, 60)],
+        );
+        assert_eq!(
+            segs(&t),
+            vec![
+                ('G', 0, 10),
+                ('C', 10, 20),
+                ('G', 20, 40),
+                ('C', 40, 50),
+                ('G', 50, 60)
+            ]
+        );
+    }
+
+    #[test]
+    fn gap_flush_with_start_emits_no_empty_covered() {
+        // gap begins exactly at `from`: no zero-width Covered prefix.
+        let t = tile(Timestamp(0), Timestamp(30), &[gap(0, 10)]);
+        assert_eq!(segs(&t), vec![('G', 0, 10), ('C', 10, 30)]);
+    }
+
+    #[test]
+    fn gap_flush_with_end_emits_no_empty_covered() {
+        // gap ends exactly at `to`: no zero-width Covered suffix.
+        let t = tile(Timestamp(0), Timestamp(30), &[gap(20, 30)]);
+        assert_eq!(segs(&t), vec![('C', 0, 20), ('G', 20, 30)]);
     }
 }
 
