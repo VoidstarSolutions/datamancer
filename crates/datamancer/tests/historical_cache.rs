@@ -385,3 +385,78 @@ async fn failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes() 
     // Provider only asked for the previously-missing span.
     assert_eq!(*fetched2.lock().unwrap(), vec![(201, 1000)]);
 }
+
+#[tokio::test]
+async fn read_only_fetches_gaps_but_does_not_persist() {
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let data = vec![bar(100, 1.0), bar(200, 2.0)];
+    let (provider, fetched) = RecordingProvider::new("rec", data);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+
+    let mut session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::read_only(),
+        )
+        .await
+        .unwrap();
+
+    let (bars, _gaps) = drain(&mut session).await;
+    assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 200]);
+    // The gap was fetched...
+    assert_eq!(*fetched.lock().unwrap(), vec![(0, 1000)]);
+    // ...but nothing was persisted: the whole range is still a gap.
+    assert!(cache.lookup(&key(0, 1000)).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn refresh_refetches_whole_range_despite_coverage() {
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    // Pre-cache the whole range with STALE data.
+    cache.store(&key(0, 1000), &[bar(500, 99.0)]).await.unwrap();
+
+    // Provider serves FRESH data across the whole range.
+    let data = vec![bar(100, 1.0), bar(900, 9.0)];
+    let (provider, fetched) = RecordingProvider::new("rec", data);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+
+    let mut session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::refresh(),
+        )
+        .await
+        .unwrap();
+
+    let (bars, _gaps) = drain(&mut session).await;
+    // Served from the provider (fresh), not the stale cached 500/99.0.
+    assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 900]);
+    // Whole range was re-fetched despite existing coverage.
+    assert_eq!(*fetched.lock().unwrap(), vec![(0, 1000)]);
+}
