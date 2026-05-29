@@ -45,9 +45,12 @@
 //!   lands, [`Session::take_events`] will accept multiple calls (returning
 //!   the receiver to the slot on `EventStream` drop), and stitched sessions
 //!   will replay through the gap.
-//! - **Write-through persistence.** `PersistenceOptions::cached()` is
-//!   accepted at construction but events are not yet written to `TapLog` or
-//!   `HistoricalCache`. Wiring lands when the resume primitive does.
+//! - **Historical cache (wired).** Historical sessions with
+//!   `PersistenceOptions` read/write axes serve covered ranges from the
+//!   `HistoricalCache` and write fetched gaps back (see
+//!   [`Controller::run_historical_cached`]).
+//! - **Live tap log (stubbed).** Live events are not yet written to a
+//!   `TapLog`; that write-through lands with the resume primitive.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
