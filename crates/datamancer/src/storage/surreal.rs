@@ -318,8 +318,6 @@ impl HistoricalCache for SurrealCache {
         let table = Self::table_for(key.kind);
         let provider = key.instrument.provider().as_str().to_string();
         let symbol = key.instrument.symbol().to_string();
-        let mut min_ts = i64::MAX;
-        let mut max_ts = i64::MIN;
         let mut stored: u64 = 0;
 
         for ev in events {
@@ -330,8 +328,6 @@ impl HistoricalCache for SurrealCache {
                 _ => None,
             };
             let Some(ts) = ts else { continue };
-            min_ts = min_ts.min(ts);
-            max_ts = max_ts.max(ts);
 
             let row_id = format!("{provider}|{symbol}|{ts:020}");
             match ev {
@@ -393,13 +389,13 @@ impl HistoricalCache for SurrealCache {
             stored += 1;
         }
 
-        // Coverage segment: prefer the request's [from, to] when it fully
-        // contains the events; otherwise use the actual event-ts span.
-        let from = key.from.0.min(min_ts);
-        // The coverage should bound [from, to) — events at exactly `to` would
-        // typically not be returned by a `from..to` half-open scan.
-        let to = key.to.0.max(max_ts.saturating_add(1));
-        self.update_coverage(key, from, to, stored).await?;
+        // Coverage reflects exactly the range the caller asserts was fetched
+        // (the CacheKey), NOT the span of whatever events happened to arrive.
+        // Callers (e.g. the read-through fetch loop) pass a key range that
+        // reflects only what was actually, successfully fetched, so an
+        // interrupted fetch leaves the unfetched remainder reported as a gap.
+        self.update_coverage(key, key.from.0, key.to.0, stored)
+            .await?;
         Ok(())
     }
 

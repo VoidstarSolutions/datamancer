@@ -218,6 +218,35 @@ async fn embedded_round_trip_persists_to_disk() {
     assert_eq!(coverage.event_count, 2);
 }
 
+#[tokio::test]
+async fn store_claims_exactly_the_key_range_not_the_event_span() {
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
+    // Key range is [100, 200) but the events sit at 100 and 250 — outside the
+    // key's upper bound. Coverage must NOT extend to 250.
+    let k = key(EventKind::Trade, 100, 200);
+    cache
+        .store(
+            &k,
+            &[trade("AAPL", 100, 1.0, 1), trade("AAPL", 250, 2.0, 1)],
+        )
+        .await
+        .unwrap();
+
+    // A probe of [200, 300) must report a gap (the 250 event did not extend
+    // coverage past 200).
+    let probe = key(EventKind::Trade, 200, 300);
+    let gaps = cache.gaps(&probe).await.unwrap();
+    assert_eq!(
+        gaps,
+        vec![GapSpan {
+            from_source_ts: Timestamp(200),
+            to_source_ts: Timestamp(300),
+        }]
+    );
+}
+
 // Sanity: the public re-exports we lean on stay in place after the API
 // reshape — Instrument constructs from a &str and EventKind is reachable.
 #[test]
