@@ -307,3 +307,81 @@ async fn partial_overlap_fetches_only_the_gaps_and_merges_in_order() {
     // The whole range is now covered.
     assert!(cache.gaps(&key(0, 1000)).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes() {
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+
+    // First provider: has 100,200,300,400 but fails on reaching ts >= 300.
+    let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0), bar(400, 4.0)];
+    let (provider, fetched1) = RecordingProvider::new("rec", data.clone());
+    let provider = provider.with_fail_at(300);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+
+    let mut session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+
+    let (bars, gaps) = drain(&mut session).await;
+    // Only 100 and 200 were forwarded before the failure at 300.
+    assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 200]);
+    // A Gap was emitted for the unfetched remainder [201, 1000).
+    assert_eq!(gaps, vec![(201, 1000)]);
+    assert_eq!(*fetched1.lock().unwrap(), vec![(0, 1000)]);
+    // Coverage claims only the confirmed prefix [0, 201).
+    let remaining = cache.gaps(&key(0, 1000)).await.unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|g| (g.from_source_ts.0, g.to_source_ts.0))
+            .collect::<Vec<_>>(),
+        vec![(201, 1000)]
+    );
+    drop(session);
+
+    // Second run with a healthy provider: only the remaining gap is fetched,
+    // and the merged stream is complete and ordered.
+    let (provider2, fetched2) = RecordingProvider::new("rec", data);
+    let dm2 = Datamancer::builder()
+        .provider_arc(Arc::new(provider2))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let mut session2 = dm2
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    let (bars2, gaps2) = drain(&mut session2).await;
+    assert_eq!(
+        bars2.iter().map(|b| b.0).collect::<Vec<_>>(),
+        vec![100, 200, 300, 400]
+    );
+    assert!(gaps2.is_empty());
+    // Provider only asked for the previously-missing span.
+    assert_eq!(*fetched2.lock().unwrap(), vec![(201, 1000)]);
+}
