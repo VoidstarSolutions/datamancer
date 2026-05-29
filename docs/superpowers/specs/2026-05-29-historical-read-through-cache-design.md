@@ -63,19 +63,72 @@ fetch successfully.
 
 ## Architecture
 
+### Control interface: `PersistenceOptions`
+
+The `persist: bool` argument on `Datamancer::session` overloads several
+independent axes. It is replaced by an options block so the full space is
+expressible without ambiguity. For Spec A only the two cache axes exist; Spec B
+adds `write_tap_log` and Spec C adds resume, additively (the struct is
+`#[non_exhaustive]` with builder setters so new axes never break call sites).
+
+```rust
+/// How a session interacts with the configured persistence layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct PersistenceOptions {
+    /// Historical: serve covered subranges from cache, fetch only the gaps.
+    pub read_cache: bool,
+    /// Historical: write fetched gap data back to the cache.
+    pub write_cache: bool,
+}
+
+impl PersistenceOptions {
+    pub const fn none()      -> Self;  // (F,F) — also Default
+    pub const fn cached()    -> Self;  // (T,T)
+    pub const fn read_only() -> Self;  // (T,F)
+    pub const fn refresh()   -> Self;  // (F,T)
+    #[must_use] pub fn read_cache(self, on: bool) -> Self;
+    #[must_use] pub fn write_cache(self, on: bool) -> Self;
+}
+```
+
+The two flags compose into the full historical option space:
+
+| `read_cache` | `write_cache` | Mode | Behavior |
+|---|---|---|---|
+| F | F | **ephemeral** | always hit provider, store nothing (old `persist=false`) |
+| T | T | **cached** | read-through: serve covered ranges, fetch & store only gaps |
+| T | F | **read-only** | serve cache + fetch gaps for this run, don't persist them |
+| F | T | **refresh** | ignore cached coverage, re-fetch the range, overwrite |
+
+### API changes
+
+- `Datamancer::session(instrument, kind, scope, persist: bool)` →
+  `session(instrument, kind, scope, options: PersistenceOptions)`.
+- `Session::set_persisting(bool)` → `set_persistence(PersistenceOptions)`;
+  `is_persisting()` → `persistence() -> PersistenceOptions`. The stored state
+  becomes `PersistenceOptions` (it is `Copy`; a `Mutex<PersistenceOptions>` or
+  packed atomic replaces the current `AtomicBool`).
+- `PersistenceRequired` becomes axis-aware: returned when a requested axis has
+  no backing layer — for Spec A, `(read_cache || write_cache)` with no
+  `historical_cache` configured.
+- Existing `session_integration.rs` call sites migrate `false →
+  PersistenceOptions::none()` and `true → PersistenceOptions::cached()`.
+
 ### Trigger
 
-The read-through path engages in `run_historical` **iff** `persist == true` AND
-a `historical_cache` is configured on the `Datamancer`. Otherwise the existing
-stream-straight-from-provider path runs unchanged. (`persist=true` with only a
-`TapLog` and no cache → stream-through; `TapLog` is a live-only sink and is not
-consulted here.) The choice is made once at fetch start; a mid-fetch
-`set_persisting` toggle does not re-plan the in-flight fetch (it only affects
-the `persisting` flag for future sessions/writes).
+The read-through path engages in `run_historical` **iff** `options.read_cache`
+is set AND a `historical_cache` is configured. The plan (which segments are
+covered vs gap) is fixed at fetch start from a single `gaps()` snapshot; a
+mid-fetch `set_persistence` does not re-plan the in-flight fetch (it only
+affects subsequent sessions/writes). When `read_cache` is false the whole range
+is treated as one gap (no cache reads); gap data is stored only when
+`options.write_cache` is set. This single loop subsumes all four modes above —
+including today's behavior, which is `(F,F)`.
 
-Rationale: `persist=true` means "use the cache" (read **and** write). Keeping
-the existing non-persist path untouched avoids disturbing the many passing
-`session_integration` tests that run with `persist=false`.
+To bound blast radius, the legacy stream-straight-from-provider path is kept
+intact for the `(F,F)` / no-cache case, and the new `run_historical_cached`
+loop runs when `(read_cache || write_cache)` and a cache is present.
 
 ### The tiling helper (pure, unit-testable)
 
@@ -104,11 +157,13 @@ New method `Controller::run_historical_cached`, selected at the top of
 
 ```
 key  = CacheKey { instrument, kind, from, to }
-gaps = cache.gaps(&key).await?           // empty on error → treat whole range as gap
-segments = tile(from, to, &gaps)
+// read_cache decides whether we consult coverage at all.
+gaps = if options.read_cache { cache.gaps(&key).await.unwrap_or(whole_range) }
+       else                  { vec![whole_range] }   // refresh / no-read: all gap
+segments = tile(from, to, &gaps)         // all-gap when read_cache is off
 
 for seg in segments:
-    select on cmd_rx in parallel (handle SetPersisting / Close; Close aborts):
+    select on cmd_rx in parallel (handle SetPersistence / Close; Close aborts):
     match seg {
         Covered(r) => {
             // Serve from disk. ReplaySource yields source_ts-ordered events.
@@ -130,15 +185,19 @@ for seg in segments:
             }
             match fetch.await {
                 Ok(Ok(())) => {
-                    cache.store(&key.with_range(r), &batch).await?;  // claims [r.from, r.to)
+                    if options.write_cache {                          // read-only mode skips this
+                        cache.store(&key.with_range(r), &batch).await?;  // claims [r.from, r.to)
+                    }
                 }
                 _ => {                      // fetch errored / panicked
-                    // Honest coverage: claim only the confirmed contiguous prefix.
-                    // +1 so the last received event (half-open scan) stays covered;
-                    // if nothing arrived, claim an empty range (whole gap re-surfaces).
+                    // Confirmed contiguous prefix. +1 so the last received event
+                    // (half-open scan) stays covered; r.from if nothing arrived.
                     let confirmed_to = batch.last().map(|e| max_source_ts(e) + 1)
                                             .unwrap_or(r.from);
-                    cache.store(&key.with_range(r.from..confirmed_to), &batch).await?;
+                    if options.write_cache {     // honest coverage: claim only the prefix
+                        cache.store(&key.with_range(r.from..confirmed_to), &batch).await?;
+                    }
+                    // Tell the consumer the rest of this segment is missing.
                     self.emit_gap_control(instrument, r.with_from(confirmed_to)).await;
                     break;                  // abort remaining segments; re-request resumes
                 }
@@ -159,7 +218,7 @@ Notes:
   on it, so mixed provenance (provider wall-clock on gap events, stored value
   on cached events) is acceptable; no special handling.
 - **Command handling preserved.** The loop must still service `cmd_rx`
-  (`SetPersisting`, `Close`) and the no-consumer fast path / `SessionClosing`
+  (`SetPersistence`, `Close`) and the no-consumer fast path / `SessionClosing`
   handshake exactly as the current `run_historical` does. `Close` mid-fetch
   aborts the in-flight segment and shuts down.
 - **Store granularity:** one `store` call per gap segment, holding that
@@ -205,6 +264,9 @@ enhancement; aborting keeps post-failure ordering trivial to reason about.)
   the `dyn HistoricalCache` + `dyn Provider`. Provider/cache-agnostic: works
   with any `HistoricalCache`, not just Surreal.
 - `SurrealCache::store()` — coverage claim tightened to exactly the key range.
+- `PersistenceOptions` + the `session` / `set_persistence` / `persistence`
+  signature changes — the control interface. Lives in `datamancer` (`session.rs`
+  or a small `persistence.rs`), re-exported from the crate root.
 - No `datamancer-core` changes. No `TapLog` work (Spec B). No `take_events`
   changes (Spec C).
 
@@ -230,19 +292,26 @@ plus `SurrealCache::Memory`:
    span.
 5. **Ordering/seq invariant** — spliced stream across a covered+gap boundary is
    strictly `source_ts`-ordered with contiguous `seq`.
+6. **Mode matrix** — `read_only` (T,F): serves cache + fetches gaps but the
+   gaps are **not** persisted (re-request still reports them as gaps).
+   `refresh` (F,T): provider asked for the **whole** range despite existing
+   coverage, and the result is stored.
 
 Unit tests for `tile()`: empty gaps, full gap, leading/trailing/middle gaps,
 adjacent gaps, single-point boundaries.
 
-Regression: the existing `session_integration.rs` suite (all `persist=false`)
-must continue to pass unchanged — the non-persist path is untouched.
+Regression: the existing `session_integration.rs` suite migrates its
+`persist: bool` call sites to `PersistenceOptions` (`false →
+PersistenceOptions::none()`); the `(F,F)` / no-cache path stays behaviorally
+unchanged.
 
 ## Example & docs
 
 - `examples/cached_history.rs`: build a `Datamancer` with
   `SurrealCache::embedded(tempdir)`, run a historical session with
-  `persist=true` over a bar range, drain it; then run the **same** request again
-  and observe it served from cache (no provider round-trip / near-instant).
+  `PersistenceOptions::cached()` over a bar range, drain it; then run the
+  **same** request again and observe it served from cache (no provider
+  round-trip / near-instant).
   Modeled on `crypto_ticker.rs`; uses Alpaca historical bars if reachable
   without credentials, otherwise documents the construction shape.
 - A "Persistence — historical cache" section in `crates/datamancer/README.md`
@@ -264,7 +333,8 @@ must continue to pass unchanged — the non-persist path is untouched.
 - **Restructuring `run_historical` regresses the lifecycle** (no-consumer fast
   path, command handling, `SessionClosing` handshake). Mitigation: branch into
   a separate `run_historical_cached` and leave the existing path byte-for-byte
-  intact for `persist=false`; reuse the same post-fetch handshake code.
+  intact for the `(F,F)` / no-cache case; reuse the same post-fetch handshake
+  code.
 - **Coverage over/under-claim.** Mitigation: `store` claims exactly the key
   range; the caller computes that range from actual fetch success. Test 4
   guards the failure case.
