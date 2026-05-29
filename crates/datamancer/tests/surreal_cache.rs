@@ -247,6 +247,21 @@ async fn store_claims_exactly_the_key_range_not_the_event_span() {
     );
 }
 
+#[tokio::test]
+async fn store_of_empty_range_marks_it_covered() {
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
+    // A successful fetch that returned no events must still mark the
+    // requested range covered, so it is not re-fetched as a gap.
+    let k = key(EventKind::Trade, 0, 1000);
+    cache.store(&k, &[]).await.unwrap();
+    assert!(
+        cache.gaps(&k).await.unwrap().is_empty(),
+        "an empty successful fetch should leave no gap in its range"
+    );
+}
+
 // Sanity: the public re-exports we lean on stay in place after the API
 // reshape — Instrument constructs from a &str and EventKind is reachable.
 #[test]

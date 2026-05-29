@@ -42,6 +42,9 @@
 //! one document per `(provider, symbol, kind)` holding a list of merged,
 //! non-overlapping `[from, to]` segments. `lookup` reports the segment
 //! that intersects the requested range; `gaps` enumerates the holes.
+//! `store` always claims exactly the requested key range as covered, so a
+//! successfully-fetched but empty range (e.g. market-closed interval or
+//! pre-inception symbol) is still recorded and will not be re-fetched as a gap.
 
 use std::path::Path;
 
@@ -312,9 +315,6 @@ impl HistoricalCache for SurrealCache {
     }
 
     async fn store(&self, key: &CacheKey, events: &[MarketEvent]) -> Result<()> {
-        if events.is_empty() {
-            return Ok(());
-        }
         let table = Self::table_for(key.kind);
         let provider = key.instrument.provider().as_str().to_string();
         let symbol = key.instrument.symbol().to_string();
