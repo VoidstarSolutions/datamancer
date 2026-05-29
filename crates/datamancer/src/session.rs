@@ -755,7 +755,17 @@ impl Controller {
             to_source_ts: to,
         }];
         let gaps = if options.read_cache {
-            cache.gaps(&plan_key).await.unwrap_or(whole)
+            match cache.gaps(&plan_key).await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(
+                        instrument = %self.inner.instrument,
+                        error = %e,
+                        "cache gaps() failed; treating whole range as a gap"
+                    );
+                    whole
+                }
+            }
         } else {
             whole
         };
@@ -776,8 +786,19 @@ impl Controller {
                         from: f,
                         to: t,
                     };
-                    let Ok(mut stream) = source.open(req).await else {
-                        continue;
+                    let mut stream = match source.open(req).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                instrument = %self.inner.instrument,
+                                from = f.0,
+                                to = t.0,
+                                error = %e,
+                                "cache replay open failed; emitting gap for covered segment"
+                            );
+                            self.emit_gap(f, t).await;
+                            continue;
+                        }
                     };
                     loop {
                         tokio::select! {
@@ -829,17 +850,19 @@ impl Controller {
                     let succeeded = matches!(fetch_task.await, Ok(Ok(())));
                     if succeeded {
                         if options.write_cache {
-                            let _ = cache
-                                .store(
-                                    &CacheKey {
-                                        instrument: instrument.clone(),
-                                        kind,
-                                        from: f,
-                                        to: t,
-                                    },
-                                    &batch,
-                                )
-                                .await;
+                            let store_key = CacheKey {
+                                instrument: instrument.clone(),
+                                kind,
+                                from: f,
+                                to: t,
+                            };
+                            if let Err(e) = cache.store(&store_key, &batch).await {
+                                tracing::warn!(
+                                    instrument = %self.inner.instrument,
+                                    error = %e,
+                                    "historical cache store failed; data delivered but not persisted"
+                                );
+                            }
                         }
                     } else {
                         // Honest coverage: claim only the confirmed prefix
@@ -851,17 +874,19 @@ impl Controller {
                             .max()
                             .map_or(f, |m| Timestamp(m.0 + 1));
                         if options.write_cache {
-                            let _ = cache
-                                .store(
-                                    &CacheKey {
-                                        instrument: instrument.clone(),
-                                        kind,
-                                        from: f,
-                                        to: confirmed_to,
-                                    },
-                                    &batch,
-                                )
-                                .await;
+                            let store_key = CacheKey {
+                                instrument: instrument.clone(),
+                                kind,
+                                from: f,
+                                to: confirmed_to,
+                            };
+                            if let Err(e) = cache.store(&store_key, &batch).await {
+                                tracing::warn!(
+                                    instrument = %self.inner.instrument,
+                                    error = %e,
+                                    "historical cache store failed; data delivered but not persisted"
+                                );
+                            }
                         }
                         self.emit_gap(confirmed_to, t).await;
                         break;
