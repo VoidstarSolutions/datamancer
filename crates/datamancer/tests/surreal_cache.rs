@@ -262,6 +262,35 @@ async fn store_of_empty_range_marks_it_covered() {
     );
 }
 
+#[tokio::test]
+async fn store_replaces_existing_rows_in_the_claimed_range() {
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
+    let k = key(EventKind::Bar(BarInterval::OneMinute), 0, 1000);
+    // Initial store deposits a (soon-to-be stale) bar at 500.
+    cache.store(&k, &[bar("AAPL", 500, 99.0)]).await.unwrap();
+    // Re-store the same range (a refresh) with different, fewer events.
+    cache.store(&k, &[bar("AAPL", 100, 1.0)]).await.unwrap();
+
+    // Replay must return only the fresh bar; the stale 500 row is gone.
+    let source = cache.as_replay_source(k.clone());
+    let request = ReplayRequest {
+        instruments: vec![inst("AAPL")],
+        kinds: vec![EventKind::Bar(BarInterval::OneMinute)],
+        from: Timestamp(0),
+        to: Timestamp(1000),
+    };
+    let mut stream = source.open(request).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let MarketEvent::Bar(b) = ev {
+            got.push(b.source_ts.0);
+        }
+    }
+    assert_eq!(got, vec![100], "refresh must not leave the stale 500 row");
+}
+
 // Sanity: the public re-exports we lean on stay in place after the API
 // reshape — Instrument constructs from a &str and EventKind is reachable.
 #[test]

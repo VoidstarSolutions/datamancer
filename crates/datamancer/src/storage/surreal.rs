@@ -318,6 +318,27 @@ impl HistoricalCache for SurrealCache {
         let table = Self::table_for(key.kind);
         let provider = key.instrument.provider().as_str().to_string();
         let symbol = key.instrument.symbol().to_string();
+
+        // Replace the claimed range: clear any existing rows in [from, to)
+        // before inserting. `store` records coverage for the whole key range,
+        // so a re-store that returns fewer events than a prior entry (notably
+        // a `refresh`) must not leave stale rows behind that a later replay
+        // would surface as if current. For the read-through gap-fill path the
+        // range is previously uncovered, so this DELETE matches nothing.
+        self.db
+            .query(
+                "DELETE FROM type::table($tbl) \
+                 WHERE provider = $prov AND symbol = $sym \
+                 AND source_ts >= $from AND source_ts < $to",
+            )
+            .bind(("tbl", table.to_string()))
+            .bind(("prov", provider.clone()))
+            .bind(("sym", symbol.clone()))
+            .bind(("from", key.from.0))
+            .bind(("to", key.to.0))
+            .await
+            .map_err(map_err)?;
+
         let mut stored: u64 = 0;
 
         for ev in events {
