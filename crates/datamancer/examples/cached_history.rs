@@ -133,12 +133,13 @@ async fn run_once(dm: &Datamancer, label: &str) -> usize {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let dir = std::env::temp_dir().join("datamancer-cached-history-demo");
-    let _ = std::fs::remove_dir_all(&dir); // start clean for the demo
+    // A unique, auto-cleaned temp dir so concurrent or interrupted runs of the
+    // demo never collide on a shared path. Removed when `dir` drops at exit.
+    let dir = tempfile::tempdir().expect("create temp dir");
 
     let fetch_count = Arc::new(AtomicUsize::new(0));
     let provider = SyntheticProvider::new("ACME", 30, fetch_count.clone());
-    let cache = SurrealCache::open(SurrealCacheConfig::embedded(&dir)).await?;
+    let cache = SurrealCache::open(SurrealCacheConfig::embedded(dir.path())).await?;
 
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
@@ -155,6 +156,5 @@ async fn main() -> Result<()> {
     assert_eq!(fetches, 1, "warm run served entirely from cache");
     println!("\n\u{2713} the warm run hit the cache, not the provider.");
 
-    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
