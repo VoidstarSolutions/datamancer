@@ -35,5 +35,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 name = "crypto_ticker"
 required-features = ["provider-alpaca"]
 
+[[example]]
+name = "cached_history"
+required-features = ["storage-surreal"]
+
 [lints]
 workspace = true
