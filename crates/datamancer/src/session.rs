@@ -224,8 +224,10 @@ impl Datamancer {
         scope: Scope,
         options: PersistenceOptions,
     ) -> Result<Session> {
-        // tap_log write axis is deferred (later spec); only the cache is required here.
         if options.uses_cache() && self.inner.historical_cache.is_none() {
+            return Err(Error::PersistenceRequired);
+        }
+        if options.write_tap_log && self.inner.tap_log.is_none() {
             return Err(Error::PersistenceRequired);
         }
 
@@ -394,6 +396,14 @@ impl DatamancerBuilder {
     #[must_use]
     pub fn tap_log(mut self, log: Box<dyn TapLog>) -> Self {
         self.tap_log = Some(Arc::from(log));
+        self
+    }
+
+    /// Register a tap log held behind an `Arc`. Useful when the caller keeps a
+    /// reference to replay the captured stream after the session ends.
+    #[must_use]
+    pub fn tap_log_arc(mut self, log: Arc<dyn TapLog>) -> Self {
+        self.tap_log = Some(log);
         self
     }
 
@@ -991,19 +1001,36 @@ impl Controller {
         }
     }
 
-    /// Stamp `seq`, optionally tee to `TapLog` (TODO), forward to the consumer
-    /// stream when held. Updates `last_emitted_source_ts` on data events.
+    /// Stamp `seq`, tee data events to the `TapLog` when configured for live
+    /// capture, then forward to the consumer stream. Updates
+    /// `last_emitted_source_ts` on data events.
     async fn forward(&mut self, ev: MarketEvent) {
         let stamped = self.assign_seq(ev);
-        if let Some(ts) = source_ts(&stamped)
-            && matches!(
-                stamped,
-                MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)
-            )
-        {
+        let is_data = matches!(
+            stamped,
+            MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)
+        );
+        if is_data && let Some(ts) = source_ts(&stamped) {
             self.last_emitted_source_ts = Some(ts);
         }
-        // TODO(persistence): tee to TapLog / HistoricalCache when persistence.uses_cache().
+        // Tee to the tap log: live capture only, data events only. Append
+        // before forwarding so a consumer that observes the event can rely on
+        // it having been enqueued for persistence. `append` is a non-blocking
+        // enqueue, so this never stalls the live stream.
+        if is_data
+            && matches!(self.inner.scope, Scope::Live { .. })
+            && let Some(log) = &self.tap_log
+        {
+            let write = self
+                .inner
+                .persistence
+                .lock()
+                .expect("persistence mutex poisoned")
+                .write_tap_log;
+            if write {
+                let _ = log.append(&stamped).await;
+            }
+        }
         let _ = self.events_tx.send(stamped).await;
     }
 
@@ -1038,6 +1065,9 @@ impl Controller {
 
     fn apply_persistence(&self, options: PersistenceOptions) -> Result<()> {
         if options.uses_cache() && self.historical_cache.is_none() {
+            return Err(Error::PersistenceRequired);
+        }
+        if options.write_tap_log && self.tap_log.is_none() {
             return Err(Error::PersistenceRequired);
         }
         *self

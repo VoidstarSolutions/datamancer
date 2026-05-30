@@ -13,10 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use datamancer::storage::{SurrealTapLog, SurrealTapLogConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, ControlKind, Datamancer, EventKind, Instrument, LiveHandle,
-    MarketEvent, PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq, Timestamp,
-    Trade,
+    MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ReplayRequest, Result, Scope,
+    Seq, TapLog, Timestamp, Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -628,5 +629,162 @@ async fn take_events_twice_concurrently_errors() {
         Err(datamancer::Error::EventsAlreadyTaken) => {}
         Err(other) => panic!("expected EventsAlreadyTaken, got {other:?}"),
         Ok(_) => panic!("expected EventsAlreadyTaken, got Ok"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tap-log helpers
+// ---------------------------------------------------------------------------
+
+async fn drain_n(stream: &mut datamancer::EventStream, n: usize) -> usize {
+    let mut data = 0usize;
+    while data < n {
+        match stream.next().await {
+            Some(MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)) => {
+                data += 1;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    data
+}
+
+fn equity(symbol: &str) -> Instrument {
+    Instrument::new(ProviderId::from_static("fake"), AssetClass::Equity, symbol)
+}
+
+fn live_trade(symbol: &str, source_ts: i64) -> MarketEvent {
+    MarketEvent::Trade(Trade {
+        instrument: equity(symbol),
+        source_ts: Timestamp(source_ts),
+        rx_ts: Timestamp(source_ts),
+        seq: Seq(0),
+        price: Price::from_f64_round(10.0),
+        size: 1,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tap-log tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn live_session_tees_data_events_to_tap_log() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    let log = std::sync::Arc::new(
+        SurrealTapLog::open(SurrealTapLogConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .tap_log_arc(log.clone())
+        .build()
+        .unwrap();
+
+    let mut session = dm
+        .session(
+            equity("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none().with_tap_log(true),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().expect("take events");
+
+    ctrl.push_live(live_trade("AAPL", 100)).await;
+    ctrl.push_live(live_trade("AAPL", 200)).await;
+    // Consuming from the stream implies forward() ran; forward() appends to the
+    // tap log before sending downstream, so a flush now captures both.
+    assert_eq!(drain_n(&mut stream, 2).await, 2);
+    log.flush().await.unwrap();
+
+    let source = log.as_replay_source();
+    let mut replay = source
+        .open(ReplayRequest {
+            instruments: vec![equity("AAPL")],
+            kinds: vec![EventKind::Trade],
+            from: Timestamp(i64::MIN),
+            to: Timestamp(i64::MAX),
+        })
+        .await
+        .unwrap();
+    let mut tss = Vec::new();
+    while let Some(ev) = replay.next().await {
+        if let MarketEvent::Trade(t) = ev {
+            tss.push(t.source_ts.0);
+        }
+    }
+    assert_eq!(tss, vec![100, 200]);
+}
+
+#[tokio::test]
+async fn tap_log_disabled_captures_nothing() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    let log = std::sync::Arc::new(
+        SurrealTapLog::open(SurrealTapLogConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .tap_log_arc(log.clone())
+        .build()
+        .unwrap();
+
+    let mut session = dm
+        .session(
+            equity("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(), // write_tap_log off
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().expect("take events");
+    ctrl.push_live(live_trade("AAPL", 100)).await;
+    assert_eq!(drain_n(&mut stream, 1).await, 1);
+    log.flush().await.unwrap();
+
+    let source = log.as_replay_source();
+    let mut replay = source
+        .open(ReplayRequest {
+            instruments: vec![equity("AAPL")],
+            kinds: vec![EventKind::Trade],
+            from: Timestamp(i64::MIN),
+            to: Timestamp(i64::MAX),
+        })
+        .await
+        .unwrap();
+    assert!(replay.next().await.is_none(), "nothing should be captured");
+}
+
+#[tokio::test]
+async fn write_tap_log_without_a_log_is_rejected() {
+    let (provider, _ctrl) = FakeProvider::new("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    match dm
+        .session(
+            equity("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none().with_tap_log(true),
+        )
+        .await
+    {
+        Err(datamancer::Error::PersistenceRequired) => {}
+        Err(other) => panic!("expected PersistenceRequired, got {other:?}"),
+        Ok(_) => panic!("expected PersistenceRequired, got Ok"),
     }
 }
