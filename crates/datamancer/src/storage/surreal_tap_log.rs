@@ -149,6 +149,12 @@ fn kind_from_tag(tag: &str) -> Option<EventKind> {
     })
 }
 
+/// Stable on-disk tag for an asset class. `AssetClass` is `#[non_exhaustive]`,
+/// so the wildcard is mandatory — but a new variant tagged `"unknown"` would
+/// not round-trip through [`asset_class_from_tag`]. The writer refuses to tap
+/// an `"unknown"` class (see `resolve_shard`) rather than persist an
+/// unreadable shard. **Adding an `AssetClass` variant requires updating this
+/// function and [`asset_class_from_tag`] in lockstep.**
 fn asset_class_tag(asset: AssetClass) -> &'static str {
     match asset {
         AssetClass::Equity => "equity",
@@ -158,6 +164,8 @@ fn asset_class_tag(asset: AssetClass) -> &'static str {
     }
 }
 
+/// Inverse of [`asset_class_tag`]. Returns `None` for an unrecognized tag;
+/// keep the two in lockstep when adding an `AssetClass` variant.
 fn asset_class_from_tag(tag: &str) -> Option<AssetClass> {
     Some(match tag {
         "equity" => AssetClass::Equity,
@@ -450,11 +458,18 @@ impl Writer {
             return Ok(name.clone());
         }
 
+        // Refuse to allocate a shard whose asset class has no stable encoding.
+        // Such a row would deserialize to `None` in `instrument_from_row` on
+        // reopen — silently dropping the shard from the in-memory map and
+        // orphaning its data while leaking an ordinal. Failing loudly here (a
+        // best-effort write error, logged and surfaced at the next `flush`) is
+        // far safer than that silent corruption. See `asset_class_tag`.
         if asset_class_tag(instrument.asset_class()) == "unknown" {
-            tracing::warn!(
-                instrument = %instrument,
-                "tap log: unknown asset class; this shard will not survive a reopen"
-            );
+            return Err(Error::Storage(format!(
+                "tap log: asset class of {instrument} has no stable on-disk encoding; \
+                 refusing to tap it. Add the variant to asset_class_tag/asset_class_from_tag \
+                 in lockstep."
+            )));
         }
 
         let ordinal = self.next_shard;
