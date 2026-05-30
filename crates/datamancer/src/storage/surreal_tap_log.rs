@@ -310,7 +310,6 @@ impl TapLog for SurrealTapLog {
     }
 
     fn as_replay_source(&self) -> Box<dyn ReplaySource> {
-        // Filled in by Task 4.
         Box::new(SurrealTapReplaySource {
             db: self.db.clone(),
         })
@@ -491,7 +490,7 @@ impl Writer {
 }
 
 // ---------------------------------------------------------------------------
-// ReplaySource (Task 4 fills in `open`)
+// ReplaySource
 // ---------------------------------------------------------------------------
 
 struct SurrealTapReplaySource {

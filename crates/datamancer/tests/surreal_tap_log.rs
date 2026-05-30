@@ -4,7 +4,6 @@
 //! the on-disk `SurrealKV` path.
 
 #![cfg(feature = "storage-surreal")]
-#![allow(dead_code, reason = "helper fns used by later task tests in this file")]
 
 use datamancer::storage::{SurrealTapLog, SurrealTapLogConfig};
 use datamancer::{
