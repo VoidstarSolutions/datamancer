@@ -167,18 +167,32 @@ fn asset_class_from_tag(tag: &str) -> Option<AssetClass> {
     })
 }
 
-/// Deterministic record id for a `(instrument, kind)` registry entry. The
-/// tuple-form `db.select(("streams", id))` escapes arbitrary id content, so a
-/// symbol like `BTC/USD` is safe here; only the *shard table name* must be a
-/// plain token, which is why shards are allocated as `tap_NNNNNN`.
+/// Deterministic, **injective** record id for a `(instrument, kind)` registry
+/// entry. Each component is length-prefixed (`<byte-len>:<bytes>`) before
+/// concatenation, so distinct tuples can never alias onto one id even when
+/// `provider` or `symbol` contains a separator character — a plain
+/// delimiter-join (`a|b|c`) could collide two different streams onto a single
+/// `streams` record and corrupt shard resolution after a reopen.
+///
+/// (The tuple-form `db.upsert(("streams", id))` separately escapes the id for
+/// storage; that is about persistence, not about the injectivity of the id we
+/// construct here. Only the *shard table name* must be a plain token, which is
+/// why shards are allocated as `tap_NNNNNN`.)
 fn registry_id(instrument: &Instrument, kind: EventKind) -> String {
-    format!(
-        "{}|{}|{}|{}",
+    let mut id = String::new();
+    for part in [
         instrument.provider().as_str(),
         asset_class_tag(instrument.asset_class()),
         instrument.symbol(),
         kind_tag(kind),
-    )
+    ] {
+        // `<byte-len>:<bytes>` — reading the count then exactly that many bytes
+        // is unambiguous regardless of what the bytes contain.
+        id.push_str(&part.len().to_string());
+        id.push(':');
+        id.push_str(part);
+    }
+    id
 }
 
 fn instrument_from_row(row: &StreamRow) -> Option<(Instrument, EventKind)> {

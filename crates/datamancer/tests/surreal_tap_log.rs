@@ -55,6 +55,16 @@ fn full_request(symbol: &str, kind: EventKind) -> ReplayRequest {
     }
 }
 
+/// Open `req` against `source` and count the events it yields.
+async fn replay_count(source: &dyn datamancer_core::ReplaySource, req: ReplayRequest) -> usize {
+    let mut stream = source.open(req).await.unwrap();
+    let mut n = 0;
+    while stream.next().await.is_some() {
+        n += 1;
+    }
+    n
+}
+
 #[tokio::test]
 async fn append_then_flush_persists_and_replays_in_order() {
     let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
@@ -99,6 +109,26 @@ async fn writer_creates_one_shard_per_instrument_kind() {
 
     // A second flush is a clean no-op (no buffered error).
     log.flush().await.unwrap();
+
+    // Each (instrument, kind) is isolated in its own shard: replaying one pair
+    // returns exactly that pair's events and nothing from the others.
+    let source = log.as_replay_source();
+    assert_eq!(
+        replay_count(&*source, full_request("AAPL", EventKind::Trade)).await,
+        1
+    );
+    assert_eq!(
+        replay_count(&*source, full_request("MSFT", EventKind::Trade)).await,
+        1
+    );
+    assert_eq!(
+        replay_count(
+            &*source,
+            full_request("AAPL", EventKind::Bar(BarInterval::OneMinute))
+        )
+        .await,
+        1
+    );
 }
 
 #[tokio::test]

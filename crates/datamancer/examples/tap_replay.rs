@@ -118,14 +118,24 @@ async fn main() -> Result<()> {
 
     // Push three trades through the live handle, deliberately NOT in source_ts
     // order, then consume them so we know forward() (and the tee) has run.
-    if let Some(tx) = sink.lock().await.as_ref() {
-        let _ = tx.send(trade(300, 30)).await;
-        let _ = tx.send(trade(100, 10)).await;
-        let _ = tx.send(trade(200, 20)).await;
-    }
+    let tx = sink
+        .lock()
+        .await
+        .as_ref()
+        .cloned()
+        .expect("live sink should be set by start_live");
+    tx.send(trade(300, 30)).await.expect("send trade 1");
+    tx.send(trade(100, 10)).await.expect("send trade 2");
+    tx.send(trade(200, 20)).await.expect("send trade 3");
+
+    // Bound each poll so a missing event surfaces as a failure rather than an
+    // indefinite hang.
     let mut emitted = Vec::new();
     while emitted.len() < 3 {
-        if let Some(MarketEvent::Trade(t)) = stream.next().await {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for a live event");
+        if let Some(MarketEvent::Trade(t)) = next {
             emitted.push(t.source_ts.0);
         }
     }

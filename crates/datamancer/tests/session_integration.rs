@@ -639,7 +639,12 @@ async fn take_events_twice_concurrently_errors() {
 async fn drain_n(stream: &mut datamancer::EventStream, n: usize) -> usize {
     let mut data = 0usize;
     while data < n {
-        match stream.next().await {
+        // Bound each poll like the rest of the suite, so a missing tee/forward
+        // surfaces as a clean failure rather than hanging CI.
+        let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("drain_n timed out waiting for events");
+        match next {
             Some(MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)) => {
                 data += 1;
             }
@@ -650,13 +655,9 @@ async fn drain_n(stream: &mut datamancer::EventStream, n: usize) -> usize {
     data
 }
 
-fn equity(symbol: &str) -> Instrument {
-    Instrument::new(ProviderId::from_static("fake"), AssetClass::Equity, symbol)
-}
-
 fn live_trade(symbol: &str, source_ts: i64) -> MarketEvent {
     MarketEvent::Trade(Trade {
-        instrument: equity(symbol),
+        instrument: inst(symbol),
         source_ts: Timestamp(source_ts),
         rx_ts: Timestamp(source_ts),
         seq: Seq(0),
@@ -685,7 +686,7 @@ async fn live_session_tees_data_events_to_tap_log() {
 
     let mut session = dm
         .session(
-            equity("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -706,7 +707,7 @@ async fn live_session_tees_data_events_to_tap_log() {
     let source = log.as_replay_source();
     let mut replay = source
         .open(ReplayRequest {
-            instruments: vec![equity("AAPL")],
+            instruments: vec![inst("AAPL")],
             kinds: vec![EventKind::Trade],
             from: Timestamp(i64::MIN),
             to: Timestamp(i64::MAX),
@@ -738,7 +739,7 @@ async fn tap_log_disabled_captures_nothing() {
 
     let mut session = dm
         .session(
-            equity("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
@@ -755,7 +756,7 @@ async fn tap_log_disabled_captures_nothing() {
     let source = log.as_replay_source();
     let mut replay = source
         .open(ReplayRequest {
-            instruments: vec![equity("AAPL")],
+            instruments: vec![inst("AAPL")],
             kinds: vec![EventKind::Trade],
             from: Timestamp(i64::MIN),
             to: Timestamp(i64::MAX),
@@ -774,7 +775,7 @@ async fn write_tap_log_without_a_log_is_rejected() {
         .unwrap();
     match dm
         .session(
-            equity("AAPL"),
+            inst("AAPL"),
             EventKind::Trade,
             Scope::Live {
                 backfill_from: None,
