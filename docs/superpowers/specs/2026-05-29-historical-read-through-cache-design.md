@@ -48,7 +48,7 @@ ordered by `from_source_ts` and disjoint. The covered subranges are exactly the
 complement within `[from, to]`. Together they **tile** the requested range into
 an alternating, time-ordered sequence of segments:
 
-```
+```text
 [from ............................................. to]
  |--covered--|------gap------|--covered--|----gap----|
    replay        fetch+store     replay     fetch+store
@@ -155,7 +155,7 @@ empty cache → one `Gap(from, to)`; fully covered → one `Covered(from, to)`.
 New method `Controller::run_historical_cached`, selected at the top of
 `run_historical` when the trigger fires. Pseudocode:
 
-```
+```text
 key  = CacheKey { instrument, kind, from, to }
 // read_cache decides whether we consult coverage at all.
 gaps = if options.read_cache { cache.gaps(&key).await.unwrap_or(whole_range) }

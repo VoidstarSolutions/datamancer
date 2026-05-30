@@ -1501,7 +1501,7 @@ git commit -m "docs(datamancer): cached_history example demonstrating read-throu
 
 In `crates/datamancer/README.md`, replace the `## Persistence (Future)` section (from that heading up to the next `##` heading) with:
 
-```markdown
+````markdown
 ## Persistence — Historical Cache
 
 Datamancer can back a historical session with a `HistoricalCache` (the bundled
@@ -1549,7 +1549,7 @@ eviction or granularity policy exists. The live **tap log** and the
 tracked separately and not yet wired.
 
 See `examples/cached_history.rs` for a runnable, credential-free demo.
-```
+````
 
 (Preserve the surrounding sections; only the persistence section changes.)
 
