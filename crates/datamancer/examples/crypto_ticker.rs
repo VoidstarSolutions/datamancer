@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use datamancer::{
-    AssetClass, ControlKind, Datamancer, EventKind, Instrument, MarketEvent, Price, ProviderId,
-    Scope, Session, Timestamp,
+    AssetClass, ControlKind, Datamancer, EventKind, Instrument, MarketEvent, PersistenceOptions,
+    Price, ProviderId, Scope, Session, Timestamp,
     providers::{AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue},
 };
 use futures::StreamExt;
@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Scope::Live {
                         backfill_from: None,
                     },
-                    false,
+                    PersistenceOptions::none(),
                 )
                 .await?;
             let mut stream = session.take_events()?;

@@ -15,7 +15,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer::{
     AssetClass, Bar, BarInterval, ControlKind, Datamancer, EventKind, Instrument, LiveHandle,
-    MarketEvent, Price, Provider, ProviderId, Result, Scope, Seq, Timestamp, Trade,
+    MarketEvent, PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq, Timestamp,
+    Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -180,7 +181,7 @@ async fn live_session_assigns_monotonic_seq_and_passes_events_through() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -231,7 +232,7 @@ async fn historical_session_streams_provider_fetch_in_order() {
                 from: Timestamp(0),
                 to: Timestamp(1000),
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -277,7 +278,7 @@ async fn live_with_backfill_emits_placeholder_seam_gap() {
             Scope::Live {
                 backfill_from: Some(Timestamp(1_000)),
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -328,7 +329,7 @@ async fn persist_true_without_persistence_layer_errors() {
             Scope::Live {
                 backfill_from: None,
             },
-            true, // persist
+            PersistenceOptions::cached(),
         )
         .await
     {
@@ -354,7 +355,7 @@ async fn live_session_conflict_rejects_second_live_session_for_same_pair() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -367,7 +368,7 @@ async fn live_session_conflict_rejects_second_live_session_for_same_pair() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
     {
@@ -395,7 +396,7 @@ async fn live_session_conflict_clears_when_first_is_dropped() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -409,7 +410,7 @@ async fn live_session_conflict_clears_when_first_is_dropped() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -430,7 +431,7 @@ async fn live_session_conflict_clears_when_first_is_closed() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -443,7 +444,7 @@ async fn live_session_conflict_clears_when_first_is_closed() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -469,7 +470,7 @@ async fn historical_sessions_for_same_pair_are_concurrent() {
                 from: Timestamp(0),
                 to: Timestamp(1000),
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -481,7 +482,7 @@ async fn historical_sessions_for_same_pair_are_concurrent() {
                 from: Timestamp(0),
                 to: Timestamp(1000),
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -524,7 +525,7 @@ async fn historical_and_live_sessions_for_same_pair_coexist() {
                 from: Timestamp(0),
                 to: Timestamp(1000),
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -535,7 +536,7 @@ async fn historical_and_live_sessions_for_same_pair_coexist() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -559,7 +560,7 @@ async fn take_events_after_drop_returns_already_taken() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -593,7 +594,7 @@ async fn historical_session_with_no_consumer_terminates() {
                 from: Timestamp(0),
                 to: Timestamp(1000),
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();
@@ -618,7 +619,7 @@ async fn take_events_twice_concurrently_errors() {
             Scope::Live {
                 backfill_from: None,
             },
-            false,
+            PersistenceOptions::none(),
         )
         .await
         .unwrap();

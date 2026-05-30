@@ -20,7 +20,7 @@
 //!
 //! Recording (write-through to persistence) is a separate axis. It defaults
 //! to whatever was passed at construction and can be toggled at runtime via
-//! [`Session::set_persisting`].
+//! [`Session::set_persistence`].
 //!
 //! # Auto-cleanup
 //!
@@ -45,17 +45,22 @@
 //!   lands, [`Session::take_events`] will accept multiple calls (returning
 //!   the receiver to the slot on `EventStream` drop), and stitched sessions
 //!   will replay through the gap.
-//! - **Write-through persistence.** `persist=true` is accepted at
-//!   construction but events are not yet written to `TapLog` or
-//!   `HistoricalCache`. Wiring lands when the resume primitive does.
+//! - **Historical cache (wired).** Historical sessions with
+//!   `PersistenceOptions` read/write axes serve covered ranges from the
+//!   `HistoricalCache` and write fetched gaps back (see
+//!   [`Controller::run_historical_cached`]).
+//! - **Live tap log (stubbed).** Live events are not yet written to a
+//!   `TapLog`; that write-through lands with the resume primitive.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use datamancer_core::{
-    Bar, Control, ControlKind, Error, EventKind, HistoricalCache, HistoryRequest, Instrument,
-    LiveHandle, MarketEvent, Provider, Quote, Result, Seq, TapLog, Timestamp, Trade,
+    Bar, CacheKey, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
+    HistoryRequest, Instrument, LiveHandle, MarketEvent, Provider, Quote, ReplayRequest, Result,
+    Seq, TapLog, Timestamp, Trade,
 };
+use futures::StreamExt;
 use futures::stream::Stream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -73,6 +78,73 @@ pub enum Scope {
     /// session fetches history from `t` up to the live edge and seams into
     /// the live tail; with `None`, it starts purely from "now."
     Live { backfill_from: Option<Timestamp> },
+}
+
+/// How a session interacts with the configured persistence layer.
+///
+/// The two cache axes compose into the full historical option space:
+///
+/// | `read_cache` | `write_cache` | mode      | behavior                                    |
+/// |--------------|---------------|-----------|---------------------------------------------|
+/// | `false`      | `false`       | ephemeral | always hit the provider, store nothing      |
+/// | `true`       | `true`        | cached    | serve covered ranges, fetch & store gaps    |
+/// | `true`       | `false`       | read-only | serve cache + fetch gaps, don't persist     |
+/// | `false`      | `true`        | refresh   | ignore coverage, re-fetch range, overwrite  |
+///
+/// `#[non_exhaustive]`: later work (tap log, resume) adds axes additively.
+/// Construct via the presets, or mutate the public fields on an owned value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct PersistenceOptions {
+    /// Historical scope: serve covered subranges from the cache and fetch only
+    /// the gaps. When false, always fetch the full range from the provider.
+    pub read_cache: bool,
+    /// Historical scope: write fetched gap data back to the cache.
+    pub write_cache: bool,
+}
+
+impl PersistenceOptions {
+    /// No persistence: always hit the provider, store nothing.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            read_cache: false,
+            write_cache: false,
+        }
+    }
+
+    /// Read-through cache: serve covered ranges, fetch and store only gaps.
+    #[must_use]
+    pub const fn cached() -> Self {
+        Self {
+            read_cache: true,
+            write_cache: true,
+        }
+    }
+
+    /// Serve from cache and fetch gaps for this run, but do not persist them.
+    #[must_use]
+    pub const fn read_only() -> Self {
+        Self {
+            read_cache: true,
+            write_cache: false,
+        }
+    }
+
+    /// Ignore cached coverage, re-fetch the whole range, overwrite the cache.
+    #[must_use]
+    pub const fn refresh() -> Self {
+        Self {
+            read_cache: false,
+            write_cache: true,
+        }
+    }
+
+    /// True if either axis touches the historical cache.
+    #[must_use]
+    pub const fn uses_cache(self) -> bool {
+        self.read_cache || self.write_cache
+    }
 }
 
 /// Top-level entry point. Owns provider instances and optional persistence,
@@ -121,8 +193,8 @@ impl Datamancer {
     /// - [`Error::LiveSessionConflict`] — a live session for this pair is
     ///   already active (Live scope only; multiple Historical sessions for
     ///   the same pair are stateless reads and run concurrently).
-    /// - [`Error::PersistenceRequired`] — `persist=true` but no
-    ///   [`HistoricalCache`]/[`TapLog`] is configured.
+    /// - [`Error::PersistenceRequired`] — `options` requires a cache but no
+    ///   [`HistoricalCache`] is configured.
     ///
     /// # Panics
     ///
@@ -133,9 +205,10 @@ impl Datamancer {
         instrument: Instrument,
         kind: EventKind,
         scope: Scope,
-        persist: bool,
+        options: PersistenceOptions,
     ) -> Result<Session> {
-        if persist && self.inner.historical_cache.is_none() && self.inner.tap_log.is_none() {
+        // tap_log write axis is deferred (later spec); only the cache is required here.
+        if options.uses_cache() && self.inner.historical_cache.is_none() {
             return Err(Error::PersistenceRequired);
         }
 
@@ -179,7 +252,7 @@ impl Datamancer {
             kind,
             scope,
             events_holder: Mutex::new(SessionStreamSlot::Available(events_rx)),
-            persisting: std::sync::atomic::AtomicBool::new(persist),
+            persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
             cmd_tx,
         });
@@ -299,7 +372,7 @@ impl DatamancerBuilder {
         self
     }
 
-    /// Attach a tap log; live events from sessions with `persist=true` will
+    /// Attach a tap log; live events from sessions configured to record will
     /// be appended.
     #[must_use]
     pub fn tap_log(mut self, log: Box<dyn TapLog>) -> Self {
@@ -308,8 +381,8 @@ impl DatamancerBuilder {
     }
 
     /// Attach a historical cache; historical fetches from sessions with
-    /// `persist=true` write-through this cache before returning to the
-    /// consumer.
+    /// `PersistenceOptions::write_cache` enabled (e.g. `PersistenceOptions::cached()`)
+    /// write-through this cache before returning to the consumer.
     #[must_use]
     pub fn historical_cache(mut self, cache: Box<dyn HistoricalCache>) -> Self {
         self.historical_cache = Some(Arc::from(cache));
@@ -372,7 +445,7 @@ struct SessionInner {
     /// Holder for the consumer-facing receiver. Available when no stream is
     /// held; Taken when a stream is currently outstanding.
     events_holder: Mutex<SessionStreamSlot>,
-    persisting: std::sync::atomic::AtomicBool,
+    persistence: std::sync::Mutex<PersistenceOptions>,
     /// Set to true the first (and only) time `take_events` succeeds. The
     /// historical controller reads it after fetch completion: if the consumer
     /// never took the stream, there's nobody to drain to and the session
@@ -397,7 +470,7 @@ impl Session {
     /// multiple calls — each new take will query persistence for
     /// `(last_emitted_source_ts, now]`, replay what's there, emit a
     /// [`ControlKind::Gap`] for what isn't (or the entire silence if
-    /// `persist=false`), then continue live.
+    /// `read_cache` is off), then continue live.
     ///
     /// # Errors
     ///
@@ -423,27 +496,42 @@ impl Session {
         }
     }
 
-    /// Toggle persistence at runtime. False stops future writes; events
-    /// already in flight to persistence still flush.
+    /// Replace the persistence options at runtime. Affects future writes;
+    /// an in-flight historical fetch keeps the plan it started with.
     ///
     /// # Errors
     ///
-    /// Returns `Error::PersistenceRequired` if no persistence layer is
-    /// configured on the parent [`Datamancer`]; `Error::SessionClosed` if
-    /// the controller has shut down.
-    pub async fn set_persisting(&self, on: bool) -> Result<()> {
+    /// Returns `Error::PersistenceRequired` if the new options require a cache
+    /// that is not configured; `Error::SessionClosed` if the controller has
+    /// shut down.
+    pub async fn set_persistence(&self, options: PersistenceOptions) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .cmd_tx
-            .send(SessionCommand::SetPersisting(on, tx))
+            .send(SessionCommand::SetPersistence(options, tx))
             .await
             .map_err(|_| Error::SessionClosed)?;
         rx.await.map_err(|_| Error::SessionClosed)?
     }
 
+    /// Returns the current persistence options for this session.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persistence mutex is poisoned (indicates a prior panic
+    /// inside a persistence-holding code path).
+    #[must_use]
+    pub fn persistence(&self) -> PersistenceOptions {
+        *self
+            .inner
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned")
+    }
+
     /// Explicit termination. Auto-cleanup also handles natural-completion
     /// cases (historical fetch exhausted, or live + stream-dropped +
-    /// persist=false).
+    /// with no persistence configured).
     ///
     /// # Errors
     ///
@@ -470,13 +558,6 @@ impl Session {
     pub fn scope(&self) -> Scope {
         self.inner.scope
     }
-
-    #[must_use]
-    pub fn is_persisting(&self) -> bool {
-        self.inner
-            .persisting
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
 }
 
 /// The session's output stream. Drop it to stop emission; re-take from the
@@ -498,7 +579,7 @@ impl Stream for EventStream {
 
 #[derive(Debug)]
 enum SessionCommand {
-    SetPersisting(bool, oneshot::Sender<Result<()>>),
+    SetPersistence(PersistenceOptions, oneshot::Sender<Result<()>>),
     Close(oneshot::Sender<()>),
 }
 
@@ -535,6 +616,21 @@ impl Controller {
         mut provider_rx: mpsc::Receiver<MarketEvent>,
         mut cmd_rx: mpsc::Receiver<SessionCommand>,
     ) {
+        let options = *self
+            .inner
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned");
+        if options.uses_cache() && self.historical_cache.is_some() {
+            // The cached read-through path runs its own per-gap channels; the
+            // default single-fetch plumbing is unused here.
+            drop(provider_tx);
+            drop(provider_rx);
+            self.run_historical_cached(from, to, options, &mut cmd_rx)
+                .await;
+            return;
+        }
+
         let provider = self.provider.clone();
         let request = HistoryRequest {
             instrument: self.inner.instrument.clone(),
@@ -565,14 +661,14 @@ impl Controller {
             }
         }
 
-        // Fetch is done. If the consumer never took the stream, the receiver
-        // is parked in `events_holder` (Slot::Available) and `events_tx.closed()`
-        // would never fire — so we'd hang forever. Shut down immediately in
-        // that case. Otherwise tell the consumer the historical run has
-        // exhausted (so a `next().await` that's blocked waiting for more
-        // events resolves to a `SessionClosing` and the consumer can drop
-        // the stream), then wait for the held stream to drain or drop and
-        // auto-close.
+        self.finish_historical(&mut cmd_rx).await;
+    }
+
+    /// Shared post-fetch handshake for historical scopes. If the consumer
+    /// never took the stream, shut down immediately (nobody to drain to).
+    /// Otherwise emit `SessionClosing`, then wait for the stream to drain or
+    /// drop and auto-close.
+    async fn finish_historical(&mut self, cmd_rx: &mut mpsc::Receiver<SessionCommand>) {
         if !self
             .inner
             .stream_taken
@@ -606,6 +702,221 @@ impl Controller {
         self.shutdown().await;
     }
 
+    /// Forward an in-band `Gap` control covering `[from, to)` for this
+    /// session's instrument, stamped at `source_ts`. Goes through `forward()`
+    /// so it gets a `seq`. The caller chooses `source_ts`: the live backfill
+    /// seam uses the wall clock (the seam is "now"); historical paths pass an
+    /// in-range timestamp so the control stays ordered within the source-time
+    /// stream rather than jumping to wall-clock ahead of older events.
+    async fn emit_gap(&mut self, source_ts: Timestamp, from: Timestamp, to: Timestamp) {
+        self.forward(MarketEvent::Control(Control {
+            source_ts,
+            rx_ts: source_ts,
+            seq: Seq(0),
+            kind: ControlKind::Gap {
+                provider: self.provider.id().to_string(),
+                instrument: self.inner.instrument.clone(),
+                span: GapSpan {
+                    from_source_ts: from,
+                    to_source_ts: to,
+                },
+            },
+        }))
+        .await;
+    }
+
+    /// Read-through historical fetch. Tiles `[from, to)` into covered/gap
+    /// segments (from `gaps()` when `read_cache`, else the whole range), then
+    /// streams them in order: covered segments replay from the cache, gap
+    /// segments fetch from the provider -- forwarded to the consumer and, when
+    /// `write_cache`, stored back. On a gap-fetch failure, only the confirmed
+    /// prefix is claimed, an in-band `Gap` is emitted for the remainder, and
+    /// the remaining segments are abandoned.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear per-segment dispatch kept inline; extraction would obscure the covered/gap handling symmetry"
+    )]
+    async fn run_historical_cached(
+        &mut self,
+        from: Timestamp,
+        to: Timestamp,
+        options: PersistenceOptions,
+        cmd_rx: &mut mpsc::Receiver<SessionCommand>,
+    ) {
+        let cache = self
+            .historical_cache
+            .clone()
+            .expect("cached path requires a historical cache");
+        let instrument = self.inner.instrument.clone();
+        let kind = self.inner.kind;
+        let plan_key = CacheKey {
+            instrument: instrument.clone(),
+            kind,
+            from,
+            to,
+        };
+
+        let whole = vec![GapSpan {
+            from_source_ts: from,
+            to_source_ts: to,
+        }];
+        let gaps = if options.read_cache {
+            match cache.gaps(&plan_key).await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(
+                        instrument = %self.inner.instrument,
+                        error = %e,
+                        "cache gaps() failed; treating whole range as a gap"
+                    );
+                    whole
+                }
+            }
+        } else {
+            whole
+        };
+        let segments = tile(from, to, &gaps);
+
+        for seg in segments {
+            match seg {
+                Segment::Covered { from: f, to: t } => {
+                    let source = cache.as_replay_source(CacheKey {
+                        instrument: instrument.clone(),
+                        kind,
+                        from: f,
+                        to: t,
+                    });
+                    let req = ReplayRequest {
+                        instruments: vec![instrument.clone()],
+                        kinds: vec![kind],
+                        from: f,
+                        to: t,
+                    };
+                    let mut stream = match source.open(req).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                instrument = %self.inner.instrument,
+                                from = f.0,
+                                to = t.0,
+                                error = %e,
+                                "cache replay open failed; emitting gap for covered segment"
+                            );
+                            // Stamp the gap at the segment start (in-range) so
+                            // it stays ordered ahead of later segments.
+                            self.emit_gap(f, f, t).await;
+                            continue;
+                        }
+                    };
+                    loop {
+                        tokio::select! {
+                            cmd = cmd_rx.recv() => {
+                                if !self.handle_command(cmd).await { return; }
+                            }
+                            ev = stream.next() => {
+                                match ev {
+                                    Some(ev) => self.forward(ev).await,
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                }
+                Segment::Gap { from: f, to: t } => {
+                    let (tx, mut rx) = mpsc::channel::<MarketEvent>(default_buffer());
+                    let provider = self.provider.clone();
+                    let request = HistoryRequest {
+                        instrument: instrument.clone(),
+                        kind,
+                        from: f,
+                        to: t,
+                    };
+                    let fetch_task =
+                        tokio::spawn(async move { provider.fetch_history(request, tx).await });
+
+                    let mut batch: Vec<MarketEvent> = Vec::new();
+                    loop {
+                        tokio::select! {
+                            cmd = cmd_rx.recv() => {
+                                if !self.handle_command(cmd).await {
+                                    fetch_task.abort();
+                                    return;
+                                }
+                            }
+                            ev = rx.recv() => {
+                                match ev {
+                                    Some(ev) => {
+                                        batch.push(ev.clone());
+                                        self.forward(ev).await;
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+
+                    let succeeded = matches!(fetch_task.await, Ok(Ok(())));
+                    if succeeded {
+                        if options.write_cache {
+                            let store_key = CacheKey {
+                                instrument: instrument.clone(),
+                                kind,
+                                from: f,
+                                to: t,
+                            };
+                            if let Err(e) = cache.store(&store_key, &batch).await {
+                                tracing::warn!(
+                                    instrument = %self.inner.instrument,
+                                    error = %e,
+                                    "historical cache store failed; data delivered but not persisted"
+                                );
+                            }
+                        }
+                    } else {
+                        // Honest coverage: claim only the confirmed prefix of
+                        // [f, t). +1 keeps the last received event inside the
+                        // half-open range; clamp to [f, t) so a provider that
+                        // over-delivers past `t` cannot over-claim coverage.
+                        // Only data-event timestamps count — a stray Control
+                        // would otherwise skew the prefix toward wall-clock.
+                        let confirmed_to = batch
+                            .iter()
+                            .filter_map(|ev| match ev {
+                                MarketEvent::Trade(tr) => Some(tr.source_ts.0),
+                                MarketEvent::Quote(q) => Some(q.source_ts.0),
+                                MarketEvent::Bar(b) => Some(b.source_ts.0),
+                                _ => None,
+                            })
+                            .max()
+                            .map_or(f, |m| Timestamp(m.saturating_add(1).clamp(f.0, t.0)));
+                        if options.write_cache {
+                            let store_key = CacheKey {
+                                instrument: instrument.clone(),
+                                kind,
+                                from: f,
+                                to: confirmed_to,
+                            };
+                            if let Err(e) = cache.store(&store_key, &batch).await {
+                                tracing::warn!(
+                                    instrument = %self.inner.instrument,
+                                    error = %e,
+                                    "historical cache store failed; data delivered but not persisted"
+                                );
+                            }
+                        }
+                        // Surface a gap only if part of [.., t) is still missing.
+                        if confirmed_to < t {
+                            self.emit_gap(confirmed_to, confirmed_to, t).await;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.finish_historical(cmd_rx).await;
+    }
+
     /// Live scope: subscribe (already done by the caller), drain provider
     /// events through the seq/forward pipeline, honor commands, auto-close
     /// when the consumer drops the stream and we're not persisting.
@@ -618,26 +929,11 @@ impl Controller {
         mut cmd_rx: mpsc::Receiver<SessionCommand>,
     ) {
         if let Some(from) = backfill_from {
-            // TODO(resume-primitive): kick off historical fetch from `from`
-            // to live-edge, bridge the seam (extend fetch to first live
-            // source_ts; emit ControlKind::Gap only if the provider can't
-            // reach). For now we surface a Gap span [from, now) so the
-            // placeholder is visible to consumers; live events follow.
+            // TODO(resume-primitive): replay from persistence across the seam.
+            // For now surface a placeholder Gap [from, now) so consumers can
+            // see the seam; live events follow.
             let now = wall_clock_ts();
-            let gap = MarketEvent::Control(Control {
-                source_ts: now,
-                rx_ts: now,
-                seq: Seq(0),
-                kind: ControlKind::Gap {
-                    provider: self.provider.id().to_string(),
-                    instrument: self.inner.instrument.clone(),
-                    span: datamancer_core::GapSpan {
-                        from_source_ts: from,
-                        to_source_ts: now,
-                    },
-                },
-            });
-            self.forward(gap).await;
+            self.emit_gap(now, from, now).await;
         }
 
         let live = Arc::new(Mutex::new(Some(live)));
@@ -663,8 +959,9 @@ impl Controller {
                 () = self.events_tx.closed() => {
                     // Consumer dropped the stream.
                     // TODO(persistence): when write-through lands, keep
-                    // running while persist=true so recording-only mode is
-                    // observable. Today, no write-through means there's
+                    // running while persistence.write_cache is set so
+                    // recording-only mode is observable. Today, no
+                    // write-through means there's
                     // nothing useful to do without an emitting consumer.
                     if let Some(h) = live.lock().await.take() {
                         let _ = h.unsubscribe(self.inner.instrument.clone(), self.inner.kind).await;
@@ -689,7 +986,7 @@ impl Controller {
         {
             self.last_emitted_source_ts = Some(ts);
         }
-        // TODO(persistence): tee to TapLog / HistoricalCache when persist=true.
+        // TODO(persistence): tee to TapLog / HistoricalCache when persistence.uses_cache().
         let _ = self.events_tx.send(stamped).await;
     }
 
@@ -708,8 +1005,8 @@ impl Controller {
     /// Returns false if the controller should exit.
     async fn handle_command(&self, cmd: Option<SessionCommand>) -> bool {
         match cmd {
-            Some(SessionCommand::SetPersisting(on, ack)) => {
-                let res = self.apply_persisting(on);
+            Some(SessionCommand::SetPersistence(options, ack)) => {
+                let res = self.apply_persistence(options);
                 let _ = ack.send(res);
                 true
             }
@@ -722,13 +1019,15 @@ impl Controller {
         }
     }
 
-    fn apply_persisting(&self, on: bool) -> Result<()> {
-        if on && self.tap_log.is_none() && self.historical_cache.is_none() {
+    fn apply_persistence(&self, options: PersistenceOptions) -> Result<()> {
+        if options.uses_cache() && self.historical_cache.is_none() {
             return Err(Error::PersistenceRequired);
         }
-        self.inner
-            .persisting
-            .store(on, std::sync::atomic::Ordering::Release);
+        *self
+            .inner
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned") = options;
         Ok(())
     }
 
@@ -781,6 +1080,44 @@ impl Drop for RegistrySentinel {
     }
 }
 
+/// One slice of a requested historical range: either already in the cache
+/// (`Covered`) or not yet fetched (`Gap`). Half-open `[from, to)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Segment {
+    Covered { from: Timestamp, to: Timestamp },
+    Gap { from: Timestamp, to: Timestamp },
+}
+
+/// Partition `[from, to)` into ordered, disjoint segments. `gaps` are the
+/// uncovered subranges (ordered, disjoint, within `[from, to)`) as reported by
+/// [`HistoricalCache::gaps`]; everything between them is covered. Zero-width
+/// pieces are never emitted.
+fn tile(from: Timestamp, to: Timestamp, gaps: &[datamancer_core::GapSpan]) -> Vec<Segment> {
+    let mut out = Vec::with_capacity(gaps.len() * 2 + 1);
+    let mut cursor = from;
+    for g in gaps {
+        let g_from = g.from_source_ts;
+        let g_to = g.to_source_ts;
+        if g_from > cursor {
+            out.push(Segment::Covered {
+                from: cursor,
+                to: g_from,
+            });
+        }
+        if g_to > g_from {
+            out.push(Segment::Gap {
+                from: g_from,
+                to: g_to,
+            });
+        }
+        cursor = cursor.max(g_to);
+    }
+    if cursor < to {
+        out.push(Segment::Covered { from: cursor, to });
+    }
+    out
+}
+
 fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
     match ev {
         MarketEvent::Trade(t) => Some(t.source_ts),
@@ -823,5 +1160,102 @@ impl Default for ReconnectPolicy {
             max_backoff_ms: 30_000,
             jitter: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::{Segment, tile};
+    use datamancer_core::{GapSpan, Timestamp};
+
+    fn gap(a: i64, b: i64) -> GapSpan {
+        GapSpan {
+            from_source_ts: Timestamp(a),
+            to_source_ts: Timestamp(b),
+        }
+    }
+
+    fn segs(v: &[Segment]) -> Vec<(char, i64, i64)> {
+        v.iter()
+            .map(|s| match *s {
+                Segment::Covered { from, to } => ('C', from.0, to.0),
+                Segment::Gap { from, to } => ('G', from.0, to.0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_gaps_is_one_covered_segment() {
+        let t = tile(Timestamp(0), Timestamp(100), &[]);
+        assert_eq!(segs(&t), vec![('C', 0, 100)]);
+    }
+
+    #[test]
+    fn whole_range_gap_is_one_gap_segment() {
+        let t = tile(Timestamp(0), Timestamp(100), &[gap(0, 100)]);
+        assert_eq!(segs(&t), vec![('G', 0, 100)]);
+    }
+
+    #[test]
+    fn leading_trailing_and_middle_gaps_interleave() {
+        // covered [10,20) and [40,50); gaps [0,10),[20,40),[50,60)
+        let t = tile(
+            Timestamp(0),
+            Timestamp(60),
+            &[gap(0, 10), gap(20, 40), gap(50, 60)],
+        );
+        assert_eq!(
+            segs(&t),
+            vec![
+                ('G', 0, 10),
+                ('C', 10, 20),
+                ('G', 20, 40),
+                ('C', 40, 50),
+                ('G', 50, 60)
+            ]
+        );
+    }
+
+    #[test]
+    fn gap_flush_with_start_emits_no_empty_covered() {
+        // gap begins exactly at `from`: no zero-width Covered prefix.
+        let t = tile(Timestamp(0), Timestamp(30), &[gap(0, 10)]);
+        assert_eq!(segs(&t), vec![('G', 0, 10), ('C', 10, 30)]);
+    }
+
+    #[test]
+    fn gap_flush_with_end_emits_no_empty_covered() {
+        // gap ends exactly at `to`: no zero-width Covered suffix.
+        let t = tile(Timestamp(0), Timestamp(30), &[gap(20, 30)]);
+        assert_eq!(segs(&t), vec![('C', 0, 20), ('G', 20, 30)]);
+    }
+}
+
+#[cfg(test)]
+mod persistence_options_tests {
+    use super::PersistenceOptions;
+
+    #[test]
+    fn presets_compose_the_four_modes() {
+        assert_eq!(PersistenceOptions::none(), PersistenceOptions::default());
+        assert!(!PersistenceOptions::none().read_cache && !PersistenceOptions::none().write_cache);
+        assert!(
+            PersistenceOptions::cached().read_cache && PersistenceOptions::cached().write_cache
+        );
+        assert!(
+            PersistenceOptions::read_only().read_cache
+                && !PersistenceOptions::read_only().write_cache
+        );
+        assert!(
+            !PersistenceOptions::refresh().read_cache && PersistenceOptions::refresh().write_cache
+        );
+    }
+
+    #[test]
+    fn uses_cache_is_true_when_any_axis_set() {
+        assert!(!PersistenceOptions::none().uses_cache());
+        assert!(PersistenceOptions::cached().uses_cache());
+        assert!(PersistenceOptions::read_only().uses_cache());
+        assert!(PersistenceOptions::refresh().uses_cache());
     }
 }

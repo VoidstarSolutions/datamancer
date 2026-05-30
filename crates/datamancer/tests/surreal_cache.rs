@@ -218,6 +218,79 @@ async fn embedded_round_trip_persists_to_disk() {
     assert_eq!(coverage.event_count, 2);
 }
 
+#[tokio::test]
+async fn store_claims_exactly_the_key_range_not_the_event_span() {
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
+    // Key range is [100, 200) but the events sit at 100 and 250 — outside the
+    // key's upper bound. Coverage must NOT extend to 250.
+    let k = key(EventKind::Trade, 100, 200);
+    cache
+        .store(
+            &k,
+            &[trade("AAPL", 100, 1.0, 1), trade("AAPL", 250, 2.0, 1)],
+        )
+        .await
+        .unwrap();
+
+    // A probe of [200, 300) must report a gap (the 250 event did not extend
+    // coverage past 200).
+    let probe = key(EventKind::Trade, 200, 300);
+    let gaps = cache.gaps(&probe).await.unwrap();
+    assert_eq!(
+        gaps,
+        vec![GapSpan {
+            from_source_ts: Timestamp(200),
+            to_source_ts: Timestamp(300),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn store_of_empty_range_marks_it_covered() {
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
+    // A successful fetch that returned no events must still mark the
+    // requested range covered, so it is not re-fetched as a gap.
+    let k = key(EventKind::Trade, 0, 1000);
+    cache.store(&k, &[]).await.unwrap();
+    assert!(
+        cache.gaps(&k).await.unwrap().is_empty(),
+        "an empty successful fetch should leave no gap in its range"
+    );
+}
+
+#[tokio::test]
+async fn store_replaces_existing_rows_in_the_claimed_range() {
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
+    let k = key(EventKind::Bar(BarInterval::OneMinute), 0, 1000);
+    // Initial store deposits a (soon-to-be stale) bar at 500.
+    cache.store(&k, &[bar("AAPL", 500, 99.0)]).await.unwrap();
+    // Re-store the same range (a refresh) with different, fewer events.
+    cache.store(&k, &[bar("AAPL", 100, 1.0)]).await.unwrap();
+
+    // Replay must return only the fresh bar; the stale 500 row is gone.
+    let source = cache.as_replay_source(k.clone());
+    let request = ReplayRequest {
+        instruments: vec![inst("AAPL")],
+        kinds: vec![EventKind::Bar(BarInterval::OneMinute)],
+        from: Timestamp(0),
+        to: Timestamp(1000),
+    };
+    let mut stream = source.open(request).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let MarketEvent::Bar(b) = ev {
+            got.push(b.source_ts.0);
+        }
+    }
+    assert_eq!(got, vec![100], "refresh must not leave the stale 500 row");
+}
+
 // Sanity: the public re-exports we lean on stay in place after the API
 // reshape — Instrument constructs from a &str and EventKind is reachable.
 #[test]

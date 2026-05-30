@@ -42,6 +42,9 @@
 //! one document per `(provider, symbol, kind)` holding a list of merged,
 //! non-overlapping `[from, to]` segments. `lookup` reports the segment
 //! that intersects the requested range; `gaps` enumerates the holes.
+//! `store` always claims exactly the requested key range as covered, so a
+//! successfully-fetched but empty range (e.g. market-closed interval or
+//! pre-inception symbol) is still recorded and will not be re-fetched as a gap.
 
 use std::path::Path;
 
@@ -312,14 +315,30 @@ impl HistoricalCache for SurrealCache {
     }
 
     async fn store(&self, key: &CacheKey, events: &[MarketEvent]) -> Result<()> {
-        if events.is_empty() {
-            return Ok(());
-        }
         let table = Self::table_for(key.kind);
         let provider = key.instrument.provider().as_str().to_string();
         let symbol = key.instrument.symbol().to_string();
-        let mut min_ts = i64::MAX;
-        let mut max_ts = i64::MIN;
+
+        // Replace the claimed range: clear any existing rows in [from, to)
+        // before inserting. `store` records coverage for the whole key range,
+        // so a re-store that returns fewer events than a prior entry (notably
+        // a `refresh`) must not leave stale rows behind that a later replay
+        // would surface as if current. For the read-through gap-fill path the
+        // range is previously uncovered, so this DELETE matches nothing.
+        self.db
+            .query(
+                "DELETE FROM type::table($tbl) \
+                 WHERE provider = $prov AND symbol = $sym \
+                 AND source_ts >= $from AND source_ts < $to",
+            )
+            .bind(("tbl", table.to_string()))
+            .bind(("prov", provider.clone()))
+            .bind(("sym", symbol.clone()))
+            .bind(("from", key.from.0))
+            .bind(("to", key.to.0))
+            .await
+            .map_err(map_err)?;
+
         let mut stored: u64 = 0;
 
         for ev in events {
@@ -330,8 +349,6 @@ impl HistoricalCache for SurrealCache {
                 _ => None,
             };
             let Some(ts) = ts else { continue };
-            min_ts = min_ts.min(ts);
-            max_ts = max_ts.max(ts);
 
             let row_id = format!("{provider}|{symbol}|{ts:020}");
             match ev {
@@ -393,13 +410,13 @@ impl HistoricalCache for SurrealCache {
             stored += 1;
         }
 
-        // Coverage segment: prefer the request's [from, to] when it fully
-        // contains the events; otherwise use the actual event-ts span.
-        let from = key.from.0.min(min_ts);
-        // The coverage should bound [from, to) — events at exactly `to` would
-        // typically not be returned by a `from..to` half-open scan.
-        let to = key.to.0.max(max_ts.saturating_add(1));
-        self.update_coverage(key, from, to, stored).await?;
+        // Coverage reflects exactly the range the caller asserts was fetched
+        // (the CacheKey), NOT the span of whatever events happened to arrive.
+        // Callers (e.g. the read-through fetch loop) pass a key range that
+        // reflects only what was actually, successfully fetched, so an
+        // interrupted fetch leaves the unfetched remainder reported as a gap.
+        self.update_coverage(key, key.from.0, key.to.0, stored)
+            .await?;
         Ok(())
     }
 

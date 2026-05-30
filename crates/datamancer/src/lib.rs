@@ -34,4 +34,6 @@ pub use datamancer_core::{
     GapSpan, HistoricalCache, HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider,
     ProviderId, Quote, ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
 };
-pub use session::{Datamancer, DatamancerBuilder, EventStream, ReconnectPolicy, Scope, Session};
+pub use session::{
+    Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,
+};
