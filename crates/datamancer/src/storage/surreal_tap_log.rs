@@ -69,7 +69,6 @@ fn map_err(err: surrealdb::Error) -> Error {
 // rows minimal is the compression win.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code, reason = "used by writer task in Task 3")]
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct TapTradeRow {
     seq: u64,
@@ -79,7 +78,6 @@ struct TapTradeRow {
     size: u64,
 }
 
-#[allow(dead_code, reason = "used by writer task in Task 3")]
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct TapQuoteRow {
     seq: u64,
@@ -91,7 +89,6 @@ struct TapQuoteRow {
     ask_size: u64,
 }
 
-#[allow(dead_code, reason = "used by writer task in Task 3")]
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct TapBarRow {
     seq: u64,
@@ -125,7 +122,6 @@ struct MetaRow {
 // Encode/decode helpers
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code, reason = "used by writer task in Task 3")]
 fn kind_tag(kind: EventKind) -> &'static str {
     match kind {
         EventKind::Trade => "trade",
@@ -153,7 +149,6 @@ fn kind_from_tag(tag: &str) -> Option<EventKind> {
     })
 }
 
-#[allow(dead_code, reason = "used by registry_id in Task 3")]
 fn asset_class_tag(asset: AssetClass) -> &'static str {
     match asset {
         AssetClass::Equity => "equity",
@@ -172,7 +167,6 @@ fn asset_class_from_tag(tag: &str) -> Option<AssetClass> {
     })
 }
 
-#[allow(dead_code, reason = "used by writer shard allocation in Task 3")]
 /// Deterministic record id for a `(instrument, kind)` registry entry. The
 /// tuple-form `db.select(("streams", id))` escapes arbitrary id content, so a
 /// symbol like `BTC/USD` is safe here; only the *shard table name* must be a
@@ -194,7 +188,7 @@ fn instrument_from_row(row: &StreamRow) -> Option<(Instrument, EventKind)> {
     Some((instrument, kind))
 }
 
-#[allow(dead_code, reason = "used by writer task in Task 3")]
+#[allow(dead_code, reason = "used by replay in Task 4")]
 fn event_seq(ev: &MarketEvent) -> u64 {
     match ev {
         MarketEvent::Trade(t) => t.seq.0,
@@ -209,7 +203,6 @@ fn event_seq(ev: &MarketEvent) -> u64 {
 // Writer command channel
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code, reason = "variants constructed by append/flush in Task 3")]
 enum WriteCmd {
     Event(MarketEvent),
     Flush(oneshot::Sender<Result<()>>),
@@ -218,7 +211,6 @@ enum WriteCmd {
 /// SurrealDB-backed tap log.
 pub struct SurrealTapLog {
     db: Surreal<Db>,
-    #[allow(dead_code, reason = "used by append/flush in Task 3")]
     tx: mpsc::UnboundedSender<WriteCmd>,
 }
 
@@ -297,14 +289,23 @@ impl SurrealTapLog {
 
 #[async_trait]
 impl TapLog for SurrealTapLog {
-    async fn append(&self, _ev: &MarketEvent) -> Result<()> {
-        // Filled in by Task 3.
+    async fn append(&self, ev: &MarketEvent) -> Result<()> {
+        // Unbounded, non-blocking enqueue: the live stream never waits on disk.
+        // A send error means the writer task is gone (log being dropped); that
+        // is not a live-session-fatal condition, so swallow it.
+        let _ = self.tx.send(WriteCmd::Event(ev.clone()));
         Ok(())
     }
 
     async fn flush(&self) -> Result<()> {
-        // Filled in by Task 3.
-        Ok(())
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self.tx.send(WriteCmd::Flush(ack_tx)).is_err() {
+            return Ok(()); // writer gone; nothing buffered to lose
+        }
+        match ack_rx.await {
+            Ok(res) => res,
+            Err(_) => Ok(()), // writer dropped before replying
+        }
     }
 
     fn as_replay_source(&self) -> Box<dyn ReplaySource> {
@@ -328,23 +329,159 @@ struct Writer {
 }
 
 impl Writer {
-    async fn run(self, mut rx: mpsc::UnboundedReceiver<WriteCmd>) {
-        // Filled in by Task 3. Silence unused-field warnings until then.
-        let _ = (
-            &self.db,
-            self.hwm,
-            self.next_shard,
-            &self.shards,
-            &self.last_error,
-        );
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<WriteCmd>) {
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                WriteCmd::Event(_) => {}
+                WriteCmd::Event(ev) => {
+                    if let Err(e) = self.write_event(ev).await {
+                        tracing::warn!(error = %e, "tap log write failed");
+                        self.last_error = Some(e);
+                    }
+                }
                 WriteCmd::Flush(ack) => {
-                    let _ = ack.send(Ok(()));
+                    // Events ahead of this barrier are already written (we drain
+                    // serially). Report and clear the most recent error, if any.
+                    let res = match self.last_error.take() {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    };
+                    let _ = ack.send(res);
                 }
             }
         }
+    }
+
+    async fn write_event(&mut self, ev: MarketEvent) -> Result<()> {
+        let (instrument, kind) = match &ev {
+            MarketEvent::Trade(t) => (t.instrument.clone(), EventKind::Trade),
+            MarketEvent::Quote(q) => (q.instrument.clone(), EventKind::Quote),
+            MarketEvent::Bar(b) => (b.instrument.clone(), EventKind::Bar(b.interval)),
+            // Non-data events are not tapped; the session gate also filters
+            // these, so this is defensive only.
+            _ => return Ok(()),
+        };
+
+        if asset_class_tag(instrument.asset_class()) == "unknown" {
+            tracing::warn!(
+                instrument = %instrument,
+                "tap log: unknown asset class; this event's shard will not survive a reopen"
+            );
+        }
+
+        let shard = self.resolve_shard(&instrument, kind).await?;
+
+        // Reserve seq and persist the high-water mark BEFORE inserting the row.
+        // A crash between persist and insert leaves an unused seq value — a
+        // harmless gap, since seq carries no drop-detection meaning — never a
+        // reused value that would corrupt ordering.
+        self.hwm += 1;
+        let seq = self.hwm;
+        self.persist_meta().await?;
+
+        match ev {
+            MarketEvent::Trade(t) => {
+                let row = TapTradeRow {
+                    seq,
+                    source_ts: t.source_ts.0,
+                    rx_ts: t.rx_ts.0,
+                    price_raw: t.price.raw(),
+                    size: t.size,
+                };
+                let _: Option<TapTradeRow> = self
+                    .db
+                    .create(shard.as_str())
+                    .content(row)
+                    .await
+                    .map_err(map_err)?;
+            }
+            MarketEvent::Quote(q) => {
+                let row = TapQuoteRow {
+                    seq,
+                    source_ts: q.source_ts.0,
+                    rx_ts: q.rx_ts.0,
+                    bid_raw: q.bid.raw(),
+                    bid_size: q.bid_size,
+                    ask_raw: q.ask.raw(),
+                    ask_size: q.ask_size,
+                };
+                let _: Option<TapQuoteRow> = self
+                    .db
+                    .create(shard.as_str())
+                    .content(row)
+                    .await
+                    .map_err(map_err)?;
+            }
+            MarketEvent::Bar(b) => {
+                let row = TapBarRow {
+                    seq,
+                    source_ts: b.source_ts.0,
+                    rx_ts: b.rx_ts.0,
+                    open_raw: b.open.raw(),
+                    high_raw: b.high.raw(),
+                    low_raw: b.low.raw(),
+                    close_raw: b.close.raw(),
+                    volume: b.volume,
+                };
+                let _: Option<TapBarRow> = self
+                    .db
+                    .create(shard.as_str())
+                    .content(row)
+                    .await
+                    .map_err(map_err)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Resolve the shard table for `(instrument, kind)`, allocating + recording
+    /// a new one in the registry on first sight. The shard name is an opaque
+    /// `tap_NNNNNN` token (valid as a `SurrealDB` table identifier) regardless of
+    /// the symbol's characters.
+    async fn resolve_shard(&mut self, instrument: &Instrument, kind: EventKind) -> Result<String> {
+        if let Some(name) = self.shards.get(&(instrument.clone(), kind)) {
+            return Ok(name.clone());
+        }
+        let ordinal = self.next_shard;
+        self.next_shard += 1;
+        let name = format!("tap_{ordinal:06}");
+        self.persist_meta().await?;
+
+        self.db
+            .query(format!("DEFINE TABLE IF NOT EXISTS {name} SCHEMALESS"))
+            .await
+            .map_err(map_err)?;
+
+        let reg = StreamRow {
+            provider: instrument.provider().as_str().to_string(),
+            asset_class: asset_class_tag(instrument.asset_class()).to_string(),
+            symbol: instrument.symbol().to_string(),
+            kind_tag: kind_tag(kind).to_string(),
+            table: name.clone(),
+        };
+        let _: Option<StreamRow> = self
+            .db
+            .upsert(("streams", registry_id(instrument, kind)))
+            .content(reg)
+            .await
+            .map_err(map_err)?;
+
+        self.shards.insert((instrument.clone(), kind), name.clone());
+        Ok(name)
+    }
+
+    async fn persist_meta(&self) -> Result<()> {
+        let row = MetaRow {
+            hwm: self.hwm,
+            next_shard: self.next_shard,
+        };
+        let _: Option<MetaRow> = self
+            .db
+            .upsert(("meta", "singleton"))
+            .content(row)
+            .await
+            .map_err(map_err)?;
+        Ok(())
     }
 }
 

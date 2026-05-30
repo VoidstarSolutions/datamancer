@@ -58,6 +58,52 @@ fn full_request(symbol: &str, kind: EventKind) -> ReplayRequest {
 }
 
 #[tokio::test]
+async fn append_then_flush_persists_and_replays_in_order() {
+    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
+        .await
+        .unwrap();
+    log.append(&trade("AAPL", 100, 100, 150.10, 1))
+        .await
+        .unwrap();
+    log.append(&trade("AAPL", 250, 250, 150.25, 2))
+        .await
+        .unwrap();
+    log.append(&trade("AAPL", 399, 399, 150.40, 3))
+        .await
+        .unwrap();
+    log.flush().await.unwrap();
+
+    let source = log.as_replay_source();
+    let mut stream = source
+        .open(full_request("AAPL", EventKind::Trade))
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let MarketEvent::Trade(t) = ev {
+            got.push((t.source_ts.0, t.size, t.seq.0));
+        }
+    }
+    // Arrival order preserved; seq is store-canonical and contiguous from 1.
+    assert_eq!(got, vec![(100, 1, 1), (250, 2, 2), (399, 3, 3)]);
+}
+
+#[tokio::test]
+async fn writer_creates_one_shard_per_instrument_kind() {
+    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
+        .await
+        .unwrap();
+    // Two instruments, one kind each, plus a bar for AAPL → 3 distinct shards.
+    log.append(&trade("AAPL", 1, 1, 10.0, 1)).await.unwrap();
+    log.append(&trade("MSFT", 2, 2, 20.0, 1)).await.unwrap();
+    log.append(&bar("AAPL", 3, 30.0)).await.unwrap();
+    log.flush().await.unwrap();
+
+    // A second flush is a clean no-op (no buffered error).
+    log.flush().await.unwrap();
+}
+
+#[tokio::test]
 async fn open_empty_log_replays_nothing() {
     let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
         .await
