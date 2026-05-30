@@ -311,3 +311,56 @@ async fn embedded_round_trip_persists_and_continues_seq() {
     }
     assert_eq!(seqs, vec![1, 2, 3], "seq continues across reopen, no reset");
 }
+
+#[tokio::test]
+async fn replay_empty_when_window_is_degenerate() {
+    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
+        .await
+        .unwrap();
+    log.append(&trade("AAPL", 100, 100, 1.0, 1)).await.unwrap();
+    log.flush().await.unwrap();
+
+    let source = log.as_replay_source();
+    // from == to and from > to both yield nothing.
+    for (from, to) in [(100, 100), (300, 200)] {
+        let request = ReplayRequest {
+            instruments: vec![inst("AAPL")],
+            kinds: vec![EventKind::Trade],
+            from: Timestamp(from),
+            to: Timestamp(to),
+        };
+        let mut stream = source.open(request).await.unwrap();
+        assert!(
+            stream.next().await.is_none(),
+            "degenerate window [{from}, {to}) must replay nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_empty_kinds_matches_all_kinds() {
+    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
+        .await
+        .unwrap();
+    log.append(&trade("AAPL", 100, 100, 1.0, 1)).await.unwrap(); // seq 1
+    log.append(&bar("AAPL", 200, 5.0)).await.unwrap(); // seq 2
+    log.flush().await.unwrap();
+
+    let source = log.as_replay_source();
+    let request = ReplayRequest {
+        instruments: vec![inst("AAPL")],
+        kinds: vec![], // empty = match all kinds
+        from: Timestamp(i64::MIN),
+        to: Timestamp(i64::MAX),
+    };
+    let mut stream = source.open(request).await.unwrap();
+    let mut seen = Vec::new();
+    while let Some(ev) = stream.next().await {
+        match ev {
+            MarketEvent::Trade(t) => seen.push(("trade", t.seq.0)),
+            MarketEvent::Bar(b) => seen.push(("bar", b.seq.0)),
+            _ => {}
+        }
+    }
+    assert_eq!(seen, vec![("trade", 1), ("bar", 2)]);
+}

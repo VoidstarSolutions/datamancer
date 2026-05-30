@@ -194,6 +194,8 @@ fn event_seq(ev: &MarketEvent) -> u64 {
         MarketEvent::Quote(q) => q.seq.0,
         MarketEvent::Bar(b) => b.seq.0,
         MarketEvent::Control(c) => c.seq.0,
+        // Non-data variants are never stored in the tap log; this arm is
+        // defensive and its return value is never used for ordering.
         _ => 0,
     }
 }
