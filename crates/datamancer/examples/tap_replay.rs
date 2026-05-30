@@ -82,7 +82,10 @@ fn trade(source_ts: i64, price: i64) -> MarketEvent {
     MarketEvent::Trade(Trade {
         instrument: instrument(),
         source_ts: Timestamp(source_ts),
+        // rx_ts is observability-only; the replay assertion never checks it.
         rx_ts: Timestamp(source_ts),
+        // Placeholder: datamancer assigns the real session seq at receipt, and
+        // the tap log records that canonical seq — Seq(0) here is never stored.
         seq: Seq(0),
         price: Price::from_units(price),
         size: 1,
