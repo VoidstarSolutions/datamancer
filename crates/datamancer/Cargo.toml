@@ -39,5 +39,9 @@ required-features = ["provider-alpaca"]
 name = "cached_history"
 required-features = ["storage-surreal"]
 
+[[example]]
+name = "tap_replay"
+required-features = ["storage-surreal"]
+
 [lints]
 workspace = true
