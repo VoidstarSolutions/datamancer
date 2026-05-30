@@ -317,7 +317,7 @@ impl TapLog for SurrealTapLog {
 }
 
 // ---------------------------------------------------------------------------
-// Background writer (Task 3 fills in the body)
+// Background writer
 // ---------------------------------------------------------------------------
 
 struct Writer {
@@ -360,13 +360,6 @@ impl Writer {
             // these, so this is defensive only.
             _ => return Ok(()),
         };
-
-        if asset_class_tag(instrument.asset_class()) == "unknown" {
-            tracing::warn!(
-                instrument = %instrument,
-                "tap log: unknown asset class; this event's shard will not survive a reopen"
-            );
-        }
 
         let shard = self.resolve_shard(&instrument, kind).await?;
 
@@ -442,9 +435,20 @@ impl Writer {
         if let Some(name) = self.shards.get(&(instrument.clone(), kind)) {
             return Ok(name.clone());
         }
+
+        if asset_class_tag(instrument.asset_class()) == "unknown" {
+            tracing::warn!(
+                instrument = %instrument,
+                "tap log: unknown asset class; this shard will not survive a reopen"
+            );
+        }
+
         let ordinal = self.next_shard;
         self.next_shard += 1;
         let name = format!("tap_{ordinal:06}");
+        // If a step below fails after this point, the error propagates and this
+        // ordinal is simply skipped — a harmless gap in shard numbering, never
+        // a reused or colliding shard name.
         self.persist_meta().await?;
 
         self.db
