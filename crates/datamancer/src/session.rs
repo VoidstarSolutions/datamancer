@@ -82,7 +82,8 @@ pub enum Scope {
 
 /// How a session interacts with the configured persistence layer.
 ///
-/// The two cache axes compose into the full historical option space:
+/// The two cache axes compose into the full historical option space; the
+/// `write_tap_log` axis is orthogonal and governs live capture only:
 ///
 /// | `read_cache` | `write_cache` | mode      | behavior                                    |
 /// |--------------|---------------|-----------|---------------------------------------------|
@@ -91,8 +92,11 @@ pub enum Scope {
 /// | `true`       | `false`       | read-only | serve cache + fetch gaps, don't persist     |
 /// | `false`      | `true`        | refresh   | ignore coverage, re-fetch range, overwrite  |
 ///
-/// `#[non_exhaustive]`: later work (tap log, resume) adds axes additively.
-/// Construct via the presets, or mutate the public fields on an owned value.
+/// `write_tap_log` is independent of scope mode above: when set on a `Live`
+/// session, every data event is teed to the configured [`crate::TapLog`].
+///
+/// `#[non_exhaustive]`: later work (resume) adds axes additively. Construct via
+/// the presets and `with_tap_log`, or mutate the public fields on an owned value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct PersistenceOptions {
@@ -101,6 +105,8 @@ pub struct PersistenceOptions {
     pub read_cache: bool,
     /// Historical scope: write fetched gap data back to the cache.
     pub write_cache: bool,
+    /// Live scope: tee every data event to the configured tap log.
+    pub write_tap_log: bool,
 }
 
 impl PersistenceOptions {
@@ -110,6 +116,7 @@ impl PersistenceOptions {
         Self {
             read_cache: false,
             write_cache: false,
+            write_tap_log: false,
         }
     }
 
@@ -119,6 +126,7 @@ impl PersistenceOptions {
         Self {
             read_cache: true,
             write_cache: true,
+            write_tap_log: false,
         }
     }
 
@@ -128,6 +136,7 @@ impl PersistenceOptions {
         Self {
             read_cache: true,
             write_cache: false,
+            write_tap_log: false,
         }
     }
 
@@ -137,7 +146,15 @@ impl PersistenceOptions {
         Self {
             read_cache: false,
             write_cache: true,
+            write_tap_log: false,
         }
+    }
+
+    /// Return a copy with the live tap-log axis set to `on`.
+    #[must_use]
+    pub const fn with_tap_log(mut self, on: bool) -> Self {
+        self.write_tap_log = on;
+        self
     }
 
     /// True if either axis touches the historical cache.
@@ -207,8 +224,10 @@ impl Datamancer {
         scope: Scope,
         options: PersistenceOptions,
     ) -> Result<Session> {
-        // tap_log write axis is deferred (later spec); only the cache is required here.
         if options.uses_cache() && self.inner.historical_cache.is_none() {
+            return Err(Error::PersistenceRequired);
+        }
+        if options.write_tap_log && self.inner.tap_log.is_none() {
             return Err(Error::PersistenceRequired);
         }
 
@@ -377,6 +396,14 @@ impl DatamancerBuilder {
     #[must_use]
     pub fn tap_log(mut self, log: Box<dyn TapLog>) -> Self {
         self.tap_log = Some(Arc::from(log));
+        self
+    }
+
+    /// Register a tap log held behind an `Arc`. Useful when the caller keeps a
+    /// reference to replay the captured stream after the session ends.
+    #[must_use]
+    pub fn tap_log_arc(mut self, log: Arc<dyn TapLog>) -> Self {
+        self.tap_log = Some(log);
         self
     }
 
@@ -974,19 +1001,36 @@ impl Controller {
         }
     }
 
-    /// Stamp `seq`, optionally tee to `TapLog` (TODO), forward to the consumer
-    /// stream when held. Updates `last_emitted_source_ts` on data events.
+    /// Stamp `seq`, tee data events to the `TapLog` when configured for live
+    /// capture, then forward to the consumer stream. Updates
+    /// `last_emitted_source_ts` on data events.
     async fn forward(&mut self, ev: MarketEvent) {
         let stamped = self.assign_seq(ev);
-        if let Some(ts) = source_ts(&stamped)
-            && matches!(
-                stamped,
-                MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)
-            )
-        {
+        let is_data = matches!(
+            stamped,
+            MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)
+        );
+        if is_data && let Some(ts) = source_ts(&stamped) {
             self.last_emitted_source_ts = Some(ts);
         }
-        // TODO(persistence): tee to TapLog / HistoricalCache when persistence.uses_cache().
+        // Tee to the tap log: live capture only, data events only. Append
+        // before forwarding so a consumer that observes the event can rely on
+        // it having been enqueued for persistence. `append` is a non-blocking
+        // enqueue, so this never stalls the live stream.
+        if is_data
+            && matches!(self.inner.scope, Scope::Live { .. })
+            && let Some(log) = &self.tap_log
+        {
+            let write = self
+                .inner
+                .persistence
+                .lock()
+                .expect("persistence mutex poisoned")
+                .write_tap_log;
+            if write {
+                let _ = log.append(&stamped).await;
+            }
+        }
         let _ = self.events_tx.send(stamped).await;
     }
 
@@ -1021,6 +1065,9 @@ impl Controller {
 
     fn apply_persistence(&self, options: PersistenceOptions) -> Result<()> {
         if options.uses_cache() && self.historical_cache.is_none() {
+            return Err(Error::PersistenceRequired);
+        }
+        if options.write_tap_log && self.tap_log.is_none() {
             return Err(Error::PersistenceRequired);
         }
         *self
@@ -1257,5 +1304,27 @@ mod persistence_options_tests {
         assert!(PersistenceOptions::cached().uses_cache());
         assert!(PersistenceOptions::read_only().uses_cache());
         assert!(PersistenceOptions::refresh().uses_cache());
+    }
+
+    #[test]
+    fn tap_log_axis_defaults_off_and_presets_stay_cache_only() {
+        assert!(!PersistenceOptions::none().write_tap_log);
+        assert!(!PersistenceOptions::cached().write_tap_log);
+        assert!(!PersistenceOptions::read_only().write_tap_log);
+        assert!(!PersistenceOptions::refresh().write_tap_log);
+        assert!(!PersistenceOptions::default().write_tap_log);
+    }
+
+    #[test]
+    fn with_tap_log_sets_only_the_tap_axis() {
+        let opts = PersistenceOptions::none().with_tap_log(true);
+        assert!(opts.write_tap_log);
+        assert!(!opts.read_cache);
+        assert!(!opts.write_cache);
+        // Stacks onto a cache preset without disturbing the cache axes.
+        let stacked = PersistenceOptions::cached().with_tap_log(true);
+        assert!(stacked.read_cache && stacked.write_cache && stacked.write_tap_log);
+        // uses_cache() still reflects only the cache axes.
+        assert!(!PersistenceOptions::none().with_tap_log(true).uses_cache());
     }
 }

@@ -8,3 +8,9 @@ pub mod surreal;
 
 #[cfg(feature = "storage-surreal")]
 pub use surreal::{SurrealCache, SurrealCacheConfig};
+
+#[cfg(feature = "storage-surreal")]
+pub mod surreal_tap_log;
+
+#[cfg(feature = "storage-surreal")]
+pub use surreal_tap_log::{SurrealTapLog, SurrealTapLogConfig};
