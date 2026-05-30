@@ -27,8 +27,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use datamancer_core::{
-    AssetClass, BarInterval, Error, EventKind, Instrument, MarketEvent, ProviderId, ReplayRequest,
-    ReplaySource, Result, TapLog,
+    AssetClass, Bar, BarInterval, Error, EventKind, Instrument, MarketEvent, Price, ProviderId,
+    Quote, ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -188,7 +188,6 @@ fn instrument_from_row(row: &StreamRow) -> Option<(Instrument, EventKind)> {
     Some((instrument, kind))
 }
 
-#[allow(dead_code, reason = "used by replay in Task 4")]
 fn event_seq(ev: &MarketEvent) -> u64 {
     match ev {
         MarketEvent::Trade(t) => t.seq.0,
@@ -498,10 +497,127 @@ struct SurrealTapReplaySource {
 }
 
 #[async_trait]
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear query/decode/merge pipeline kept inline; extraction would obscure the per-kind handling"
+)]
 impl ReplaySource for SurrealTapReplaySource {
-    async fn open(&self, _request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
-        // Filled in by Task 4.
-        let _ = &self.db;
-        Ok(stream::empty().boxed())
+    async fn open(&self, request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
+        let from = request.from.0;
+        let to = request.to.0;
+        if from >= to {
+            return Ok(stream::empty().boxed());
+        }
+
+        let regs: Vec<StreamRow> = self.db.select("streams").await.map_err(map_err)?;
+
+        let mut all: Vec<MarketEvent> = Vec::new();
+        for row in &regs {
+            let Some((instrument, kind)) = instrument_from_row(row) else {
+                continue;
+            };
+            if !request.instruments.is_empty() && !request.instruments.contains(&instrument) {
+                continue;
+            }
+            if !request.kinds.is_empty() && !request.kinds.contains(&kind) {
+                continue;
+            }
+
+            // Per-shard query: rows in the source_ts window, seq-ordered. Each
+            // shard's rows are already a sorted run; merging happens below.
+            match kind {
+                EventKind::Trade => {
+                    let rows: Vec<TapTradeRow> = self
+                        .db
+                        .query(
+                            "SELECT * FROM type::table($tbl) \
+                             WHERE source_ts >= $from AND source_ts < $to \
+                             ORDER BY seq ASC",
+                        )
+                        .bind(("tbl", row.table.clone()))
+                        .bind(("from", from))
+                        .bind(("to", to))
+                        .await
+                        .map_err(map_err)?
+                        .take(0)
+                        .map_err(map_err)?;
+                    all.extend(rows.into_iter().map(|r| {
+                        MarketEvent::Trade(Trade {
+                            instrument: instrument.clone(),
+                            source_ts: Timestamp(r.source_ts),
+                            rx_ts: Timestamp(r.rx_ts),
+                            seq: Seq(r.seq),
+                            price: Price::from_raw(r.price_raw),
+                            size: r.size,
+                        })
+                    }));
+                }
+                EventKind::Quote => {
+                    let rows: Vec<TapQuoteRow> = self
+                        .db
+                        .query(
+                            "SELECT * FROM type::table($tbl) \
+                             WHERE source_ts >= $from AND source_ts < $to \
+                             ORDER BY seq ASC",
+                        )
+                        .bind(("tbl", row.table.clone()))
+                        .bind(("from", from))
+                        .bind(("to", to))
+                        .await
+                        .map_err(map_err)?
+                        .take(0)
+                        .map_err(map_err)?;
+                    all.extend(rows.into_iter().map(|r| {
+                        MarketEvent::Quote(Quote {
+                            instrument: instrument.clone(),
+                            source_ts: Timestamp(r.source_ts),
+                            rx_ts: Timestamp(r.rx_ts),
+                            seq: Seq(r.seq),
+                            bid: Price::from_raw(r.bid_raw),
+                            bid_size: r.bid_size,
+                            ask: Price::from_raw(r.ask_raw),
+                            ask_size: r.ask_size,
+                        })
+                    }));
+                }
+                EventKind::Bar(interval) => {
+                    let rows: Vec<TapBarRow> = self
+                        .db
+                        .query(
+                            "SELECT * FROM type::table($tbl) \
+                             WHERE source_ts >= $from AND source_ts < $to \
+                             ORDER BY seq ASC",
+                        )
+                        .bind(("tbl", row.table.clone()))
+                        .bind(("from", from))
+                        .bind(("to", to))
+                        .await
+                        .map_err(map_err)?
+                        .take(0)
+                        .map_err(map_err)?;
+                    all.extend(rows.into_iter().map(|r| {
+                        MarketEvent::Bar(Bar {
+                            instrument: instrument.clone(),
+                            interval,
+                            source_ts: Timestamp(r.source_ts),
+                            rx_ts: Timestamp(r.rx_ts),
+                            seq: Seq(r.seq),
+                            open: Price::from_raw(r.open_raw),
+                            high: Price::from_raw(r.high_raw),
+                            low: Price::from_raw(r.low_raw),
+                            close: Price::from_raw(r.close_raw),
+                            volume: r.volume,
+                        })
+                    }));
+                }
+            }
+        }
+
+        // Merge the per-shard sorted runs into one globally seq-ordered stream.
+        // seq is a unique global total order, so a single sort by seq IS the
+        // k-way merge result. (Materialize-then-sort mirrors the cache's replay
+        // shape; a streaming cursor merge is a future memory optimization.)
+        all.sort_by_key(event_seq);
+        Ok(stream::iter(all).boxed())
     }
 }
