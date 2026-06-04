@@ -43,5 +43,9 @@ required-features = ["storage-surreal"]
 name = "tap_replay"
 required-features = ["storage-surreal"]
 
+[[example]]
+name = "resume"
+required-features = ["storage-surreal"]
+
 [lints]
 workspace = true
