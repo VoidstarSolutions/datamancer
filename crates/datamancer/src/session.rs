@@ -1165,6 +1165,72 @@ fn tile(from: Timestamp, to: Timestamp, gaps: &[datamancer_core::GapSpan]) -> Ve
     out
 }
 
+/// Bounded FIFO of pending consumer events with honest overflow accounting.
+///
+/// While no consumer stream is attached, the controller buffers events here.
+/// Pushing beyond capacity evicts the oldest event and extends `dropped` to
+/// cover the evicted event's `source_ts`; the span is surfaced as one in-band
+/// [`ControlKind::Gap`] when a consumer (re)attaches. Evicted events are never
+/// `seq`-stamped, so an overflow is a reported gap — never a `seq` hole.
+#[allow(dead_code, reason = "consumed by the Sink tasks that follow")]
+struct EventRing {
+    capacity: usize,
+    buf: std::collections::VecDeque<MarketEvent>,
+    dropped: Option<GapSpan>,
+}
+
+#[allow(dead_code, reason = "consumed by the Sink tasks that follow")]
+impl EventRing {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            buf: std::collections::VecDeque::new(),
+            dropped: None,
+        }
+    }
+
+    fn push(&mut self, ev: MarketEvent) {
+        if self.buf.len() == self.capacity
+            && let Some(evicted) = self.buf.pop_front()
+        {
+            self.note_drop(&evicted);
+        }
+        self.buf.push_back(ev);
+    }
+
+    /// Extend the dropped span over an evicted event. Only data events count:
+    /// a control's wall-clock `source_ts` would skew the market-data span.
+    fn note_drop(&mut self, ev: &MarketEvent) {
+        let Some(ts) = data_source_ts(ev) else { return };
+        let next = Timestamp(ts.0.saturating_add(1));
+        match &mut self.dropped {
+            Some(span) => {
+                span.from_source_ts = span.from_source_ts.min(ts);
+                span.to_source_ts = span.to_source_ts.max(next);
+            }
+            None => {
+                self.dropped = Some(GapSpan {
+                    from_source_ts: ts,
+                    to_source_ts: next,
+                });
+            }
+        }
+    }
+
+    fn into_parts(self) -> (Option<GapSpan>, std::collections::VecDeque<MarketEvent>) {
+        (self.dropped, self.buf)
+    }
+}
+
+/// `source_ts` of data events only (`Trade | Quote | Bar`); `None` for
+/// controls and any future non-data variants.
+fn data_source_ts(ev: &MarketEvent) -> Option<Timestamp> {
+    match ev {
+        MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_) => source_ts(ev),
+        _ => None,
+    }
+}
+
 fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
     match ev {
         MarketEvent::Trade(t) => Some(t.source_ts),
@@ -1275,6 +1341,107 @@ mod tile_tests {
         // gap ends exactly at `to`: no zero-width Covered suffix.
         let t = tile(Timestamp(0), Timestamp(30), &[gap(20, 30)]);
         assert_eq!(segs(&t), vec![('C', 0, 20), ('G', 20, 30)]);
+    }
+}
+
+#[cfg(test)]
+mod event_ring_tests {
+    use super::EventRing;
+    use datamancer_core::{
+        AssetClass, Control, ControlKind, Instrument, MarketEvent, Price, ProviderId, Seq,
+        Timestamp, Trade,
+    };
+
+    fn trade(ts: i64) -> MarketEvent {
+        MarketEvent::Trade(Trade {
+            instrument: Instrument::new(ProviderId::from_static("t"), AssetClass::Equity, "X"),
+            source_ts: Timestamp(ts),
+            rx_ts: Timestamp(ts),
+            seq: Seq(0),
+            price: Price::from_f64_round(1.0),
+            size: 1,
+        })
+    }
+
+    fn control(ts: i64) -> MarketEvent {
+        MarketEvent::Control(Control {
+            source_ts: Timestamp(ts),
+            rx_ts: Timestamp(ts),
+            seq: Seq(0),
+            kind: ControlKind::SessionClosing,
+        })
+    }
+
+    fn tss(events: &std::collections::VecDeque<MarketEvent>) -> Vec<i64> {
+        events
+            .iter()
+            .map(|e| match e {
+                MarketEvent::Trade(t) => t.source_ts.0,
+                MarketEvent::Control(c) => c.source_ts.0,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn under_capacity_keeps_everything_with_no_span() {
+        let mut ring = EventRing::new(4);
+        for ts in [100, 200, 300] {
+            ring.push(trade(ts));
+        }
+        let (dropped, events) = ring.into_parts();
+        assert!(dropped.is_none());
+        assert_eq!(tss(&events), vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn overflow_evicts_oldest_and_tracks_span() {
+        let mut ring = EventRing::new(2);
+        for ts in [100, 200, 300, 400] {
+            ring.push(trade(ts));
+        }
+        let (dropped, events) = ring.into_parts();
+        // 100 and 200 evicted; half-open span keeps 200 inside.
+        let span = dropped.expect("overflow must record a span");
+        assert_eq!(span.from_source_ts.0, 100);
+        assert_eq!(span.to_source_ts.0, 201);
+        assert_eq!(tss(&events), vec![300, 400]);
+    }
+
+    #[test]
+    fn span_covers_out_of_order_source_ts() {
+        // Arrival order != source_ts order: span is min..max+1, not first..last+1.
+        let mut ring = EventRing::new(1);
+        for ts in [300, 100, 200, 50] {
+            ring.push(trade(ts));
+        }
+        let (dropped, events) = ring.into_parts();
+        let span = dropped.expect("span");
+        assert_eq!(span.from_source_ts.0, 100); // min of evicted {300, 100, 200}
+        assert_eq!(span.to_source_ts.0, 301); // max of evicted + 1
+        assert_eq!(tss(&events), vec![50]);
+    }
+
+    #[test]
+    fn evicted_controls_do_not_extend_the_span() {
+        let mut ring = EventRing::new(1);
+        ring.push(control(999));
+        ring.push(trade(100)); // evicts the control
+        ring.push(trade(200)); // evicts trade 100
+        let (dropped, events) = ring.into_parts();
+        let span = dropped.expect("span");
+        assert_eq!(span.from_source_ts.0, 100);
+        assert_eq!(span.to_source_ts.0, 101);
+        assert_eq!(tss(&events), vec![200]);
+    }
+
+    #[test]
+    fn zero_capacity_is_clamped_to_one() {
+        let mut ring = EventRing::new(0);
+        ring.push(trade(100));
+        let (dropped, events) = ring.into_parts();
+        assert!(dropped.is_none());
+        assert_eq!(tss(&events), vec![100]);
     }
 }
 
