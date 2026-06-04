@@ -1,10 +1,5 @@
 //! End-to-end Session tests using a fake provider. Exercises historical and
 //! live scopes against the new per-(instrument, kind) Session surface.
-//!
-//! The stitched-with-backfill seam is currently stubbed in the controller
-//! (it emits a placeholder Gap rather than running the resume primitive),
-//! so a corresponding test for that path is deferred until the resume
-//! primitive lands alongside the registry.
 
 #![cfg(feature = "storage-surreal")]
 
@@ -257,63 +252,6 @@ async fn historical_session_streams_provider_fetch_in_order() {
     assert_eq!(bars[0].seq.0, 0);
     assert_eq!(bars[1].seq.0, 1);
     assert_eq!(bars[2].seq.0, 2);
-}
-
-#[tokio::test]
-async fn live_with_backfill_emits_placeholder_seam_gap() {
-    // The resume primitive isn't wired up yet; the controller emits a Gap
-    // covering [backfill_from, now) so the placeholder is observable.
-    // Replace this test with a real seam test once the resume primitive
-    // lands (it should replay from persistence and only fall back to a Gap
-    // when persistence can't cover the span).
-    let (provider, ctrl) = FakeProvider::new("fake");
-    let dm = Datamancer::builder()
-        .provider_arc(provider)
-        .build()
-        .unwrap();
-
-    let session = dm
-        .session(
-            inst("AAPL"),
-            EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(1_000)),
-            },
-            PersistenceOptions::none(),
-        )
-        .await
-        .unwrap();
-    let mut stream = session.take_events().await.unwrap();
-
-    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
-        .await
-        .unwrap()
-        .unwrap();
-    match first {
-        MarketEvent::Control(c) => match c.kind {
-            ControlKind::Gap {
-                instrument, span, ..
-            } => {
-                assert_eq!(instrument.symbol(), "AAPL");
-                assert_eq!(span.from_source_ts.0, 1_000);
-            }
-            other => panic!("expected Gap control, got {other:?}"),
-        },
-        other => panic!("expected Control, got {other:?}"),
-    }
-
-    // After the placeholder gap, live events flow normally.
-    ctrl.push_live(trade("AAPL", 5_000, 1.0)).await;
-    let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
-        .await
-        .unwrap()
-        .unwrap();
-    match next {
-        MarketEvent::Trade(t) => assert_eq!(t.source_ts.0, 5_000),
-        other => panic!("expected live Trade, got {other:?}"),
-    }
-
-    let _ = session.close().await;
 }
 
 #[tokio::test]

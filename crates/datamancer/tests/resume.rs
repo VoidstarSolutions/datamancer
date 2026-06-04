@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use datamancer::storage::{SurrealTapLog, SurrealTapLogConfig};
+use datamancer::storage::{SurrealCache, SurrealCacheConfig, SurrealTapLog, SurrealTapLogConfig};
 use datamancer::{
-    AssetClass, ControlKind, Datamancer, EventKind, Instrument, LiveHandle, MarketEvent,
-    PersistenceOptions, Price, Provider, ProviderId, ReplayRequest, Result, Scope, Seq, TapLog,
-    Timestamp, Trade,
+    AssetClass, CacheKey, ControlKind, Datamancer, EventKind, GapSpan, HistoricalCache, Instrument,
+    LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ReplayRequest,
+    Result, Scope, Seq, TapLog, Timestamp, Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -59,15 +59,13 @@ impl FakeProvider {
         )
     }
 
-    // The next two allows are removed by the stitched-session task, which
-    // starts using these constructors.
-    #[allow(dead_code, reason = "exercised by the stitched-session tests")]
+    /// Hold the fetch open until the gate fires. Releases exactly one fetch
+    /// (single `Notify` permit), so do not build multi-fetch barriers on it.
     fn gated(mut self, gate: Arc<Notify>) -> Self {
         self.gate = Some(gate);
         self
     }
 
-    #[allow(dead_code, reason = "exercised by the stitched-session tests")]
     fn with_fail_at(mut self, ts: i64) -> Self {
         self.fail_at = Some(ts);
         self
@@ -82,12 +80,10 @@ impl FakeHandles {
         }
     }
 
-    #[allow(dead_code, reason = "exercised by the stitched-session tests")]
     async fn set_history(&self, events: Vec<MarketEvent>) {
         self.state.lock().await.history = events;
     }
 
-    #[allow(dead_code, reason = "exercised by the stitched-session tests")]
     fn fetched(&self) -> Vec<(i64, i64)> {
         self.fetched.lock().unwrap().clone()
     }
@@ -294,5 +290,223 @@ async fn overflow_reports_one_gap_and_tap_log_captures_everything() {
         }
     }
     assert_eq!(survivors, vec![(700, 1), (800, 2), (900, 3), (1000, 4)]);
+    let _ = session.close().await;
+}
+
+fn key(from: i64, to: i64) -> CacheKey {
+    CacheKey {
+        instrument: inst("AAPL"),
+        kind: EventKind::Trade,
+        from: Timestamp(from),
+        to: Timestamp(to),
+    }
+}
+
+/// Drain `n` data events (collecting any Gap spans seen on the way) from a
+/// stream, returning (`source_ts`, seq) pairs in arrival order.
+async fn drain_data(
+    stream: &mut datamancer::EventStream,
+    n: usize,
+) -> (Vec<(i64, u64)>, Vec<(i64, i64)>) {
+    let mut data = Vec::new();
+    let mut gaps = Vec::new();
+    while data.len() < n {
+        let ev = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out draining stream")
+            .expect("stream ended early");
+        match ev {
+            MarketEvent::Trade(t) => data.push((t.source_ts.0, t.seq.0)),
+            MarketEvent::Control(c) => {
+                if let ControlKind::Gap { span, .. } = c.kind {
+                    gaps.push((span.from_source_ts.0, span.to_source_ts.0));
+                }
+            }
+            _ => {}
+        }
+    }
+    (data, gaps)
+}
+
+#[tokio::test]
+async fn stitched_session_splices_cache_provider_and_live_in_order() {
+    // Cache holds [0, 500) with trades at 100, 300. The provider serves the
+    // rest of the backfill (600, 900). Live trades are pushed while the
+    // gated fetch is held open, proving the pending-live buffering.
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    cache
+        .store(&key(0, 500), &[trade(100), trade(300)])
+        .await
+        .unwrap();
+
+    let gate = Arc::new(Notify::new());
+    let (provider, handles) = FakeProvider::new("fake");
+    let provider = provider.gated(gate.clone());
+    handles.set_history(vec![trade(600), trade(900)]).await;
+
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: Some(Timestamp(0)),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+
+    // The fetch is gated open: these arrive live, mid-backfill, and must be
+    // buffered to splice in AFTER the backfill output.
+    handles.push_live(trade(5_000)).await;
+    handles.push_live(trade(6_000)).await;
+    gate.notify_one();
+
+    let (data, gaps) = drain_data(&mut stream, 6).await;
+    // Backfill in source_ts order (cache then provider gap), then the live
+    // tail in arrival order; seq contiguous across both seams; no Gap.
+    assert_eq!(
+        data,
+        vec![
+            (100, 0),
+            (300, 1),
+            (600, 2),
+            (900, 3),
+            (5_000, 4),
+            (6_000, 5)
+        ]
+    );
+    assert!(gaps.is_empty(), "healthy seam emits no synthetic control");
+
+    // Provider was asked only for the uncovered [500, B) — B is the
+    // wall-clock live edge, far above the test timestamps.
+    let fetched = handles.fetched();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].0, 500);
+    assert!(fetched[0].1 > 900, "fetch bound is the live edge B");
+
+    // Edge-conservative claim: coverage stops at last_event_ts + 1 (901),
+    // so [901, 1000) is still reported as a gap (spec test 7).
+    let remaining = cache.gaps(&key(0, 1000)).await.unwrap();
+    assert_eq!(
+        remaining,
+        vec![GapSpan {
+            from_source_ts: Timestamp(901),
+            to_source_ts: Timestamp(1000),
+        }]
+    );
+    let _ = session.close().await;
+}
+
+#[tokio::test]
+async fn failed_backfill_gaps_to_the_live_edge_and_live_continues() {
+    let (provider, handles) = FakeProvider::new("fake");
+    let provider = provider.with_fail_at(900);
+    handles.set_history(vec![trade(600), trade(900)]).await;
+
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: Some(Timestamp(0)),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+    handles.push_live(trade(7_000)).await;
+
+    // 600 arrives, the fetch fails at 900, the remainder gaps through to the
+    // live edge B, and the live tail still flows.
+    let (data, gaps) = drain_data(&mut stream, 2).await;
+    assert_eq!(
+        data.iter().map(|d| d.0).collect::<Vec<_>>(),
+        vec![600, 7_000]
+    );
+    assert_eq!(gaps.len(), 1, "exactly one gap for the failed remainder");
+    assert_eq!(gaps[0].0, 601, "gap starts at the confirmed prefix end");
+    assert!(gaps[0].1 > 900, "gap runs through to the live edge B");
+
+    // Coverage claims only the confirmed prefix [0, 601).
+    let remaining = cache.gaps(&key(0, 1000)).await.unwrap();
+    assert_eq!(
+        remaining,
+        vec![GapSpan {
+            from_source_ts: Timestamp(601),
+            to_source_ts: Timestamp(1000),
+        }]
+    );
+    let _ = session.close().await;
+}
+
+#[tokio::test]
+async fn tap_log_captures_only_the_live_tail_of_a_stitched_session() {
+    let gate = Arc::new(Notify::new());
+    let (provider, handles) = FakeProvider::new("fake");
+    let provider = provider.gated(gate.clone());
+    handles.set_history(vec![trade(600), trade(900)]).await;
+
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let log = Arc::new(
+        SurrealTapLog::open(SurrealTapLogConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache)
+        .tap_log_arc(log.clone())
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: Some(Timestamp(0)),
+            },
+            PersistenceOptions::cached().with_tap_log(true),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+    handles.push_live(trade(5_000)).await; // live, mid-backfill: tapped
+    gate.notify_one();
+
+    let (data, _gaps) = drain_data(&mut stream, 3).await;
+    assert_eq!(
+        data.iter().map(|d| d.0).collect::<Vec<_>>(),
+        vec![600, 900, 5_000]
+    );
+
+    // Only the live tail is tapped — backfill events land in the cache, not
+    // the tap log (live-tail-only decision; no seq rebase ever needed).
+    assert_eq!(wait_for_tapped(&log, 1).await, vec![5_000]);
     let _ = session.close().await;
 }

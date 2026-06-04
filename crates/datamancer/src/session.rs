@@ -304,6 +304,7 @@ impl Datamancer {
             historical_cache: self.inner.historical_cache.clone(),
             sink,
             ring_capacity: self.inner.resume_buffer_events,
+            in_backfill: false,
         };
 
         let drop_guard = match scope {
@@ -710,6 +711,10 @@ struct Controller {
     sink: Sink,
     /// Capacity for rings created on detach (from the builder knob).
     ring_capacity: usize,
+    /// True while the stitched-session backfill phase is forwarding
+    /// historical events: gates the tap tee so the log captures the live
+    /// tail only (backfill data belongs to the cache).
+    in_backfill: bool,
 }
 
 impl Controller {
@@ -1125,10 +1130,84 @@ impl Controller {
         self.finish_historical(cmd_rx).await;
     }
 
+    /// Phases 1–2 of a stitched live session: plan `[from, B)` exactly like
+    /// the historical read-through path (whole-range gap when there is no
+    /// cache or `read_cache` is off), stream the segments while buffering
+    /// live arrivals, then drain the buffer at the seam. Returns `false`
+    /// when the controller must exit (Close command / Session dropped).
+    async fn run_backfill(
+        &mut self,
+        from: Timestamp,
+        provider_rx: &mut mpsc::Receiver<MarketEvent>,
+        cmd_rx: &mut mpsc::Receiver<SessionCommand>,
+        drop_rx: &mut oneshot::Receiver<()>,
+    ) -> bool {
+        let edge = wall_clock_ts();
+        if from >= edge {
+            return true;
+        }
+        let options = *self
+            .inner
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned");
+
+        let whole = vec![GapSpan {
+            from_source_ts: from,
+            to_source_ts: edge,
+        }];
+        let gaps = match (&self.historical_cache, options.read_cache) {
+            (Some(cache), true) => {
+                let plan_key = CacheKey {
+                    instrument: self.inner.instrument.clone(),
+                    kind: self.inner.kind,
+                    from,
+                    to: edge,
+                };
+                match cache.gaps(&plan_key).await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::warn!(
+                            instrument = %self.inner.instrument,
+                            error = %e,
+                            "cache gaps() failed; treating whole backfill as a gap"
+                        );
+                        whole
+                    }
+                }
+            }
+            _ => whole,
+        };
+        let segments = tile(from, edge, &gaps);
+
+        let mut pending = EventRing::new(self.ring_capacity);
+        self.in_backfill = true;
+        let outcome = self
+            .stream_segments(
+                segments,
+                options,
+                cmd_rx,
+                Some(BackfillSide {
+                    provider_rx,
+                    pending: &mut pending,
+                    drop_rx,
+                    edge,
+                }),
+            )
+            .await;
+        self.in_backfill = false;
+        if outcome == SegmentOutcome::Closed {
+            return false;
+        }
+        // The seam: live arrivals buffered during the backfill, in arrival
+        // order (already teed at receipt — flush_ring goes through emit).
+        self.flush_ring(pending).await;
+        true
+    }
+
     /// Live scope: subscribe (already done by the caller), drain provider
     /// events through the seq/forward pipeline, honor commands, auto-close
     /// when the Session handle drops (via `drop_rx`).
-    /// Backfill seam is stubbed — see module-level TODO.
     async fn run_live(
         mut self,
         live: Box<dyn LiveHandle>,
@@ -1137,15 +1216,23 @@ impl Controller {
         mut cmd_rx: mpsc::Receiver<SessionCommand>,
         mut drop_rx: oneshot::Receiver<()>,
     ) {
-        if let Some(from) = backfill_from {
-            // TODO(resume-primitive): replay from persistence across the seam.
-            // For now surface a placeholder Gap [from, now) so consumers can
-            // see the seam; live events follow.
-            let now = wall_clock_ts();
-            self.emit_gap(now, from, now).await;
-        }
-
         let live = Arc::new(Mutex::new(Some(live)));
+        if let Some(from) = backfill_from
+            && !self
+                .run_backfill(from, &mut provider_rx, &mut cmd_rx, &mut drop_rx)
+                .await
+        {
+            // `stream_segments` already ran shutdown() on the Closed path —
+            // only release the provider subscription here, never re-shutdown
+            // (a second SessionClosing would be emitted).
+            if let Some(h) = live.lock().await.take() {
+                let _ = h
+                    .unsubscribe(self.inner.instrument.clone(), self.inner.kind)
+                    .await;
+                let _ = h.close().await;
+            }
+            return;
+        }
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
@@ -1203,9 +1290,13 @@ impl Controller {
 
     /// Tee a data event to the tap log (when configured for live capture),
     /// then hand it toward the consumer. `seq` is stamped downstream at
-    /// delivery, in `EventStream::poll_next`.
+    /// delivery, in `EventStream::poll_next`. During the backfill phase
+    /// (`in_backfill == true`) the tee is suppressed so only the live tail
+    /// lands in the log; backfill data belongs to the cache.
     async fn forward(&mut self, ev: MarketEvent) {
-        self.tee(&ev).await;
+        if !self.in_backfill {
+            self.tee(&ev).await;
+        }
         self.emit(ev).await;
     }
 
@@ -1346,12 +1437,13 @@ enum SegmentOutcome {
     /// remaining segments abandoned — the scope's normal continuation applies.
     Done,
     /// A Close command or Session drop ended the controller mid-stream.
+    /// `shutdown()` has already run on this path — callers must not call it
+    /// again (a second `SessionClosing` would be emitted).
     Closed,
 }
 
 /// Live-side plumbing threaded through `stream_segments` by the backfill
 /// phase of a stitched session. `None` on the plain historical path.
-#[allow(dead_code, reason = "constructed by the backfill task that follows")]
 struct BackfillSide<'a> {
     /// Live arrivals during the backfill; teed at receipt and buffered in
     /// `pending` so they splice in after the backfill output.
