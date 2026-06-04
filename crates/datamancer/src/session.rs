@@ -8,15 +8,20 @@
 //!
 //! # Lifecycle
 //!
-//! [`Session::take_events`] is **single-shot** in this iteration. The first
-//! call hands the consumer the [`EventStream`]; subsequent calls return
-//! [`Error::EventsAlreadyTaken`] whether or not the stream is still alive.
-//! Re-take after drop, plus the historical→live backfill seam, both depend
-//! on the resume primitive (query persistence for everything since
-//! `last_emitted_source_ts`, emit a [`ControlKind::Gap`] for what's missing,
-//! then continue live). Until that lands, dropping a Live session's stream
-//! tears the session down; if you want to keep events flowing, hold the
-//! stream.
+//! [`Session::take_events`] is **multi-shot for live scope**: dropping the
+//! stream detaches the consumer while the session keeps running (and
+//! recording, when configured); a later call re-attaches, first surfacing a
+//! single [`ControlKind::Gap`] for anything the bounded resume buffer had to
+//! evict. The `Session` handle anchors a live session's lifetime — dropping
+//! it (or calling [`Session::close`]) tears the session down even while a
+//! stream is held. Historical sessions stay single-shot and fetch-anchored.
+//!
+//! `Scope::Live { backfill_from: Some(t) }` runs a real backfill over
+//! `[t, B)` (B = the wall-clock live edge at session start) through the
+//! historical read-through machinery, buffering live arrivals and splicing
+//! them in after the backfill output. A healthy seam emits no synthetic
+//! control; `Gap` appears only for real, known loss (fetch failure, buffer
+//! overflow).
 //!
 //! Recording (write-through to persistence) is a separate axis. It defaults
 //! to whatever was passed at construction and can be toggled at runtime via
@@ -24,8 +29,9 @@
 //!
 //! # Auto-cleanup
 //!
-//! - **Live**: alive while the [`EventStream`] is held. Once the consumer
-//!   drops it, the session unsubscribes upstream and shuts down.
+//! - **Live**: alive while the `Session` handle is held. Dropping the handle
+//!   unsubscribes upstream and shuts down; dropping just the `EventStream`
+//!   only detaches the consumer.
 //! - **Historical**: alive while the fetch is running. After the fetch
 //!   completes the controller waits for the held stream to drain (or drop)
 //!   and then shuts down. If the consumer never took the stream, the
@@ -33,24 +39,6 @@
 //!   nobody to drain to.
 //!
 //! Explicit [`Session::close`] is always available for forced termination.
-//!
-//! # Status
-//!
-//! This is the captured-API-shape stage. Several internals are explicitly
-//! stubbed and marked with TODO:
-//!
-//! - **Resume primitive.** Re-take after drop and the historical→live seam
-//!   on stitched sessions both currently surface a single placeholder Gap
-//!   rather than replaying-from-persistence. Once the resume primitive
-//!   lands, [`Session::take_events`] will accept multiple calls (returning
-//!   the receiver to the slot on `EventStream` drop), and stitched sessions
-//!   will replay through the gap.
-//! - **Historical cache (wired).** Historical sessions with
-//!   `PersistenceOptions` read/write axes serve covered ranges from the
-//!   `HistoricalCache` and write fetched gaps back (see
-//!   [`Controller::run_historical_cached`]).
-//! - **Live tap log (stubbed).** Live events are not yet written to a
-//!   `TapLog`; that write-through lands with the resume primitive.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};

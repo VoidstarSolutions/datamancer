@@ -146,7 +146,7 @@ fn key(from: i64, to: i64) -> CacheKey {
 
 /// Drain a historical session to completion, returning bar `source_ts`/`seq` pairs
 /// (in arrival order) and any Gap control spans seen.
-async fn drain(session: &mut datamancer::Session) -> (Vec<(i64, u64)>, Vec<(i64, i64)>) {
+async fn drain(session: &datamancer::Session) -> (Vec<(i64, u64)>, Vec<(i64, i64)>) {
     let mut stream = session.take_events().await.unwrap();
     let mut bars = Vec::new();
     let mut gaps = Vec::new();
@@ -183,7 +183,7 @@ async fn cold_fetch_populates_cache_and_streams_in_order() {
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst(),
             EventKind::Bar(BarInterval::OneMinute),
@@ -196,7 +196,7 @@ async fn cold_fetch_populates_cache_and_streams_in_order() {
         .await
         .unwrap();
 
-    let (bars, gaps) = drain(&mut session).await;
+    let (bars, gaps) = drain(&session).await;
     assert_eq!(
         bars,
         vec![(100, 0), (200, 1), (300, 2)],
@@ -230,7 +230,7 @@ async fn fully_cached_serves_without_touching_provider() {
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst(),
             EventKind::Bar(BarInterval::OneMinute),
@@ -243,7 +243,7 @@ async fn fully_cached_serves_without_touching_provider() {
         .await
         .unwrap();
 
-    let (bars, gaps) = drain(&mut session).await;
+    let (bars, gaps) = drain(&session).await;
     assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 900]);
     // seq is reassigned on the pure cache-replay branch (stored bars carry
     // Seq(0)); pin it so a stored-seq passthrough regression is caught here too.
@@ -277,7 +277,7 @@ async fn partial_overlap_fetches_only_the_gaps_and_merges_in_order() {
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst(),
             EventKind::Bar(BarInterval::OneMinute),
@@ -290,7 +290,7 @@ async fn partial_overlap_fetches_only_the_gaps_and_merges_in_order() {
         .await
         .unwrap();
 
-    let (bars, gaps) = drain(&mut session).await;
+    let (bars, gaps) = drain(&session).await;
     // Cached (350,550) spliced with fetched (100,250,700,900), ordered.
     assert_eq!(
         bars.iter().map(|b| b.0).collect::<Vec<_>>(),
@@ -326,7 +326,7 @@ async fn failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes() 
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst(),
             EventKind::Bar(BarInterval::OneMinute),
@@ -339,7 +339,7 @@ async fn failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes() 
         .await
         .unwrap();
 
-    let (bars, gaps) = drain(&mut session).await;
+    let (bars, gaps) = drain(&session).await;
     // Only 100 and 200 were forwarded before the failure at 300.
     assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 200]);
     // A Gap was emitted for the unfetched remainder [201, 1000).
@@ -364,7 +364,7 @@ async fn failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes() 
         .historical_cache_arc(cache.clone())
         .build()
         .unwrap();
-    let mut session2 = dm2
+    let session2 = dm2
         .session(
             inst(),
             EventKind::Bar(BarInterval::OneMinute),
@@ -376,7 +376,7 @@ async fn failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes() 
         )
         .await
         .unwrap();
-    let (bars2, gaps2) = drain(&mut session2).await;
+    let (bars2, gaps2) = drain(&session2).await;
     assert_eq!(
         bars2.iter().map(|b| b.0).collect::<Vec<_>>(),
         vec![100, 200, 300, 400]
@@ -401,7 +401,7 @@ async fn read_only_fetches_gaps_but_does_not_persist() {
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst(),
             EventKind::Bar(BarInterval::OneMinute),
@@ -414,7 +414,7 @@ async fn read_only_fetches_gaps_but_does_not_persist() {
         .await
         .unwrap();
 
-    let (bars, _gaps) = drain(&mut session).await;
+    let (bars, _gaps) = drain(&session).await;
     assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 200]);
     // The gap was fetched...
     assert_eq!(*fetched.lock().unwrap(), vec![(0, 1000)]);
@@ -441,7 +441,7 @@ async fn refresh_refetches_whole_range_despite_coverage() {
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst(),
             EventKind::Bar(BarInterval::OneMinute),
@@ -454,7 +454,7 @@ async fn refresh_refetches_whole_range_despite_coverage() {
         .await
         .unwrap();
 
-    let (bars, gaps) = drain(&mut session).await;
+    let (bars, gaps) = drain(&session).await;
     // Served from the provider (fresh), not the stale cached 500/99.0.
     assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 900]);
     // Whole range was re-fetched despite existing coverage.

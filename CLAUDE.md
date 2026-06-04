@@ -36,7 +36,10 @@ These are load-bearing design rules — violating them breaks downstream consume
 - **Single ordered stream.** A `Session` exposes exactly one `events()` stream merging all subscriptions. Per-instrument demux is a consumer concern.
 - **Three timestamp fields, distinct roles** (on every data event):
   - `source_ts` — provider-reported market time. **Only** field engine logic should reason about. Never assigned by datamancer.
-  - `seq: u64` — session-monotonic, assigned by datamancer at receipt. **The sole ordering field.** Live: arrival order. Historical fetch: source-timestamp order. `seq` is a pure total-order key: contiguous by construction (datamancer numbers only events it received, so a provider-side drop is invisible at this layer — it is never a hole in `seq`). It carries no drop-detection role. Real gaps are a `source_ts`/coverage concept surfaced as in-band `Control::Gap` events, which themselves occupy a `seq` slot. The tap log owns its own canonical `seq` and may rebase it on splice.
+  - `seq: u64` — session-monotonic, stamped by datamancer at delivery into
+    the consumer stream (`EventStream` stamps on poll from a counter shared
+    across re-takes; arrival order is preserved). **The sole ordering field.** Live: arrival order. Historical fetch: source-timestamp order. `seq` is a pure total-order key: contiguous by construction (datamancer numbers only events it received, so a provider-side drop is invisible at this layer — it is never a hole in `seq`). It carries no drop-detection role. Real gaps are a `source_ts`/coverage concept surfaced as in-band `Control::Gap` events, which themselves occupy a `seq` slot. Likewise resume-buffer overflow: evicted events are never numbered and
+    are surfaced as an in-band `Control::Gap`, never a `seq` hole. The tap log owns its own canonical `seq` and may rebase it on splice.
   - `rx_ts` — wall-clock at byte receipt. **Observability only.** Engine decision logic must never depend on it (re-introduces wall-clock non-determinism). Collapses to `source_ts` in pure-historical replay.
 - **`Control` events ride the data stream.** Connectivity changes, gaps, subscription state — all in-band, not a side channel.
 - **No timestamp re-sort.** Events emit in arrival order, not re-sorted by `source_ts`. Consumers needing strict timestamp ordering buffer themselves.
@@ -46,4 +49,8 @@ These are load-bearing design rules — violating them breaks downstream consume
 
 ## Scope reminders
 
-Datamancer produces events; it is **not** an analysis framework, time-series store, or cross-venue reconciler. Persistence (tap log, historical fetch cache, local replay source) is in scope but deferred — keep the session API free of choices that would preclude transparently teeing live to a tap log or serving historical fetches from cache.
+Datamancer produces events; it is **not** an analysis framework, time-series store, or cross-venue reconciler. Persistence is wired: historical read-through cache, live tap-log
+write-through, and the resume primitive (multi-shot `take_events`,
+historical→live backfill seam) are implemented. Remaining deferred: cache
+volume/eviction and tap-log `seq` rebase (unexercised — appends are strictly
+end-of-log). Keep the session API free of choices that would preclude local replay-source integration.

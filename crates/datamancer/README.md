@@ -19,7 +19,7 @@ The first supported provider is Alpaca. Provider integration is meant to be addi
 - **Replay.** Presenting historical or persisted data as an ordered event stream that is indistinguishable in shape from a live stream. Replay always runs as fast as the consumer can drain it.
 - **Stitched streams.** "Backfill the last N days, then continue with live" is a first-class operation, not something the consumer assembles by hand.
 - **Connectivity reporting.** Gaps, reconnects, subscription state changes, and provider errors are reported in-band as event-stream entries, not via side channels.
-- **Persistence (in scope, deferred).** A live tap log of received events, a local cache of historical fetches, and replay from either of those, all eventually first-class. Not yet implemented; the API is being kept free of choices that would preclude these later.
+- **Persistence.** A live tap log of received events and a local cache of historical fetches are implemented and first-class. Replay from a tap log is in scope; the session API is kept free of choices that would preclude it.
 
 ## What Datamancer Does Not Do
 
@@ -139,11 +139,33 @@ range is legitimately covered (markets close; symbols have an inception date).
 ### Deferred
 
 Cache **volume** is not yet bounded — a very large fetch can fill the disk; no
-eviction or granularity policy exists. The live **tap log** and the
-**resume primitive** (replay-on-retake, historical→live backfill seam) are
-tracked separately and not yet wired.
+eviction or granularity policy exists.
 
 See `examples/cached_history.rs` for a runnable, credential-free demo.
+
+## Resume
+
+Live sessions survive consumer absence. The `Session` handle is the lifecycle
+anchor: hold it and the session keeps running (and recording, when
+configured) whether or not a stream is attached. `take_events` is async and
+multi-shot for live scope — drop the stream, re-take later, and delivery
+resumes from a bounded in-memory buffer (`DatamancerBuilder::resume_buffer_events`,
+default 65 536 events). If the buffer overflowed, one
+in-band `Control::Gap` reports exactly the evicted span before the survivors
+flow. `seq` is stamped at delivery from a counter shared across re-takes, so
+the delivered stream is always contiguous — an evicted event is a reported
+gap, never a `seq` hole.
+
+`Scope::Live { backfill_from: Some(t) }` stitches history ahead of the live
+tail: the window `[t, live-edge)` is served through the historical
+read-through path (cache + provider gap-fetch, honoring the session's
+`read_cache`/`write_cache` axes) while live arrivals buffer; the seam drains
+in arrival order. Coverage for the segment touching the live edge is claimed
+conservatively (history endpoints lag the live feed), so a later request
+re-fetches the sliver instead of permanently masking it. The tap log captures
+only the live tail — backfill data belongs to the cache.
+
+See `examples/resume.rs` for a runnable, credential-free demo.
 
 ## Non-goals
 
