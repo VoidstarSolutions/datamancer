@@ -967,7 +967,11 @@ impl Controller {
                     let fetch_task =
                         tokio::spawn(async move { provider.fetch_history(request, tx).await });
 
+                    // `batch` exists solely for the cache write; coverage
+                    // claims need only the max data `source_ts` seen.
+                    let store = options.write_cache && self.historical_cache.is_some();
                     let mut batch: Vec<MarketEvent> = Vec::new();
+                    let mut max_data_ts: Option<Timestamp> = None;
                     loop {
                         tokio::select! {
                             cmd = cmd_rx.recv() => {
@@ -993,7 +997,8 @@ impl Controller {
                             ev = rx.recv() => {
                                 match ev {
                                     Some(ev) => {
-                                        batch.push(ev.clone());
+                                        max_data_ts = max_data_ts.max(data_source_ts(&ev));
+                                        if store { batch.push(ev.clone()); }
                                         self.forward(ev).await;
                                     }
                                     None => break,
@@ -1010,7 +1015,7 @@ impl Controller {
                         // seconds. Claim only through the last received event;
                         // the unmaterialized sliver stays a gap.
                         let claim_to = if edge == Some(t) {
-                            confirmed_prefix_end(&batch, f, t)
+                            confirmed_prefix_end(max_data_ts, f, t)
                         } else {
                             t
                         };
@@ -1035,7 +1040,7 @@ impl Controller {
                         // Honest coverage: claim only the confirmed prefix of
                         // [f, t); the unfetched remainder is gapped through to
                         // the live edge when one exists.
-                        let confirmed_to = confirmed_prefix_end(&batch, f, t);
+                        let confirmed_to = confirmed_prefix_end(max_data_ts, f, t);
                         if options.write_cache
                             && let Some(cache) = &self.historical_cache
                         {
@@ -1466,13 +1471,8 @@ async fn session_dropped(rx: &mut Option<&mut oneshot::Receiver<()>>) {
 
 /// Largest data-event `source_ts` in `batch` + 1, clamped to `[f, t)`; `f`
 /// when no data events arrived. The confirmed contiguous prefix of a fetch.
-fn confirmed_prefix_end(batch: &[MarketEvent], f: Timestamp, t: Timestamp) -> Timestamp {
-    batch
-        .iter()
-        .filter_map(data_source_ts)
-        .map(|ts| ts.0)
-        .max()
-        .map_or(f, |m| Timestamp(m.saturating_add(1).clamp(f.0, t.0)))
+fn confirmed_prefix_end(max_data_ts: Option<Timestamp>, f: Timestamp, t: Timestamp) -> Timestamp {
+    max_data_ts.map_or(f, |m| Timestamp(m.0.saturating_add(1).clamp(f.0, t.0)))
 }
 
 /// Partition `[from, to)` into ordered, disjoint segments. `gaps` are the
@@ -1509,9 +1509,11 @@ fn tile(from: Timestamp, to: Timestamp, gaps: &[datamancer_core::GapSpan]) -> Ve
 ///
 /// While no consumer stream is attached, the controller buffers events here.
 /// Pushing beyond capacity evicts the oldest event and extends `dropped` to
-/// cover the evicted event's `source_ts`; the span is surfaced as one in-band
-/// [`ControlKind::Gap`] when a consumer (re)attaches. Evicted events are never
-/// `seq`-stamped, so an overflow is a reported gap — never a `seq` hole.
+/// cover the evicted event's `source_ts` (an evicted [`ControlKind::Gap`]
+/// contributes its embedded span instead, so eviction never erases loss
+/// accounting); the span is surfaced as one in-band [`ControlKind::Gap`] when
+/// a consumer (re)attaches. Evicted events are never `seq`-stamped, so an
+/// overflow is a reported gap — never a `seq` hole.
 struct EventRing {
     capacity: usize,
     buf: std::collections::VecDeque<MarketEvent>,
@@ -1536,20 +1538,31 @@ impl EventRing {
         self.buf.push_back(ev);
     }
 
-    /// Extend the dropped span over an evicted event. Only data events count:
-    /// a control's wall-clock `source_ts` would skew the market-data span.
+    /// Extend the dropped span over an evicted event. Data events count via
+    /// their `source_ts`; an evicted `Control::Gap` contributes its embedded
+    /// span (it carries real loss accounting — eviction must not erase it).
+    /// Other controls are skipped: their wall-clock `source_ts` would skew
+    /// the market-data span.
     fn note_drop(&mut self, ev: &MarketEvent) {
-        let Some(ts) = data_source_ts(ev) else { return };
-        let next = Timestamp(ts.0.saturating_add(1));
+        let (from, to) = if let MarketEvent::Control(Control {
+            kind: ControlKind::Gap { span, .. },
+            ..
+        }) = ev
+        {
+            (span.from_source_ts, span.to_source_ts)
+        } else {
+            let Some(ts) = data_source_ts(ev) else { return };
+            (ts, Timestamp(ts.0.saturating_add(1)))
+        };
         match &mut self.dropped {
             Some(span) => {
-                span.from_source_ts = span.from_source_ts.min(ts);
-                span.to_source_ts = span.to_source_ts.max(next);
+                span.from_source_ts = span.from_source_ts.min(from);
+                span.to_source_ts = span.to_source_ts.max(to);
             }
             None => {
                 self.dropped = Some(GapSpan {
-                    from_source_ts: ts,
-                    to_source_ts: next,
+                    from_source_ts: from,
+                    to_source_ts: to,
                 });
             }
         }
@@ -1722,6 +1735,23 @@ mod event_ring_tests {
         })
     }
 
+    fn gap_control(ts: i64, from: i64, to: i64) -> MarketEvent {
+        use datamancer_core::GapSpan;
+        MarketEvent::Control(Control {
+            source_ts: Timestamp(ts),
+            rx_ts: Timestamp(ts),
+            seq: Seq(0),
+            kind: ControlKind::Gap {
+                provider: "t".to_string(),
+                instrument: Instrument::new(ProviderId::from_static("t"), AssetClass::Equity, "X"),
+                span: GapSpan {
+                    from_source_ts: Timestamp(from),
+                    to_source_ts: Timestamp(to),
+                },
+            },
+        })
+    }
+
     fn tss(events: &std::collections::VecDeque<MarketEvent>) -> Vec<i64> {
         events
             .iter()
@@ -1783,6 +1813,35 @@ mod event_ring_tests {
         assert_eq!(span.from_source_ts.0, 100);
         assert_eq!(span.to_source_ts.0, 101);
         assert_eq!(tss(&events), vec![200]);
+    }
+
+    #[test]
+    fn evicted_gap_control_preserves_its_span() {
+        // A buffered Control::Gap carries real loss accounting (e.g. it was
+        // re-buffered after a failed flush). Evicting it must not erase that
+        // record: its embedded span survives as the ring's dropped span.
+        let mut ring = EventRing::new(1);
+        ring.push(gap_control(999, 100, 201));
+        ring.push(trade(500)); // evicts the gap control
+        let (dropped, events) = ring.into_parts();
+        let span = dropped.expect("evicted gap control must preserve its span");
+        assert_eq!(span.from_source_ts.0, 100);
+        assert_eq!(span.to_source_ts.0, 201);
+        assert_eq!(tss(&events), vec![500]);
+    }
+
+    #[test]
+    fn evicted_gap_control_span_merges_with_evicted_data() {
+        let mut ring = EventRing::new(1);
+        ring.push(gap_control(999, 100, 201));
+        ring.push(trade(300)); // evicts the gap control
+        ring.push(trade(400)); // evicts trade 300
+        let (dropped, events) = ring.into_parts();
+        let span = dropped.expect("span");
+        // Union of the gap control's [100, 201) and evicted trade's [300, 301).
+        assert_eq!(span.from_source_ts.0, 100);
+        assert_eq!(span.to_source_ts.0, 301);
+        assert_eq!(tss(&events), vec![400]);
     }
 
     #[test]
