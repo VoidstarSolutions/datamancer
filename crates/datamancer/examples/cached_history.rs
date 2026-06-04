@@ -106,7 +106,7 @@ fn instrument(symbol: &str) -> Instrument {
 }
 
 async fn run_once(dm: &Datamancer, label: &str) -> usize {
-    let mut session: Session = dm
+    let session: Session = dm
         .session(
             instrument("ACME"),
             EventKind::Bar(BarInterval::OneDay),
@@ -118,7 +118,7 @@ async fn run_once(dm: &Datamancer, label: &str) -> usize {
         )
         .await
         .expect("open session");
-    let mut stream = session.take_events().expect("take events");
+    let mut stream = session.take_events().await.expect("take events");
     let mut bars = 0usize;
     while let Some(ev) = stream.next().await {
         match ev {

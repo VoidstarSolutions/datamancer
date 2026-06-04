@@ -264,14 +264,27 @@ impl Datamancer {
             None
         };
 
-        let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(8);
+
+        // Historical sessions pre-create the consumer channel (single-shot
+        // take from the slot). Live sessions start Detached and attach via
+        // SessionCommand::Take, so events before the first take are buffered.
+        let (sink, events_slot) = match scope {
+            Scope::Historical { .. } => {
+                let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
+                (Sink::Attached(events_tx), Some(events_rx))
+            }
+            Scope::Live { .. } => (
+                Sink::Detached(EventRing::new(self.inner.resume_buffer_events)),
+                None,
+            ),
+        };
 
         let inner = Arc::new(SessionInner {
             instrument: instrument.clone(),
             kind,
             scope,
-            events_holder: Mutex::new(SessionStreamSlot::Available(events_rx)),
+            events_holder: Mutex::new(events_slot),
             persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
             cmd_tx,
@@ -279,9 +292,9 @@ impl Datamancer {
         });
 
         // Provider tasks push raw events into `provider_tx`. The controller
-        // drains `provider_rx`, stamps seq, optionally tees to persistence,
-        // and forwards to the consumer-facing `events_tx`. Keeping these
-        // separate is what gives the controller a place to interpose.
+        // drains `provider_rx`, optionally tees to persistence, and forwards
+        // to the consumer-facing sink. Keeping these separate is what gives
+        // the controller a place to interpose.
         let (provider_tx, provider_rx) = mpsc::channel::<MarketEvent>(default_buffer());
 
         let controller = Controller {
@@ -289,24 +302,34 @@ impl Datamancer {
             provider: provider.clone(),
             tap_log: self.inner.tap_log.clone(),
             historical_cache: self.inner.historical_cache.clone(),
-            sink: Sink::Attached(events_tx),
+            sink,
             ring_capacity: self.inner.resume_buffer_events,
         };
 
-        match scope {
+        let drop_guard = match scope {
             Scope::Historical { from, to } => {
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
+                None
             }
             Scope::Live { backfill_from } => {
                 let live = provider.start_live(provider_tx).await?;
                 live.subscribe(instrument.clone(), kind).await?;
-                tokio::spawn(controller.run_live(live, backfill_from, provider_rx, cmd_rx));
+                let (drop_tx, drop_rx) = oneshot::channel::<()>();
+                tokio::spawn(controller.run_live(
+                    live,
+                    backfill_from,
+                    provider_rx,
+                    cmd_rx,
+                    drop_rx,
+                ));
+                Some(drop_tx)
             }
-        }
+        };
 
         Ok(Session {
             inner,
             _registry_anchor: registry_anchor,
+            _drop_guard: drop_guard,
         })
     }
 
@@ -478,15 +501,20 @@ pub struct Session {
     /// On drop, [`RegistrySentinel::drop`] clears the slot if no successor has
     /// taken it.
     _registry_anchor: Option<Arc<RegistrySentinel>>,
+    /// Dropped (without firing) when this handle drops; the live controller
+    /// treats closure of this channel as the teardown signal. `None` for
+    /// `Scope::Historical`, whose lifecycle stays fetch/stream-anchored.
+    _drop_guard: Option<oneshot::Sender<()>>,
 }
 
 struct SessionInner {
     instrument: Instrument,
     kind: EventKind,
     scope: Scope,
-    /// Holder for the consumer-facing receiver. Available when no stream is
-    /// held; Taken when a stream is currently outstanding.
-    events_holder: Mutex<SessionStreamSlot>,
+    /// Holder for the consumer-facing receiver. `Some` when no stream is
+    /// held (historical scope only — pre-created); `None` when taken or for
+    /// live sessions (which attach via `SessionCommand::Take`).
+    events_holder: Mutex<Option<mpsc::Receiver<MarketEvent>>>,
     persistence: std::sync::Mutex<PersistenceOptions>,
     /// Set to true the first (and only) time `take_events` succeeds. The
     /// historical controller reads it after fetch completion: if the consumer
@@ -500,49 +528,56 @@ struct SessionInner {
     seq_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
-enum SessionStreamSlot {
-    Available(mpsc::Receiver<MarketEvent>),
-    Taken,
-}
-
 impl Session {
-    /// Take the event stream. **Single-shot in this iteration**: the first
-    /// call returns the stream; every subsequent call returns
-    /// [`Error::EventsAlreadyTaken`], whether or not the original stream is
-    /// still alive.
+    /// Take the event stream.
     ///
-    /// Re-take after drop is gated on the resume primitive landing (see the
-    /// module-level `# Status`). Once it does, this method will accept
-    /// multiple calls — each new take will query persistence for
-    /// `(last_emitted_source_ts, now]`, replay what's there, emit a
-    /// [`ControlKind::Gap`] for what isn't (or the entire silence if
-    /// `read_cache` is off), then continue live.
+    /// **Live scope — multi-shot.** The first call attaches a stream; after
+    /// the consumer drops it, a later call re-attaches. Events arriving while
+    /// detached are buffered (bounded — see
+    /// [`DatamancerBuilder::resume_buffer_events`]); on re-attach a single
+    /// [`ControlKind::Gap`] reports anything the buffer had to evict, then
+    /// the buffered events flow, then live continues. Events still sitting
+    /// undelivered in a dropped stream's channel are lost without a gap
+    /// (bounded by the channel buffer); they are never `seq`-stamped, so the
+    /// delivered stream stays contiguous. Drain before dropping if you need
+    /// every event, or record via the tap log.
+    ///
+    /// **Historical scope — single-shot.** The first call returns the
+    /// stream; subsequent calls error.
     ///
     /// # Errors
     ///
-    /// Returns `Error::EventsAlreadyTaken` if the stream has already been
-    /// taken from this session.
-    pub fn take_events(&mut self) -> Result<EventStream> {
-        let mut slot = self
-            .inner
-            .events_holder
-            .try_lock()
-            .map_err(|_| Error::EventsAlreadyTaken)?;
-        match std::mem::replace(&mut *slot, SessionStreamSlot::Taken) {
-            SessionStreamSlot::Available(rx) => {
+    /// - [`Error::EventsAlreadyTaken`] — a previous stream is still
+    ///   outstanding and open (live), or was already taken (historical).
+    /// - [`Error::SessionClosed`] — the controller has shut down.
+    pub async fn take_events(&self) -> Result<EventStream> {
+        let rx = match self.inner.scope {
+            Scope::Historical { .. } => self
+                .inner
+                .events_holder
+                .lock()
+                .await
+                .take()
+                .ok_or(Error::EventsAlreadyTaken)
+                .inspect(|_| {
+                    self.inner
+                        .stream_taken
+                        .store(true, std::sync::atomic::Ordering::Release);
+                })?,
+            Scope::Live { .. } => {
+                let (ack_tx, ack_rx) = oneshot::channel();
                 self.inner
-                    .stream_taken
-                    .store(true, std::sync::atomic::Ordering::Release);
-                Ok(EventStream {
-                    rx,
-                    seq: self.inner.seq_counter.clone(),
-                })
+                    .cmd_tx
+                    .send(SessionCommand::Take(ack_tx))
+                    .await
+                    .map_err(|_| Error::SessionClosed)?;
+                ack_rx.await.map_err(|_| Error::SessionClosed)??
             }
-            SessionStreamSlot::Taken => {
-                *slot = SessionStreamSlot::Taken;
-                Err(Error::EventsAlreadyTaken)
-            }
-        }
+        };
+        Ok(EventStream {
+            rx,
+            seq: self.inner.seq_counter.clone(),
+        })
     }
 
     /// Replace the persistence options at runtime. Affects future writes;
@@ -643,6 +678,7 @@ impl Stream for EventStream {
 #[derive(Debug)]
 enum SessionCommand {
     SetPersistence(PersistenceOptions, oneshot::Sender<Result<()>>),
+    Take(oneshot::Sender<Result<mpsc::Receiver<MarketEvent>>>),
     Close(oneshot::Sender<()>),
 }
 
@@ -666,17 +702,6 @@ enum Sink {
     Detached(EventRing),
 }
 
-impl Sink {
-    /// Resolves when an attached consumer stream is dropped; pends forever
-    /// while detached.
-    async fn consumer_gone(&self) {
-        match self {
-            Sink::Attached(tx) => tx.closed().await,
-            Sink::Detached(_) => std::future::pending().await,
-        }
-    }
-}
-
 struct Controller {
     inner: Arc<SessionInner>,
     provider: Arc<dyn Provider>,
@@ -688,6 +713,39 @@ struct Controller {
 }
 
 impl Controller {
+    /// Validate and perform a (re)attach: refuse while a previous stream is
+    /// outstanding and open, otherwise swap in a fresh channel and hand back
+    /// the prior ring (if any) for flushing.
+    fn prepare_attach(&mut self) -> Result<(mpsc::Receiver<MarketEvent>, Option<EventRing>)> {
+        if let Sink::Attached(tx) = &self.sink
+            && !tx.is_closed()
+        {
+            return Err(Error::EventsAlreadyTaken);
+        }
+        let (tx, rx) = mpsc::channel(default_buffer());
+        let prior = std::mem::replace(&mut self.sink, Sink::Attached(tx));
+        let ring = match prior {
+            Sink::Detached(ring) => Some(ring),
+            Sink::Attached(_) => None,
+        };
+        Ok((rx, ring))
+    }
+
+    /// Drain a ring into the (just-attached) sink: one `Gap` for anything the
+    /// ring evicted, then the buffered events in arrival order. Buffered
+    /// events were already teed at receipt, so this goes through `emit`, not
+    /// `forward`.
+    async fn flush_ring(&mut self, ring: EventRing) {
+        let (dropped, events) = ring.into_parts();
+        if let Some(span) = dropped {
+            self.emit_gap(span.from_source_ts, span.from_source_ts, span.to_source_ts)
+                .await;
+        }
+        for ev in events {
+            self.emit(ev).await;
+        }
+    }
+
     /// Historical scope: spawn the provider's fetch, forward events as they
     /// arrive, exit when fetch completes and the stream is drained or
     /// dropped.
@@ -1007,7 +1065,7 @@ impl Controller {
 
     /// Live scope: subscribe (already done by the caller), drain provider
     /// events through the seq/forward pipeline, honor commands, auto-close
-    /// when the consumer drops the stream and we're not persisting.
+    /// when the Session handle drops (via `drop_rx`).
     /// Backfill seam is stubbed — see module-level TODO.
     async fn run_live(
         mut self,
@@ -1015,6 +1073,7 @@ impl Controller {
         backfill_from: Option<Timestamp>,
         mut provider_rx: mpsc::Receiver<MarketEvent>,
         mut cmd_rx: mpsc::Receiver<SessionCommand>,
+        mut drop_rx: oneshot::Receiver<()>,
     ) {
         if let Some(from) = backfill_from {
             // TODO(resume-primitive): replay from persistence across the seam.
@@ -1044,13 +1103,9 @@ impl Controller {
                     };
                     self.forward(ev).await;
                 }
-                () = self.sink.consumer_gone() => {
-                    // Consumer dropped the stream.
-                    // TODO(persistence): when write-through lands, keep
-                    // running while persistence.write_cache is set so
-                    // recording-only mode is observable. Today, no
-                    // write-through means there's
-                    // nothing useful to do without an emitting consumer.
+                _ = &mut drop_rx => {
+                    // Session handle dropped: the handle is the lifecycle
+                    // anchor, stream or no stream.
                     if let Some(h) = live.lock().await.take() {
                         let _ = h.unsubscribe(self.inner.instrument.clone(), self.inner.kind).await;
                         let _ = h.close().await;
@@ -1124,6 +1179,23 @@ impl Controller {
             Some(SessionCommand::SetPersistence(options, ack)) => {
                 let res = self.apply_persistence(options);
                 let _ = ack.send(res);
+                true
+            }
+            Some(SessionCommand::Take(ack)) => {
+                match self.prepare_attach() {
+                    Ok((rx, prior_ring)) => {
+                        // Hand the receiver over BEFORE flushing: the flush
+                        // can exceed the fresh channel's capacity, and the
+                        // consumer must be able to drain it concurrently.
+                        let _ = ack.send(Ok(rx));
+                        if let Some(ring) = prior_ring {
+                            self.flush_ring(ring).await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = ack.send(Err(e));
+                    }
+                }
                 true
             }
             Some(SessionCommand::Close(ack)) => {
@@ -1285,10 +1357,6 @@ impl EventRing {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "consumed by the re-attach path that follows in Task 4"
-    )]
     fn into_parts(self) -> (Option<GapSpan>, std::collections::VecDeque<MarketEvent>) {
         (self.dropped, self.buf)
     }

@@ -147,7 +147,7 @@ fn key(from: i64, to: i64) -> CacheKey {
 /// Drain a historical session to completion, returning bar `source_ts`/`seq` pairs
 /// (in arrival order) and any Gap control spans seen.
 async fn drain(session: &mut datamancer::Session) -> (Vec<(i64, u64)>, Vec<(i64, i64)>) {
-    let mut stream = session.take_events().unwrap();
+    let mut stream = session.take_events().await.unwrap();
     let mut bars = Vec::new();
     let mut gaps = Vec::new();
     while let Some(ev) = stream.next().await {

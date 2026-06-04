@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for sym in SYMBOLS {
         for kind in [EventKind::Trade, EventKind::Quote] {
-            let mut session = dm
+            let session = dm
                 .session(
                     Instrument::new(
                         ProviderId::from_static("alpaca-crypto"),
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     PersistenceOptions::none(),
                 )
                 .await?;
-            let mut stream = session.take_events()?;
+            let mut stream = session.take_events().await?;
             sessions.push(session);
 
             let state = state.clone();

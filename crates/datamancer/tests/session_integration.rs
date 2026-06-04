@@ -175,7 +175,7 @@ async fn live_session_assigns_monotonic_seq_and_passes_events_through() {
         .provider_arc(provider)
         .build()
         .unwrap();
-    let mut session = dm
+    let session = dm
         .session(
             inst("AAPL"),
             EventKind::Trade,
@@ -186,7 +186,7 @@ async fn live_session_assigns_monotonic_seq_and_passes_events_through() {
         )
         .await
         .unwrap();
-    let mut events = session.take_events().unwrap();
+    let mut events = session.take_events().await.unwrap();
 
     ctrl.push_live(trade("AAPL", 100, 1.0)).await;
     ctrl.push_live(trade("AAPL", 200, 2.0)).await;
@@ -225,7 +225,7 @@ async fn historical_session_streams_provider_fetch_in_order() {
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst("AAPL"),
             EventKind::Bar(BarInterval::OneMinute),
@@ -238,7 +238,7 @@ async fn historical_session_streams_provider_fetch_in_order() {
         .await
         .unwrap();
 
-    let mut stream = session.take_events().unwrap();
+    let mut stream = session.take_events().await.unwrap();
     let mut bars = Vec::new();
     for _ in 0..3 {
         let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
@@ -272,7 +272,7 @@ async fn live_with_backfill_emits_placeholder_seam_gap() {
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst("AAPL"),
             EventKind::Trade,
@@ -283,7 +283,7 @@ async fn live_with_backfill_emits_placeholder_seam_gap() {
         )
         .await
         .unwrap();
-    let mut stream = session.take_events().unwrap();
+    let mut stream = session.take_events().await.unwrap();
 
     let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
@@ -463,7 +463,7 @@ async fn historical_sessions_for_same_pair_are_concurrent() {
 
     // Two concurrent Historical sessions for the same pair both succeed and
     // each independently receive the full fake history.
-    let mut a = dm
+    let a = dm
         .session(
             inst("AAPL"),
             EventKind::Bar(BarInterval::OneMinute),
@@ -475,7 +475,7 @@ async fn historical_sessions_for_same_pair_are_concurrent() {
         )
         .await
         .unwrap();
-    let mut b = dm
+    let b = dm
         .session(
             inst("AAPL"),
             EventKind::Bar(BarInterval::OneMinute),
@@ -488,8 +488,8 @@ async fn historical_sessions_for_same_pair_are_concurrent() {
         .await
         .unwrap();
 
-    let mut sa = a.take_events().unwrap();
-    let mut sb = b.take_events().unwrap();
+    let mut sa = a.take_events().await.unwrap();
+    let mut sb = b.take_events().await.unwrap();
     for stream in [&mut sa, &mut sb] {
         let mut tss = Vec::new();
         for _ in 0..2 {
@@ -545,16 +545,13 @@ async fn historical_and_live_sessions_for_same_pair_coexist() {
 }
 
 #[tokio::test]
-async fn take_events_after_drop_returns_already_taken() {
-    // Captures the documented single-shot semantics: dropping the EventStream
-    // does not return the receiver to the slot, so re-take fails. When the
-    // resume primitive lands this test should flip to assert successful re-take.
-    let (provider, _ctrl) = FakeProvider::new("fake");
+async fn live_stream_retake_resumes_with_contiguous_seq() {
+    let (provider, ctrl) = FakeProvider::new("fake");
     let dm = Datamancer::builder()
         .provider_arc(provider)
         .build()
         .unwrap();
-    let mut session = dm
+    let session = dm
         .session(
             inst("AAPL"),
             EventKind::Trade,
@@ -565,13 +562,42 @@ async fn take_events_after_drop_returns_already_taken() {
         )
         .await
         .unwrap();
-    let stream = session.take_events().unwrap();
-    drop(stream);
-    match session.take_events() {
-        Err(datamancer::Error::EventsAlreadyTaken) => {}
-        Err(other) => panic!("expected EventsAlreadyTaken, got {other:?}"),
-        Ok(_) => panic!("expected EventsAlreadyTaken, got Ok"),
+
+    // First take: receive two events (guarantees the controller processed them).
+    let mut first = session.take_events().await.unwrap();
+    ctrl.push_live(trade("AAPL", 100, 1.0)).await;
+    ctrl.push_live(trade("AAPL", 200, 2.0)).await;
+    let mut seqs = Vec::new();
+    for _ in 0..2 {
+        let ev = tokio::time::timeout(Duration::from_secs(2), first.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if let MarketEvent::Trade(t) = ev {
+            seqs.push((t.source_ts.0, t.seq.0));
+        }
     }
+    drop(first);
+
+    // Events arriving while detached are buffered (or delivered on re-attach
+    // if the take command wins the race — either way order and seq hold).
+    ctrl.push_live(trade("AAPL", 300, 3.0)).await;
+    ctrl.push_live(trade("AAPL", 400, 4.0)).await;
+
+    let mut second = session.take_events().await.unwrap();
+    for _ in 0..2 {
+        let ev = tokio::time::timeout(Duration::from_secs(2), second.next())
+            .await
+            .unwrap()
+            .unwrap();
+        match ev {
+            MarketEvent::Trade(t) => seqs.push((t.source_ts.0, t.seq.0)),
+            other => panic!("expected Trade (no Gap on a clean re-take), got {other:?}"),
+        }
+    }
+    // Arrival order preserved, seq contiguous across the re-take, no Gap.
+    assert_eq!(seqs, vec![(100, 0), (200, 1), (300, 2), (400, 3)]);
+    let _ = session.close().await;
 }
 
 #[tokio::test]
@@ -613,7 +639,7 @@ async fn take_events_twice_concurrently_errors() {
         .provider_arc(provider)
         .build()
         .unwrap();
-    let mut session = dm
+    let session = dm
         .session(
             inst("AAPL"),
             EventKind::Trade,
@@ -624,8 +650,8 @@ async fn take_events_twice_concurrently_errors() {
         )
         .await
         .unwrap();
-    let _stream = session.take_events().unwrap();
-    match session.take_events() {
+    let _stream = session.take_events().await.unwrap();
+    match session.take_events().await {
         Err(datamancer::Error::EventsAlreadyTaken) => {}
         Err(other) => panic!("expected EventsAlreadyTaken, got {other:?}"),
         Ok(_) => panic!("expected EventsAlreadyTaken, got Ok"),
@@ -684,7 +710,7 @@ async fn live_session_tees_data_events_to_tap_log() {
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst("AAPL"),
             EventKind::Trade,
@@ -695,7 +721,7 @@ async fn live_session_tees_data_events_to_tap_log() {
         )
         .await
         .unwrap();
-    let mut stream = session.take_events().expect("take events");
+    let mut stream = session.take_events().await.expect("take events");
 
     ctrl.push_live(live_trade("AAPL", 100)).await;
     ctrl.push_live(live_trade("AAPL", 200)).await;
@@ -737,7 +763,7 @@ async fn tap_log_disabled_captures_nothing() {
         .build()
         .unwrap();
 
-    let mut session = dm
+    let session = dm
         .session(
             inst("AAPL"),
             EventKind::Trade,
@@ -748,7 +774,7 @@ async fn tap_log_disabled_captures_nothing() {
         )
         .await
         .unwrap();
-    let mut stream = session.take_events().expect("take events");
+    let mut stream = session.take_events().await.expect("take events");
     ctrl.push_live(live_trade("AAPL", 100)).await;
     assert_eq!(drain_n(&mut stream, 1).await, 1);
     log.flush().await.unwrap();
@@ -764,6 +790,76 @@ async fn tap_log_disabled_captures_nothing() {
         .await
         .unwrap();
     assert!(replay.next().await.is_none(), "nothing should be captured");
+}
+
+#[tokio::test]
+async fn historical_take_events_stays_single_shot() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_history(vec![bar("AAPL", 100, 10.0)]).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let stream = session.take_events().await.unwrap();
+    drop(stream);
+    match session.take_events().await {
+        Err(datamancer::Error::EventsAlreadyTaken) => {}
+        Err(other) => panic!("expected EventsAlreadyTaken, got {other:?}"),
+        Ok(_) => panic!("expected EventsAlreadyTaken, got Ok"),
+    }
+}
+
+#[tokio::test]
+async fn dropping_the_session_ends_a_held_stream() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+    ctrl.push_live(trade("AAPL", 100, 1.0)).await;
+    let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(ev, MarketEvent::Trade(_)));
+
+    // The Session handle is the lifecycle anchor: dropping it tears the
+    // session down even though the stream is still held.
+    drop(session);
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("controller should close the stream after Session drop");
+        match ev {
+            Some(MarketEvent::Control(c)) if c.kind == ControlKind::SessionClosing => {}
+            Some(_) => {}
+            None => break,
+        }
+    }
 }
 
 #[tokio::test]
