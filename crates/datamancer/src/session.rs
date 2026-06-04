@@ -274,6 +274,7 @@ impl Datamancer {
             persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
             cmd_tx,
+            seq_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
 
         // Provider tasks push raw events into `provider_tx`. The controller
@@ -288,8 +289,6 @@ impl Datamancer {
             tap_log: self.inner.tap_log.clone(),
             historical_cache: self.inner.historical_cache.clone(),
             events_tx,
-            next_seq: 0,
-            last_emitted_source_ts: None,
         };
 
         match scope {
@@ -479,6 +478,10 @@ struct SessionInner {
     /// shuts down immediately rather than hanging on `events_tx.closed()`.
     stream_taken: std::sync::atomic::AtomicBool,
     cmd_tx: mpsc::Sender<SessionCommand>,
+    /// Feeds `seq` stamping in `EventStream::poll_next`. Shared across
+    /// re-takes so the delivered stream's seq is contiguous by construction;
+    /// events that are never delivered are never numbered.
+    seq_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 enum SessionStreamSlot {
@@ -514,7 +517,10 @@ impl Session {
                 self.inner
                     .stream_taken
                     .store(true, std::sync::atomic::Ordering::Release);
-                Ok(EventStream { rx })
+                Ok(EventStream {
+                    rx,
+                    seq: self.inner.seq_counter.clone(),
+                })
             }
             SessionStreamSlot::Taken => {
                 *slot = SessionStreamSlot::Taken;
@@ -589,8 +595,14 @@ impl Session {
 
 /// The session's output stream. Drop it to stop emission; re-take from the
 /// owning [`Session`] if you want events again.
+///
+/// `seq` is stamped here, at delivery, from a counter shared across re-takes:
+/// the delivered stream is contiguous by construction, and events that never
+/// reach a consumer (ring overflow, undelivered channel residue at drop) are
+/// never numbered.
 pub struct EventStream {
     rx: mpsc::Receiver<MarketEvent>,
+    seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Stream for EventStream {
@@ -600,7 +612,15 @@ impl Stream for EventStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(ev)) => {
+                // Relaxed: a single consumer polls sequentially; the channel
+                // already provides the cross-task happens-before edge.
+                let seq = Seq(self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                std::task::Poll::Ready(Some(stamp_seq(ev, seq)))
+            }
+            other => other,
+        }
     }
 }
 
@@ -624,11 +644,6 @@ struct Controller {
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
     events_tx: mpsc::Sender<MarketEvent>,
-    next_seq: u64,
-    /// Source-ts of the last data event handed to the consumer's stream. Used
-    /// by the resume primitive on stream re-take and at the historical→live
-    /// seam.
-    last_emitted_source_ts: Option<Timestamp>,
 }
 
 impl Controller {
@@ -705,14 +720,12 @@ impl Controller {
             return;
         }
         let now = wall_clock_ts();
-        let seq = Seq(self.next_seq);
-        self.next_seq += 1;
         let _ = self
             .events_tx
             .send(MarketEvent::Control(Control {
                 source_ts: now,
                 rx_ts: now,
-                seq,
+                seq: Seq(0),
                 kind: ControlKind::SessionClosing,
             }))
             .await;
@@ -1001,48 +1014,37 @@ impl Controller {
         }
     }
 
-    /// Stamp `seq`, tee data events to the `TapLog` when configured for live
-    /// capture, then forward to the consumer stream. Updates
-    /// `last_emitted_source_ts` on data events.
+    /// Tee a data event to the tap log (when configured for live capture),
+    /// then hand it toward the consumer. `seq` is stamped downstream at
+    /// delivery, in `EventStream::poll_next`.
     async fn forward(&mut self, ev: MarketEvent) {
-        let stamped = self.assign_seq(ev);
-        let is_data = matches!(
-            stamped,
-            MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)
-        );
-        if is_data && let Some(ts) = source_ts(&stamped) {
-            self.last_emitted_source_ts = Some(ts);
-        }
-        // Tee to the tap log: live capture only, data events only. Append
-        // before forwarding so a consumer that observes the event can rely on
-        // it having been enqueued for persistence. `append` is a non-blocking
-        // enqueue, so this never stalls the live stream.
-        if is_data
-            && matches!(self.inner.scope, Scope::Live { .. })
-            && let Some(log) = &self.tap_log
-        {
-            let write = self
-                .inner
-                .persistence
-                .lock()
-                .expect("persistence mutex poisoned")
-                .write_tap_log;
-            if write {
-                let _ = log.append(&stamped).await;
-            }
-        }
-        let _ = self.events_tx.send(stamped).await;
+        self.tee(&ev).await;
+        let _ = self.events_tx.send(ev).await;
     }
 
-    fn assign_seq(&mut self, ev: MarketEvent) -> MarketEvent {
-        let seq = Seq(self.next_seq);
-        self.next_seq += 1;
-        match ev {
-            MarketEvent::Trade(t) => MarketEvent::Trade(Trade { seq, ..t }),
-            MarketEvent::Quote(q) => MarketEvent::Quote(Quote { seq, ..q }),
-            MarketEvent::Bar(b) => MarketEvent::Bar(Bar { seq, ..b }),
-            MarketEvent::Control(c) => MarketEvent::Control(Control { seq, ..c }),
-            other => other,
+    /// Tee a data event to the tap log when this session is configured for
+    /// live capture. Append before forwarding so a consumer that observes the
+    /// event can rely on it having been enqueued for persistence; `append` is
+    /// a non-blocking enqueue, so this never stalls the live stream.
+    async fn tee(&self, ev: &MarketEvent) {
+        if !matches!(
+            ev,
+            MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)
+        ) {
+            return;
+        }
+        if !matches!(self.inner.scope, Scope::Live { .. }) {
+            return;
+        }
+        let Some(log) = &self.tap_log else { return };
+        let write = self
+            .inner
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned")
+            .write_tap_log;
+        if write {
+            let _ = log.append(ev).await;
         }
     }
 
@@ -1085,7 +1087,7 @@ impl Controller {
             .send(MarketEvent::Control(Control {
                 source_ts: now,
                 rx_ts: now,
-                seq: Seq(self.next_seq),
+                seq: Seq(0),
                 kind: ControlKind::SessionClosing,
             }))
             .await;
@@ -1228,6 +1230,18 @@ fn data_source_ts(ev: &MarketEvent) -> Option<Timestamp> {
     match ev {
         MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_) => source_ts(ev),
         _ => None,
+    }
+}
+
+/// Overwrite an event's `seq`. Called exactly once per delivered event, in
+/// `EventStream::poll_next`.
+fn stamp_seq(ev: MarketEvent, seq: Seq) -> MarketEvent {
+    match ev {
+        MarketEvent::Trade(t) => MarketEvent::Trade(Trade { seq, ..t }),
+        MarketEvent::Quote(q) => MarketEvent::Quote(Quote { seq, ..q }),
+        MarketEvent::Bar(b) => MarketEvent::Bar(Bar { seq, ..b }),
+        MarketEvent::Control(c) => MarketEvent::Control(Control { seq, ..c }),
+        other => other,
     }
 }
 
