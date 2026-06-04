@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
         .tap_log_arc(log.clone())
         .build()?;
 
-    let mut session = dm
+    let session = dm
         .session(
             instrument(),
             EventKind::Trade,
@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
             PersistenceOptions::none().with_tap_log(true),
         )
         .await?;
-    let mut stream = session.take_events().expect("take events");
+    let mut stream = session.take_events().await.expect("take events");
 
     // Push three trades through the live handle, deliberately NOT in source_ts
     // order, then consume them so we know forward() (and the tee) has run.

@@ -32,7 +32,7 @@ async fn live_test_feed_yields_an_event() {
         .provider(Box::new(provider))
         .build()
         .unwrap();
-    let mut session = dm
+    let session = dm
         .session(
             Instrument::new(
                 ProviderId::from_static("alpaca"),
@@ -48,7 +48,7 @@ async fn live_test_feed_yields_an_event() {
         .await
         .expect("session open");
 
-    let mut stream = session.take_events().unwrap();
+    let mut stream = session.take_events().await.unwrap();
 
     // Wait up to 30 seconds for any event (control or data).
     let ev = tokio::time::timeout(Duration::from_secs(30), stream.next())
@@ -82,7 +82,7 @@ async fn live_test_feed_delivers_a_trade() {
         .provider(Box::new(provider))
         .build()
         .unwrap();
-    let mut session = dm
+    let session = dm
         .session(
             Instrument::new(
                 ProviderId::from_static("alpaca"),
@@ -98,7 +98,7 @@ async fn live_test_feed_delivers_a_trade() {
         .await
         .expect("session open");
 
-    let mut stream = session.take_events().unwrap();
+    let mut stream = session.take_events().await.unwrap();
 
     // Allow up to 60s overall for at least one Trade. The test feed emits
     // synthetic FAKEPACA trades roughly once per second, so this is generous.
