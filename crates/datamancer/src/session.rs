@@ -187,6 +187,7 @@ struct DatamancerInner {
     /// [`RegistrySentinel`]; the map keeps a `Weak` so a stale entry can be
     /// distinguished from a live one via `strong_count()`.
     live_sessions: LiveSessionRegistry,
+    resume_buffer_events: usize,
 }
 
 type LiveSessionRegistry =
@@ -288,7 +289,8 @@ impl Datamancer {
             provider: provider.clone(),
             tap_log: self.inner.tap_log.clone(),
             historical_cache: self.inner.historical_cache.clone(),
-            events_tx,
+            sink: Sink::Attached(events_tx),
+            ring_capacity: self.inner.resume_buffer_events,
         };
 
         match scope {
@@ -362,6 +364,7 @@ pub struct DatamancerBuilder {
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
     instrument_provider: Vec<(Instrument, String)>,
+    resume_buffer_events: Option<usize>,
 }
 
 impl DatamancerBuilder {
@@ -423,6 +426,16 @@ impl DatamancerBuilder {
         self
     }
 
+    /// Bound (in events) for a live session's detached resume buffer and the
+    /// stitched backfill's pending-live buffer. Overflow evicts the oldest
+    /// events and reports them as one in-band `Control::Gap` on the next
+    /// attach. Defaults to 65 536.
+    #[must_use]
+    pub fn resume_buffer_events(mut self, events: usize) -> Self {
+        self.resume_buffer_events = Some(events);
+        self
+    }
+
     /// Finalize the builder.
     ///
     /// # Errors
@@ -445,6 +458,9 @@ impl DatamancerBuilder {
                 historical_cache: self.historical_cache,
                 instrument_provider: self.instrument_provider,
                 live_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                resume_buffer_events: self
+                    .resume_buffer_events
+                    .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),
             }),
         })
     }
@@ -638,12 +654,37 @@ fn default_buffer() -> usize {
     1024
 }
 
+/// Default bound for the detached resume buffer and the backfill pending-live
+/// buffer, in events.
+const DEFAULT_RESUME_BUFFER_EVENTS: usize = 65_536;
+
+/// The controller's consumer-facing side. `Attached` delivers into the
+/// outstanding [`EventStream`]'s channel (with backpressure); `Detached`
+/// buffers into a bounded [`EventRing`] until the next `take_events`.
+enum Sink {
+    Attached(mpsc::Sender<MarketEvent>),
+    Detached(EventRing),
+}
+
+impl Sink {
+    /// Resolves when an attached consumer stream is dropped; pends forever
+    /// while detached.
+    async fn consumer_gone(&self) {
+        match self {
+            Sink::Attached(tx) => tx.closed().await,
+            Sink::Detached(_) => std::future::pending().await,
+        }
+    }
+}
+
 struct Controller {
     inner: Arc<SessionInner>,
     provider: Arc<dyn Provider>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
-    events_tx: mpsc::Sender<MarketEvent>,
+    sink: Sink,
+    /// Capacity for rings created on detach (from the builder knob).
+    ring_capacity: usize,
 }
 
 impl Controller {
@@ -720,15 +761,22 @@ impl Controller {
             return;
         }
         let now = wall_clock_ts();
-        let _ = self
-            .events_tx
-            .send(MarketEvent::Control(Control {
-                source_ts: now,
-                rx_ts: now,
-                seq: Seq(0),
-                kind: ControlKind::SessionClosing,
-            }))
-            .await;
+        self.emit(MarketEvent::Control(Control {
+            source_ts: now,
+            rx_ts: now,
+            seq: Seq(0),
+            kind: ControlKind::SessionClosing,
+        }))
+        .await;
+        // Wait for the consumer to drain (channel closes on drop). If the
+        // consumer already detached, there is nobody left to drain to.
+        let tx = match &self.sink {
+            Sink::Attached(tx) if !tx.is_closed() => tx.clone(),
+            _ => {
+                self.shutdown().await;
+                return;
+            }
+        };
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
@@ -736,7 +784,7 @@ impl Controller {
                         return;
                     }
                 }
-                () = self.events_tx.closed() => break,
+                () = tx.closed() => break,
             }
         }
         self.shutdown().await;
@@ -996,7 +1044,7 @@ impl Controller {
                     };
                     self.forward(ev).await;
                 }
-                () = self.events_tx.closed() => {
+                () = self.sink.consumer_gone() => {
                     // Consumer dropped the stream.
                     // TODO(persistence): when write-through lands, keep
                     // running while persistence.write_cache is set so
@@ -1014,12 +1062,34 @@ impl Controller {
         }
     }
 
+    /// Deliver an event toward the consumer. Attached: send (blocking on
+    /// backpressure); if the consumer dropped the stream, flip to Detached
+    /// and buffer. Detached: push into the bounded ring. Never stamps `seq` —
+    /// that happens at delivery in `EventStream::poll_next`, so an event that
+    /// ends up evicted from the ring is never numbered.
+    async fn emit(&mut self, ev: MarketEvent) {
+        let ev = match &self.sink {
+            Sink::Attached(tx) if !tx.is_closed() => match tx.send(ev).await {
+                Ok(()) => return,
+                Err(tokio::sync::mpsc::error::SendError(ev)) => ev,
+            },
+            _ => ev,
+        };
+        // Consumer gone (or never attached): buffer until the next take.
+        if matches!(self.sink, Sink::Attached(_)) {
+            self.sink = Sink::Detached(EventRing::new(self.ring_capacity));
+        }
+        if let Sink::Detached(ring) = &mut self.sink {
+            ring.push(ev);
+        }
+    }
+
     /// Tee a data event to the tap log (when configured for live capture),
     /// then hand it toward the consumer. `seq` is stamped downstream at
     /// delivery, in `EventStream::poll_next`.
     async fn forward(&mut self, ev: MarketEvent) {
         self.tee(&ev).await;
-        let _ = self.events_tx.send(ev).await;
+        self.emit(ev).await;
     }
 
     /// Tee a data event to the tap log when this session is configured for
@@ -1049,7 +1119,7 @@ impl Controller {
     }
 
     /// Returns false if the controller should exit.
-    async fn handle_command(&self, cmd: Option<SessionCommand>) -> bool {
+    async fn handle_command(&mut self, cmd: Option<SessionCommand>) -> bool {
         match cmd {
             Some(SessionCommand::SetPersistence(options, ack)) => {
                 let res = self.apply_persistence(options);
@@ -1080,17 +1150,15 @@ impl Controller {
         Ok(())
     }
 
-    async fn shutdown(&self) {
+    async fn shutdown(&mut self) {
         let now = wall_clock_ts();
-        let _ = self
-            .events_tx
-            .send(MarketEvent::Control(Control {
-                source_ts: now,
-                rx_ts: now,
-                seq: Seq(0),
-                kind: ControlKind::SessionClosing,
-            }))
-            .await;
+        self.emit(MarketEvent::Control(Control {
+            source_ts: now,
+            rx_ts: now,
+            seq: Seq(0),
+            kind: ControlKind::SessionClosing,
+        }))
+        .await;
         if let Some(log) = &self.tap_log {
             let _ = log.flush().await;
         }
@@ -1174,14 +1242,12 @@ fn tile(from: Timestamp, to: Timestamp, gaps: &[datamancer_core::GapSpan]) -> Ve
 /// cover the evicted event's `source_ts`; the span is surfaced as one in-band
 /// [`ControlKind::Gap`] when a consumer (re)attaches. Evicted events are never
 /// `seq`-stamped, so an overflow is a reported gap — never a `seq` hole.
-#[allow(dead_code, reason = "consumed by the Sink tasks that follow")]
 struct EventRing {
     capacity: usize,
     buf: std::collections::VecDeque<MarketEvent>,
     dropped: Option<GapSpan>,
 }
 
-#[allow(dead_code, reason = "consumed by the Sink tasks that follow")]
 impl EventRing {
     fn new(capacity: usize) -> Self {
         Self {
@@ -1219,6 +1285,10 @@ impl EventRing {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "consumed by the re-attach path that follows in Task 4"
+    )]
     fn into_parts(self) -> (Option<GapSpan>, std::collections::VecDeque<MarketEvent>) {
         (self.dropped, self.buf)
     }
