@@ -292,7 +292,6 @@ impl Datamancer {
             historical_cache: self.inner.historical_cache.clone(),
             sink,
             ring_capacity: self.inner.resume_buffer_events,
-            in_backfill: false,
         };
 
         let drop_guard = match scope {
@@ -699,10 +698,6 @@ struct Controller {
     sink: Sink,
     /// Capacity for rings created on detach (from the builder knob).
     ring_capacity: usize,
-    /// True while the stitched-session backfill phase is forwarding
-    /// historical events: gates the tap tee so the log captures the live
-    /// tail only (backfill data belongs to the cache).
-    in_backfill: bool,
 }
 
 impl Controller {
@@ -938,17 +933,13 @@ impl Controller {
                                 return SegmentOutcome::Closed;
                             }
                             ev = recv_live(&mut live_rx) => {
-                                match ev {
-                                    Some(ev) => {
-                                        self.tee(&ev).await;
-                                        if let Some(p) = pending.as_mut() { p.push(ev); }
-                                    }
-                                    None => live_rx = None, // live side ended; surfaced after the backfill
-                                }
+                                self.buffer_live_arrival(ev, &mut live_rx, &mut pending).await;
                             }
                             ev = stream.next() => {
                                 match ev {
-                                    Some(ev) => self.forward(ev).await,
+                                    // Replayed data: emit directly, never tee
+                                    // (the tap log captures the live tail only).
+                                    Some(ev) => self.emit(ev).await,
                                     None => break,
                                 }
                             }
@@ -986,20 +977,16 @@ impl Controller {
                                 return SegmentOutcome::Closed;
                             }
                             ev = recv_live(&mut live_rx) => {
-                                match ev {
-                                    Some(ev) => {
-                                        self.tee(&ev).await;
-                                        if let Some(p) = pending.as_mut() { p.push(ev); }
-                                    }
-                                    None => live_rx = None,
-                                }
+                                self.buffer_live_arrival(ev, &mut live_rx, &mut pending).await;
                             }
                             ev = rx.recv() => {
                                 match ev {
                                     Some(ev) => {
                                         max_data_ts = max_data_ts.max(data_source_ts(&ev));
                                         if store { batch.push(ev.clone()); }
-                                        self.forward(ev).await;
+                                        // Fetched data: emit directly, never tee
+                                        // (backfill data belongs to the cache).
+                                        self.emit(ev).await;
                                     }
                                     None => break,
                                 }
@@ -1174,7 +1161,6 @@ impl Controller {
         let segments = tile(from, edge, &gaps);
 
         let mut pending = EventRing::new(self.ring_capacity);
-        self.in_backfill = true;
         let outcome = self
             .stream_segments(
                 segments,
@@ -1188,7 +1174,6 @@ impl Controller {
                 }),
             )
             .await;
-        self.in_backfill = false;
         if outcome == SegmentOutcome::Closed {
             return false;
         }
@@ -1283,14 +1268,34 @@ impl Controller {
 
     /// Tee a data event to the tap log (when configured for live capture),
     /// then hand it toward the consumer. `seq` is stamped downstream at
-    /// delivery, in `EventStream::poll_next`. During the backfill phase
-    /// (`in_backfill == true`) the tee is suppressed so only the live tail
-    /// lands in the log; backfill data belongs to the cache.
+    /// delivery, in `EventStream::poll_next`. Replayed/backfill data must
+    /// not come through here — `stream_segments` emits it directly, so only
+    /// the live tail lands in the log (backfill data belongs to the cache).
     async fn forward(&mut self, ev: MarketEvent) {
-        if !self.in_backfill {
-            self.tee(&ev).await;
-        }
+        self.tee(&ev).await;
         self.emit(ev).await;
+    }
+
+    /// Backfill seam: a live arrival during the backfill is teed at receipt
+    /// (durability — it must reach the tap log even if later evicted from
+    /// `pending`) and buffered in arrival order for the post-backfill flush.
+    /// A closed live side is parked (`live_rx = None`); it is surfaced after
+    /// the backfill completes.
+    async fn buffer_live_arrival(
+        &mut self,
+        ev: Option<MarketEvent>,
+        live_rx: &mut Option<&mut mpsc::Receiver<MarketEvent>>,
+        pending: &mut Option<&mut EventRing>,
+    ) {
+        match ev {
+            Some(ev) => {
+                self.tee(&ev).await;
+                if let Some(p) = pending.as_mut() {
+                    p.push(ev);
+                }
+            }
+            None => *live_rx = None,
+        }
     }
 
     /// Tee a data event to the tap log when this session is configured for
