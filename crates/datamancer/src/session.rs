@@ -871,61 +871,42 @@ impl Controller {
         .await;
     }
 
-    /// Read-through historical fetch. Tiles `[from, to)` into covered/gap
-    /// segments (from `gaps()` when `read_cache`, else the whole range), then
-    /// streams them in order: covered segments replay from the cache, gap
-    /// segments fetch from the provider -- forwarded to the consumer and, when
-    /// `write_cache`, stored back. On a gap-fetch failure, only the confirmed
-    /// prefix is claimed, an in-band `Gap` is emitted for the remainder, and
-    /// the remaining segments are abandoned.
+    /// Stream a planned segment sequence: covered segments replay from the
+    /// cache, gap segments fetch from the provider (forwarded and, when
+    /// `write_cache`, stored back). With a `BackfillSide`, live arrivals are
+    /// teed + buffered concurrently, the segment touching `edge` gets a
+    /// conservative coverage claim (history endpoints lag the live feed), and
+    /// a failed fetch gaps through to `edge`. On a gap-fetch failure only the
+    /// confirmed prefix is claimed, an in-band `Gap` is emitted for the
+    /// remainder, and the remaining segments are abandoned.
     #[allow(
         clippy::too_many_lines,
         reason = "linear per-segment dispatch kept inline; extraction would obscure the covered/gap handling symmetry"
     )]
-    async fn run_historical_cached(
+    async fn stream_segments(
         &mut self,
-        from: Timestamp,
-        to: Timestamp,
+        segments: Vec<Segment>,
         options: PersistenceOptions,
         cmd_rx: &mut mpsc::Receiver<SessionCommand>,
-    ) {
-        let cache = self
-            .historical_cache
-            .clone()
-            .expect("cached path requires a historical cache");
+        live: Option<BackfillSide<'_>>,
+    ) -> SegmentOutcome {
         let instrument = self.inner.instrument.clone();
         let kind = self.inner.kind;
-        let plan_key = CacheKey {
-            instrument: instrument.clone(),
-            kind,
-            from,
-            to,
+        let edge = live.as_ref().map(|l| l.edge);
+        let (mut live_rx, mut pending, mut drop_rx) = match live {
+            Some(l) => (Some(l.provider_rx), Some(l.pending), Some(l.drop_rx)),
+            None => (None, None, None),
         };
-
-        let whole = vec![GapSpan {
-            from_source_ts: from,
-            to_source_ts: to,
-        }];
-        let gaps = if options.read_cache {
-            match cache.gaps(&plan_key).await {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!(
-                        instrument = %self.inner.instrument,
-                        error = %e,
-                        "cache gaps() failed; treating whole range as a gap"
-                    );
-                    whole
-                }
-            }
-        } else {
-            whole
-        };
-        let segments = tile(from, to, &gaps);
 
         for seg in segments {
             match seg {
                 Segment::Covered { from: f, to: t } => {
+                    let Some(cache) = self.historical_cache.clone() else {
+                        // Covered segments only arise from a cache's gaps()
+                        // report; defensively gap it if the cache vanished.
+                        self.emit_gap(f, f, t).await;
+                        continue;
+                    };
                     let source = cache.as_replay_source(CacheKey {
                         instrument: instrument.clone(),
                         kind,
@@ -957,7 +938,20 @@ impl Controller {
                     loop {
                         tokio::select! {
                             cmd = cmd_rx.recv() => {
-                                if !self.handle_command(cmd).await { return; }
+                                if !self.handle_command(cmd).await { return SegmentOutcome::Closed; }
+                            }
+                            () = session_dropped(&mut drop_rx) => {
+                                self.shutdown().await;
+                                return SegmentOutcome::Closed;
+                            }
+                            ev = recv_live(&mut live_rx) => {
+                                match ev {
+                                    Some(ev) => {
+                                        self.tee(&ev).await;
+                                        if let Some(p) = pending.as_mut() { p.push(ev); }
+                                    }
+                                    None => live_rx = None, // live side ended; surfaced after the backfill
+                                }
                             }
                             ev = stream.next() => {
                                 match ev {
@@ -986,7 +980,21 @@ impl Controller {
                             cmd = cmd_rx.recv() => {
                                 if !self.handle_command(cmd).await {
                                     fetch_task.abort();
-                                    return;
+                                    return SegmentOutcome::Closed;
+                                }
+                            }
+                            () = session_dropped(&mut drop_rx) => {
+                                fetch_task.abort();
+                                self.shutdown().await;
+                                return SegmentOutcome::Closed;
+                            }
+                            ev = recv_live(&mut live_rx) => {
+                                match ev {
+                                    Some(ev) => {
+                                        self.tee(&ev).await;
+                                        if let Some(p) = pending.as_mut() { p.push(ev); }
+                                    }
+                                    None => live_rx = None,
                                 }
                             }
                             ev = rx.recv() => {
@@ -1003,12 +1011,24 @@ impl Controller {
 
                     let succeeded = matches!(fetch_task.await, Ok(Ok(())));
                     if succeeded {
-                        if options.write_cache {
+                        // A segment ending at the live edge gets a conservative
+                        // claim: history endpoints lag the live feed, so a
+                        // "successful" fetch may silently lack the last
+                        // seconds. Claim only through the last received event;
+                        // the unmaterialized sliver stays a gap.
+                        let claim_to = if edge == Some(t) {
+                            confirmed_prefix_end(&batch, f, t)
+                        } else {
+                            t
+                        };
+                        if options.write_cache
+                            && let Some(cache) = &self.historical_cache
+                        {
                             let store_key = CacheKey {
                                 instrument: instrument.clone(),
                                 kind,
                                 from: f,
-                                to: t,
+                                to: claim_to,
                             };
                             if let Err(e) = cache.store(&store_key, &batch).await {
                                 tracing::warn!(
@@ -1020,22 +1040,12 @@ impl Controller {
                         }
                     } else {
                         // Honest coverage: claim only the confirmed prefix of
-                        // [f, t). +1 keeps the last received event inside the
-                        // half-open range; clamp to [f, t) so a provider that
-                        // over-delivers past `t` cannot over-claim coverage.
-                        // Only data-event timestamps count — a stray Control
-                        // would otherwise skew the prefix toward wall-clock.
-                        let confirmed_to = batch
-                            .iter()
-                            .filter_map(|ev| match ev {
-                                MarketEvent::Trade(tr) => Some(tr.source_ts.0),
-                                MarketEvent::Quote(q) => Some(q.source_ts.0),
-                                MarketEvent::Bar(b) => Some(b.source_ts.0),
-                                _ => None,
-                            })
-                            .max()
-                            .map_or(f, |m| Timestamp(m.saturating_add(1).clamp(f.0, t.0)));
-                        if options.write_cache {
+                        // [f, t); the unfetched remainder is gapped through to
+                        // the live edge when one exists.
+                        let confirmed_to = confirmed_prefix_end(&batch, f, t);
+                        if options.write_cache
+                            && let Some(cache) = &self.historical_cache
+                        {
                             let store_key = CacheKey {
                                 instrument: instrument.clone(),
                                 kind,
@@ -1050,14 +1060,66 @@ impl Controller {
                                 );
                             }
                         }
-                        // Surface a gap only if part of [.., t) is still missing.
-                        if confirmed_to < t {
-                            self.emit_gap(confirmed_to, confirmed_to, t).await;
+                        let gap_to = edge.unwrap_or(t);
+                        if confirmed_to < gap_to {
+                            self.emit_gap(confirmed_to, confirmed_to, gap_to).await;
                         }
                         break;
                     }
                 }
             }
+        }
+        SegmentOutcome::Done
+    }
+
+    /// Read-through historical fetch. Tiles `[from, to)` into covered/gap
+    /// segments (from `gaps()` when `read_cache`, else the whole range), then
+    /// streams them in order: covered segments replay from the cache, gap
+    /// segments fetch from the provider -- forwarded to the consumer and, when
+    /// `write_cache`, stored back. On a gap-fetch failure, only the confirmed
+    /// prefix is claimed, an in-band `Gap` is emitted for the remainder, and
+    /// the remaining segments are abandoned.
+    async fn run_historical_cached(
+        &mut self,
+        from: Timestamp,
+        to: Timestamp,
+        options: PersistenceOptions,
+        cmd_rx: &mut mpsc::Receiver<SessionCommand>,
+    ) {
+        let cache = self
+            .historical_cache
+            .clone()
+            .expect("cached path requires a historical cache");
+        let plan_key = CacheKey {
+            instrument: self.inner.instrument.clone(),
+            kind: self.inner.kind,
+            from,
+            to,
+        };
+
+        let whole = vec![GapSpan {
+            from_source_ts: from,
+            to_source_ts: to,
+        }];
+        let gaps = if options.read_cache {
+            match cache.gaps(&plan_key).await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(
+                        instrument = %self.inner.instrument,
+                        error = %e,
+                        "cache gaps() failed; treating whole range as a gap"
+                    );
+                    whole
+                }
+            }
+        } else {
+            whole
+        };
+        let segments = tile(from, to, &gaps);
+
+        if self.stream_segments(segments, options, cmd_rx, None).await == SegmentOutcome::Closed {
+            return;
         }
 
         self.finish_historical(cmd_rx).await;
@@ -1275,6 +1337,62 @@ impl Drop for RegistrySentinel {
 enum Segment {
     Covered { from: Timestamp, to: Timestamp },
     Gap { from: Timestamp, to: Timestamp },
+}
+
+/// Outcome of streaming a planned segment sequence.
+#[derive(Debug, PartialEq, Eq)]
+enum SegmentOutcome {
+    /// Every segment streamed, or a failed gap-fetch was gapped and the
+    /// remaining segments abandoned — the scope's normal continuation applies.
+    Done,
+    /// A Close command or Session drop ended the controller mid-stream.
+    Closed,
+}
+
+/// Live-side plumbing threaded through `stream_segments` by the backfill
+/// phase of a stitched session. `None` on the plain historical path.
+#[allow(dead_code, reason = "constructed by the backfill task that follows")]
+struct BackfillSide<'a> {
+    /// Live arrivals during the backfill; teed at receipt and buffered in
+    /// `pending` so they splice in after the backfill output.
+    provider_rx: &'a mut mpsc::Receiver<MarketEvent>,
+    pending: &'a mut EventRing,
+    /// Session-handle drop signal (live lifecycle anchor).
+    drop_rx: &'a mut oneshot::Receiver<()>,
+    /// The live boundary `B`: the gap segment touching it gets a
+    /// conservative coverage claim, and a failed fetch gaps through to it.
+    edge: Timestamp,
+}
+
+/// Receive from an optional live receiver; pend forever when absent (or
+/// after the live side reported closure).
+async fn recv_live(rx: &mut Option<&mut mpsc::Receiver<MarketEvent>>) -> Option<MarketEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolve when the Session handle drops; pend forever when no guard is
+/// threaded through (historical scope).
+async fn session_dropped(rx: &mut Option<&mut oneshot::Receiver<()>>) {
+    match rx {
+        Some(rx) => {
+            let _ = (&mut **rx).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Largest data-event `source_ts` in `batch` + 1, clamped to `[f, t)`; `f`
+/// when no data events arrived. The confirmed contiguous prefix of a fetch.
+fn confirmed_prefix_end(batch: &[MarketEvent], f: Timestamp, t: Timestamp) -> Timestamp {
+    batch
+        .iter()
+        .filter_map(data_source_ts)
+        .map(|ts| ts.0)
+        .max()
+        .map_or(f, |m| Timestamp(m.saturating_add(1).clamp(f.0, t.0)))
 }
 
 /// Partition `[from, to)` into ordered, disjoint segments. `gaps` are the
