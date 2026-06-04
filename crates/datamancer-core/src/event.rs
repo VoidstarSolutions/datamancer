@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Instrument, Price};
 
-/// A monotonically-increasing identifier assigned by datamancer at receipt.
+/// A monotonically-increasing identifier assigned by datamancer at delivery into the consumer stream.
 ///
 /// **The sole ordering field for the stream.** In a live session `seq` is
 /// assigned in arrival order; replaying in `seq` order reproduces the

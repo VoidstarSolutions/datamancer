@@ -1,6 +1,6 @@
 //! Integration tests for the resume primitive: detached buffering with honest
-//! overflow gaps, recording through silence, and (in later tasks) the
-//! historical→live backfill seam.
+//! overflow gaps, recording through silence, and the historical→live backfill
+//! seam.
 
 #![cfg(feature = "storage-surreal")]
 
