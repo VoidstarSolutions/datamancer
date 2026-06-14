@@ -51,9 +51,9 @@ use std::path::Path;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    Bar, BarInterval, CacheCoverage, CacheKey, Error, EventKind, GapSpan, HistoricalCache,
-    Instrument, MarketEvent, Price, Quote, ReplayRequest, ReplaySource, Result, Seq, Timestamp,
-    Trade,
+    Adjustment, Bar, BarInterval, CacheCoverage, CacheKey, Error, EventKind, GapSpan,
+    HistoricalCache, Instrument, MarketEvent, Price, Quote, ReplayRequest, ReplaySource, Result,
+    Seq, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -156,12 +156,23 @@ impl SurrealCache {
         }
     }
 
+    /// Adjustment a row is actually stored under. Trades and quotes are never
+    /// corporate-action adjusted, so they always key under `Raw` regardless of
+    /// the session-wide mode carried on the key; only bars segregate by mode.
+    fn effective_adjustment(key: &CacheKey) -> Adjustment {
+        match key.kind {
+            EventKind::Bar(_) => key.adjustment,
+            EventKind::Trade | EventKind::Quote => Adjustment::Raw,
+        }
+    }
+
     fn coverage_id(key: &CacheKey) -> String {
         format!(
-            "{}|{}|{}",
+            "{}|{}|{}|{}",
             key.instrument.provider(),
             key.instrument.symbol(),
-            Self::table_for(key.kind)
+            Self::table_for(key.kind),
+            Self::effective_adjustment(key).as_str(),
         )
     }
 }
@@ -188,6 +199,10 @@ struct TradeRow {
     /// Price in datamancer-core internal units.
     price_raw: i64,
     size: u64,
+    /// Adjustment discriminant. Trades are never adjusted, so this is always
+    /// `"raw"`; it keeps the mode-scoped `WHERE adjustment = $adj` filter on
+    /// the shared store DELETE / count uniform across kinds.
+    adjustment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -200,6 +215,8 @@ struct QuoteRow {
     bid_size: u64,
     ask_raw: i64,
     ask_size: u64,
+    /// Adjustment discriminant; always `"raw"` for quotes. See [`TradeRow`].
+    adjustment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -213,6 +230,10 @@ struct BarRow {
     low_raw: i64,
     close_raw: i64,
     volume: u64,
+    /// Corporate-action adjustment mode this bar was fetched under. Segregates
+    /// adjusted vs raw bars for the same `(symbol, range)` so a mode-scoped
+    /// SELECT never returns orphaned rows from another mode.
+    adjustment: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, SurrealValue)]
@@ -318,6 +339,7 @@ impl HistoricalCache for SurrealCache {
         let table = Self::table_for(key.kind);
         let provider = key.instrument.provider().as_str().to_string();
         let symbol = key.instrument.symbol().to_string();
+        let adj = Self::effective_adjustment(key).as_str();
 
         // Replace the claimed range: clear any existing rows in [from, to)
         // before inserting. `store` records coverage for the whole key range,
@@ -325,15 +347,21 @@ impl HistoricalCache for SurrealCache {
         // a `refresh`) must not leave stale rows behind that a later replay
         // would surface as if current. For the read-through gap-fill path the
         // range is previously uncovered, so this DELETE matches nothing.
+        //
+        // The DELETE is scoped to this adjustment mode (`AND adjustment =
+        // $adj`): a store under one mode must never clear another mode's rows
+        // in the same `(symbol, range)`.
         self.db
             .query(
                 "DELETE FROM type::table($tbl) \
                  WHERE provider = $prov AND symbol = $sym \
+                 AND adjustment = $adj \
                  AND source_ts >= $from AND source_ts < $to",
             )
             .bind(("tbl", table.to_string()))
             .bind(("prov", provider.clone()))
             .bind(("sym", symbol.clone()))
+            .bind(("adj", adj.to_string()))
             .bind(("from", key.from.0))
             .bind(("to", key.to.0))
             .await
@@ -350,7 +378,10 @@ impl HistoricalCache for SurrealCache {
             };
             let Some(ts) = ts else { continue };
 
-            let row_id = format!("{provider}|{symbol}|{ts:020}");
+            // Mode is part of the row id so adjusted and raw rows for the same
+            // `(provider, symbol, ts)` coexist instead of upserting over one
+            // another.
+            let row_id = format!("{provider}|{symbol}|{adj}|{ts:020}");
             match ev {
                 MarketEvent::Trade(t) => {
                     let row = TradeRow {
@@ -360,6 +391,7 @@ impl HistoricalCache for SurrealCache {
                         rx_ts: t.rx_ts.0,
                         price_raw: t.price.raw(),
                         size: t.size,
+                        adjustment: adj.to_string(),
                     };
                     let _: Option<TradeRow> = self
                         .db
@@ -378,6 +410,7 @@ impl HistoricalCache for SurrealCache {
                         bid_size: q.bid_size,
                         ask_raw: q.ask.raw(),
                         ask_size: q.ask_size,
+                        adjustment: adj.to_string(),
                     };
                     let _: Option<QuoteRow> = self
                         .db
@@ -397,6 +430,7 @@ impl HistoricalCache for SurrealCache {
                         low_raw: b.low.raw(),
                         close_raw: b.close.raw(),
                         volume: b.volume,
+                        adjustment: adj.to_string(),
                     };
                     let _: Option<BarRow> = self
                         .db
@@ -471,16 +505,19 @@ impl SurrealCache {
         let table = Self::table_for(key.kind);
         let provider = key.instrument.provider().as_str().to_string();
         let symbol = key.instrument.symbol().to_string();
+        let adj = Self::effective_adjustment(key).as_str();
         let mut response = self
             .db
             .query(
                 "SELECT count() AS n FROM type::table($tbl) \
                  WHERE provider = $prov AND symbol = $sym \
+                 AND adjustment = $adj \
                  AND source_ts >= $from AND source_ts < $to GROUP ALL",
             )
             .bind(("tbl", table.to_string()))
             .bind(("prov", provider))
             .bind(("sym", symbol))
+            .bind(("adj", adj.to_string()))
             .bind(("from", from))
             .bind(("to", to))
             .await
@@ -536,6 +573,9 @@ impl ReplaySource for SurrealReplaySource {
         }
         let symbol = self.key.instrument.symbol().to_string();
         let table = SurrealCache::table_for(kind);
+        let adj = SurrealCache::effective_adjustment(&self.key)
+            .as_str()
+            .to_string();
 
         let events: Vec<MarketEvent> = match kind {
             EventKind::Trade => {
@@ -544,12 +584,14 @@ impl ReplaySource for SurrealReplaySource {
                     .query(
                         "SELECT * FROM type::table($tbl) \
                          WHERE provider = $prov AND symbol = $sym \
+                         AND adjustment = $adj \
                          AND source_ts >= $from AND source_ts < $to \
                          ORDER BY source_ts ASC",
                     )
                     .bind(("tbl", table.to_string()))
                     .bind(("prov", provider))
                     .bind(("sym", symbol))
+                    .bind(("adj", adj.clone()))
                     .bind(("from", from))
                     .bind(("to", to))
                     .await
@@ -576,12 +618,14 @@ impl ReplaySource for SurrealReplaySource {
                     .query(
                         "SELECT * FROM type::table($tbl) \
                          WHERE provider = $prov AND symbol = $sym \
+                         AND adjustment = $adj \
                          AND source_ts >= $from AND source_ts < $to \
                          ORDER BY source_ts ASC",
                     )
                     .bind(("tbl", table.to_string()))
                     .bind(("prov", provider))
                     .bind(("sym", symbol))
+                    .bind(("adj", adj.clone()))
                     .bind(("from", from))
                     .bind(("to", to))
                     .await
@@ -610,12 +654,14 @@ impl ReplaySource for SurrealReplaySource {
                     .query(
                         "SELECT * FROM type::table($tbl) \
                          WHERE provider = $prov AND symbol = $sym \
+                         AND adjustment = $adj \
                          AND source_ts >= $from AND source_ts < $to \
                          ORDER BY source_ts ASC",
                     )
                     .bind(("tbl", table.to_string()))
                     .bind(("prov", provider))
                     .bind(("sym", symbol))
+                    .bind(("adj", adj.clone()))
                     .bind(("from", from))
                     .bind(("to", to))
                     .await
