@@ -40,6 +40,9 @@
 //!
 //! Explicit [`Session::close`] is always available for forced termination.
 
+#[allow(unused_imports)] // wired in Task 2
+use crate::fetch_locks::FetchLocks;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
