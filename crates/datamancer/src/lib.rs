@@ -24,8 +24,8 @@
 
 #![forbid(unsafe_code)]
 
-pub mod providers;
 mod fetch_locks;
+pub mod providers;
 mod session;
 pub mod storage;
 

@@ -1134,7 +1134,10 @@ impl Controller {
                     error = %e,
                     "cache gaps() failed; treating whole range as a gap"
                 );
-                vec![GapSpan { from_source_ts: from, to_source_ts: to }]
+                vec![GapSpan {
+                    from_source_ts: from,
+                    to_source_ts: to,
+                }]
             });
             if initial.is_empty() {
                 initial
@@ -1147,7 +1150,10 @@ impl Controller {
                         "cache gaps() failed after acquiring fetch slot; \
                          treating whole range as a gap"
                     );
-                    vec![GapSpan { from_source_ts: from, to_source_ts: to }]
+                    vec![GapSpan {
+                        from_source_ts: from,
+                        to_source_ts: to,
+                    }]
                 });
                 if !regaps.is_empty() {
                     fetch_guard = Some(guard);
@@ -1155,7 +1161,10 @@ impl Controller {
                 regaps
             }
         } else {
-            vec![GapSpan { from_source_ts: from, to_source_ts: to }]
+            vec![GapSpan {
+                from_source_ts: from,
+                to_source_ts: to,
+            }]
         };
         let segments = tile(from, to, &gaps);
 

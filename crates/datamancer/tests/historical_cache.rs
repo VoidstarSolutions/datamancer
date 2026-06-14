@@ -6,8 +6,8 @@
 
 #![cfg(feature = "storage-surreal")]
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datamancer::storage::{SurrealCache, SurrealCacheConfig};
@@ -534,7 +534,11 @@ async fn concurrent_identical_requests_fetch_once() {
         started: started.clone(),
         release: release_rx,
     };
-    let cache = Arc::new(SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap());
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .historical_cache_arc(cache.clone())
@@ -570,7 +574,11 @@ async fn concurrent_identical_requests_fetch_once() {
         results.push(h.await.unwrap());
     }
 
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one provider fetch");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly one provider fetch"
+    );
     for bars in &results {
         assert_eq!(
             bars,
@@ -582,7 +590,11 @@ async fn concurrent_identical_requests_fetch_once() {
 
 #[tokio::test]
 async fn failed_fetch_releases_slot_for_next_session() {
-    let cache = Arc::new(SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap());
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
 
     // Session A: provider fails at ts >= 200, so only [.., 200) of the data
     // is delivered/stored; the remainder is reported as a Gap.
@@ -598,14 +610,20 @@ async fn failed_fetch_releases_slot_for_next_session() {
         .session(
             inst(),
             EventKind::Bar(BarInterval::OneMinute),
-            Scope::Historical { from: Timestamp(0), to: Timestamp(1000) },
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
             PersistenceOptions::cached(),
         )
         .await
         .unwrap();
     let (bars_a, gaps_a) = drain(&session_a).await;
     assert_eq!(bars_a.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100]);
-    assert!(!gaps_a.is_empty(), "A reports the unfetched remainder as a gap");
+    assert!(
+        !gaps_a.is_empty(),
+        "A reports the unfetched remainder as a gap"
+    );
 
     // Session B: a healthy provider on the SAME cache. The slot must have
     // been released by A's failure, and B must fetch the still-uncovered
@@ -620,7 +638,10 @@ async fn failed_fetch_releases_slot_for_next_session() {
         .session(
             inst(),
             EventKind::Bar(BarInterval::OneMinute),
-            Scope::Historical { from: Timestamp(0), to: Timestamp(1000) },
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
             PersistenceOptions::cached(),
         )
         .await
@@ -641,7 +662,11 @@ async fn failed_fetch_releases_slot_for_next_session() {
 async fn distinct_ranges_each_fetch() {
     let data = vec![bar(100, 1.0), bar(1100, 2.0)];
     let (provider, fetched) = RecordingProvider::new("rec", data);
-    let cache = Arc::new(SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap());
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .historical_cache_arc(cache.clone())
@@ -653,7 +678,10 @@ async fn distinct_ranges_each_fetch() {
             .session(
                 inst(),
                 EventKind::Bar(BarInterval::OneMinute),
-                Scope::Historical { from: Timestamp(from), to: Timestamp(to) },
+                Scope::Historical {
+                    from: Timestamp(from),
+                    to: Timestamp(to),
+                },
                 PersistenceOptions::cached(),
             )
             .await
