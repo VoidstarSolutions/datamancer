@@ -28,8 +28,13 @@ impl FetchLocks {
     /// Acquire the fetch slot for `key`, waiting if another task holds it.
     ///
     /// The map holds a `Weak` to each key's lock so an entry whose holders
-    /// have all gone away can be replaced on the next request (mirrors the
-    /// `live_sessions` registry). Distinct keys never block one another.
+    /// have all gone away is replaced on the next request for that same key.
+    /// Unlike the `live_sessions` registry (which reaps via a drop guard),
+    /// dead entries here are *not* reaped — a key fetched once and never again
+    /// leaves a tombstone `Weak` for the lifetime of this `Datamancer`. Growth
+    /// is therefore bounded by distinct-key cardinality, not by concurrency;
+    /// reaping is deferred alongside the parked cache-eviction work. Distinct
+    /// keys never block one another.
     pub(crate) async fn acquire(&self, key: &CacheKey) -> OwnedMutexGuard<()> {
         let lock = {
             let mut map = self.map.lock().expect("fetch-locks mutex poisoned");

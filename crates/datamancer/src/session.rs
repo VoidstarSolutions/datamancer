@@ -1132,6 +1132,12 @@ impl Controller {
         // concurrent sessions over *overlapping but non-identical* ranges take
         // different slots and may each fetch the overlap — range-precise
         // coalescing is a deliberate non-goal (coverage dedups it next time).
+        let whole_range = || {
+            vec![GapSpan {
+                from_source_ts: from,
+                to_source_ts: to,
+            }]
+        };
         let mut fetch_guard = None;
         let gaps = if options.read_cache {
             let initial = cache.gaps(&plan_key).await.unwrap_or_else(|e| {
@@ -1140,10 +1146,7 @@ impl Controller {
                     error = %e,
                     "cache gaps() failed; treating whole range as a gap"
                 );
-                vec![GapSpan {
-                    from_source_ts: from,
-                    to_source_ts: to,
-                }]
+                whole_range()
             });
             if initial.is_empty() {
                 initial
@@ -1156,10 +1159,7 @@ impl Controller {
                         "cache gaps() failed after acquiring fetch slot; \
                          treating whole range as a gap"
                     );
-                    vec![GapSpan {
-                        from_source_ts: from,
-                        to_source_ts: to,
-                    }]
+                    whole_range()
                 });
                 if !regaps.is_empty() {
                     fetch_guard = Some(guard);
@@ -1167,10 +1167,7 @@ impl Controller {
                 regaps
             }
         } else {
-            vec![GapSpan {
-                from_source_ts: from,
-                to_source_ts: to,
-            }]
+            whole_range()
         };
         let segments = tile(from, to, &gaps);
 
@@ -1211,6 +1208,12 @@ impl Controller {
             from_source_ts: from,
             to_source_ts: edge,
         }];
+        // NOTE: single-flight (see `run_historical_cached`) is deliberately
+        // NOT wired here. Backfill is the stitched-live path and out of scope
+        // for the cold-sweep coalescer, which only runs over `Scope::Historical`
+        // — so the two paths never race on the same key in the target workload.
+        // A follow-up could factor the acquire+re-tile into a shared helper and
+        // wire it here.
         let gaps = match (&self.historical_cache, options.read_cache) {
             (Some(cache), true) => {
                 let plan_key = CacheKey {
