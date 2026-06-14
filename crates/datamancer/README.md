@@ -136,6 +136,17 @@ stored, an in-band `Control::Gap` marks the remainder, and a later request
 re-fetches what is still missing. An empty result over a successfully-fetched
 range is legitimately covered (markets close; symbols have an inception date).
 
+### Single-flight fetch
+
+Within one `Datamancer` process, at most one provider fetch is outstanding per
+`CacheKey`. Concurrent `cached()` sessions requesting the same uncovered range
+do not each hit the provider: the first to need a fetch takes a per-key slot
+and fetches; the rest wait, then re-evaluate coverage and serve from cache what
+the winner just stored (re-fetching only any still-uncovered remainder). A
+cold-cache parameter sweep that opens hundreds of sessions over the same window
+therefore fetches it once. This is in-process only; coordinating fetches across
+processes is out of scope (see the consumer-transport design).
+
 ### Deferred
 
 Cache **volume** is not yet bounded — a very large fetch can fill the disk; no

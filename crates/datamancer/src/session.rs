@@ -40,6 +40,8 @@
 //!
 //! Explicit [`Session::close`] is always available for forced termination.
 
+use crate::fetch_locks::FetchLocks;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
@@ -181,6 +183,9 @@ struct DatamancerInner {
     /// and every `CacheKey` (so the cache segregates by mode). Never set
     /// independently on the provider or cache instances.
     adjustment: Adjustment,
+    /// Per-`CacheKey` single-flight registry: at most one outstanding
+    /// provider fetch per key (see `fetch_locks`).
+    fetch_locks: FetchLocks,
 }
 
 type LiveSessionRegistry =
@@ -298,6 +303,7 @@ impl Datamancer {
             historical_cache: self.inner.historical_cache.clone(),
             sink,
             ring_capacity: self.inner.resume_buffer_events,
+            fetch_locks: self.inner.fetch_locks.clone(),
         };
 
         let drop_guard = match scope {
@@ -493,6 +499,7 @@ impl DatamancerBuilder {
                     .resume_buffer_events
                     .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),
                 adjustment: self.adjustment,
+                fetch_locks: FetchLocks::default(),
             }),
         })
     }
@@ -723,6 +730,7 @@ struct Controller {
     sink: Sink,
     /// Capacity for rings created on detach (from the builder knob).
     ring_capacity: usize,
+    fetch_locks: FetchLocks,
 }
 
 impl Controller {
@@ -1113,28 +1121,61 @@ impl Controller {
             adjustment: self.inner.adjustment,
         };
 
-        let whole = vec![GapSpan {
-            from_source_ts: from,
-            to_source_ts: to,
-        }];
+        // Single-flight: an unlocked pre-check lets a fully-covered range
+        // replay without ever touching the fetch slot. If there is anything
+        // to fetch, acquire the per-key slot and RE-TILE against fresh
+        // coverage — a concurrent winner may have just filled some or all of
+        // it. We hold the slot across the fetch only when we actually fetch.
+        //
+        // The slot keys on the full `plan_key` (range included), so this
+        // coalesces byte-identical requests (the cold-cache sweep). Two
+        // concurrent sessions over *overlapping but non-identical* ranges take
+        // different slots and may each fetch the overlap — range-precise
+        // coalescing is a deliberate non-goal (coverage dedups it next time).
+        let whole_range = || {
+            vec![GapSpan {
+                from_source_ts: from,
+                to_source_ts: to,
+            }]
+        };
+        let mut fetch_guard = None;
         let gaps = if options.read_cache {
-            match cache.gaps(&plan_key).await {
-                Ok(g) => g,
-                Err(e) => {
+            let initial = cache.gaps(&plan_key).await.unwrap_or_else(|e| {
+                tracing::warn!(
+                    instrument = %self.inner.instrument,
+                    error = %e,
+                    "cache gaps() failed; treating whole range as a gap"
+                );
+                whole_range()
+            });
+            if initial.is_empty() {
+                initial
+            } else {
+                let guard = self.fetch_locks.acquire(&plan_key).await;
+                let regaps = cache.gaps(&plan_key).await.unwrap_or_else(|e| {
                     tracing::warn!(
                         instrument = %self.inner.instrument,
                         error = %e,
-                        "cache gaps() failed; treating whole range as a gap"
+                        "cache gaps() failed after acquiring fetch slot; \
+                         treating whole range as a gap"
                     );
-                    whole
+                    whole_range()
+                });
+                if !regaps.is_empty() {
+                    fetch_guard = Some(guard);
                 }
+                regaps
             }
         } else {
-            whole
+            whole_range()
         };
         let segments = tile(from, to, &gaps);
 
-        if self.stream_segments(segments, options, cmd_rx, None).await == SegmentOutcome::Closed {
+        let outcome = self.stream_segments(segments, options, cmd_rx, None).await;
+        // Release the fetch slot (if held) before finishing, so a queued
+        // waiter proceeds as soon as our store has landed.
+        drop(fetch_guard);
+        if outcome == SegmentOutcome::Closed {
             return;
         }
 
@@ -1167,6 +1208,12 @@ impl Controller {
             from_source_ts: from,
             to_source_ts: edge,
         }];
+        // NOTE: single-flight (see `run_historical_cached`) is deliberately
+        // NOT wired here. Backfill is the stitched-live path and out of scope
+        // for the cold-sweep coalescer, which only runs over `Scope::Historical`
+        // — so the two paths never race on the same key in the target workload.
+        // A follow-up could factor the acquire+re-tile into a shared helper and
+        // wire it here.
         let gaps = match (&self.historical_cache, options.read_cache) {
             (Some(cache), true) => {
                 let plan_key = CacheKey {

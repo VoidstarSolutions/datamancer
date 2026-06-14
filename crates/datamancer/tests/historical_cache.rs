@@ -6,6 +6,7 @@
 
 #![cfg(feature = "storage-surreal")]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -17,7 +18,7 @@ use datamancer::{
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 // --- synthetic provider -----------------------------------------------------
 
@@ -48,7 +49,6 @@ impl RecordingProvider {
         )
     }
 
-    #[allow(dead_code)]
     fn with_fail_at(mut self, ts: i64) -> Self {
         self.fail_at = Some(ts);
         self
@@ -466,4 +466,406 @@ async fn refresh_refetches_whole_range_despite_coverage() {
     assert!(gaps.is_empty());
     // write_cache=true: the refreshed data is persisted (full refresh cycle).
     assert!(cache.lookup(&key(0, 1000)).await.unwrap().is_some());
+}
+
+// --- gated provider (forces genuine fetch overlap) --------------------------
+
+/// Counts `fetch_history` calls and blocks inside each fetch until released,
+/// so a test can guarantee multiple sessions are contending before the winner
+/// finishes. Serves the same dataset filtered to the requested range.
+struct GatedProvider {
+    id: String,
+    data: Vec<MarketEvent>,
+    calls: Arc<AtomicUsize>,
+    started: Arc<tokio::sync::Notify>,
+    release: watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl Provider for GatedProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(NoopLive))
+    }
+    async fn fetch_history(
+        &self,
+        request: HistoryRequest,
+        sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        let mut rx = self.release.clone();
+        while !*rx.borrow() {
+            rx.changed().await.ok();
+        }
+        for ev in &self.data {
+            let ts = match ev {
+                MarketEvent::Bar(b) => b.source_ts.0,
+                _ => continue,
+            };
+            if ts < request.from.0 || ts >= request.to.0 {
+                continue;
+            }
+            if sink.send(ev.clone()).await.is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn concurrent_identical_requests_fetch_once() {
+    const N: usize = 8;
+    let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0)];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (release_tx, release_rx) = watch::channel(false);
+
+    let provider = GatedProvider {
+        id: "rec".to_string(),
+        data,
+        calls: calls.clone(),
+        started: started.clone(),
+        release: release_rx,
+    };
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let dm = Arc::new(dm);
+
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let dm = dm.clone();
+        handles.push(tokio::spawn(async move {
+            let session = dm
+                .session(
+                    inst(),
+                    EventKind::Bar(BarInterval::OneMinute),
+                    Scope::Historical {
+                        from: Timestamp(0),
+                        to: Timestamp(1000),
+                    },
+                    PersistenceOptions::cached(),
+                )
+                .await
+                .unwrap();
+            drain(&session).await.0
+        }));
+    }
+
+    started.notified().await;
+    release_tx.send(true).unwrap();
+
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly one provider fetch"
+    );
+    for bars in &results {
+        assert_eq!(
+            bars,
+            &vec![(100, 0), (200, 1), (300, 2)],
+            "every consumer gets the full range"
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_fetch_releases_slot_for_next_session() {
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+
+    // Session A: provider fails at ts >= 200, so only [.., 200) of the data
+    // is delivered/stored; the remainder is reported as a Gap.
+    let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0)];
+    let (failing, _f1) = RecordingProvider::new("rec", data.clone());
+    let failing = failing.with_fail_at(200);
+    let dm_a = Datamancer::builder()
+        .provider_arc(Arc::new(failing))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let session_a = dm_a
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    let (bars_a, gaps_a) = drain(&session_a).await;
+    assert_eq!(bars_a.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100]);
+    assert!(
+        !gaps_a.is_empty(),
+        "A reports the unfetched remainder as a gap"
+    );
+
+    // Session B: a healthy provider on the SAME cache. The slot must have
+    // been released by A's failure, and B must fetch the still-uncovered
+    // remainder and deliver the full range.
+    let (healthy, f2) = RecordingProvider::new("rec", data);
+    let dm_b = Datamancer::builder()
+        .provider_arc(Arc::new(healthy))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let session_b = dm_b
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    let (bars_b, _gaps_b) = drain(&session_b).await;
+    assert_eq!(
+        bars_b.iter().map(|b| b.0).collect::<Vec<_>>(),
+        vec![100, 200, 300],
+        "B sees the full range after re-tiling the remainder"
+    );
+    assert!(
+        !f2.lock().unwrap().is_empty(),
+        "B fetched the remainder rather than serving a permanently-masked gap"
+    );
+}
+
+#[tokio::test]
+async fn distinct_ranges_each_fetch() {
+    let data = vec![bar(100, 1.0), bar(1100, 2.0)];
+    let (provider, fetched) = RecordingProvider::new("rec", data);
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+
+    for (from, to) in [(0_i64, 1000_i64), (1000, 2000)] {
+        let session = dm
+            .session(
+                inst(),
+                EventKind::Bar(BarInterval::OneMinute),
+                Scope::Historical {
+                    from: Timestamp(from),
+                    to: Timestamp(to),
+                },
+                PersistenceOptions::cached(),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&session).await;
+    }
+
+    let fetched = fetched.lock().unwrap().clone();
+    assert!(
+        fetched.contains(&(0, 1000)) && fetched.contains(&(1000, 2000)),
+        "distinct cache keys each fetch their own range: {fetched:?}"
+    );
+}
+
+// --- gated + failing provider (same-registry release after failure) ---------
+
+/// The first fetch is gated (blocks until released) and then fails on reaching
+/// `source_ts >= fail_at`, delivering only the prefix; every later fetch serves
+/// normally. Records each requested `[from, to)` and counts calls.
+///
+/// This forces a deterministic interleaving within ONE `FetchLocks` registry:
+/// the winner holds the slot (gated, nothing stored yet) while the second
+/// session is necessarily blocked in `acquire()`. Releasing the gate makes the
+/// winner store its prefix and FAIL, dropping the guard — so the test proves
+/// the slot is released on the failure path of a *same-process* fetch.
+struct GatedFailingProvider {
+    id: String,
+    data: Vec<MarketEvent>,
+    fetched: FetchLog,
+    calls: Arc<AtomicUsize>,
+    started: Arc<tokio::sync::Notify>,
+    release: watch::Receiver<bool>,
+    fail_at: i64,
+}
+
+#[async_trait]
+impl Provider for GatedFailingProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(NoopLive))
+    }
+    async fn fetch_history(
+        &self,
+        request: HistoryRequest,
+        sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.fetched
+            .lock()
+            .unwrap()
+            .push((request.from.0, request.to.0));
+        if n == 0 {
+            // Winner: announce we hold the slot, then block until released so
+            // the second session is provably waiting in `acquire()`.
+            self.started.notify_one();
+            let mut rx = self.release.clone();
+            while !*rx.borrow() {
+                rx.changed().await.ok();
+            }
+        }
+        for ev in &self.data {
+            let ts = match ev {
+                MarketEvent::Bar(b) => b.source_ts.0,
+                _ => continue,
+            };
+            if ts < request.from.0 || ts >= request.to.0 {
+                continue;
+            }
+            // Only the gated winner fails; later fetches serve the remainder.
+            if n == 0 && ts >= self.fail_at {
+                return Err(datamancer::Error::Provider {
+                    provider: self.id.clone(),
+                    message: "synthetic gated mid-fetch failure".to_string(),
+                });
+            }
+            if sink.send(ev.clone()).await.is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn same_registry_failed_fetch_releases_slot_for_waiter() {
+    let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0)];
+    let fetched: FetchLog = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (release_tx, release_rx) = watch::channel(false);
+
+    let provider = GatedFailingProvider {
+        id: "rec".to_string(),
+        data,
+        fetched: fetched.clone(),
+        calls: calls.clone(),
+        started: started.clone(),
+        release: release_rx,
+        fail_at: 200,
+    };
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    // ONE Datamancer — both sessions share a single `FetchLocks` registry.
+    let dm = Arc::new(
+        Datamancer::builder()
+            .provider_arc(Arc::new(provider))
+            .historical_cache_arc(cache.clone())
+            .build()
+            .unwrap(),
+    );
+
+    let spawn_session = || {
+        let dm = dm.clone();
+        tokio::spawn(async move {
+            let session = dm
+                .session(
+                    inst(),
+                    EventKind::Bar(BarInterval::OneMinute),
+                    Scope::Historical {
+                        from: Timestamp(0),
+                        to: Timestamp(1000),
+                    },
+                    PersistenceOptions::cached(),
+                )
+                .await
+                .unwrap();
+            drain(&session).await
+        })
+    };
+    let h1 = spawn_session();
+    let h2 = spawn_session();
+
+    // The winner is inside fetch_history holding the slot (nothing stored yet),
+    // so the other session is blocked in acquire(). Release the gate: the
+    // winner delivers the prefix [100], then FAILS at 200 and drops its guard.
+    started.notified().await;
+    release_tx.send(true).unwrap();
+
+    let mut outcomes = [h1.await.unwrap(), h2.await.unwrap()];
+    // Fewer bars = the failed winner; the full delivery = the waiter.
+    outcomes.sort_by_key(|(bars, _)| bars.len());
+    let (winner_bars, winner_gaps) = &outcomes[0];
+    let (waiter_bars, waiter_gaps) = &outcomes[1];
+
+    // The winner delivered only the prefix and reported the remainder as a gap.
+    assert_eq!(
+        winner_bars.iter().map(|b| b.0).collect::<Vec<_>>(),
+        vec![100],
+        "the failed winner delivers only the prefix"
+    );
+    assert_eq!(*winner_gaps, vec![(101, 1000)]);
+
+    // The waiter saw the full range with no gap: it woke after the failed
+    // winner RELEASED the slot, re-tiled against the stored prefix, and fetched
+    // only the remainder.
+    assert_eq!(
+        waiter_bars.iter().map(|b| b.0).collect::<Vec<_>>(),
+        vec![100, 200, 300],
+        "the waiter sees the full range after re-tiling"
+    );
+    assert!(waiter_gaps.is_empty());
+
+    // Exactly two provider fetches, and the SECOND is the remainder, not
+    // another whole-range fetch. Without single-flight, the waiter's unlocked
+    // pre-check would see an empty cache while the winner is gated and fetch
+    // the whole (0, 1000) too — so this ordering is the load-bearing proof that
+    // the waiter blocked on the per-key slot until the winner stored and
+    // released on its failure path.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "exactly two provider fetches"
+    );
+    assert_eq!(
+        *fetched.lock().unwrap(),
+        vec![(0, 1000), (101, 1000)],
+        "winner fetched the whole range (failed); waiter fetched only the remainder"
+    );
 }
