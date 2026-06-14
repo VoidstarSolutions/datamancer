@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use datamancer::storage::{SurrealCache, SurrealCacheConfig};
 use datamancer::{
-    AssetClass, Bar, BarInterval, CacheKey, ControlKind, Datamancer, EventKind, HistoricalCache,
-    Instrument, LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, Result,
-    Scope, Seq, Timestamp,
+    Adjustment, AssetClass, Bar, BarInterval, CacheKey, ControlKind, Datamancer, EventKind,
+    HistoricalCache, Instrument, LiveHandle, MarketEvent, PersistenceOptions, Price, Provider,
+    ProviderId, Result, Scope, Seq, Timestamp,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -141,6 +141,9 @@ fn key(from: i64, to: i64) -> CacheKey {
         kind: EventKind::Bar(BarInterval::OneMinute),
         from: Timestamp(from),
         to: Timestamp(to),
+        // Match the session's default mode so these direct cache probes line up
+        // with what the session stores.
+        adjustment: Adjustment::default(),
     }
 }
 

@@ -30,9 +30,10 @@ pub mod storage;
 
 pub use datamancer_core::traits;
 pub use datamancer_core::{
-    AssetClass, Bar, BarInterval, CacheCoverage, CacheKey, Control, ControlKind, Error, EventKind,
-    GapSpan, HistoricalCache, HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider,
-    ProviderId, Quote, ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
+    Adjustment, AssetClass, Bar, BarInterval, CacheCoverage, CacheKey, Control, ControlKind, Error,
+    EventKind, GapSpan, HistoricalCache, HistoryRequest, Instrument, LiveHandle, MarketEvent,
+    Price, Provider, ProviderId, Quote, ReplayRequest, ReplaySource, Result, Seq, TapLog,
+    Timestamp, Trade,
 };
 pub use session::{
     Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,

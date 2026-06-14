@@ -12,12 +12,14 @@
 
 #![forbid(unsafe_code)]
 
+mod adjustment;
 mod error;
 mod event;
 mod instrument;
 mod price;
 pub mod traits;
 
+pub use adjustment::Adjustment;
 pub use error::{Error, Result};
 pub use event::{
     Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, MarketEvent, Quote, Seq, Timestamp,

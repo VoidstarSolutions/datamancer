@@ -8,8 +8,8 @@
 
 use datamancer::storage::{SurrealCache, SurrealCacheConfig};
 use datamancer::{
-    AssetClass, Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache, Instrument,
-    MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
+    Adjustment, AssetClass, Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache,
+    Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
 };
 use datamancer_core::ReplayRequest;
 use futures::StreamExt;
@@ -49,11 +49,16 @@ fn bar(symbol: &str, ts: i64, close: f64) -> MarketEvent {
 }
 
 fn key(kind: EventKind, from: i64, to: i64) -> CacheKey {
+    key_adj(kind, from, to, Adjustment::default())
+}
+
+fn key_adj(kind: EventKind, from: i64, to: i64, adjustment: Adjustment) -> CacheKey {
     CacheKey {
         instrument: inst("AAPL"),
         kind,
         from: Timestamp(from),
         to: Timestamp(to),
+        adjustment,
     }
 }
 
@@ -289,6 +294,52 @@ async fn store_replaces_existing_rows_in_the_claimed_range() {
         }
     }
     assert_eq!(got, vec![100], "refresh must not leave the stale 500 row");
+}
+
+#[tokio::test]
+async fn bars_segregate_by_adjustment_mode() {
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
+    let kind = EventKind::Bar(BarInterval::OneMinute);
+    // Same (symbol, range) under two modes, with deliberately different close
+    // prices so a mode mix-up is observable.
+    let raw = key_adj(kind, 0, 1000, Adjustment::Raw);
+    let all = key_adj(kind, 0, 1000, Adjustment::All);
+
+    cache.store(&raw, &[bar("AAPL", 100, 10.0)]).await.unwrap();
+    // Storing the All-mode bar must NOT delete the raw-mode row in the same
+    // (symbol, range): the store DELETE is mode-scoped.
+    cache.store(&all, &[bar("AAPL", 100, 20.0)]).await.unwrap();
+
+    // Coverage counts are per-mode, not pooled.
+    assert_eq!(cache.lookup(&raw).await.unwrap().unwrap().event_count, 1);
+    assert_eq!(cache.lookup(&all).await.unwrap().unwrap().event_count, 1);
+
+    // A read under each mode returns only that mode's bar — no orphaned
+    // cross-mode rows leak through the symbol/time-filtered SELECT.
+    assert_eq!(read_closes(&cache, &all).await, vec![20.0]);
+    assert_eq!(read_closes(&cache, &raw).await, vec![10.0]);
+}
+
+async fn read_closes(cache: &SurrealCache, k: &CacheKey) -> Vec<f64> {
+    use datamancer::ReplayRequest;
+    use futures::StreamExt;
+    let source = cache.as_replay_source(k.clone());
+    let request = ReplayRequest {
+        instruments: vec![k.instrument.clone()],
+        kinds: vec![k.kind],
+        from: k.from,
+        to: k.to,
+    };
+    let mut stream = source.open(request).await.unwrap();
+    let mut closes = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let MarketEvent::Bar(b) = ev {
+            closes.push(b.close.to_f64());
+        }
+    }
+    closes
 }
 
 // Sanity: the public re-exports we lean on stay in place after the API

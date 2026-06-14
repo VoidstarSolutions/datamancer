@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::{
+    adjustment::Adjustment,
     error::Result,
     event::{EventKind, MarketEvent, Timestamp},
     instrument::Instrument,
@@ -108,4 +109,8 @@ pub struct HistoryRequest {
     pub kind: EventKind,
     pub from: Timestamp,
     pub to: Timestamp,
+    /// Corporate-action adjustment mode the provider should fetch under.
+    /// Descends from the session's single source of truth; the provider reads
+    /// this rather than carrying its own mode.
+    pub adjustment: Adjustment,
 }

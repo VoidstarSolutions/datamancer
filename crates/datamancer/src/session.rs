@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use datamancer_core::{
-    Bar, CacheKey, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
+    Adjustment, Bar, CacheKey, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
     HistoryRequest, Instrument, LiveHandle, MarketEvent, Provider, Quote, ReplayRequest, Result,
     Seq, TapLog, Timestamp, Trade,
 };
@@ -176,6 +176,11 @@ struct DatamancerInner {
     /// distinguished from a live one via `strong_count()`.
     live_sessions: LiveSessionRegistry,
     resume_buffer_events: usize,
+    /// Single source of truth for the corporate-action adjustment mode.
+    /// Stamped into every `HistoryRequest` (so the provider fetches adjusted)
+    /// and every `CacheKey` (so the cache segregates by mode). Never set
+    /// independently on the provider or cache instances.
+    adjustment: Adjustment,
 }
 
 type LiveSessionRegistry =
@@ -277,6 +282,7 @@ impl Datamancer {
             stream_taken: std::sync::atomic::AtomicBool::new(false),
             cmd_tx,
             seq_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            adjustment: self.inner.adjustment,
         });
 
         // Provider tasks push raw events into `provider_tx`. The controller
@@ -376,6 +382,10 @@ pub struct DatamancerBuilder {
     historical_cache: Option<Arc<dyn HistoricalCache>>,
     instrument_provider: Vec<(Instrument, String)>,
     resume_buffer_events: Option<usize>,
+    /// Corporate-action adjustment mode. `Adjustment`'s `Default` is `All`, so
+    /// `DatamancerBuilder::default()` already yields fully-adjusted bars; call
+    /// [`adjustment`](Self::adjustment) to override.
+    adjustment: Adjustment,
 }
 
 impl DatamancerBuilder {
@@ -447,6 +457,16 @@ impl DatamancerBuilder {
         self
     }
 
+    /// Set the corporate-action adjustment mode applied to historical bar
+    /// fetches and used to segregate the cache. Defaults to [`Adjustment::All`]
+    /// (split + dividend + spin-off). The mode is stamped into both the
+    /// provider request and the cache key from this single source of truth.
+    #[must_use]
+    pub fn adjustment(mut self, adjustment: Adjustment) -> Self {
+        self.adjustment = adjustment;
+        self
+    }
+
     /// Finalize the builder.
     ///
     /// # Errors
@@ -472,6 +492,7 @@ impl DatamancerBuilder {
                 resume_buffer_events: self
                     .resume_buffer_events
                     .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),
+                adjustment: self.adjustment,
             }),
         })
     }
@@ -514,6 +535,10 @@ struct SessionInner {
     /// re-takes so the delivered stream's seq is contiguous by construction;
     /// events that are never delivered are never numbered.
     seq_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Corporate-action adjustment mode for this session, copied from
+    /// `DatamancerInner.adjustment`. Stamped into every `HistoryRequest` and
+    /// `CacheKey` the controller builds.
+    adjustment: Adjustment,
 }
 
 impl Session {
@@ -766,6 +791,7 @@ impl Controller {
             kind: self.inner.kind,
             from,
             to,
+            adjustment: self.inner.adjustment,
         };
         // Spawn the fetch with `provider_tx` so it owns the only producer
         // side; when the fetch returns, the channel closes and `recv` yields
@@ -900,6 +926,7 @@ impl Controller {
                         kind,
                         from: f,
                         to: t,
+                        adjustment: self.inner.adjustment,
                     });
                     let req = ReplayRequest {
                         instruments: vec![instrument.clone()],
@@ -954,6 +981,7 @@ impl Controller {
                         kind,
                         from: f,
                         to: t,
+                        adjustment: self.inner.adjustment,
                     };
                     let fetch_task =
                         tokio::spawn(async move { provider.fetch_history(request, tx).await });
@@ -1014,6 +1042,7 @@ impl Controller {
                                 kind,
                                 from: f,
                                 to: claim_to,
+                                adjustment: self.inner.adjustment,
                             };
                             if let Err(e) = cache.store(&store_key, &batch).await {
                                 tracing::warn!(
@@ -1036,6 +1065,7 @@ impl Controller {
                                 kind,
                                 from: f,
                                 to: confirmed_to,
+                                adjustment: self.inner.adjustment,
                             };
                             if let Err(e) = cache.store(&store_key, &batch).await {
                                 tracing::warn!(
@@ -1080,6 +1110,7 @@ impl Controller {
             kind: self.inner.kind,
             from,
             to,
+            adjustment: self.inner.adjustment,
         };
 
         let whole = vec![GapSpan {
@@ -1143,6 +1174,7 @@ impl Controller {
                     kind: self.inner.kind,
                     from,
                     to: edge,
+                    adjustment: self.inner.adjustment,
                 };
                 match cache.gaps(&plan_key).await {
                     Ok(g) => g,
