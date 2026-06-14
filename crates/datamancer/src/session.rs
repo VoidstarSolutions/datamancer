@@ -1128,29 +1128,27 @@ impl Controller {
         // it. We hold the slot across the fetch only when we actually fetch.
         let mut fetch_guard = None;
         let gaps = if options.read_cache {
-            let initial = if let Ok(g) = cache.gaps(&plan_key).await {
-                g
-            } else {
+            let initial = cache.gaps(&plan_key).await.unwrap_or_else(|e| {
                 tracing::warn!(
                     instrument = %self.inner.instrument,
+                    error = %e,
                     "cache gaps() failed; treating whole range as a gap"
                 );
                 vec![GapSpan { from_source_ts: from, to_source_ts: to }]
-            };
+            });
             if initial.is_empty() {
                 initial
             } else {
                 let guard = self.fetch_locks.acquire(&plan_key).await;
-                let regaps = if let Ok(g) = cache.gaps(&plan_key).await {
-                    g
-                } else {
+                let regaps = cache.gaps(&plan_key).await.unwrap_or_else(|e| {
                     tracing::warn!(
                         instrument = %self.inner.instrument,
+                        error = %e,
                         "cache gaps() failed after acquiring fetch slot; \
                          treating whole range as a gap"
                     );
                     vec![GapSpan { from_source_ts: from, to_source_ts: to }]
-                };
+                });
                 if !regaps.is_empty() {
                     fetch_guard = Some(guard);
                 }
