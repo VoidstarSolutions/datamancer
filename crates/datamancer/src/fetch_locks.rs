@@ -48,7 +48,9 @@ impl FetchLocks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datamancer_core::{AssetClass, BarInterval, EventKind, Instrument, ProviderId, Timestamp};
+    use datamancer_core::{
+        Adjustment, AssetClass, BarInterval, EventKind, Instrument, ProviderId, Timestamp,
+    };
     use futures::FutureExt;
 
     fn key(from: i64, to: i64) -> CacheKey {
@@ -57,6 +59,7 @@ mod tests {
             kind: EventKind::Bar(BarInterval::OneMinute),
             from: Timestamp(from),
             to: Timestamp(to),
+            adjustment: Adjustment::default(),
         }
     }
 
