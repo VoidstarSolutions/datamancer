@@ -15,31 +15,41 @@
 //! Tables are declared `SCHEMALESS` so the `SurrealValue`-derived row
 //! structs in this module round-trip directly. There's one table per kind:
 //!
-//! - `trades` — `{ provider, symbol, source_ts, rx_ts, price_raw, size }`
+//! - `trades` — `{ provider, symbol, source_ts, rx_ts, price_raw, size,
+//!   adjustment }`
 //! - `quotes` — `{ provider, symbol, source_ts, rx_ts, bid_raw, bid_size,
-//!   ask_raw, ask_size }`
+//!   ask_raw, ask_size, adjustment }`
 //! - `bars_1s`, `bars_1m`, `bars_5m`, `bars_15m`, `bars_1h`, `bars_1d`
 //!   — one table per supported [`BarInterval`]; OHLCV columns plus the
-//!   common `provider`, `symbol`, `source_ts`, `rx_ts`.
+//!   common `provider`, `symbol`, `source_ts`, `rx_ts`, `adjustment`.
 //!
-//! Each row's record id is the string `"{provider}|{symbol}|{ts:020}"` — the
-//! 20-digit zero-padded `source_ts` (nanoseconds since epoch as `i64`)
-//! ensures that lexicographic ordering on the record id matches
-//! source-time ordering. The id is doing two jobs: it gives upserts a
-//! natural primary key (re-ingest of the same `(provider, symbol, ts)`
-//! overwrites rather than duplicates), and it groups rows for one
-//! instrument together on disk.
+//! Every row carries an `adjustment` discriminant (the corporate-action mode
+//! the data was fetched under). Trades and quotes are never adjusted, so theirs
+//! is always `"raw"`; bars vary by mode. It segregates adjusted from raw bars
+//! for the same `(symbol, range)` — see the record id and read filter below.
+//!
+//! Each row's record id is the string
+//! `"{provider}|{symbol}|{adjustment}|{ts:020}"` — the 20-digit zero-padded
+//! `source_ts` (nanoseconds since epoch as `i64`) ensures that lexicographic
+//! ordering on the record id matches source-time ordering. The id is doing two
+//! jobs: it gives upserts a natural primary key (re-ingest of the same
+//! `(provider, symbol, adjustment, ts)` overwrites rather than duplicates), and
+//! it groups rows for one instrument together on disk. Folding `adjustment`
+//! into the id lets adjusted and raw rows for the same `(provider, symbol, ts)`
+//! coexist instead of upserting over one another.
 //!
 //! Reads use plain `SELECT … FROM <table> WHERE provider = $prov AND
-//! symbol = $sym AND source_ts >= $from AND source_ts < $to
-//! ORDER BY source_ts ASC` — half-open range filter on the indexed
-//! `source_ts` column. The tables are SCHEMALESS so no indices are defined
-//! today; this is fine for the test/dev access pattern but a follow-up
-//! should consider explicit indices on `(provider, symbol, source_ts)`
-//! if range scans get heavy.
+//! symbol = $sym AND adjustment = $adj AND source_ts >= $from AND
+//! source_ts < $to ORDER BY source_ts ASC` — half-open range filter on the
+//! indexed `source_ts` column, scoped to one adjustment mode so a fresh read
+//! never surfaces orphaned rows from another mode. The store DELETE and count
+//! are filtered by `adjustment` for the same reason. The tables are SCHEMALESS
+//! so no indices are defined today; this is fine for the test/dev access
+//! pattern but a follow-up should consider explicit indices on
+//! `(provider, symbol, adjustment, source_ts)` if range scans get heavy.
 //!
 //! Coverage of stored ranges is recorded in a per-key `coverage` table —
-//! one document per `(provider, symbol, kind)` holding a list of merged,
+//! one document per `(provider, symbol, kind, adjustment)` holding a list of merged,
 //! non-overlapping `[from, to]` segments. `lookup` reports the segment
 //! that intersects the requested range; `gaps` enumerates the holes.
 //! `store` always claims exactly the requested key range as covered, so a
