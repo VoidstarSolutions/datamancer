@@ -21,14 +21,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    AssetClass, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest, Instrument,
-    LiveHandle, MarketEvent, Price, Provider, ProviderId, Result, Seq, Timestamp, Trade,
+    Adjustment, AssetClass, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest,
+    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Result, Seq, Timestamp,
+    Trade,
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
     AccountType, MarketDataClient, StreamingFeed, TradingClient,
     restful::{
         market_data::TimeFrame,
+        market_data::stock::Adjustment as AlpacaAdjustment,
         trading::assets::{Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus},
     },
     streaming::{
@@ -666,6 +668,20 @@ fn ts_to_chrono(ts: Timestamp) -> DateTime<Utc> {
 // Historical fetch
 // ---------------------------------------------------------------------------
 
+/// Map datamancer's adjustment mode onto oxidized-alpaca's. The two enums are
+/// 1:1; this keeps the provider boundary the only place that knows the Alpaca
+/// type. Applied only to the historical `stock_bars` REST path — live ticks and
+/// trades are always raw.
+fn map_adjustment(adjustment: Adjustment) -> AlpacaAdjustment {
+    match adjustment {
+        Adjustment::Raw => AlpacaAdjustment::Raw,
+        Adjustment::Split => AlpacaAdjustment::Split,
+        Adjustment::Dividend => AlpacaAdjustment::Dividend,
+        Adjustment::SpinOff => AlpacaAdjustment::SpinOff,
+        Adjustment::All => AlpacaAdjustment::All,
+    }
+}
+
 async fn fetch_history_via(
     rest: &MarketDataClient,
     request: HistoryRequest,
@@ -728,6 +744,7 @@ async fn fetch_history_via(
                 .stock_bars(symbol, timeframe)
                 .start(from)
                 .end(to)
+                .adjustment(map_adjustment(request.adjustment))
                 .execute()
                 .await
                 .map_err(|e| Error::Provider {
@@ -862,6 +879,17 @@ mod tests {
         );
         assert!(list.trades.is_none());
         assert!(list.bars.is_none());
+    }
+
+    #[test]
+    fn maps_core_adjustment_to_alpaca_adjustment() {
+        use datamancer_core::Adjustment as Core;
+        use oxidized_alpaca::restful::market_data::stock::Adjustment as Alpaca;
+        assert_eq!(map_adjustment(Core::Raw), Alpaca::Raw);
+        assert_eq!(map_adjustment(Core::Split), Alpaca::Split);
+        assert_eq!(map_adjustment(Core::Dividend), Alpaca::Dividend);
+        assert_eq!(map_adjustment(Core::SpinOff), Alpaca::SpinOff);
+        assert_eq!(map_adjustment(Core::All), Alpaca::All);
     }
 
     #[test]
