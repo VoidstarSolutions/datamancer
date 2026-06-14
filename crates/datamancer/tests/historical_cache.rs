@@ -7,6 +7,7 @@
 #![cfg(feature = "storage-surreal")]
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use datamancer::storage::{SurrealCache, SurrealCacheConfig};
@@ -17,7 +18,7 @@ use datamancer::{
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 // --- synthetic provider -----------------------------------------------------
 
@@ -466,4 +467,116 @@ async fn refresh_refetches_whole_range_despite_coverage() {
     assert!(gaps.is_empty());
     // write_cache=true: the refreshed data is persisted (full refresh cycle).
     assert!(cache.lookup(&key(0, 1000)).await.unwrap().is_some());
+}
+
+// --- gated provider (forces genuine fetch overlap) --------------------------
+
+/// Counts `fetch_history` calls and blocks inside each fetch until released,
+/// so a test can guarantee multiple sessions are contending before the winner
+/// finishes. Serves the same dataset filtered to the requested range.
+struct GatedProvider {
+    id: String,
+    data: Vec<MarketEvent>,
+    calls: Arc<AtomicUsize>,
+    started: Arc<tokio::sync::Notify>,
+    release: watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl Provider for GatedProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(NoopLive))
+    }
+    async fn fetch_history(
+        &self,
+        request: HistoryRequest,
+        sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        let mut rx = self.release.clone();
+        while !*rx.borrow() {
+            rx.changed().await.ok();
+        }
+        for ev in &self.data {
+            let ts = match ev {
+                MarketEvent::Bar(b) => b.source_ts.0,
+                _ => continue,
+            };
+            if ts < request.from.0 || ts >= request.to.0 {
+                continue;
+            }
+            if sink.send(ev.clone()).await.is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn concurrent_identical_requests_fetch_once() {
+    const N: usize = 8;
+    let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0)];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (release_tx, release_rx) = watch::channel(false);
+
+    let provider = GatedProvider {
+        id: "rec".to_string(),
+        data,
+        calls: calls.clone(),
+        started: started.clone(),
+        release: release_rx,
+    };
+    let cache = Arc::new(SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap());
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let dm = Arc::new(dm);
+
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let dm = dm.clone();
+        handles.push(tokio::spawn(async move {
+            let session = dm
+                .session(
+                    inst(),
+                    EventKind::Bar(BarInterval::OneMinute),
+                    Scope::Historical {
+                        from: Timestamp(0),
+                        to: Timestamp(1000),
+                    },
+                    PersistenceOptions::cached(),
+                )
+                .await
+                .unwrap();
+            drain(&session).await.0
+        }));
+    }
+
+    started.notified().await;
+    release_tx.send(true).unwrap();
+
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one provider fetch");
+    for bars in &results {
+        assert_eq!(
+            bars,
+            &vec![(100, 0), (200, 1), (300, 2)],
+            "every consumer gets the full range"
+        );
+    }
 }

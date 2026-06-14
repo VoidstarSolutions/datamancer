@@ -40,7 +40,6 @@
 //!
 //! Explicit [`Session::close`] is always available for forced termination.
 
-#[allow(unused_imports)] // wired in Task 2
 use crate::fetch_locks::FetchLocks;
 
 use std::collections::HashMap;
@@ -184,6 +183,9 @@ struct DatamancerInner {
     /// and every `CacheKey` (so the cache segregates by mode). Never set
     /// independently on the provider or cache instances.
     adjustment: Adjustment,
+    /// Per-`CacheKey` single-flight registry: at most one outstanding
+    /// provider fetch per key (see `fetch_locks`).
+    fetch_locks: FetchLocks,
 }
 
 type LiveSessionRegistry =
@@ -301,6 +303,7 @@ impl Datamancer {
             historical_cache: self.inner.historical_cache.clone(),
             sink,
             ring_capacity: self.inner.resume_buffer_events,
+            fetch_locks: self.inner.fetch_locks.clone(),
         };
 
         let drop_guard = match scope {
@@ -496,6 +499,7 @@ impl DatamancerBuilder {
                     .resume_buffer_events
                     .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),
                 adjustment: self.adjustment,
+                fetch_locks: FetchLocks::default(),
             }),
         })
     }
@@ -726,6 +730,7 @@ struct Controller {
     sink: Sink,
     /// Capacity for rings created on detach (from the builder knob).
     ring_capacity: usize,
+    fetch_locks: FetchLocks,
 }
 
 impl Controller {
@@ -1116,28 +1121,51 @@ impl Controller {
             adjustment: self.inner.adjustment,
         };
 
-        let whole = vec![GapSpan {
-            from_source_ts: from,
-            to_source_ts: to,
-        }];
+        // Single-flight: an unlocked pre-check lets a fully-covered range
+        // replay without ever touching the fetch slot. If there is anything
+        // to fetch, acquire the per-key slot and RE-TILE against fresh
+        // coverage — a concurrent winner may have just filled some or all of
+        // it. We hold the slot across the fetch only when we actually fetch.
+        let mut fetch_guard = None;
         let gaps = if options.read_cache {
-            match cache.gaps(&plan_key).await {
-                Ok(g) => g,
-                Err(e) => {
+            let initial = if let Ok(g) = cache.gaps(&plan_key).await {
+                g
+            } else {
+                tracing::warn!(
+                    instrument = %self.inner.instrument,
+                    "cache gaps() failed; treating whole range as a gap"
+                );
+                vec![GapSpan { from_source_ts: from, to_source_ts: to }]
+            };
+            if initial.is_empty() {
+                initial
+            } else {
+                let guard = self.fetch_locks.acquire(&plan_key).await;
+                let regaps = if let Ok(g) = cache.gaps(&plan_key).await {
+                    g
+                } else {
                     tracing::warn!(
                         instrument = %self.inner.instrument,
-                        error = %e,
-                        "cache gaps() failed; treating whole range as a gap"
+                        "cache gaps() failed after acquiring fetch slot; \
+                         treating whole range as a gap"
                     );
-                    whole
+                    vec![GapSpan { from_source_ts: from, to_source_ts: to }]
+                };
+                if !regaps.is_empty() {
+                    fetch_guard = Some(guard);
                 }
+                regaps
             }
         } else {
-            whole
+            vec![GapSpan { from_source_ts: from, to_source_ts: to }]
         };
         let segments = tile(from, to, &gaps);
 
-        if self.stream_segments(segments, options, cmd_rx, None).await == SegmentOutcome::Closed {
+        let outcome = self.stream_segments(segments, options, cmd_rx, None).await;
+        // Release the fetch slot (if held) before finishing, so a queued
+        // waiter proceeds as soon as our store has landed.
+        drop(fetch_guard);
+        if outcome == SegmentOutcome::Closed {
             return;
         }
 

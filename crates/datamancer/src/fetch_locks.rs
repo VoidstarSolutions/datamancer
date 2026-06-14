@@ -20,12 +20,10 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 /// Hands out a per-`CacheKey` async guard with mutual exclusion. Cheap to
 /// clone (an `Arc` around the shared map); every clone shares one registry.
 #[derive(Clone, Default)]
-#[allow(dead_code)] // wired in Task 2
 pub(crate) struct FetchLocks {
     map: Arc<Mutex<HashMap<CacheKey, Weak<AsyncMutex<()>>>>>,
 }
 
-#[allow(dead_code)] // wired in Task 2
 impl FetchLocks {
     /// Acquire the fetch slot for `key`, waiting if another task holds it.
     ///
