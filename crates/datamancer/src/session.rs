@@ -1126,6 +1126,12 @@ impl Controller {
         // to fetch, acquire the per-key slot and RE-TILE against fresh
         // coverage — a concurrent winner may have just filled some or all of
         // it. We hold the slot across the fetch only when we actually fetch.
+        //
+        // The slot keys on the full `plan_key` (range included), so this
+        // coalesces byte-identical requests (the cold-cache sweep). Two
+        // concurrent sessions over *overlapping but non-identical* ranges take
+        // different slots and may each fetch the overlap — range-precise
+        // coalescing is a deliberate non-goal (coverage dedups it next time).
         let mut fetch_guard = None;
         let gaps = if options.read_cache {
             let initial = cache.gaps(&plan_key).await.unwrap_or_else(|e| {
