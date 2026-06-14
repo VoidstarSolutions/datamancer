@@ -8,8 +8,8 @@
 
 use datamancer::storage::{SurrealCache, SurrealCacheConfig};
 use datamancer::{
-    AssetClass, Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache, Instrument,
-    MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
+    Adjustment, AssetClass, Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache,
+    Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
 };
 use datamancer_core::ReplayRequest;
 use futures::StreamExt;
@@ -49,11 +49,16 @@ fn bar(symbol: &str, ts: i64, close: f64) -> MarketEvent {
 }
 
 fn key(kind: EventKind, from: i64, to: i64) -> CacheKey {
+    key_adj(kind, from, to, Adjustment::default())
+}
+
+fn key_adj(kind: EventKind, from: i64, to: i64, adjustment: Adjustment) -> CacheKey {
     CacheKey {
         instrument: inst("AAPL"),
         kind,
         from: Timestamp(from),
         to: Timestamp(to),
+        adjustment,
     }
 }
 

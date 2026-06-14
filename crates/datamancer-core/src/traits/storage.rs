@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use crate::{
+    adjustment::Adjustment,
     error::Result,
     event::{EventKind, GapSpan, MarketEvent, Seq, Timestamp},
     instrument::Instrument,
@@ -113,6 +114,11 @@ pub struct CacheKey {
     pub kind: EventKind,
     pub from: Timestamp,
     pub to: Timestamp,
+    /// Corporate-action adjustment mode this range is stored/served under.
+    /// Backends segregate rows by this so adjusted and raw bars for the same
+    /// `(symbol, range)` never collide. Descends from the same session source
+    /// of truth as [`HistoryRequest::adjustment`](crate::HistoryRequest).
+    pub adjustment: Adjustment,
 }
 
 /// What a `HistoricalCache` reports about a cached range.

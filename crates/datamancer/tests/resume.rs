@@ -10,9 +10,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer::storage::{SurrealCache, SurrealCacheConfig, SurrealTapLog, SurrealTapLogConfig};
 use datamancer::{
-    AssetClass, CacheKey, ControlKind, Datamancer, EventKind, GapSpan, HistoricalCache, Instrument,
-    LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ReplayRequest,
-    Result, Scope, Seq, TapLog, Timestamp, Trade,
+    Adjustment, AssetClass, CacheKey, ControlKind, Datamancer, EventKind, GapSpan, HistoricalCache,
+    Instrument, LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId,
+    ReplayRequest, Result, Scope, Seq, TapLog, Timestamp, Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -299,6 +299,7 @@ fn key(from: i64, to: i64) -> CacheKey {
         kind: EventKind::Trade,
         from: Timestamp(from),
         to: Timestamp(to),
+        adjustment: Adjustment::default(),
     }
 }
 
