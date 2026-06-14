@@ -49,7 +49,6 @@ impl RecordingProvider {
         )
     }
 
-    #[allow(dead_code)]
     fn with_fail_at(mut self, ts: i64) -> Self {
         self.fail_at = Some(ts);
         self
@@ -579,4 +578,92 @@ async fn concurrent_identical_requests_fetch_once() {
             "every consumer gets the full range"
         );
     }
+}
+
+#[tokio::test]
+async fn failed_fetch_releases_slot_for_next_session() {
+    let cache = Arc::new(SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap());
+
+    // Session A: provider fails at ts >= 200, so only [.., 200) of the data
+    // is delivered/stored; the remainder is reported as a Gap.
+    let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0)];
+    let (failing, _f1) = RecordingProvider::new("rec", data.clone());
+    let failing = failing.with_fail_at(200);
+    let dm_a = Datamancer::builder()
+        .provider_arc(Arc::new(failing))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let session_a = dm_a
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical { from: Timestamp(0), to: Timestamp(1000) },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    let (bars_a, gaps_a) = drain(&session_a).await;
+    assert_eq!(bars_a.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100]);
+    assert!(!gaps_a.is_empty(), "A reports the unfetched remainder as a gap");
+
+    // Session B: a healthy provider on the SAME cache. The slot must have
+    // been released by A's failure, and B must fetch the still-uncovered
+    // remainder and deliver the full range.
+    let (healthy, f2) = RecordingProvider::new("rec", data);
+    let dm_b = Datamancer::builder()
+        .provider_arc(Arc::new(healthy))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let session_b = dm_b
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical { from: Timestamp(0), to: Timestamp(1000) },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    let (bars_b, _gaps_b) = drain(&session_b).await;
+    assert_eq!(
+        bars_b.iter().map(|b| b.0).collect::<Vec<_>>(),
+        vec![100, 200, 300],
+        "B sees the full range after re-tiling the remainder"
+    );
+    assert!(
+        !f2.lock().unwrap().is_empty(),
+        "B fetched the remainder rather than serving a permanently-masked gap"
+    );
+}
+
+#[tokio::test]
+async fn distinct_ranges_each_fetch() {
+    let data = vec![bar(100, 1.0), bar(1100, 2.0)];
+    let (provider, fetched) = RecordingProvider::new("rec", data);
+    let cache = Arc::new(SurrealCache::open(SurrealCacheConfig::Memory).await.unwrap());
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+
+    for (from, to) in [(0_i64, 1000_i64), (1000, 2000)] {
+        let session = dm
+            .session(
+                inst(),
+                EventKind::Bar(BarInterval::OneMinute),
+                Scope::Historical { from: Timestamp(from), to: Timestamp(to) },
+                PersistenceOptions::cached(),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&session).await;
+    }
+
+    let fetched = fetched.lock().unwrap().clone();
+    assert!(
+        fetched.contains(&(0, 1000)) && fetched.contains(&(1000, 2000)),
+        "distinct cache keys each fetch their own range: {fetched:?}"
+    );
 }
