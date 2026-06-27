@@ -824,6 +824,21 @@ impl Controller {
             }
         }
 
+        // The fetch task owns the only `provider_tx`; the loop broke because
+        // that sender dropped — which also happens when the fetch returns
+        // `Err` before sending anything (e.g. missing credentials). Join it so
+        // a fetch failure surfaces as an in-band `ProviderError` instead of an
+        // empty, success-looking result.
+        match fetch_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => self.emit_provider_error(from, e.to_string()).await,
+            Err(join_err) if join_err.is_cancelled() => {}
+            Err(join_err) => {
+                self.emit_provider_error(from, format!("fetch task panicked: {join_err}"))
+                    .await;
+            }
+        }
+
         self.finish_historical(&mut cmd_rx).await;
     }
 
@@ -888,6 +903,25 @@ impl Controller {
                     from_source_ts: from,
                     to_source_ts: to,
                 },
+            },
+        }))
+        .await;
+    }
+
+    /// Forward an in-band `ProviderError` control surfacing a failed provider
+    /// fetch (missing credentials, an auth rejection, a mid-stream transport
+    /// fault). Historical fetches run the provider call detached, so without
+    /// this the failure is invisible to the consumer — the event stream just
+    /// ends with no data, indistinguishable from an empty range. Stamped at an
+    /// in-range `source_ts` so it stays ordered within the source-time stream.
+    async fn emit_provider_error(&mut self, source_ts: Timestamp, message: String) {
+        self.forward(MarketEvent::Control(Control {
+            source_ts,
+            rx_ts: source_ts,
+            seq: Seq(0),
+            kind: ControlKind::ProviderError {
+                provider: self.provider.id().to_string(),
+                message,
             },
         }))
         .await;
@@ -1030,8 +1064,13 @@ impl Controller {
                         }
                     }
 
-                    let succeeded = matches!(fetch_task.await, Ok(Ok(())));
-                    if succeeded {
+                    let fetch_error = match fetch_task.await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(e.to_string()),
+                        Err(join_err) if join_err.is_cancelled() => None,
+                        Err(join_err) => Some(format!("fetch task panicked: {join_err}")),
+                    };
+                    if fetch_error.is_none() {
                         // A segment ending at the live edge gets a conservative
                         // claim: history endpoints lag the live feed, so a
                         // "successful" fetch may silently lack the last
@@ -1086,6 +1125,12 @@ impl Controller {
                         let gap_to = edge.unwrap_or(t);
                         if confirmed_to < gap_to {
                             self.emit_gap(confirmed_to, confirmed_to, gap_to).await;
+                        }
+                        // The gap above only records coverage; surface the
+                        // underlying cause so the consumer can tell a failed
+                        // fetch from a legitimately empty range.
+                        if let Some(message) = fetch_error {
+                            self.emit_provider_error(f, message).await;
                         }
                         break;
                     }
