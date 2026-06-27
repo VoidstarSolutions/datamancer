@@ -313,7 +313,7 @@ async fn historical_session_surfaces_provider_fetch_error_as_control() {
     });
     assert_eq!(
         provider_error.as_deref(),
-        Some("provider fake: REST client not initialized (credentials missing?)"),
+        Some("REST client not initialized (credentials missing?)"),
         "expected a ProviderError control carrying the fetch failure; got {controls:?}"
     );
 }

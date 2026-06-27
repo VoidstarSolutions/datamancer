@@ -807,6 +807,10 @@ impl Controller {
         let fetch_task =
             tokio::spawn(async move { provider.fetch_history(request, provider_tx).await });
 
+        // Track the latest forwarded source timestamp so a failure control is
+        // stamped at the confirmed end of the data already emitted, not back at
+        // the range start (which would make `source_ts` move backwards).
+        let mut max_data_ts: Option<Timestamp> = None;
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
@@ -817,7 +821,10 @@ impl Controller {
                 }
                 ev = provider_rx.recv() => {
                     match ev {
-                        Some(ev) => self.forward(ev).await,
+                        Some(ev) => {
+                            max_data_ts = max_data_ts.max(data_source_ts(&ev));
+                            self.forward(ev).await;
+                        }
                         None => break, // fetch exhausted
                     }
                 }
@@ -829,12 +836,16 @@ impl Controller {
         // `Err` before sending anything (e.g. missing credentials). Join it so
         // a fetch failure surfaces as an in-band `ProviderError` instead of an
         // empty, success-looking result.
+        let error_ts = max_data_ts.unwrap_or(from);
         match fetch_task.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => self.emit_provider_error(from, e.to_string()).await,
+            Ok(Err(e)) => {
+                self.emit_provider_error(error_ts, provider_error_message(&e))
+                    .await;
+            }
             Err(join_err) if join_err.is_cancelled() => {}
             Err(join_err) => {
-                self.emit_provider_error(from, format!("fetch task panicked: {join_err}"))
+                self.emit_provider_error(error_ts, format!("fetch task panicked: {join_err}"))
                     .await;
             }
         }
@@ -1066,7 +1077,7 @@ impl Controller {
 
                     let fetch_error = match fetch_task.await {
                         Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e.to_string()),
+                        Ok(Err(e)) => Some(provider_error_message(&e)),
                         Err(join_err) if join_err.is_cancelled() => None,
                         Err(join_err) => Some(format!("fetch task panicked: {join_err}")),
                     };
@@ -1128,9 +1139,11 @@ impl Controller {
                         }
                         // The gap above only records coverage; surface the
                         // underlying cause so the consumer can tell a failed
-                        // fetch from a legitimately empty range.
+                        // fetch from a legitimately empty range. Stamp it at the
+                        // confirmed prefix boundary (matching the gap) so the
+                        // control stays ordered after the data already emitted.
                         if let Some(message) = fetch_error {
-                            self.emit_provider_error(f, message).await;
+                            self.emit_provider_error(confirmed_to, message).await;
                         }
                         break;
                     }
@@ -1708,6 +1721,17 @@ fn data_source_ts(ev: &MarketEvent) -> Option<Timestamp> {
     match ev {
         MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_) => source_ts(ev),
         _ => None,
+    }
+}
+
+/// Provider-local message for an in-band `ProviderError` control. The control
+/// already carries the provider id separately, so `Error::Provider`'s
+/// `provider {id}: …` Display prefix would duplicate it — strip it down to the
+/// inner message. Other error variants keep their full Display.
+fn provider_error_message(e: &Error) -> String {
+    match e {
+        Error::Provider { message, .. } => message.clone(),
+        other => other.to_string(),
     }
 }
 
