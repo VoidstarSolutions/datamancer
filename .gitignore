@@ -2,3 +2,11 @@
 target/
 .omniscient/
 .claude/
+
+# Omniscient local semantic index (derived artifact: large, binary, rebuilt by
+# re-indexing and churned by the filesystem watcher). The repo config
+# (omniscient.toml) is tracked; the index is not.
+.omniscient/
+
+# Claude Code local working directory.
+.claude/
