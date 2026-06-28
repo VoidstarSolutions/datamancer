@@ -14,7 +14,7 @@ The first supported provider is Alpaca. Provider integration is meant to be addi
 
 - **Provider integration.** Per-provider transports (websocket for live, REST for historical), authentication, rate-limit handling, and reconnect logic, isolated behind a unified surface.
 - **Typed event production.** Provider-native messages are converted into datamancer's public event types. Consumers never see provider-specific shapes.
-- **Subscription management.** A live session's subscription set is mutable at runtime: instruments and event kinds can be added or removed without tearing down the underlying connection.
+- **Subscription management (roadmap).** A live session is currently scoped to a single `(instrument, kind)` pair, fixed at construction. Making a session's subscription set mutable at runtime — adding or removing instruments and event kinds without tearing down the underlying connection — is planned (see [Subscriptions](#subscriptions-roadmap)).
 - **Historical fetch.** Pulling bar (and eventually trade and quote) history for an instrument set over a date range, with pagination and rate-limit handling abstracted away.
 - **Replay.** Presenting historical or persisted data as an ordered event stream that is indistinguishable in shape from a live stream. Replay always runs as fast as the consumer can drain it.
 - **Stitched streams.** "Backfill the last N days, then continue with live" is a first-class operation, not something the consumer assembles by hand.
@@ -47,23 +47,49 @@ Every data variant carries three timestamp/identifier fields, with distinct role
 
 ## Sessions
 
-A session is the unit of consumption. Three constructors, all returning the same `Session` type:
+A session is the unit of consumption. There is one constructor; the kind of
+session is selected by the `Scope` argument, and every session returns the same
+`Session` type:
 
 ```rust
-let live = datamancer.live(LiveConfig { providers, credentials, ... })?;
-let backtest = datamancer.replay(ReplayConfig { source, instruments, range })?;
-let warm_start = datamancer.stitched(StitchConfig { backfill_from, ... })?;
+let session = datamancer
+    .session(instrument, kind, scope, PersistenceOptions::cached())
+    .await?;
 ```
+
+`Scope::Live { backfill_from }` opens a live session (optionally stitching
+history ahead of the live tail — see [Resume](#resume)); `Scope::Historical { from, to }`
+replays a bounded range. Each session is scoped to a single `(instrument, kind)`
+pair, fixed at construction.
 
 A `Session` exposes:
 
-- `events()` — the single output stream (`Stream<Item = MarketEvent>`).
-- `subscribe(Subscription)` / `unsubscribe(Subscription)` — mutate the active subscription set. Live and stitched sessions accept these throughout their lifetime; replay sessions fix the subscription set at construction (the subscription set is part of what defines a reproducible analysis).
+- `take_events()` — take the single output stream (an `EventStream`, which is
+  `Stream<Item = MarketEvent>`). Live scope is multi-shot: drop the stream and
+  re-take later (see [Resume](#resume)). Historical scope is single-shot.
+- `set_persistence()` / `persistence()` — replace or read the session's
+  `PersistenceOptions` at runtime.
+- `instrument()` / `kind()` / `scope()` — inspect what the session is bound to.
 - `close()` — explicit shutdown.
 
-The choice of explicit `close` over reference-counted lifetime keeps subscription teardown visible in code, which matters once persistence is wired up and shutdown order affects whether buffered events make it to disk.
+The choice of explicit `close` over reference-counted lifetime keeps session
+teardown visible in code, which matters once persistence is wired up and shutdown
+order affects whether buffered events make it to disk.
 
-## Subscriptions
+### Roadmap: multi-subscription sessions
+
+The intended end state is a richer session API: dedicated `live` / `replay` /
+`stitched` constructors taking `LiveConfig` / `ReplayConfig` / `StitchConfig`,
+and a mutable, multi-instrument subscription set per session
+(`subscribe` / `unsubscribe`) multiplexed into the one ordered stream. The
+current one-pair-per-session model is the implemented subset; the
+[Subscriptions](#subscriptions-roadmap) and [Configuration](#configuration)
+sections below describe that roadmap, not today's API.
+
+## Subscriptions (roadmap)
+
+> **Not yet implemented.** Today a session is fixed to one `(instrument, kind)`
+> pair at construction. The model below is the planned multi-subscription API.
 
 A subscription is `(instrument, set-of-event-kinds)`:
 
@@ -77,6 +103,18 @@ session.subscribe(Subscription {
 Subscriptions accumulate; the single output stream multiplexes everything that has been requested. Adding the same instrument with a new event kind extends the existing subscription rather than duplicating it.
 
 ## Configuration
+
+Process-wide wiring is done through `DatamancerBuilder`: registering providers
+(`provider` / `provider_arc`), pinning an instrument to a specific provider
+(`pin`), attaching a tap log (`tap_log`) and a historical cache
+(`historical_cache`), bounding the resume buffer (`resume_buffer_events`), and
+selecting the corporate-action `adjustment` mode. Per-session behavior is then
+selected by the `Scope` and `PersistenceOptions` arguments to `session()`.
+
+### Roadmap: per-session config structs
+
+> **Not yet implemented.** The richer per-session configuration below pairs with
+> the multi-subscription session API above.
 
 A `LiveConfig` covers:
 

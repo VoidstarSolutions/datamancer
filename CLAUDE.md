@@ -33,7 +33,7 @@ Integration tests live in `crates/datamancer/tests/`. `alpaca_real.rs` is `#[ign
 These are load-bearing design rules — violating them breaks downstream consumers in subtle ways. The crate README (`crates/datamancer/README.md`) is the authoritative design doc; read it before changing public API.
 
 - **Source-agnostic output.** All provider-specific concerns stay inside `datamancer`. Once an event leaves the crate it must be indistinguishable across providers.
-- **Single ordered stream.** A `Session` exposes exactly one `events()` stream merging all subscriptions. Per-instrument demux is a consumer concern.
+- **Single ordered stream.** A `Session` is scoped to one `(instrument, kind)` pair and exposes that pair's events as a single ordered stream via `take_events()` (async; multi-shot for live scope, single-shot for historical). Merging multiple subscriptions into one session is roadmap (see the README); per-instrument demux is a consumer concern.
 - **Three timestamp fields, distinct roles** (on every data event):
   - `source_ts` — provider-reported market time. **Only** field engine logic should reason about. Never assigned by datamancer.
   - `seq: u64` — session-monotonic, stamped by datamancer at delivery into
