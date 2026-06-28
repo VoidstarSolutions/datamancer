@@ -30,17 +30,17 @@ The first supported provider is Alpaca. Provider integration is meant to be addi
 
 ## Event Model
 
-Datamancer's public output is a stream of `MarketEvent`. Variants currently planned:
+Datamancer's public output is a stream of `MarketEvent`. The variants:
 
 - `Trade { instrument, source_ts, rx_ts, seq, price, size }`
 - `Bar { instrument, interval, source_ts, rx_ts, seq, open, high, low, close, volume }`
-- `Quote { instrument, source_ts, rx_ts, seq, bid, ask, ... }`
-- `Control(SessionEvent)` — connectivity, subscription state, gap notifications
+- `Quote { instrument, source_ts, rx_ts, seq, bid, bid_size, ask, ask_size }`
+- `Control(Control)` — connectivity, subscription state, and gap notifications, carried as a `ControlKind`
 
 Every data variant carries three timestamp/identifier fields, with distinct roles that should not be conflated:
 
 - **`source_ts`** — the timestamp the provider reported for the event. Source of truth for "when did this happen in the market" and the **only** timestamp engine logic should reason about. Sourced verbatim from provider data; never assigned by datamancer.
-- **`seq: u64`** — a session-monotonic sequence number assigned by datamancer at receipt. **The sole ordering field** for the stream. Live mode assigns `seq` in arrival order, so replaying in `seq` order reproduces the consumer's original experience exactly. Historical fetch assigns `seq` in source-timestamp order during fetch, so `seq` order matches market order. Persistence sinks use `seq` gaps to detect drops.
+- **`seq: u64`** — a session-monotonic sequence number stamped by datamancer at delivery into the consumer stream. **The sole ordering field** for the stream. Live mode stamps `seq` in arrival order, so replaying in `seq` order reproduces the consumer's original experience exactly. Historical fetch stamps `seq` in source-timestamp order, so `seq` order matches market order. `seq` is contiguous by construction and carries no drop-detection role: datamancer numbers only the events it delivers, so a provider-side drop is never a hole in `seq`. Real gaps are a `source_ts`/coverage concept, surfaced in-band as `Control::Gap` events.
 - **`rx_ts`** — wall-clock at the moment the bytes were received from the provider, captured pre-parse. **Observability only.** Used for measuring provider-to-engine latency (`rx_ts - source_ts`), correlating engine state with external wall-clock events (logs, traces, debugger sessions), and operational monitoring. **Engine decision logic must never depend on `rx_ts`** — doing so re-introduces wall-clock as a determinism hazard. For replay-from-historical-fetch, where there is no live arrival to record, `rx_ts` collapses to `source_ts`.
 
 `Control` events ride the same stream as data events because connectivity changes are part of the session's truth: a gap can invalidate downstream signals, and forcing consumers to acknowledge it in-band is safer than offering it as a separate stream they may forget to subscribe to.

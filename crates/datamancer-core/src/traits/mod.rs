@@ -5,7 +5,7 @@
 //! layer. Each submodule owns a single concern, with its trait(s) and the
 //! parameter/return types those traits use.
 //!
-//! Concrete data types (`MarketEvent`, `Subscription`, `Price`, `Instrument`,
+//! Concrete data types (`MarketEvent`, `EventKind`, `Price`, `Instrument`,
 //! etc.) live in their own modules at the crate root — this module is the
 //! contract surface, not the data surface.
 
