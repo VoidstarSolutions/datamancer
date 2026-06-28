@@ -435,7 +435,7 @@ async fn failed_gap_fetch_emits_provider_error_control() {
     }
     assert_eq!(
         provider_errors,
-        vec!["provider rec: synthetic mid-fetch failure".to_string()],
+        vec!["synthetic mid-fetch failure".to_string()],
         "a failed gap fetch must emit exactly one ProviderError control"
     );
 }
