@@ -390,6 +390,57 @@ async fn failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes() 
 }
 
 #[tokio::test]
+async fn failed_gap_fetch_emits_provider_error_control() {
+    // The Gap control records *coverage*; a failed fetch must additionally
+    // surface its *cause* as a ProviderError so a consumer can tell a failed
+    // fetch from a legitimately empty range. (The Gap-only assertions live in
+    // `failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes`.)
+    let cache = Arc::new(
+        SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0)];
+    let (provider, _fetched) = RecordingProvider::new("rec", data);
+    let provider = provider.with_fail_at(200);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+
+    let mut stream = session.take_events().await.unwrap();
+    let mut provider_errors = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let MarketEvent::Control(c) = ev {
+            match c.kind {
+                ControlKind::ProviderError { message, .. } => provider_errors.push(message),
+                ControlKind::SessionClosing => break,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        provider_errors,
+        vec!["synthetic mid-fetch failure".to_string()],
+        "a failed gap fetch must emit exactly one ProviderError control"
+    );
+}
+
+#[tokio::test]
 async fn read_only_fetches_gaps_but_does_not_persist() {
     let cache = Arc::new(
         SurrealCache::open(SurrealCacheConfig::Memory)

@@ -26,6 +26,10 @@ use tokio::sync::{Mutex, mpsc};
 struct FakeProviderState {
     sink: Option<mpsc::Sender<MarketEvent>>,
     history: Vec<MarketEvent>,
+    /// When set, `fetch_history` returns this as a `Provider` error after
+    /// sending whatever `history` is queued — models a provider that fails the
+    /// fetch (missing credentials, auth rejection, mid-stream transport fault).
+    history_error: Option<String>,
 }
 
 struct FakeProvider {
@@ -68,6 +72,10 @@ impl FakeController {
     async fn set_history(&self, events: Vec<MarketEvent>) {
         self.state.lock().await.history = events;
     }
+
+    async fn set_history_error(&self, message: &str) {
+        self.state.lock().await.history_error = Some(message.to_string());
+    }
 }
 
 #[async_trait]
@@ -91,11 +99,20 @@ impl Provider for FakeProvider {
         _request: HistoryRequest,
         sink: mpsc::Sender<MarketEvent>,
     ) -> Result<()> {
-        let history = self.state.lock().await.history.clone();
+        let (history, history_error) = {
+            let guard = self.state.lock().await;
+            (guard.history.clone(), guard.history_error.clone())
+        };
         for ev in history {
             if sink.send(ev).await.is_err() {
                 break;
             }
+        }
+        if let Some(message) = history_error {
+            return Err(datamancer::Error::Provider {
+                provider: self.id.clone(),
+                message,
+            });
         }
         Ok(())
     }
@@ -252,6 +269,53 @@ async fn historical_session_streams_provider_fetch_in_order() {
     assert_eq!(bars[0].seq.0, 0);
     assert_eq!(bars[1].seq.0, 1);
     assert_eq!(bars[2].seq.0, 2);
+}
+
+#[tokio::test]
+async fn historical_session_surfaces_provider_fetch_error_as_control() {
+    // A provider whose `fetch_history` returns `Err` (e.g. missing
+    // credentials) must surface the failure in-band as a `ProviderError`
+    // control rather than ending the stream silently. The non-cached
+    // historical path spawns the fetch detached, so this is the seam that
+    // would otherwise drop the error.
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_history_error("REST client not initialized (credentials missing?)")
+        .await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+
+    let mut stream = session.take_events().await.unwrap();
+    let mut controls = Vec::new();
+    while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+        if let MarketEvent::Control(c) = ev {
+            controls.push(c.kind);
+        }
+    }
+
+    let provider_error = controls.iter().find_map(|kind| match kind {
+        ControlKind::ProviderError { message, .. } => Some(message.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        provider_error.as_deref(),
+        Some("REST client not initialized (credentials missing?)"),
+        "expected a ProviderError control carrying the fetch failure; got {controls:?}"
+    );
 }
 
 #[tokio::test]
