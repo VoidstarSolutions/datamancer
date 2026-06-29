@@ -9,7 +9,7 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 > **Reconciliation pass — authoritative; supersedes any conflicting text below.** Applied from the [cross-phase consistency report](2026-06-28-server-plan-consistency-report.md). Architect decisions: registry/ids/stats built in **Phase 2** (Issue 3); diagnostics snapshot **split** (Issue 6).
 >
 > Resolutions affecting this phase:
-> - **Snapshot naming (Issue 5):** use `SystemSnapshot` and `Datamancer::snapshot() -> Result<SystemSnapshot>` (async, fallible) throughout — not `IntrospectionSnapshot`/`introspect()`. The ArcSwap-refresh task already plans off-thread acquisition, so async+fallible is mechanical; narrow CHECKPOINT A to the unit-identity-key question.
+> - **Snapshot naming (Issue 5):** use `SystemSnapshot` and `Datamancer::snapshot() -> Result<SystemSnapshot>` (async, fallible) throughout — not the earlier working names `IntrospectionSnapshot`/`introspect()`. The ArcSwap-refresh task already plans off-thread acquisition, so async+fallible is mechanical; narrow CHECKPOINT A to the unit-identity-key question.
 > - **Reads the live-state snapshot (Issue 6):** the UI reads Phase 3's bounded live-state snapshot in-process; the heavier cache catalog comes from its separate accessor/cadence.
 > - **Per-symbol `seq` display tolerates the sentinel (Issue 8):** treat `Seq::SYNTHETIC` synthetic-control entries as exempt from per-symbol monotonicity in any gap/ordering display.
 
@@ -99,13 +99,13 @@ their outputs, none of which exist on `main` today.)
 
 - **RE-PLAN CHECKPOINT A — Phase-3 snapshot type.** Assumed: Phase 3 lands a
   single consolidated, owned, `Serialize`-deriving snapshot type in
-  `datamancer-core` (working name `IntrospectionSnapshot`) containing provider
+  `datamancer-core` (working name `SystemSnapshot`) containing provider
   accounting, the cache catalog, and live system state (authoritative
   per-`(instrument, kind)` sessions, client sessions + subscriptions,
   per-unit subscriber/refcount, per-symbol `seq` position, per-instrument last
   `source_ts`/`rx_ts` + latency, resume-buffer occupancy, gap counts). Assumed
-  accessor on the orchestrator: `Datamancer::introspect() -> IntrospectionSnapshot`
-  (or an `Arc<ArcSwap<IntrospectionSnapshot>>`-style cheap-clone handle). The
+  accessor on the orchestrator: `Datamancer::snapshot() -> SystemSnapshot`
+  (or an `Arc<ArcSwap<SystemSnapshot>>`-style cheap-clone handle). The
   exact type name, module path, sub-struct names, the **identity used to key
   authoritative units** (instrument-only vs `(instrument, kind)` vs
   `(instrument, kind, adjustment)` — note `CacheKey` already carries
@@ -193,7 +193,7 @@ Create `crates/datamancerd/src/web/` with:
   `pub async fn serve(state: WebState, addr: SocketAddr, shutdown: impl Future)`.
 - `web/state.rs` — `WebState`, a cheap-`Clone` (`Arc`-wrapped) handle carrying
   whatever obtains a fresh Phase-3 snapshot (RE-PLAN CHECKPOINT A: likely
-  `Arc<Datamancer>` or `Arc<ArcSwap<IntrospectionSnapshot>>`).
+  `Arc<Datamancer>` or `Arc<ArcSwap<SystemSnapshot>>`).
 - `web/handlers.rs` — the `get` handlers.
 - `web/dto.rs` — only if the raw Phase-3 snapshot needs reshaping for the wire.
   Prefer serializing the snapshot (or its sub-structs) directly; add view-model
@@ -202,7 +202,7 @@ Create `crates/datamancerd/src/web/` with:
 
 ### 3. State handle: snapshot acquisition off the hot path
 
-- `WebState` exposes `fn snapshot(&self) -> IntrospectionSnapshot` (or
+- `WebState` exposes `fn snapshot(&self) -> SystemSnapshot` (or
   `Arc<...>`). It must **not** hold a lock across `.await` and must not block the
   shared executor that also drives the live data plane.
 - **Default plan: daemon-side periodic refresh into an `ArcSwap`.** The daemon
@@ -215,7 +215,7 @@ Create `crates/datamancerd/src/web/` with:
   browser poll interval; pick a refresh interval (e.g. 1 s) decoupled from how
   often the SPA polls.
 - **Fallback:** if Phase 3 instead offers only an on-demand
-  `Datamancer::introspect()` that walks live structures cheaply and
+  `Datamancer::snapshot()` that walks live structures cheaply and
   non-blockingly, the handler may call it directly. Any potentially-blocking
   component (the disk walk) must still go behind `tokio::task::spawn_blocking`
   or be moved to the daemon's refresh timer. **RE-PLAN CHECKPOINT A governs the
@@ -225,7 +225,7 @@ Create `crates/datamancerd/src/web/` with:
 
 Endpoint set (axum 0.8 brace syntax for any params):
 
-- `GET /api/snapshot` — the entire `IntrospectionSnapshot` as JSON. The single
+- `GET /api/snapshot` — the entire `SystemSnapshot` as JSON. The single
   source of truth; the UI can be built against this alone. All others are
   conveniences/filters over the same data.
 - `GET /api/cache` — cache catalog: enumerated keys (instrument, kind,
@@ -268,14 +268,16 @@ beyond a field access). Keep handlers thin: acquire snapshot → project → `Js
 
 ### 6. The web UI (static assets, served by `tower-http`)
 
-- **RE-PLAN CHECKPOINT — UI tech (roadmap open question): server-rendered vs
-  SPA.** Default recommendation: a **lightweight static SPA** (plain HTML +
-  vanilla JS or a tiny framework, no build pipeline required) that polls the
-  JSON endpoints on an interval and renders tables/cards. Rationale: the data is
-  read-only and low-rate; a static bundle keeps the daemon dependency-light and
-  avoids a templating engine in a data process. Revisit if the operator wants
-  live push (would argue for SSE/WS — out of scope here).
-- Serve assets with `ServeDir` + a SPA fallback
+- **RE-PLAN CHECKPOINT — UI tech: RESOLVED (server-rendered + HTMX).** The
+  locked decision (see the reconciliation block above) is **server-rendered Rust
+  templates (maud) + HTMX + SSE, no SPA / JS build toolchain**. The earlier
+  "lightweight static SPA" recommendation below is **rejected** and retained
+  only as a recorded alternative — do not implement it. (Rationale for the
+  static-SPA alternative was: read-only, low-rate data, dependency-light daemon;
+  superseded because SSE live-push and server-rendered tables fit the operator
+  surface better and avoid a polling client.)
+- ~~Serve assets with `ServeDir` + a SPA fallback~~ (rejected; static assets are
+  served read-only and the live view is SSE-driven, not a polling SPA)
   (`ServeDir::new(ui_dir).not_found_service(ServeFile::new(index_html))`).
   Default: assets **on-disk**, rooted at a path from the Phase-5 config, falling
   back to a compiled-in default dir. If a single-file binary is wanted later,
@@ -344,7 +346,7 @@ Tests live in the `datamancerd` crate. Named regression guards:
   synthetic/known snapshot (or a real `Datamancer` with seeded cache + a fake
   provider), `GET /api/snapshot`, assert `200`, `content-type:
   application/json`, and that the body deserializes back into
-  `IntrospectionSnapshot` (round-trip). Primary guard tying the UI contract to
+  `SystemSnapshot` (round-trip). Primary guard tying the UI contract to
   the Phase-3 type. (CHECKPOINT A/C: reuse Phase-3's serialize round-trip
   fixture.)
 - **`web_section_endpoints_match_snapshot`** (integration) — assert
@@ -399,8 +401,8 @@ adds no core code; if they break, something leaked out of the daemon crate).
 
 ## Open questions
 
-1. **(Roadmap) UI tech: server-rendered vs SPA.** Defaults to a static polling
-   SPA; revisit if live-push or heavier interactivity is wanted.
+1. **(Roadmap) UI tech: RESOLVED — server-rendered + HTMX + SSE** (no SPA, no JS
+   build). The static-polling-SPA default is rejected; see the checkpoint above.
 2. **(Roadmap, CHECKPOINT D) Read-only now vs unifying with the Phase-5 control
    surface** (trigger fetch / sub-unsub from the UI). Deferred; `get`-only now
    makes adding a guarded mutation surface later additive.

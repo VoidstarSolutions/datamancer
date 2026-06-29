@@ -22,10 +22,9 @@ use std::sync::Arc;
 use datamancer::{
     AssetClass, ControlKind, Datamancer, EventKind, Instrument, MarketEvent, PersistenceOptions,
     ProviderId, Scope,
-    providers::{AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue},
+    providers::{AccountType, AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue},
 };
 use futures::StreamExt;
-use oxidized_alpaca::AccountType;
 
 const SYMBOLS: &[&str] = &["BTC/USD", "ETH/USD"];
 

@@ -93,6 +93,12 @@ pub trait Provider: Send + Sync + 'static {
     /// surfacing them as `Some` and leaving them `None` for providers that do
     /// not override this. Implementations should record off the hot per-message
     /// path (e.g. once per HTTP page or websocket frame batch).
+    ///
+    /// **Stability contract:** an implementation must return clones of one
+    /// stable, long-lived `Arc<dyn ProviderMetrics>` — not a freshly allocated
+    /// sink per call. `Datamancer::snapshot()` re-queries `metrics()` on every
+    /// sample; returning a new sink each time would reset the cumulative
+    /// counters (`bytes`, `rate_limit_hits`) to zero on each snapshot.
     fn metrics(&self) -> Option<Arc<dyn ProviderMetrics>> {
         None
     }

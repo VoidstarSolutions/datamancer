@@ -95,8 +95,9 @@ client-session enumeration.
   `seq` position" with a `Relaxed` load of that counter. **Confirm** the
   field/owner when Phase 1 lands; if Phase 1 keeps the counter per-consumer the
   "identical across clients" field is meaningless and this must be revisited.
-  Whether `seq_position` is "next to assign" vs "last assigned" is pinned in Open
-  Questions and must be fixed when Phase 1 lands.
+  **RESOLVED (as shipped):** `seq_position` is the **last-assigned** source `seq`
+  for that symbol — `LiveStats::seq_position()` returns the last stamped `seq`
+  seen (`client.rs:255`), not the counter's next value.
 
 - **RE-PLAN CHECKPOINT P2-REG (from Phase 2).** Phase 2 turns the live-session
   registry (`type LiveSessionRegistry = Arc<Mutex<HashMap<(Instrument,
@@ -415,7 +416,9 @@ structures to avoid blocking Slice C on Phase 2: attach an `Arc<LiveStats>` to
 `RegistrySentinel` (session.rs:1538) and give the controller a clone. On each
 forwarded live event (`forward()`, session.rs:1411) update `last_source_ts`,
 `last_rx_ts` (and thus `latency_ns`); on `Control::Gap` bump `gap_count`. The
-`seq_position` reads the per-pair `seq_counter` (`Arc<AtomicU64>`, P1-SEQ).
+`seq_position` is the **last-assigned** source `seq`: `record_event` stores each
+stamped event's `seq` into `LiveStats.last_seq`, and `seq_position()` returns it
+(`client.rs:255`) — not a read of the next-to-assign counter.
 Resume-buffer occupancy reads `EventRing` length; `dropped_events` is a cumulative
 counter incremented on the eviction path (`flush_ring`/`into_parts`,
 session.rs:756-772, and the detached-ring `push` at session.rs:1402/1431 — wire
@@ -571,8 +574,8 @@ must still pass (Phase 3 adds reads/atomics, changes no delivery behavior).
    snapshots / counters-with-rates (roadmap:245)? Recommendation: point-in-time
    now; rate computation (deltas) is a UI/Phase-6 concern over successive
    snapshots.
-5. **`seq_position` semantics under P1-SEQ** — "next to assign" or "last
-   assigned"? Pin once Phase 1 lands so the field is unambiguous across the
+5. **`seq_position` semantics under P1-SEQ** — RESOLVED: **last assigned** (the
+   last stamped `seq` seen, `LiveStats::seq_position()`), consistent across the
    in-process reader and the transport.
 6. **`ClientSessionId` ownership (P2-REG layering).** Define in `datamancer-core`
    (Phase 2 consumes it) or carry a raw `u64` in `ClientSessionSnapshot`? Resolve
@@ -656,8 +659,8 @@ against the working tree):
 
 **Unresolved concerns (correctly deferred to checkpoints, not guesses):**
 
-- P1-SEQ field name/owner and `seq_position` "next vs last" semantics — cannot be
-  finalized until Phase 1 lands.
+- P1-SEQ field name/owner and `seq_position` semantics — RESOLVED: `seq_position`
+  is the last-assigned source `seq` (`LiveStats::seq_position()`).
 - P2-REG registry value shape (whether Phase 2 attaches state or Phase 3 must) and
   `ClientSessionId` ownership — coordinate with Phase 2.
 - P2-RING resume-buffer granularity — determines whether `ResumeBufferSnapshot`

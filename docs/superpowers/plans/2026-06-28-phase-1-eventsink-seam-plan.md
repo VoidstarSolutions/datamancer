@@ -260,10 +260,13 @@ resume path this is correct**: while detached there is no other producer into
 the outbound order, so push order == canonical delivery order; survivors keep
 their push-time `seq` with a hole where evicted events were.
 
-`forward` (session.rs:1411) is **unchanged** in shape — `tee(&ev); emit(ev)`.
-The tap log therefore still sees the pre-stamp (stub `Seq(0)`) event, exactly as
-it saw a pre-poll-stamp event before. Tap-log/source `seq` convergence stays out
-of scope (Open questions).
+**Post-implementation note:** convergence landed in this phase, so the original
+"unchanged `forward`" plan below was superseded. As shipped, `forward`
+(session.rs:1834) is `stamp(ev) → tee(&ev) → deliver(ev)` — it stamps the source
+`seq` **before** the tee, so the tap log records the source `seq` verbatim and
+tap-log replay reproduces the delivered stream's `seq`. (The one remaining
+pre-stamp tee is the backfill-seam `buffer_live_arrival` path, tracked
+separately.)
 
 ### Step 4 — The two ring-flush paths (the resume × backfill split)
 
@@ -476,12 +479,10 @@ baseline contradicts itself.
   serializing transports can be added additively.
 - **`EventSink::flush` at shutdown** — wired in for forward-compat though
   in-process is a no-op; confirm this is the desired shape.
-- **Tap-log `seq` convergence** — the tap log keeps its own store-canonical
-  `seq`; the eventual "tap-log seq and source seq are the same value" is
-  **explicitly deferred**. Stamping-before-tee is now structurally trivial
-  (move `tee` after `stamp` in `forward`) but is left untouched to keep the
-  `surreal_tap_log` tests green; this is the natural hook for the phase that
-  lands convergence.
+- **Tap-log `seq` convergence** — ~~deferred~~ **LANDED in this phase.** `forward`
+  now stamps before the tee (`stamp → tee → deliver`), so the tap log persists
+  the source `seq` verbatim and no longer mints its own. (The original plan
+  deferred this; it was pulled into Phase 1 since the change was a one-liner.)
 - **Per-stream resume buffer granularity** — Phase 1 keeps one ring per
   authoritative session. Per-symbol-vs-per-multiplexed-stream buffering is a
   Phase 2 decision; nothing here forecloses it.
@@ -549,11 +550,9 @@ Changes made to the draft:
   sink-signature sign-off before Phase 4).
 
 Unresolved concerns (flagged, not blocking Phase 1):
-- Tap-log/source `seq` convergence remains deferred. The plan keeps
-  `forward = tee; emit` so the tap log still sees stub-`seq` events. If the
-  roadmap wants convergence sooner, moving `tee` after `stamp` is a one-line
-  change but risks the `surreal_tap_log` seq tests — left for the phase that
-  owns convergence.
+- ~~Tap-log/source `seq` convergence remains deferred.~~ **Resolved in this
+  phase:** `forward` is `stamp → tee → deliver`, so the tap log persists the
+  source `seq` verbatim.
 - `EventSink::flush` at shutdown is wired for forward-compat only (no-op
   in-process); confirm this is the desired shape vs deferring entirely to
   Phase 4.

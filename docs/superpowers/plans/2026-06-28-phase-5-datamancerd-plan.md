@@ -23,7 +23,7 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 >
 > **Startup anchors:** `always_on=true` holds the authoritative session for the process lifetime regardless of clients; `false` (default) is refcount-driven (pre-created for warmth, torn down at last client).
 >
-> **Backfill sharing:** an authoritative session created with `backfill_from` keeps history available while anchored; later clients of that symbol attach to the **live tail only**. Control `subscribe` carries scope/backfill as *preferences*; on conflict with an existing authoritative scope the reply returns the **actual** scope rather than erroring.
+> **Backfill sharing:** an authoritative session created with `backfill_from` keeps history available while anchored; later clients of that symbol attach to the **live tail only**. Runtime client `subscribe` is **pure-live**: it mirrors Phase 2's `ClientSession::subscribe`, which rejects any historical/backfill scope (`Error::UnsupportedClientScope`). Backfill is owned by the authoritative session at creation time (a startup anchor), not re-specified per client subscribe — so there is no scope to reconcile or silently override.
 >
 > **Service-cap overrun:** **reject the subscribe** (`service cap N exceeded`); dynamic recreation deferred.
 >
