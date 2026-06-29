@@ -3,6 +3,7 @@ members = [
     "crates/datamancer",
     "crates/datamancer-core",
     "crates/datamancer-transport-iceoryx2",
+    "crates/datamancerd",
 ]
 resolver = "3"
 

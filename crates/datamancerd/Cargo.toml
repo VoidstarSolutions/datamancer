@@ -1,0 +1,26 @@
+[package]
+name = "datamancerd"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Standalone datamancer server: same-host multi-client market-data daemon"
+
+[dependencies]
+datamancer = { path = "../datamancer", features = ["transport-iceoryx2"] }
+async-trait = "0.1"
+iceoryx2 = "0.9.2"
+tokio = { workspace = true, features = ["signal", "io-util"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+thiserror = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
