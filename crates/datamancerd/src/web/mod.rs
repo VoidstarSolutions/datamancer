@@ -140,6 +140,7 @@ mod tests {
     use datamancer::{CacheSnapshot, ProviderSnapshot, SystemSnapshot};
     use http_body_util::BodyExt as _;
     use serde_json::Value;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tower::ServiceExt as _;
 
     fn state() -> WebState {
@@ -283,10 +284,33 @@ mod tests {
 
     #[tokio::test]
     async fn web_graceful_shutdown_drains() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        // A handler that signals when it has started and blocks until released,
+        // so we can prove a request is genuinely in flight when shutdown fires.
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = {
+            let started = started.clone();
+            let release = release.clone();
+            axum::Router::new().route(
+                "/slow",
+                axum::routing::get(move || {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        "ok"
+                    }
+                }),
+            )
+        };
+
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(state(), None);
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
@@ -295,10 +319,25 @@ mod tests {
                 .await
         });
 
-        // Issue one in-flight request, then trigger shutdown.
-        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        drop(stream);
+        // Issue a real request and wait until the handler is actually running.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        started.notified().await; // request is now in flight
+
+        // Trigger shutdown while the request is mid-flight, then let it finish.
         tx.send(()).unwrap();
+        release.notify_one();
+
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "in-flight request must complete with 200 during graceful shutdown, got: {text}"
+        );
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await

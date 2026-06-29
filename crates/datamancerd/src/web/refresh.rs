@@ -39,9 +39,14 @@ impl Refreshers {
     /// Propagates the first `Datamancer::snapshot()` failure (so the daemon does
     /// not bind a web surface that cannot produce a snapshot).
     pub async fn warm(dm: &Datamancer) -> datamancer::Result<Self> {
-        let initial = dm.snapshot().await?;
-        let live = Arc::new(ArcSwap::from_pointee(initial.clone()));
-        let cache = Arc::new(ArcSwap::from_pointee(initial));
+        // Warm each swap with the shape its task will maintain: the live swap
+        // with live-only state (no catalog walk), the cache swap with the full
+        // snapshot (the catalog). The full snapshot also surfaces a catalog
+        // error here, so the daemon does not bind a web surface that cannot
+        // produce one.
+        let cache_snap = dm.snapshot().await?;
+        let live = Arc::new(ArcSwap::from_pointee(dm.snapshot_live()));
+        let cache = Arc::new(ArcSwap::from_pointee(cache_snap));
         let (live_tx, live_rx) = watch::channel(0);
         let state = WebState::new(live.clone(), cache.clone(), live_rx);
         Ok(Self {
@@ -83,15 +88,15 @@ fn spawn_live(
     tokio::spawn(async move {
         loop {
             ticker.tick().await;
-            match dm.snapshot().await {
-                Ok(snap) => {
-                    #[cfg(feature = "metrics")]
-                    crate::web::metrics::update_from_snapshot(&snap);
-                    live.store(Arc::new(snap));
-                    tx.send_modify(|v| *v = v.wrapping_add(1));
-                }
-                Err(e) => tracing::warn!(error = %e, "web live-state refresh failed"),
-            }
+            // Live-only snapshot: the fast path must NOT do the (potentially
+            // slow, on-disk) cache-catalog walk — that is the slow cache task's
+            // job. `snapshot_live` skips it, so a slow catalog never stalls the
+            // SSE/live JSON path.
+            let snap = dm.snapshot_live();
+            #[cfg(feature = "metrics")]
+            crate::web::metrics::update_from_snapshot(&snap);
+            live.store(Arc::new(snap));
+            tx.send_modify(|v| *v = v.wrapping_add(1));
         }
     })
 }

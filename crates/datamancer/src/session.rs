@@ -516,6 +516,30 @@ impl Datamancer {
     /// Panics if a registry mutex is poisoned (a prior panic inside a
     /// registry-holding path).
     pub async fn snapshot(&self) -> Result<SystemSnapshot> {
+        // The cache catalog is the only part that AWAITs (and the only
+        // potentially-slow part — it may walk on-disk storage). Compute it here,
+        // then assemble the synchronous live state around it.
+        let cache = match &self.inner.historical_cache {
+            Some(c) => CacheSnapshot::new(c.catalog().await?, None),
+            None => CacheSnapshot::new(Vec::new(), None),
+        };
+        Ok(self.assemble_snapshot(cache))
+    }
+
+    /// Like [`Self::snapshot`] but **omits the cache catalog** (an empty
+    /// `CacheSnapshot`), so it never performs the potentially-slow catalog walk.
+    /// For the fast live/diagnostics refresh path that ticks on a tight cadence
+    /// and needs only provider/session live state; the catalog is refreshed
+    /// separately on a slower cadence via [`Self::snapshot`].
+    #[must_use]
+    pub fn snapshot_live(&self) -> SystemSnapshot {
+        self.assemble_snapshot(CacheSnapshot::new(Vec::new(), None))
+    }
+
+    /// Assemble the synchronous snapshot parts (provider accounting + live
+    /// session state) around an already-computed cache catalog. No awaits; the
+    /// registry locks are released before returning and never held across one.
+    fn assemble_snapshot(&self, cache: CacheSnapshot) -> SystemSnapshot {
         let captured_at = wall_clock_ts();
 
         // 1. Provider accounting, folding in the optional metrics hook.
@@ -551,11 +575,8 @@ impl Datamancer {
             })
             .collect();
 
-        // 2. Cache catalog. AWAIT happens here, BEFORE taking any registry lock.
-        let cache = match &self.inner.historical_cache {
-            Some(c) => CacheSnapshot::new(c.catalog().await?, None),
-            None => CacheSnapshot::new(Vec::new(), None),
-        };
+        // 2. Cache catalog is supplied by the caller (already computed, or empty
+        // for `snapshot_live`).
 
         // 3. Authoritative sessions: take the registry lock only to upgrade each
         // Weak, read the referrer refcount, and clone the LiveStats handle; drop
@@ -613,13 +634,13 @@ impl Datamancer {
             })
             .collect();
 
-        Ok(SystemSnapshot::new(
+        SystemSnapshot::new(
             captured_at,
             providers,
             cache,
             authoritative_sessions,
             client_sessions,
-        ))
+        )
     }
 
     /// Look up a registered provider by id.

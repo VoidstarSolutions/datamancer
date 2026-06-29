@@ -104,12 +104,12 @@ function paint(snap){
   const auth = document.getElementById('authoritative');
   const arows = (snap.authoritative_sessions||[]).map(s=>{
     const k = key(s); const h = hist.get(k) || []; if(s.latency_ns!=null){ h.push(s.latency_ns); if(h.length>CAP) h.shift(); hist.set(k,h); }
-    return [s.instrument.symbol, JSON.stringify(s.kind), s.subscriber_refcount, (s.seq_position?.[0] ?? s.seq_position ?? '—'), (s.latency_ns ?? '—'), s.gap_count, spark(h)];
+    return [s.instrument.provider, s.instrument.symbol, JSON.stringify(s.kind), s.subscriber_refcount, (s.seq_position?.[0] ?? s.seq_position ?? '—'), (s.latency_ns ?? '—'), s.gap_count, spark(h)];
   });
-  auth.replaceChildren(table(['symbol','kind','refcount','seq (per-symbol)','latency_ns (obs)','gaps','latency'], arows));
+  auth.replaceChildren(table(['provider','symbol','kind','refcount','seq (per-symbol)','latency_ns (obs)','gaps','latency'], arows));
   const cl = document.getElementById('clients');
   cl.replaceChildren(table(['id','subscriptions','buffer occ/cap','dropped'],
-    (snap.client_sessions||[]).map(c=>[c.id?.[0]??c.id, (c.subscriptions||[]).map(x=>x.instrument.symbol).join(', '), (c.resume_buffer.occupancy+'/'+c.resume_buffer.capacity), c.resume_buffer.dropped_events])));
+    (snap.client_sessions||[]).map(c=>[c.id?.[0]??c.id, (c.subscriptions||[]).map(x=>x.instrument.provider+':'+x.instrument.symbol).join(', '), (c.resume_buffer.occupancy+'/'+c.resume_buffer.capacity), c.resume_buffer.dropped_events])));
   const cache = document.getElementById('cache');
   cache.replaceChildren(table(['provider','symbol','kind','adjustment','events','est_bytes','gaps'],
     ((snap.cache&&snap.cache.entries)||[]).map(e=>[e.provider, e.symbol, JSON.stringify(e.kind), JSON.stringify(e.adjustment), e.event_count, (e.est_bytes??'—'), (e.gaps||[]).length])));

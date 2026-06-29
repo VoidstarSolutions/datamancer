@@ -23,30 +23,35 @@ use datamancer::SystemSnapshot;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
-static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+/// The recorder install outcome, computed exactly once. Storing the `Result`
+/// (not just the handle) makes `install` idempotent **and** race-free: the
+/// one-shot `install_recorder` runs inside `get_or_init`, so two concurrent
+/// callers never both attempt it (which would fail the loser).
+static HANDLE: OnceLock<Result<PrometheusHandle, String>> = OnceLock::new();
 
 /// Install the process-global Prometheus recorder exactly once and retain its
-/// render handle. Idempotent at the `OnceLock` level (a second call is a no-op),
-/// but the underlying `install_recorder` is itself one-shot per process.
+/// render handle. Safe under concurrent calls: the underlying one-shot
+/// `install_recorder` runs at most once via `get_or_init`.
 ///
 /// # Errors
 ///
-/// Returns the builder error if the global recorder cannot be installed.
+/// Returns the builder error if the global recorder could not be installed.
 pub fn install() -> Result<(), String> {
-    if HANDLE.get().is_some() {
-        return Ok(());
-    }
-    let handle = PrometheusBuilder::new()
-        .install_recorder()
-        .map_err(|e| format!("install prometheus recorder: {e}"))?;
-    let _ = HANDLE.set(handle);
-    Ok(())
+    HANDLE
+        .get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .map_err(|e| format!("install prometheus recorder: {e}"))
+        })
+        .as_ref()
+        .map(|_| ())
+        .map_err(Clone::clone)
 }
 
-/// The render handle, if the recorder has been installed.
+/// The render handle, if the recorder has been installed successfully.
 #[must_use]
 pub fn handle() -> Option<&'static PrometheusHandle> {
-    HANDLE.get()
+    HANDLE.get().and_then(|r| r.as_ref().ok())
 }
 
 /// Update the recorded metrics from a freshly-assembled snapshot. Per-symbol
@@ -69,18 +74,22 @@ pub fn update_from_snapshot(snap: &SystemSnapshot) {
         }
     }
     for s in &snap.authoritative_sessions {
+        // Label by provider AND symbol: `symbol()` alone collapses two
+        // providers' identically-named symbols (e.g. both `AAPL`) into one
+        // series. `kind` completes the per-`(instrument, kind)` identity.
+        let provider = s.instrument.provider().to_string();
         let inst = s.instrument.symbol().to_string();
         let kind = format!("{:?}", s.kind);
-        gauge!("datamancerd_session_subscriber_refcount", "instrument" => inst.clone(), "kind" => kind.clone())
+        gauge!("datamancerd_session_subscriber_refcount", "provider" => provider.clone(), "instrument" => inst.clone(), "kind" => kind.clone())
             .set(f64::from(s.subscriber_refcount));
-        counter!("datamancerd_session_gaps_total", "instrument" => inst.clone(), "kind" => kind.clone())
+        counter!("datamancerd_session_gaps_total", "provider" => provider.clone(), "instrument" => inst.clone(), "kind" => kind.clone())
             .absolute(s.gap_count);
         if let Some(latency) = s.latency_ns {
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "observability gauge; precision loss on huge latencies is acceptable"
             )]
-            gauge!("datamancerd_session_latency_ns", "instrument" => inst.clone(), "kind" => kind.clone())
+            gauge!("datamancerd_session_latency_ns", "provider" => provider.clone(), "instrument" => inst.clone(), "kind" => kind.clone())
                 .set(latency as f64);
         }
     }
