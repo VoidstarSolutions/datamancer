@@ -47,3 +47,14 @@ pub use datamancer_core::{
 pub use session::{
     Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,
 };
+
+/// iceoryx2 zero-copy transport (data + diagnostics planes), gated behind the
+/// `transport-iceoryx2` feature. Re-exports the
+/// [`datamancer-transport-iceoryx2`](datamancer_transport_iceoryx2) crate so
+/// embedders enable the transport through this single feature flag. The sink is
+/// an additional [`EventSink`](datamancer_core::EventSink) selected like any
+/// other; `SymbolId`/interning stay sink-local (never core).
+#[cfg(feature = "transport-iceoryx2")]
+pub mod transport {
+    pub use datamancer_transport_iceoryx2::*;
+}

@@ -67,15 +67,19 @@ impl Iceoryx2DataSink {
             // Blocking backpressure: no silent overflow; the publisher retries.
             .enable_safe_overflow(false)
             .history_size(DEFAULT_DATA_HISTORY)
+            // The subscriber buffer must exceed the history size; over-provision.
+            .subscriber_max_buffer_size(DEFAULT_DATA_HISTORY * 2)
             .max_subscribers(DEFAULT_MAX_SUBSCRIBERS)
             .open_or_create()
             .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+        let ann_history = DEFAULT_MAX_SUBSCRIBERS * 64;
         let ann_service = node
             .service_builder(&ann_name)
             .publish_subscribe::<SymbolAnnouncement>()
             // Announcements are idempotent upserts; safe overflow is fine and a
             // generous history lets late joiners drain the full table.
-            .history_size(DEFAULT_MAX_SUBSCRIBERS * 64)
+            .history_size(ann_history)
+            .subscriber_max_buffer_size(ann_history * 2)
             .max_subscribers(DEFAULT_MAX_SUBSCRIBERS)
             .open_or_create()
             .map_err(|e| TransportError::Service(format!("{e:?}")))?;
