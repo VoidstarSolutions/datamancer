@@ -345,18 +345,24 @@ Embedders who want zero hops still link the library and use the in-process sink.
 operators — read-only.
 
 **Work (daemon-side).**
-- HTTP server (likely `axum`) exposing JSON endpoints over the Phase-3 snapshot
-  API, plus the UI itself (use the `frontend-design` skill when building it).
+- **`axum` HTTP server** serving **server-rendered Rust templates (`maud`/`askama`)
+  + HTMX**, with **SSE** for live-updating panels and a small JS chart lib
+  (`uPlot`/`ECharts`) as a static asset. JSON endpoints over the Phase-3 snapshot
+  back the templates. Use the `frontend-design` skill when building the UI.
 - Optionally a `/metrics` Prometheus endpoint off the same data.
+- Read-only first; operator interactivity (trigger fetch, sub/unsubscribe — the
+  Phase-5 control surface) layers on as HTMX `hx-post` actions without a rewrite.
 
 **Surfaces** the cache catalog and coverage, provider call counts / rate-limit
 usage / throughput, and live state (client sessions, subscriptions, per-symbol
 latency, gaps, connection health).
 
 **Open questions (for the plan).**
-- UI tech: server-rendered vs lightweight SPA.
+- ~~UI tech: server-rendered vs lightweight SPA.~~ **Locked 2026-06-28:**
+  server-rendered (`maud`/`askama`) + HTMX + SSE on `axum`, JS chart lib as a
+  static asset. (Template-engine and chart-lib picks left to implementation.)
 - Read-only now vs later unifying with the Phase-5 control surface (trigger fetch
-  / sub-unsub from the UI).
+  / sub-unsub from the UI) — the HTMX approach makes this additive.
 - Auth **deferred** (same-host, single-operator).
 
 **Depends on:** Phase 5 (daemon to host it) + Phase 3 (the snapshot).

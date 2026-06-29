@@ -13,6 +13,8 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 > - **Reads the live-state snapshot (Issue 6):** the UI reads Phase 3's bounded live-state snapshot in-process; the heavier cache catalog comes from its separate accessor/cadence.
 > - **Per-symbol `seq` display tolerates the sentinel (Issue 8):** treat `Seq::SYNTHETIC` synthetic-control entries as exempt from per-symbol monotonicity in any gap/ordering display.
 
+> **Tech stack (locked 2026-06-28).** `axum` backend serving **server-rendered Rust templates (`maud` or `askama`) + HTMX**, with **SSE** for live-updating panels and a small JS charting library (`uPlot` or `ECharts`) loaded as a static asset for graphs. **No SPA / JS build toolchain.** Read-only ships first; operator interactivity (trigger fetch, sub/unsubscribe — the Phase-5 control surface) layers on incrementally as HTMX actions (`hx-post` to axum handlers) without a rewrite. This resolves the prior "server-rendered vs SPA" open question. Template-engine pick (`maud` vs `askama`) and chart-lib pick (`uPlot` vs `ECharts`) are minor, left to implementation.
+
 > **Fidelity: design-level.** Concrete endpoint shapes and field names firm up
 > once Phase 3 fixes the snapshot type and Phase 5 fixes the daemon
 > runtime/lifecycle. Every dependency on those phases is a **RE-PLAN
