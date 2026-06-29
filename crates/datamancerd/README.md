@@ -29,7 +29,8 @@ cargo test -p datamancerd --test daemon_e2e -- --ignored
 
 Provider credentials are **not** in the config. The `account_type` selects which
 environment credential pair `oxidized_alpaca` loads
-(`paper` → `ALPACA_PAPER_API_KEY_ID`/`SECRET`, `live` → `ALPACA_API_KEY_ID`/…).
+(`paper` → `ALPACA_PAPER_API_KEY_ID`/`ALPACA_PAPER_API_SECRET_KEY`,
+`live` → `ALPACA_LIVE_API_KEY_ID`/`ALPACA_LIVE_API_SECRET_KEY`).
 
 ## Config (TOML)
 
