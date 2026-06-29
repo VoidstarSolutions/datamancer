@@ -66,8 +66,16 @@ pub(crate) struct AuthoritativeSession {
     pub(crate) instrument: Instrument,
     pub(crate) kind: EventKind,
     pub(crate) provider_id: String,
-    #[allow(dead_code, reason = "retained for diagnostics; not yet surfaced")]
+    /// The session's actual scope, shared across every referrer. A second opener
+    /// attaches to this (its requested scope is not re-applied), so referrer
+    /// handles must report *this*, not their own requested value.
     pub(crate) scope: Scope,
+    /// The session's current persistence options, shared across every referrer
+    /// and the source of truth for the synchronous getter. Updated by
+    /// [`Self::set_persistence`]; a second opener never re-applies its own
+    /// requested options, so a referrer must report this rather than a stale
+    /// per-handle copy.
+    persistence: std::sync::Mutex<PersistenceOptions>,
     /// Command channel to the authoritative controller (`AddSubscriber`,
     /// `SetPersistence`).
     cmd_tx: mpsc::Sender<SessionCommand>,
@@ -90,6 +98,7 @@ impl AuthoritativeSession {
         kind: EventKind,
         provider_id: String,
         scope: Scope,
+        persistence: PersistenceOptions,
         cmd_tx: mpsc::Sender<SessionCommand>,
         remove_tx: mpsc::UnboundedSender<SubscriberId>,
         stats: Arc<LiveStats>,
@@ -101,6 +110,7 @@ impl AuthoritativeSession {
             kind,
             provider_id,
             scope,
+            persistence: std::sync::Mutex::new(persistence),
             cmd_tx,
             remove_tx,
             next_subscriber_id: AtomicU64::new(0),
@@ -145,14 +155,29 @@ impl AuthoritativeSession {
     }
 
     /// Replace the authoritative session's persistence options. Shared across
-    /// all referrers (the tap-log tee is a property of the singleton).
+    /// all referrers (the tap-log tee is a property of the singleton). On
+    /// success the shared copy is updated so every referrer's `persistence()`
+    /// getter reflects it.
     pub(crate) async fn set_persistence(&self, options: PersistenceOptions) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SessionCommand::SetPersistence(options, tx))
             .await
             .map_err(|_| Error::SessionClosed)?;
-        rx.await.map_err(|_| Error::SessionClosed)?
+        rx.await.map_err(|_| Error::SessionClosed)??;
+        *self
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned") = options;
+        Ok(())
+    }
+
+    /// The session's current persistence options (shared across referrers).
+    pub(crate) fn persistence(&self) -> PersistenceOptions {
+        *self
+            .persistence
+            .lock()
+            .expect("persistence mutex poisoned")
     }
 }
 
@@ -213,6 +238,10 @@ pub(crate) struct LiveStats {
     last_source_ts: AtomicI64,
     last_rx_ts: AtomicI64,
     gap_count: AtomicU64,
+    /// Live fan-out subscriber count (referrers actually attached). Distinct
+    /// from the registry `Arc` strong count, which over-counts (a single
+    /// referrer holds several strong `Arc<AuthoritativeSession>`).
+    subscribers: AtomicU64,
 }
 
 impl LiveStats {
@@ -224,7 +253,19 @@ impl LiveStats {
             last_source_ts: AtomicI64::new(0),
             last_rx_ts: AtomicI64::new(0),
             gap_count: AtomicU64::new(0),
+            subscribers: AtomicU64::new(0),
         }
+    }
+
+    /// Record the current fan-out subscriber count (set after each add/remove).
+    pub(crate) fn set_subscribers(&self, n: usize) {
+        self.subscribers
+            .store(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Current fan-out subscriber count.
+    pub(crate) fn subscriber_count(&self) -> u64 {
+        self.subscribers.load(Ordering::Relaxed)
     }
 
     /// Record one fan-out event: advance the last-`seq`/timestamps and bump the
@@ -545,6 +586,12 @@ impl FanOut {
     /// the refcounted-teardown trigger.
     pub(crate) fn should_teardown(&self) -> bool {
         self.had_subscriber && self.subscribers.is_empty()
+    }
+
+    /// Number of attached referrers — the true subscriber count (the registry
+    /// `Arc` strong count over-counts).
+    pub(crate) fn subscriber_count(&self) -> usize {
+        self.subscribers.len()
     }
 
     /// Deliver one fully-stamped event to every referrer. Caches a

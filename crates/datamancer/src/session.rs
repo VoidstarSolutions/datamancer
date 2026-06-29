@@ -333,8 +333,6 @@ impl Datamancer {
                         authoritative,
                         instrument,
                         kind,
-                        scope,
-                        persistence: std::sync::Mutex::new(options),
                     }),
                 })
             }
@@ -402,6 +400,7 @@ impl Datamancer {
             kind,
             provider.id().to_string(),
             scope,
+            options,
             cmd_tx.clone(),
             remove_tx,
             stats.clone(),
@@ -569,8 +568,12 @@ impl Datamancer {
                 .expect("live-session registry mutex poisoned");
             map.values()
                 .filter_map(|weak| {
-                    let refcount = u32::try_from(weak.strong_count()).unwrap_or(u32::MAX);
                     weak.upgrade().map(|auth| {
+                        // True subscriber count from the fan-out, not the `Arc`
+                        // strong count (which over-counts: one referrer holds
+                        // several strong `Arc<AuthoritativeSession>`).
+                        let refcount =
+                            u32::try_from(auth.stats.subscriber_count()).unwrap_or(u32::MAX);
                         (
                             auth.instrument.clone(),
                             auth.kind,
@@ -829,14 +832,12 @@ struct HistoricalSession {
 
 struct LiveSession {
     handle: ClientHandle,
+    /// Source of truth for `scope`/`persistence`, shared across every referrer.
+    /// The getters read from here so a second opener never reports its own
+    /// (unapplied) requested values.
     authoritative: Arc<AuthoritativeSession>,
     instrument: Instrument,
     kind: EventKind,
-    scope: Scope,
-    /// Locally cached persistence options for the synchronous getter. The
-    /// authoritative session is the source of truth (shared across referrers);
-    /// the single-owner live `Session` keeps this in step via `set_persistence`.
-    persistence: std::sync::Mutex<PersistenceOptions>,
 }
 
 struct SessionInner {
@@ -930,11 +931,7 @@ impl Session {
                     .map_err(|_| Error::SessionClosed)?;
                 rx.await.map_err(|_| Error::SessionClosed)?
             }
-            SessionVariant::Live(l) => {
-                l.authoritative.set_persistence(options).await?;
-                *l.persistence.lock().expect("persistence mutex poisoned") = options;
-                Ok(())
-            }
+            SessionVariant::Live(l) => l.authoritative.set_persistence(options).await,
         }
     }
 
@@ -952,7 +949,7 @@ impl Session {
                 .persistence
                 .lock()
                 .expect("persistence mutex poisoned"),
-            SessionVariant::Live(l) => *l.persistence.lock().expect("persistence mutex poisoned"),
+            SessionVariant::Live(l) => l.authoritative.persistence(),
         }
     }
 
@@ -995,7 +992,7 @@ impl Session {
     pub fn scope(&self) -> Scope {
         match &self.variant {
             SessionVariant::Historical(h) => h.inner.scope,
-            SessionVariant::Live(l) => l.scope,
+            SessionVariant::Live(l) => l.authoritative.scope,
         }
     }
 }
@@ -1338,8 +1335,8 @@ impl Controller {
         let instrument = self.inner.instrument.clone();
         let kind = self.inner.kind;
         let edge = live.as_ref().map(|l| l.edge);
-        let (mut live_rx, mut pending, mut drop_rx) = match live {
-            Some(l) => (Some(l.provider_rx), Some(l.pending), Some(l.drop_rx)),
+        let (mut live_rx, mut pending, mut remove_rx) = match live {
+            Some(l) => (Some(l.provider_rx), Some(l.pending), Some(l.remove_rx)),
             None => (None, None, None),
         };
 
@@ -1386,9 +1383,11 @@ impl Controller {
                             cmd = cmd_rx.recv() => {
                                 if !self.handle_command(cmd).await { return SegmentOutcome::Closed; }
                             }
-                            () = session_dropped(&mut drop_rx) => {
-                                self.shutdown().await;
-                                return SegmentOutcome::Closed;
+                            removal = recv_removal(&mut remove_rx) => {
+                                if self.backfill_removal_triggers_teardown(removal) {
+                                    self.shutdown().await;
+                                    return SegmentOutcome::Closed;
+                                }
                             }
                             ev = recv_live(&mut live_rx) => {
                                 Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
@@ -1431,10 +1430,12 @@ impl Controller {
                                     return SegmentOutcome::Closed;
                                 }
                             }
-                            () = session_dropped(&mut drop_rx) => {
-                                fetch_task.abort();
-                                self.shutdown().await;
-                                return SegmentOutcome::Closed;
+                            removal = recv_removal(&mut remove_rx) => {
+                                if self.backfill_removal_triggers_teardown(removal) {
+                                    fetch_task.abort();
+                                    self.shutdown().await;
+                                    return SegmentOutcome::Closed;
+                                }
                             }
                             ev = recv_live(&mut live_rx) => {
                                 Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
@@ -1635,6 +1636,7 @@ impl Controller {
         from: Timestamp,
         provider_rx: &mut mpsc::Receiver<MarketEvent>,
         cmd_rx: &mut mpsc::Receiver<SessionCommand>,
+        remove_rx: &mut mpsc::UnboundedReceiver<SubscriberId>,
     ) -> bool {
         let edge = wall_clock_ts();
         if from >= edge {
@@ -1682,12 +1684,10 @@ impl Controller {
         let segments = tile(from, edge, &gaps);
 
         let mut pending = EventRing::new(self.ring_capacity);
-        // The live lifecycle anchor is now the subscriber refcount, not a
-        // Session drop guard. Keep a never-firing drop channel so the shared
-        // `stream_segments` backfill path compiles without a real anchor: a
-        // referrer that leaves mid-backfill is observed after the backfill seam
-        // (the controller's teardown check), not by aborting the fetch.
-        let (_drop_keepalive, mut drop_rx) = oneshot::channel::<()>();
+        // The live lifecycle anchor is the subscriber refcount. Thread the real
+        // removal channel through so a referrer that leaves mid-backfill is
+        // observed immediately and, when the last one goes, the backfill aborts
+        // rather than running to the seam.
         let outcome = self
             .stream_segments(
                 segments,
@@ -1696,7 +1696,7 @@ impl Controller {
                 Some(BackfillSide {
                     provider_rx,
                     pending: &mut pending,
-                    drop_rx: &mut drop_rx,
+                    remove_rx,
                     edge,
                 }),
             )
@@ -1727,8 +1727,15 @@ impl Controller {
         mut remove_rx: mpsc::UnboundedReceiver<SubscriberId>,
     ) {
         let live = Arc::new(Mutex::new(Some(live)));
+        // Seed the subscriber count from the pre-seeded first referrer so the
+        // diagnostics snapshot reports a true count from the start.
+        if let Some(fanout) = self.fanout.as_ref() {
+            self.stats.set_subscribers(fanout.subscriber_count());
+        }
         if let Some(from) = backfill_from
-            && !self.run_backfill(from, &mut provider_rx, &mut cmd_rx).await
+            && !self
+                .run_backfill(from, &mut provider_rx, &mut cmd_rx, &mut remove_rx)
+                .await
         {
             self.teardown_upstream(&live).await;
             return;
@@ -1769,6 +1776,19 @@ impl Controller {
     fn remove_subscriber(&mut self, id: SubscriberId) {
         if let Some(fanout) = self.fanout.as_mut() {
             fanout.remove(id);
+            self.stats.set_subscribers(fanout.subscriber_count());
+        }
+    }
+
+    /// Apply a backfill-time removal signal; returns `true` when the backfill
+    /// should abort (the last referrer left, or the removal channel closed).
+    fn backfill_removal_triggers_teardown(&mut self, removal: Removal) -> bool {
+        match removal {
+            Removal::One(id) => {
+                self.remove_subscriber(id);
+                self.live_should_teardown()
+            }
+            Removal::Closed => true,
         }
     }
 
@@ -1945,6 +1965,7 @@ impl Controller {
             Some(SessionCommand::AddSubscriber { id, sender, ack }) => {
                 if let Some(fanout) = self.fanout.as_mut() {
                     fanout.add(id, sender);
+                    self.stats.set_subscribers(fanout.subscriber_count());
                 }
                 let _ = ack.send(());
                 true
@@ -2023,8 +2044,11 @@ struct BackfillSide<'a> {
     /// `pending` so they splice in after the backfill output.
     provider_rx: &'a mut mpsc::Receiver<MarketEvent>,
     pending: &'a mut EventRing,
-    /// Session-handle drop signal (live lifecycle anchor).
-    drop_rx: &'a mut oneshot::Receiver<()>,
+    /// Subscriber-removal signal. Polled during the backfill so a referrer that
+    /// leaves mid-fetch is observed immediately: when the last one goes, the
+    /// backfill aborts rather than running to the seam (which would burn
+    /// provider quota and delay shutdown on a large range).
+    remove_rx: &'a mut mpsc::UnboundedReceiver<SubscriberId>,
     /// The live boundary `B`: the gap segment touching it gets a
     /// conservative coverage claim, and a failed fetch gaps through to it.
     edge: Timestamp,
@@ -2039,13 +2063,23 @@ async fn recv_live(rx: &mut Option<&mut mpsc::Receiver<MarketEvent>>) -> Option<
     }
 }
 
-/// Resolve when the Session handle drops; pend forever when no guard is
-/// threaded through (historical scope).
-async fn session_dropped(rx: &mut Option<&mut oneshot::Receiver<()>>) {
+/// Outcome of polling the removal channel during a backfill.
+#[derive(Clone, Copy)]
+enum Removal {
+    /// A subscriber id to drop.
+    One(SubscriberId),
+    /// The removal channel closed (no senders left) — tear down.
+    Closed,
+}
+
+/// Receive a subscriber removal from the optional removal channel; pend forever
+/// when no channel is threaded through (historical scope, which has no fan-out).
+async fn recv_removal(rx: &mut Option<&mut mpsc::UnboundedReceiver<SubscriberId>>) -> Removal {
     match rx {
-        Some(rx) => {
-            let _ = (&mut **rx).await;
-        }
+        Some(rx) => match rx.recv().await {
+            Some(id) => Removal::One(id),
+            None => Removal::Closed,
+        },
         None => std::future::pending().await,
     }
 }
