@@ -627,6 +627,21 @@ impl SurrealCache {
             .map_err(map_err)?;
         let mut doc = existing.unwrap_or_default();
         doc.merge_in(from, to, added_events);
+        // `merge_in` bumps `event_count` additively, which drifts upward on a
+        // re-store/refresh: `store` DELETEs the range then re-inserts, but the
+        // additive count never subtracts the removed rows. Recompute the count
+        // from the actual stored rows over the union of covered segments so the
+        // catalog reports current contents, not a running sum of every write.
+        // Segments are half-open [from, to) (see `intersect`/`gaps_within`) and
+        // `count_events_in` is likewise half-open, so each segment counts
+        // directly. Touching segments are merged, so no row is double-counted at
+        // a boundary.
+        let mut total: u64 = 0;
+        for &(seg_from, seg_to) in &doc.segments {
+            total =
+                total.saturating_add(self.count_events_in(key, seg_from, seg_to).await?);
+        }
+        doc.event_count = total;
         // Record the asset class so the catalog can reconstruct a faithful
         // `Instrument` (the id and row shapes do not otherwise carry it).
         doc.asset_class = Some(key.instrument.asset_class().to_string());

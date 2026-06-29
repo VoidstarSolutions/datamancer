@@ -1110,12 +1110,17 @@ struct Controller {
 }
 
 impl Controller {
-    /// Drain the backfill `pending` ring at the seam. Its events were pushed
+    /// Drain the backfill `pending` ring at the seam. Its events were buffered
     /// **unstamped** (`buffer_live_arrival` does a raw push) so their `seq` is
     /// deferred to here — stamping at the seam places the live arrivals *after*
     /// all backfill segments in canonical order and preserves monotonicity.
-    /// One `Gap` for anything the ring evicted, then the survivors, all through
-    /// `emit` (which stamps). Behavior-identical to the pre-split `flush_ring`.
+    /// One `Gap` for anything the ring evicted, then the survivors, each through
+    /// `forward` (which stamps **then** tees **then** delivers). Going through
+    /// `forward` rather than `emit` is load-bearing: it persists the
+    /// seam-assigned source `seq` to the tap log verbatim. Teeing here (not at
+    /// receipt) means an event the ring evicted is never teed — correct, since
+    /// it is not delivered either: it is reported as the `Gap` above, so the tap
+    /// log stays a faithful record of the delivered live tail.
     async fn flush_backfill_pending(&mut self, ring: EventRing) {
         let (dropped, _dropped_first_seq, events) = ring.into_parts();
         if let Some(span) = dropped {
@@ -1123,7 +1128,7 @@ impl Controller {
                 .await;
         }
         for ev in events {
-            self.emit(ev).await;
+            self.forward(ev).await;
         }
     }
 
@@ -1374,7 +1379,7 @@ impl Controller {
                                 return SegmentOutcome::Closed;
                             }
                             ev = recv_live(&mut live_rx) => {
-                                self.buffer_live_arrival(ev, &mut live_rx, &mut pending).await;
+                                Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
                             }
                             ev = stream.next() => {
                                 match ev {
@@ -1420,7 +1425,7 @@ impl Controller {
                                 return SegmentOutcome::Closed;
                             }
                             ev = recv_live(&mut live_rx) => {
-                                self.buffer_live_arrival(ev, &mut live_rx, &mut pending).await;
+                                Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
                             }
                             ev = rx.recv() => {
                                 match ev {
@@ -1688,10 +1693,10 @@ impl Controller {
             return false;
         }
         // The seam: live arrivals buffered during the backfill, in arrival
-        // order (already teed at receipt — flush_backfill_pending stamps them
-        // here via emit). Stamping at the seam (in reception order, not
-        // source_ts order) places these live arrivals after all backfill
-        // segments in canonical delivery order and keeps `seq` monotonic.
+        // order. flush_backfill_pending stamps each (reception order, not
+        // source_ts order) — placing them after all backfill segments in
+        // canonical delivery order, keeping `seq` monotonic — then tees the
+        // stamped event so the tap log records the seam `seq` verbatim.
         self.flush_backfill_pending(pending).await;
         true
     }
@@ -1851,20 +1856,21 @@ impl Controller {
         self.deliver(ev).await;
     }
 
-    /// Backfill seam: a live arrival during the backfill is teed at receipt
-    /// (durability — it must reach the tap log even if later evicted from
-    /// `pending`) and buffered in arrival order for the post-backfill flush.
-    /// A closed live side is parked (`live_rx = None`); it is surfaced after
-    /// the backfill completes.
-    async fn buffer_live_arrival(
-        &mut self,
+    /// Backfill seam: a live arrival during the backfill is buffered in arrival
+    /// order for the post-backfill flush. It is **not** teed here: `seq` is
+    /// assigned at the seam (delivery order, after all backfill segments), and
+    /// the tap log must record that seam `seq` verbatim — so teeing happens in
+    /// `flush_backfill_pending` once the event is stamped, not at receipt with a
+    /// stub `Seq(0)`. An arrival the ring evicts is reported as a `Gap` at the
+    /// seam and is correctly never persisted. A closed live side is parked
+    /// (`live_rx = None`); it is surfaced after the backfill completes.
+    fn buffer_live_arrival(
         ev: Option<MarketEvent>,
         live_rx: &mut Option<&mut mpsc::Receiver<MarketEvent>>,
         pending: &mut Option<&mut EventRing>,
     ) {
         match ev {
             Some(ev) => {
-                self.tee(&ev).await;
                 if let Some(p) = pending.as_mut() {
                     p.push(ev);
                 }
