@@ -15,6 +15,30 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 > - **Backfill scope is creation-time (Issue 7):** backfill is fixed when the authoritative session is created; later referrers (a live `ClientSession::subscribe`, the daemon anchor) attach to the existing scope without re-specifying it. A pure-live subscribe may attach to a backfill-created authoritative session (it joins the live tail).
 > - **seq sentinel (Issue 8):** use Phase 1's `Seq::SYNTHETIC` constant for client-local synthetic controls; do not invent a separate value.
 
+> **Detailed-planning hardening (gotcha pass, 2026-06-28) — authoritative.** Adversarial code-level review against current `session.rs` (registry/`RegistrySentinel` ~1538, `run_live` ~1326, `Sink`/`emit`/`forward`) and the Phase 1 hardening. Supersedes conflicting body text.
+>
+> **Load-bearing invariant.** The authoritative controller holds a **`Weak`** (never a strong `Arc`) to its `AuthoritativeSession`; teardown triggers when the subscriber fan-out map empties (all `SubscriberGuard`s dropped). A strong `Arc` here deadlocks refcounted teardown. Add a `debug_assert` tying fan-out size to `strong_count`.
+>
+> **Locked decisions:**
+> - **Fan-out isolation:** each subscriber gets its own **bounded channel**; the authoritative task **`try_send`s**. A subscriber that fills (slow/wedged) or closes its channel is **removed from the fan-out and gets a `Control::Gap`** for the missed span — never stalls co-subscribers or the provider. (Consistent with the resume-buffer "missed a numbered span → Gap" model.)
+> - **Partial-failure signal:** on a per-symbol substream teardown/failure, emit a per-symbol **`SubscriptionChanged{active:false}`** and **suppress** that substream's `SessionClosing`; the client emits one `SessionClosing` only on `ClientSession::close`.
+>
+> **Locked implementation choices:**
+> - **Interleave:** `StreamMap` (O(1) runtime add/remove) — not `FuturesUnordered`.
+> - **Tee once at the source.** The client multiplex controller delivers via `emit` only — never `forward`/`tee` (no double-tee, no re-stamp). Guard comment in the loop.
+> - **`ClientSessionId`:** `AtomicU64` `fetch_add` (in `datamancer-core`), process-scoped, not persisted. **Client-session registry:** lazy `Weak` cleanup at lookup.
+> - **`LiveStats`:** per-field atomics (lock-free reads for Phase 3); no composite-consistency guarantee (document).
+> - **Per-client `EventRing`:** `dropped: HashMap<Instrument, GapSpan>`; `note_drop` processes only data events + per-symbol controls (`Gap` embeds its instrument); connection-scoped controls never reach the per-client ring (coalesced upstream) — add a skip-guard + `debug_assert`. Flush emits one `Gap` per affected instrument in first-evicted-`seq` order (overlapping spans are correct).
+> - **`next_seq`:** `saturating_add` so it can never wrap into `Seq(u64::MAX)`.
+> - **`SubscriptionChanged` cache:** one per symbol on `AuthoritativeSession` (bounded by live symbols), replayed to each new subscriber. Replay carries the real (older) `seq` → a real, possibly large per-symbol `seq` jump on late join; document as **not a loss**.
+> - **Connection-scoped Control dedup:** provider-string approximation retained (P2-E), documented as a Phase-2 limitation (multiple authoritative sessions can share a provider id); the per-symbol `SubscriptionChanged` signal above carries symbol-level visibility. Real connection identity deferred to Phase 3.
+>
+> **Phase-1 dependency guards (tests up front, fail loud):** `poll_next` is pass-through (no re-stamp); `EventSink`/`InProcessSink` exist; overflow yields a real `Control::Gap`; backfill stamps at the seam (not at push).
+>
+> **Tests to add/confirm:** interleave arrival-order (assert **no** cross-symbol `seq` order); runtime add/remove mid-stream; refcounted teardown (last-referrer tears down; survives while one remains; teardown-window reopen spawns a fresh authoritative session); `slow_client_does_not_stall_co_subscriber` (timeout-bounded — the isolation guard); `per_client_overflow_reports_one_gap_per_affected_instrument`; per-symbol `SubscriptionChanged{active:false}` on substream teardown; connection-scoped control appears once; backfill creation-time scope (reject `backfill_from: Some` on `ClientSession::subscribe`; a late live referrer joins the existing scope, live tail only).
+>
+> **Accepted pre-existing:** registry-mutex panic-safety (session.rs:245) — the new `authoritative` helper must be panic-free while holding the lock.
+
 ## Context & goal
 
 Today a consumer opens a `Session` scoped to exactly one `(instrument, kind)` pair (`crates/datamancer/src/session.rs:219`, the `Datamancer::session` entry point) and drains a single `EventStream`. The live-session registry (`session.rs:191`) enforces *at most one* live session per pair via `RegistrySentinel` strong-count (`session.rs:1538`, `Drop` at `:1543`), rejecting a second live opener with `Error::LiveSessionConflict` (`session.rs:249`).
