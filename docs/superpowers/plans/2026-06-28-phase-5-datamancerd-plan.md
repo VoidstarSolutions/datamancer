@@ -13,6 +13,26 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 > - **Anchor attaches to existing scope (Issue 7):** the daemon's lifecycle anchor and any client `subscribe` attach to the authoritative session's creation-time scope without re-specifying backfill (compose-via-refcount). Backfill is set when the authoritative session is first created.
 > - **Diagnostics publishing (Issue 6):** publish Phase 3's bounded live-state snapshot on the fast diagnostics service and the cache catalog on the separate slower/chunked service.
 
+> **Detailed-planning hardening (gotcha pass, 2026-06-28) — authoritative.** Adversarial design-level review vs the Datamancer/Session API + Phases 1-4. (Cross-phase "not coded yet" items are sequencing, not gotchas.) Supersedes conflicting body text.
+>
+> **Locked decision — control surface = Unix domain socket + newline-JSON.** Same-host, filesystem-permission access control, no extra transport dep, CLI-scriptable. **One long-lived control connection per client**; explicit graceful **`close`** op + connection-**EOF as emergency teardown** (tears down that client's `ClientSession` + iceoryx2 service, decrements authoritative refcounts). Subscribe/unsubscribe map to `ClientSession` mutators via an `mpsc` to a single-threaded server task (no lock held across `.await`). Library errors (`LiveSessionConflict`/`UnsupportedEventKind`/`PersistenceRequired`) map to **stable JSON error codes** (constants table, regression-guarded).
+>
+> **Config (TOML):** provider creds (secret refs via env/file), cache/DB path, tap log, adjustment, `resume_buffer_events`, `[[startup_session]]` (+ `always_on: bool`, default `false`), iceoryx2 caps, diagnostics cadences, control-socket path, `[web_ui]` (enabled, localhost bind addr/port, `assets_dir`, `live_state_cadence_ms`=1000, `cache_catalog_cadence_ms`=30000), `[server] shutdown_timeout_secs`=30.
+>
+> **iceoryx2 Node:** **one per process** (datamancerd creates at startup); per-client sinks own their *service* on it (refines Phase 4's "sink owns Node+service").
+>
+> **Startup anchors:** `always_on=true` holds the authoritative session for the process lifetime regardless of clients; `false` (default) is refcount-driven (pre-created for warmth, torn down at last client).
+>
+> **Backfill sharing:** an authoritative session created with `backfill_from` keeps history available while anchored; later clients of that symbol attach to the **live tail only**. Control `subscribe` carries scope/backfill as *preferences*; on conflict with an existing authoritative scope the reply returns the **actual** scope rather than erroring.
+>
+> **Service-cap overrun:** **reject the subscribe** (`service cap N exceeded`); dynamic recreation deferred.
+>
+> **Shutdown ordering:** SIGTERM/SIGINT → stop accepting control requests → stop authoritative provider subscriptions → flush per-client sinks + tap log (serialized, single shutdown holder) → drain → exit; whole drain bounded by `shutdown_timeout_secs`. **Last**-client-drop (not first) flushes a shared authoritative tap log (Phase 2 lifecycle). `EventSink::flush` log-and-swallow (Phase 1).
+>
+> **Runtime/supervision:** one tokio multi-thread runtime hosts authoritative tasks, per-client controllers, the control listener, the diagnostics publisher, and (Phase 6) the web server. An authoritative-task panic surfaces to subscribers as per-symbol `SubscriptionChanged{active:false}` (Phase 2); the daemon logs, does not abort.
+>
+> **Tests:** config parse/validate; client connect→subscribe→receive→disconnect cleanup (EOF + graceful `close`); dead-client teardown decrements refcounts; `always_on` anchor survives zero clients; refcount anchor tears down at last client; graceful shutdown drains within timeout; control request/response round-trip + stable error codes. Integration tests gated on Phase 1/2 landing.
+
 ## Fidelity
 
 **Design-level.** This phase sits on Phases 1-4 and firms up once they land.

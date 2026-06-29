@@ -28,7 +28,7 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 >
 > **Diagnostics plane:** live-state snapshot via **periodic pub-sub** (`history_size(1)`, bounded fixed payload to Phase 3's live-state cap); **cache catalog via request-response pull** (per-request chunking). Provider connectivity/last-error surface here.
 >
-> **Service lifecycle:** the sink owns its `Node` + per-client service; not cloneable; dropped on client-session close. Per-client service **over-provisions** `max_subscribers`/history — document the symbol-cap assumption; dynamic service recreation on cap-exceed is a Phase-5 concern.
+> **Service lifecycle:** **one iceoryx2 `Node` per process** (datamancerd-owned, see Phase 5); the sink owns its **per-client service** on that Node; not cloneable; dropped on client-session close. Per-client service **over-provisions** `max_subscribers`/history — document the symbol-cap assumption; dynamic service recreation on cap-exceed is a Phase-5 concern (Phase 5 rejects a subscribe that would exceed the cap).
 >
 > **Tests (feature-gated; likely `#[ignore]` in CI):** POD round-trip per variant; `SymbolId → Instrument` resolution incl. **data-before-announcement hold**; no-history late-joiner recovery (timeout-bounded); blocking-backpressure → Phase-2 drop-to-Gap; diagnostics snapshot pub + catalog request-response chunk reassembly; flush/shutdown drain; synthetic-`seq` sentinel survives round-trip.
 

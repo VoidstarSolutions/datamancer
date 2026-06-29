@@ -15,6 +15,24 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 
 > **Tech stack (locked 2026-06-28).** `axum` backend serving **server-rendered Rust templates (`maud` or `askama`) + HTMX**, with **SSE** for live-updating panels and a small JS charting library (`uPlot` or `ECharts`) loaded as a static asset for graphs. **No SPA / JS build toolchain.** Read-only ships first; operator interactivity (trigger fetch, sub/unsubscribe — the Phase-5 control surface) layers on incrementally as HTMX actions (`hx-post` to axum handlers) without a rewrite. This resolves the prior "server-rendered vs SPA" open question. Template-engine pick (`maud` vs `askama`) and chart-lib pick (`uPlot` vs `ECharts`) are minor, left to implementation.
 
+> **Detailed-planning hardening (gotcha pass, 2026-06-28) — authoritative.** Adversarial review vs Phase 3 (snapshot) + Phase 5 (host). The locked HTMX stack stands; any "polling SPA" text elsewhere in this plan is **superseded**.
+>
+> **Live updates:** **SSE streams the live-state snapshot only** (full live-state per tick at `live_state_cadence_ms`; the browser accumulates samples). The **cache catalog is on-demand** via a separate endpoint (`cache_catalog_cadence_ms`). The daemon runs **two independent refresh tasks → two ArcSwaps** so catalog I/O never stalls live updates. Routes: SSE `/api/stream` (live-state), `/api/snapshot` (JSON), `/api/cache` (catalog, slow).
+>
+> **Charts:** point-in-time snapshot → **client-side JS circular buffer** of SSE samples (e.g. 5 min @ 1/s); no server-side history. Chart lib vendored as a static asset in `assets_dir` (missing → 404 + warn); compiled-in default dir fallback.
+>
+> **Handlers:** `Result<Json<T>, AppError>` (`AppError: IntoResponse`); snapshot failure → 500 `{"error":"snapshot unavailable"}`. **Warm both ArcSwaps at startup before binding** so a handler never serves an empty snapshot. GET-only routes; localhost bind only; basic security headers (CSP / X-Content-Type-Options) even same-host.
+>
+> **Per-symbol UI:** all gap/latency/seq views are per-`(instrument,kind)`; no global-sequence or cross-symbol-merged view. `latency_ns` is rendered as observability only (CLAUDE.md `rx_ts` invariant) and doc-guarded on the snapshot field.
+>
+> **`/metrics`:** off by default; gauges/counters labeled per actively-subscribed `(instrument,kind)` with a documented cardinality cap ("enable once a scraper is deployed").
+>
+> **Interactivity-later:** read-only now = **button-less templates**; a future phase adds `hx-post` affordances + guarded `post` handlers wired to the Phase-5 control surface (additive, no rewrite).
+>
+> **Placement:** the web module lives in `datamancerd` (not re-exported as library API); `web-ui` and `metrics` are datamancerd cargo features (`metrics` usable independently of `web-ui`).
+>
+> **Tests:** handler renders a known snapshot to expected JSON/HTML; SSE emits on snapshot change; `/metrics` well-formed; catalog endpoint hits the slow accessor; per-symbol rendering; ArcSwap-not-ready startup path.
+
 > **Fidelity: design-level.** Concrete endpoint shapes and field names firm up
 > once Phase 3 fixes the snapshot type and Phase 5 fixes the daemon
 > runtime/lifecycle. Every dependency on those phases is a **RE-PLAN
