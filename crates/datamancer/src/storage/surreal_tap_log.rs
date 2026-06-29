@@ -80,8 +80,11 @@ fn map_err(err: surrealdb::Error) -> Error {
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct TapTradeRow {
+    // `Option` so rows written before `ord` existed deserialize as `None` (the
+    // `SurrealValue` derive does not honor `#[serde(default)]` for an absent
+    // field); such legacy rows read back as ordinal 0 at replay.
     #[serde(default)]
-    ord: u64,
+    ord: Option<u64>,
     seq: u64,
     source_ts: i64,
     rx_ts: i64,
@@ -91,8 +94,11 @@ struct TapTradeRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct TapQuoteRow {
+    // `Option` so rows written before `ord` existed deserialize as `None` (the
+    // `SurrealValue` derive does not honor `#[serde(default)]` for an absent
+    // field); such legacy rows read back as ordinal 0 at replay.
     #[serde(default)]
-    ord: u64,
+    ord: Option<u64>,
     seq: u64,
     source_ts: i64,
     rx_ts: i64,
@@ -104,8 +110,11 @@ struct TapQuoteRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct TapBarRow {
+    // `Option` so rows written before `ord` existed deserialize as `None` (the
+    // `SurrealValue` derive does not honor `#[serde(default)]` for an absent
+    // field); such legacy rows read back as ordinal 0 at replay.
     #[serde(default)]
-    ord: u64,
+    ord: Option<u64>,
     seq: u64,
     source_ts: i64,
     rx_ts: i64,
@@ -132,8 +141,11 @@ struct MetaRow {
     /// High-water mark of the global append ordinal (`ord`). Persisted as a
     /// reservation boundary, not per write, so a crash skips the unused tail of
     /// the current batch (a harmless gap in `ord`) but never reuses an ordinal.
+    /// `Option` (not `#[serde(default)]`) so a `meta` row written before this
+    /// field existed deserializes as `None` under the `SurrealValue` derive
+    /// (which, unlike serde, does not honor `default` for an absent field).
     #[serde(default)]
-    next_ord: u64,
+    next_ord: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,11 +330,11 @@ impl SurrealTapLog {
         let writer = Writer {
             db: db.clone(),
             next_shard: meta.next_shard,
-            // Resume the append ordinal at the persisted high-water mark. Any
-            // ordinals reserved-but-unused before the last shutdown are skipped,
-            // never reused.
-            next_ord: meta.next_ord,
-            ord_high: meta.next_ord,
+            // Resume the append ordinal at the persisted high-water mark (0 for a
+            // legacy `meta` row predating the field). Any ordinals reserved but
+            // unused before the last shutdown are skipped, never reused.
+            next_ord: meta.next_ord.unwrap_or(0),
+            ord_high: meta.next_ord.unwrap_or(0),
             shards,
             last_error: None,
         };
@@ -426,7 +438,7 @@ impl Writer {
         match ev {
             MarketEvent::Trade(t) => {
                 let row = TapTradeRow {
-                    ord,
+                    ord: Some(ord),
                     seq,
                     source_ts: t.source_ts.0,
                     rx_ts: t.rx_ts.0,
@@ -442,7 +454,7 @@ impl Writer {
             }
             MarketEvent::Quote(q) => {
                 let row = TapQuoteRow {
-                    ord,
+                    ord: Some(ord),
                     seq,
                     source_ts: q.source_ts.0,
                     rx_ts: q.rx_ts.0,
@@ -460,7 +472,7 @@ impl Writer {
             }
             MarketEvent::Bar(b) => {
                 let row = TapBarRow {
-                    ord,
+                    ord: Some(ord),
                     seq,
                     source_ts: b.source_ts.0,
                     rx_ts: b.rx_ts.0,
@@ -554,7 +566,7 @@ impl Writer {
         let row = MetaRow {
             next_shard: self.next_shard,
             // Persist the reservation boundary, not the live counter.
-            next_ord: self.ord_high,
+            next_ord: Some(self.ord_high),
         };
         let _: Option<MetaRow> = self
             .db
@@ -621,7 +633,7 @@ impl ReplaySource for SurrealTapReplaySource {
                         .map_err(map_err)?;
                     all.extend(rows.into_iter().map(|r| {
                         (
-                            r.ord,
+                            r.ord.unwrap_or(0),
                             MarketEvent::Trade(Trade {
                                 instrument: instrument.clone(),
                                 source_ts: Timestamp(r.source_ts),
@@ -650,7 +662,7 @@ impl ReplaySource for SurrealTapReplaySource {
                         .map_err(map_err)?;
                     all.extend(rows.into_iter().map(|r| {
                         (
-                            r.ord,
+                            r.ord.unwrap_or(0),
                             MarketEvent::Quote(Quote {
                                 instrument: instrument.clone(),
                                 source_ts: Timestamp(r.source_ts),
@@ -681,7 +693,7 @@ impl ReplaySource for SurrealTapReplaySource {
                         .map_err(map_err)?;
                     all.extend(rows.into_iter().map(|r| {
                         (
-                            r.ord,
+                            r.ord.unwrap_or(0),
                             MarketEvent::Bar(Bar {
                                 instrument: instrument.clone(),
                                 interval,
