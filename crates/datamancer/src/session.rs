@@ -51,8 +51,8 @@
 
 use crate::accounting::ProviderAccounting;
 use crate::client::{
-    AuthoritativeSession, ClientHandle, ClientSession, FanOut, LiveStats, SubscriberGuard,
-    SubscriberId, spawn_client,
+    AuthoritativeSession, ClientHandle, ClientSession, ClientStats, FanOut, LiveStats,
+    SubscriberGuard, SubscriberId, spawn_client,
 };
 use crate::fetch_locks::FetchLocks;
 
@@ -61,9 +61,10 @@ use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use datamancer_core::{
-    Adjustment, Bar, CacheKey, Control, ControlKind, Error, EventKind, EventSink, GapSpan,
-    HistoricalCache, HistoryRequest, Instrument, LiveHandle, MarketEvent, Provider, PublishOutcome,
-    Quote, ReplayRequest, Result, Seq, TapLog, Timestamp, Trade,
+    Adjustment, AuthoritativeSessionSnapshot, Bar, CacheKey, CacheSnapshot, ClientSessionSnapshot,
+    Control, ControlKind, Error, EventKind, EventSink, GapSpan, HistoricalCache, HistoryRequest,
+    Instrument, LiveHandle, MarketEvent, Provider, ProviderSnapshot, PublishOutcome, Quote,
+    ReplayRequest, Result, Seq, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -205,6 +206,10 @@ struct DatamancerInner {
     /// into each controller so the cold-site and stream-derived counters land
     /// on the same handle the diagnostics snapshot reads.
     provider_accounting: HashMap<datamancer_core::ProviderId, Arc<ProviderAccounting>>,
+    /// Registry of active multiplexing client sessions: each controller holds
+    /// the strong `Arc<ClientStats>` and the registry a `Weak`, so a finished
+    /// controller drops out automatically. Read by the diagnostics snapshot.
+    client_sessions: ClientSessionRegistry,
 }
 
 impl DatamancerInner {
@@ -225,6 +230,9 @@ impl DatamancerInner {
 
 pub(crate) type LiveSessionRegistry =
     Arc<std::sync::Mutex<HashMap<(Instrument, EventKind), Weak<AuthoritativeSession>>>>;
+
+pub(crate) type ClientSessionRegistry =
+    Arc<std::sync::Mutex<HashMap<datamancer_core::ClientSessionId, Weak<ClientStats>>>>;
 
 impl Datamancer {
     #[must_use]
@@ -478,6 +486,135 @@ impl Datamancer {
         ClientSession::new(handle)
     }
 
+    /// The client-session registry, for [`spawn_client`] to register a new
+    /// controller's [`ClientStats`] under.
+    pub(crate) fn client_registry(&self) -> ClientSessionRegistry {
+        self.inner.client_sessions.clone()
+    }
+
+    /// Assemble a consolidated, serializable [`SystemSnapshot`] of runtime state:
+    /// provider accounting, the cache catalog, and per-symbol live state
+    /// (authoritative + client sessions).
+    ///
+    /// **Sampled, not transactional.** Per-symbol fields are read from `Relaxed`
+    /// atomics; the registry mutex is held only long enough to clone handles and
+    /// is **never** held across an `.await` (the `catalog()` call awaits first,
+    /// before any registry lock). Fields may skew by nanoseconds across symbols —
+    /// acceptable because determinism is per-symbol and the snapshot is
+    /// diagnostic. See [`datamancer_core::SystemSnapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates an error from [`HistoricalCache::catalog`] when a cache is
+    /// configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a registry mutex is poisoned (a prior panic inside a
+    /// registry-holding path).
+    pub async fn snapshot(&self) -> Result<SystemSnapshot> {
+        let captured_at = wall_clock_ts();
+
+        // 1. Provider accounting, folding in the optional metrics hook.
+        let providers = self
+            .inner
+            .provider_accounting
+            .iter()
+            .map(|(id, acc)| {
+                let metrics = self
+                    .inner
+                    .providers
+                    .iter()
+                    .find(|p| p.id() == id.as_str())
+                    .and_then(|p| p.metrics());
+                let (bytes, rate_limit_hits) = metrics.map_or((None, None), |m| {
+                    (Some(m.bytes()), Some(m.rate_limit_hits()))
+                });
+                ProviderSnapshot::new(
+                    id.clone(),
+                    acc.connection_state(),
+                    acc.history_fetches(),
+                    acc.history_fetch_coalesced(),
+                    acc.live_starts(),
+                    acc.subscribes(),
+                    acc.unsubscribes(),
+                    acc.reconnects(),
+                    acc.messages(),
+                    acc.gaps_emitted(),
+                    acc.last_error(),
+                )
+                .with_bytes(bytes)
+                .with_rate_limit_hits(rate_limit_hits)
+            })
+            .collect();
+
+        // 2. Cache catalog. AWAIT happens here, BEFORE taking any registry lock.
+        let cache = match &self.inner.historical_cache {
+            Some(c) => CacheSnapshot::new(c.catalog().await?, None),
+            None => CacheSnapshot::new(Vec::new(), None),
+        };
+
+        // 3. Authoritative sessions: take the registry lock only to upgrade each
+        // Weak, read the referrer refcount, and clone the LiveStats handle; drop
+        // the lock before reading atomics (and never hold it across an await).
+        let auth_handles: Vec<_> = {
+            let map = self
+                .inner
+                .live_sessions
+                .lock()
+                .expect("live-session registry mutex poisoned");
+            map.values()
+                .filter_map(|weak| {
+                    let refcount = u32::try_from(weak.strong_count()).unwrap_or(u32::MAX);
+                    weak.upgrade().map(|auth| {
+                        (
+                            auth.instrument.clone(),
+                            auth.kind,
+                            refcount,
+                            auth.stats.clone(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        let authoritative_sessions = auth_handles
+            .into_iter()
+            .map(|(instrument, kind, refcount, stats)| {
+                AuthoritativeSessionSnapshot::new(instrument, kind, refcount, stats.gap_count())
+                    .with_seq_position(stats.seq_position())
+                    .with_timestamps(stats.last_source_ts(), stats.last_rx_ts())
+            })
+            .collect();
+
+        // 4. Client sessions: same clone-then-release discipline.
+        let client_handles: Vec<_> = {
+            let map = self
+                .inner
+                .client_sessions
+                .lock()
+                .expect("client-session registry mutex poisoned");
+            map.values().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        let client_sessions = client_handles
+            .into_iter()
+            .map(|stats| {
+                ClientSessionSnapshot::new(
+                    stats.id(),
+                    stats.subscription_refs(),
+                    stats.resume_buffer_snapshot(),
+                )
+            })
+            .collect();
+
+        Ok(SystemSnapshot::new(
+            captured_at,
+            providers,
+            cache,
+            authoritative_sessions,
+            client_sessions,
+        ))
+    }
+
     /// Look up a registered provider by id.
     ///
     /// # Errors
@@ -656,6 +793,7 @@ impl DatamancerBuilder {
                 adjustment: self.adjustment,
                 fetch_locks: FetchLocks::default(),
                 provider_accounting,
+                client_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
         })
     }

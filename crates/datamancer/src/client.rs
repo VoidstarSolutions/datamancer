@@ -27,11 +27,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use datamancer_core::{
     ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, MarketEvent,
-    Result, Seq, Timestamp,
+    Result, Seq, SubscriptionRef, Timestamp,
 };
 use futures::StreamExt as _;
 use tokio::sync::{mpsc, oneshot};
@@ -39,8 +39,8 @@ use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::session::{
-    Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions, Scope, SessionCommand,
-    default_buffer,
+    ClientSessionRegistry, Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions, Scope,
+    SessionCommand, default_buffer,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,15 +61,12 @@ pub(crate) struct SubscriberId(pub(crate) u64);
 /// the former `RegistrySentinel`: its `Drop` clears the registry slot when no
 /// successor has taken it.
 pub(crate) struct AuthoritativeSession {
-    // `instrument`/`kind`/`scope`/`stats` are the Phase 3 diagnostics read
-    // surface (the live-state snapshot iterates the registry and reads them);
-    // Phase 2 only writes them. See the phase-3 plan's "read registry/stats".
-    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    // `instrument`/`kind`/`stats` are read by the Phase 3 diagnostics snapshot
+    // (it iterates the registry); Phase 2 only writes them.
     pub(crate) instrument: Instrument,
-    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
     pub(crate) kind: EventKind,
     pub(crate) provider_id: String,
-    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    #[allow(dead_code, reason = "retained for diagnostics; not yet surfaced")]
     pub(crate) scope: Scope,
     /// Command channel to the authoritative controller (`AddSubscriber`,
     /// `SetPersistence`).
@@ -78,7 +75,6 @@ pub(crate) struct AuthoritativeSession {
     /// [`SubscriberGuard::drop`] can signal removal without blocking.
     remove_tx: mpsc::UnboundedSender<SubscriberId>,
     next_subscriber_id: AtomicU64,
-    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
     pub(crate) stats: Arc<LiveStats>,
     registry: LiveSessionRegistry,
     key: (Instrument, EventKind),
@@ -256,7 +252,6 @@ impl LiveStats {
     }
 
     /// Last source-stamped `seq` seen, or `None` before any event.
-    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
     pub(crate) fn seq_position(&self) -> Option<Seq> {
         self.has_seq
             .load(Ordering::Relaxed)
@@ -264,7 +259,6 @@ impl LiveStats {
     }
 
     /// Last data-event `source_ts`, or `None` before any data event.
-    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
     pub(crate) fn last_source_ts(&self) -> Option<Timestamp> {
         self.has_ts
             .load(Ordering::Relaxed)
@@ -272,7 +266,6 @@ impl LiveStats {
     }
 
     /// Last data-event `rx_ts`, or `None` before any data event.
-    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
     pub(crate) fn last_rx_ts(&self) -> Option<Timestamp> {
         self.has_ts
             .load(Ordering::Relaxed)
@@ -280,7 +273,6 @@ impl LiveStats {
     }
 
     /// Cumulative `Control::Gap` count for this symbol.
-    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
     pub(crate) fn gap_count(&self) -> u64 {
         self.gap_count.load(Ordering::Relaxed)
     }
@@ -301,6 +293,99 @@ fn data_rx_ts(ev: &MarketEvent) -> Option<Timestamp> {
         MarketEvent::Quote(q) => Some(q.rx_ts),
         MarketEvent::Bar(b) => Some(b.rx_ts),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client stats (per-client resume-buffer + subscription view; Phase 3 reads)
+// ---------------------------------------------------------------------------
+
+/// Per-client-session introspection state, written by the [`ClientController`]
+/// and read (sampled) by the Phase 3 diagnostics snapshot. Held strong by the
+/// controller; the registry keeps a `Weak`, so a finished controller drops out
+/// automatically (see [`Drop`]).
+pub(crate) struct ClientStats {
+    id: ClientSessionId,
+    /// Resume-buffer capacity (events) — the builder knob, constant per client.
+    capacity: usize,
+    /// Current per-client resume-buffer occupancy (0 while attached).
+    occupancy: AtomicUsize,
+    /// Cumulative events evicted from the resume buffer (overflow).
+    dropped_events: AtomicU64,
+    /// Current subscription set, mirrored from the controller's `entries`.
+    subscriptions: std::sync::Mutex<Vec<(Instrument, EventKind)>>,
+    registry: ClientSessionRegistry,
+}
+
+impl ClientStats {
+    pub(crate) fn new(
+        id: ClientSessionId,
+        capacity: usize,
+        registry: ClientSessionRegistry,
+    ) -> Self {
+        Self {
+            id,
+            capacity,
+            occupancy: AtomicUsize::new(0),
+            dropped_events: AtomicU64::new(0),
+            subscriptions: std::sync::Mutex::new(Vec::new()),
+            registry,
+        }
+    }
+
+    /// Record `n` evicted events (resume-buffer overflow).
+    pub(crate) fn record_drops(&self, n: u64) {
+        if n > 0 {
+            self.dropped_events.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Set the current resume-buffer occupancy.
+    pub(crate) fn set_occupancy(&self, n: usize) {
+        self.occupancy.store(n, Ordering::Relaxed);
+    }
+
+    /// Mirror the controller's current subscription set.
+    pub(crate) fn set_subscriptions(&self, subs: Vec<(Instrument, EventKind)>) {
+        if let Ok(mut slot) = self.subscriptions.lock() {
+            *slot = subs;
+        }
+    }
+
+    pub(crate) fn id(&self) -> ClientSessionId {
+        self.id
+    }
+
+    /// A point-in-time [`datamancer_core::ResumeBufferSnapshot`] for this client.
+    pub(crate) fn resume_buffer_snapshot(&self) -> datamancer_core::ResumeBufferSnapshot {
+        datamancer_core::ResumeBufferSnapshot::new(
+            self.capacity,
+            self.occupancy.load(Ordering::Relaxed),
+            self.dropped_events.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The current subscription set as serializable refs.
+    pub(crate) fn subscription_refs(&self) -> Vec<SubscriptionRef> {
+        self.subscriptions
+            .lock()
+            .map(|s| {
+                s.iter()
+                    .map(|(instrument, kind)| SubscriptionRef {
+                        instrument: instrument.clone(),
+                        kind: *kind,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for ClientStats {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.registry.lock() {
+            map.remove(&self.id);
+        }
     }
 }
 
@@ -422,13 +507,23 @@ impl ClientRing {
         }
     }
 
-    pub(crate) fn push(&mut self, ev: MarketEvent, provider: String) {
-        if self.buf.len() == self.capacity
+    /// Push one event; returns `true` if it evicted the oldest (overflow).
+    pub(crate) fn push(&mut self, ev: MarketEvent, provider: String) -> bool {
+        let evicted = if self.buf.len() == self.capacity
             && let Some((evicted, evicted_provider)) = self.buf.pop_front()
         {
             self.note_drop(&evicted, &evicted_provider);
-        }
+            true
+        } else {
+            false
+        };
         self.buf.push_back((ev, provider));
+        evicted
+    }
+
+    /// Current buffered event count.
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len()
     }
 
     /// Extend the dropped span for the evicted event's instrument. Data events
@@ -577,6 +672,8 @@ struct ClientController {
     ring_capacity: usize,
     seen_provider_state: HashMap<String, ConnState>,
     last_provider_error: HashMap<String, String>,
+    /// Per-client introspection state read by the diagnostics snapshot.
+    stats: Arc<ClientStats>,
 }
 
 fn substream(rx: mpsc::Receiver<MarketEvent>) -> SubStream {
@@ -700,6 +797,7 @@ impl ClientController {
             },
         );
         self.streams.insert(key, substream(rx));
+        self.sync_subscriptions();
         Ok(())
     }
 
@@ -715,6 +813,7 @@ impl ClientController {
         // clients), so it is synthetic and rides `Seq::SYNTHETIC`.
         drop(entry);
         self.streams.remove(&key);
+        self.sync_subscriptions();
         self.deliver(
             subscription_changed(&instrument, kind, &provider, false),
             provider,
@@ -733,6 +832,7 @@ impl ClientController {
         };
         let provider = entry.provider.clone();
         drop(entry);
+        self.sync_subscriptions();
         self.deliver(
             subscription_changed(&key.0, key.1, &provider, false),
             provider,
@@ -816,9 +916,16 @@ impl ClientController {
         if matches!(self.sink, ClientSink::Attached(_)) {
             self.sink = ClientSink::Detached(ClientRing::new(self.ring_capacity));
         }
-        if let ClientSink::Detached(ring) = &mut self.sink {
-            ring.push(ev, provider);
+        let (evicted, occupancy) = if let ClientSink::Detached(ring) = &mut self.sink {
+            let evicted = ring.push(ev, provider);
+            (evicted, ring.len())
+        } else {
+            (false, 0)
+        };
+        if evicted {
+            self.stats.record_drops(1);
         }
+        self.stats.set_occupancy(occupancy);
     }
 
     fn prepare_attach(&mut self) -> Result<(mpsc::Receiver<MarketEvent>, Option<ClientRing>)> {
@@ -829,6 +936,9 @@ impl ClientController {
         }
         let (tx, rx) = mpsc::channel(default_buffer());
         let prior = std::mem::replace(&mut self.sink, ClientSink::Attached(tx));
+        // Attached: nothing sits in the resume buffer. (The drained ring's
+        // cumulative `dropped_events` is retained on `ClientStats`.)
+        self.stats.set_occupancy(0);
         Ok((
             rx,
             match prior {
@@ -836,6 +946,12 @@ impl ClientController {
                 ClientSink::Attached(_) => None,
             },
         ))
+    }
+
+    /// Mirror the current subscription set onto [`ClientStats`] for the snapshot.
+    fn sync_subscriptions(&self) {
+        self.stats
+            .set_subscriptions(self.entries.keys().cloned().collect());
     }
 
     /// Drain a detached ring on re-attach: one `Gap` per affected instrument
@@ -1023,6 +1139,13 @@ pub(crate) fn spawn_client(
         );
         streams.insert(key, substream(rx));
     }
+    let id = ClientSessionId::next();
+    let registry = dm.client_registry();
+    let stats = Arc::new(ClientStats::new(id, ring_capacity, registry.clone()));
+    stats.set_subscriptions(entries.keys().cloned().collect());
+    if let Ok(mut map) = registry.lock() {
+        map.insert(id, Arc::downgrade(&stats));
+    }
     let controller = ClientController {
         dm,
         cmd_rx,
@@ -1032,12 +1155,10 @@ pub(crate) fn spawn_client(
         ring_capacity,
         seen_provider_state: HashMap::new(),
         last_provider_error: HashMap::new(),
+        stats,
     };
     tokio::spawn(controller.run());
-    ClientHandle {
-        cmd_tx,
-        id: ClientSessionId::next(),
-    }
+    ClientHandle { cmd_tx, id }
 }
 
 /// The primary consumer handle: a mutable set of `(instrument, kind)`

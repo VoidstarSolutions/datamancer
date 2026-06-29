@@ -134,10 +134,6 @@ impl ProviderAccounting {
 }
 
 // --- read side (sampled; consumed by `Datamancer::snapshot`) ----------------
-#[allow(
-    dead_code,
-    reason = "read by the Phase 3 diagnostics snapshot (wired in Slice C)"
-)]
 impl ProviderAccounting {
     pub(crate) fn history_fetches(&self) -> u64 {
         self.history_fetches.load(Ordering::Relaxed)

@@ -37,11 +37,12 @@ pub mod storage;
 pub use client::ClientSession;
 pub use datamancer_core::traits;
 pub use datamancer_core::{
-    Adjustment, AssetClass, Bar, BarInterval, CacheCatalogEntry, CacheCoverage, CacheKey,
-    ClientSessionId, ConnectionState, Control, ControlKind, Error, EventKind, GapSpan,
-    HistoricalCache, HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider,
-    ProviderId, ProviderMetrics, Quote, ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp,
-    Trade,
+    Adjustment, AssetClass, AuthoritativeSessionSnapshot, Bar, BarInterval, CacheCatalogEntry,
+    CacheCoverage, CacheKey, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
+    ConnectionState, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
+    HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId,
+    ProviderMetrics, ProviderSnapshot, Quote, ReplayRequest, ReplaySource, Result,
+    ResumeBufferSnapshot, Seq, SubscriptionRef, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 pub use session::{
     Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,

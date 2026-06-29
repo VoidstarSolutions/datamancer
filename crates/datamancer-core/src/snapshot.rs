@@ -159,6 +159,167 @@ pub struct SubscriptionRef {
     pub kind: EventKind,
 }
 
+// Constructors. The snapshot aggregates are `#[non_exhaustive]` (forward-compat
+// for the diagnostics plane / UI), so the in-workspace assembler in
+// `datamancer` builds them through these rather than struct literals.
+
+impl SystemSnapshot {
+    #[must_use]
+    pub fn new(
+        captured_at: Timestamp,
+        providers: Vec<ProviderSnapshot>,
+        cache: CacheSnapshot,
+        authoritative_sessions: Vec<AuthoritativeSessionSnapshot>,
+        client_sessions: Vec<ClientSessionSnapshot>,
+    ) -> Self {
+        Self {
+            captured_at,
+            providers,
+            cache,
+            authoritative_sessions,
+            client_sessions,
+        }
+    }
+}
+
+impl ProviderSnapshot {
+    /// Construct from the counts datamancer tracks. `rate_limit_hits` and
+    /// `bytes` are `None` unless a provider's metrics hook reports them; set
+    /// them with [`with_rate_limit_hits`](Self::with_rate_limit_hits) /
+    /// [`with_bytes`](Self::with_bytes).
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "flat accounting record; one in-workspace call site"
+    )]
+    pub fn new(
+        provider: ProviderId,
+        connection_state: ConnectionState,
+        history_fetches: u64,
+        history_fetch_coalesced: u64,
+        live_starts: u64,
+        subscribes: u64,
+        unsubscribes: u64,
+        reconnects: u64,
+        messages: u64,
+        gaps_emitted: u64,
+        last_error: Option<String>,
+    ) -> Self {
+        Self {
+            provider,
+            connection_state,
+            history_fetches,
+            history_fetch_coalesced,
+            live_starts,
+            subscribes,
+            unsubscribes,
+            reconnects,
+            rate_limit_hits: None,
+            messages,
+            bytes: None,
+            gaps_emitted,
+            last_error,
+        }
+    }
+
+    /// Set the provider-reported rate-limit-hit count.
+    #[must_use]
+    pub fn with_rate_limit_hits(mut self, hits: Option<u64>) -> Self {
+        self.rate_limit_hits = hits;
+        self
+    }
+
+    /// Set the provider-reported byte throughput.
+    #[must_use]
+    pub fn with_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.bytes = bytes;
+        self
+    }
+}
+
+impl CacheSnapshot {
+    #[must_use]
+    pub fn new(entries: Vec<CacheCatalogEntry>, total_disk_bytes: Option<u64>) -> Self {
+        Self {
+            entries,
+            total_disk_bytes,
+        }
+    }
+}
+
+impl AuthoritativeSessionSnapshot {
+    /// Construct from required identity + refcount + gap count. The sampled
+    /// `LiveStats` fields (`seq_position`, timestamps, `latency_ns`) default to
+    /// `None`; set them with the `with_*` builders.
+    #[must_use]
+    pub fn new(
+        instrument: Instrument,
+        kind: EventKind,
+        subscriber_refcount: u32,
+        gap_count: u64,
+    ) -> Self {
+        Self {
+            instrument,
+            kind,
+            subscriber_refcount,
+            seq_position: None,
+            last_source_ts: None,
+            last_rx_ts: None,
+            latency_ns: None,
+            gap_count,
+        }
+    }
+
+    /// Set the last-assigned per-symbol source `seq`.
+    #[must_use]
+    pub fn with_seq_position(mut self, seq: Option<Seq>) -> Self {
+        self.seq_position = seq;
+        self
+    }
+
+    /// Set the last data-event timestamps and derive `latency_ns` from them.
+    #[must_use]
+    pub fn with_timestamps(
+        mut self,
+        last_source_ts: Option<Timestamp>,
+        last_rx_ts: Option<Timestamp>,
+    ) -> Self {
+        self.last_source_ts = last_source_ts;
+        self.last_rx_ts = last_rx_ts;
+        self.latency_ns = match (last_source_ts, last_rx_ts) {
+            (Some(s), Some(r)) => Some(r.0 - s.0),
+            _ => None,
+        };
+        self
+    }
+}
+
+impl ResumeBufferSnapshot {
+    #[must_use]
+    pub fn new(capacity: usize, occupancy: usize, dropped_events: u64) -> Self {
+        Self {
+            capacity,
+            occupancy,
+            dropped_events,
+        }
+    }
+}
+
+impl ClientSessionSnapshot {
+    #[must_use]
+    pub fn new(
+        id: ClientSessionId,
+        subscriptions: Vec<SubscriptionRef>,
+        resume_buffer: ResumeBufferSnapshot,
+    ) -> Self {
+        Self {
+            id,
+            subscriptions,
+            resume_buffer,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
