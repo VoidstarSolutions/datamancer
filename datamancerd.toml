@@ -1,0 +1,77 @@
+# Sample datamancerd configuration.
+#
+# Run with:  cargo run -p datamancerd -- --config datamancerd.toml
+#
+# Provider credentials are NOT in this file — `account_type` selects which
+# environment credential pair oxidized_alpaca loads:
+#   paper -> ALPACA_PAPER_API_KEY_ID / ALPACA_PAPER_API_SECRET_KEY
+#   live  -> ALPACA_LIVE_API_KEY_ID  / ALPACA_LIVE_API_SECRET_KEY
+#
+# Every section below is optional except [provider] (at least one provider must
+# be configured). The values shown for non-provider sections are the defaults;
+# delete a section to accept its defaults. Unknown keys are rejected.
+
+# ── Providers ──────────────────────────────────────────────────────────────
+# Configure at least one. Crypto needs no special entitlements on a paper key,
+# so it is the easiest first run.
+[provider.alpaca_crypto]
+account_type = "paper"            # paper | live
+venue = "us"                      # us | us_kraken | eu_kraken
+
+# [provider.alpaca]               # equities; uncomment to enable
+# account_type = "paper"
+
+# ── Persistence ────────────────────────────────────────────────────────────
+# Required only if a startup session (or a client subscription) uses them.
+# Paths below are repo-local so this sample runs without root. A real
+# deployment typically uses system paths like /var/lib/datamancerd/{cache,taplog}
+# (create them and chown to the service user first).
+[cache]
+backend = "surreal-embedded"      # surreal-embedded | surreal-memory
+path = "./.datamancerd/cache"     # required for surreal-embedded
+
+[tap_log]
+backend = "surreal-embedded"
+path = "./.datamancerd/taplog"
+
+# ── Session knobs ──────────────────────────────────────────────────────────
+[session]
+resume_buffer_events = 65536      # bounded per-client resume buffer
+adjustment = "all"                # raw | split | dividend | spin_off | all
+
+# ── Control surface + service naming ───────────────────────────────────────
+[server]
+admin_socket = "./.datamancerd/admin.sock"     # newline-JSON control socket (use /run/datamancerd/admin.sock in prod)
+service_prefix = "datamancerd"                 # iceoryx2 service-name prefix
+shutdown_timeout_secs = 30                      # bounds the graceful drain
+
+# ── Diagnostics-plane cadence ──────────────────────────────────────────────
+[diagnostics]
+publish_interval_ms = 1000        # live-state snapshot publish cadence
+cache_catalog_interval_ms = 30000 # slower cache-catalog refresh
+
+# ── iceoryx2 transport caps ────────────────────────────────────────────────
+[iceoryx2]
+max_clients = 64                  # per-client data-plane service cap
+
+# ── Optional read-only web introspection UI (feature `web-ui`, default on) ──
+[web_ui]
+enabled = true                    # off unless explicitly enabled
+bind = "127.0.0.1"                # loopback only; a non-loopback bind is rejected
+port = 9080
+# assets_dir = "/usr/share/datamancerd/ui"   # optional static assets
+live_state_cadence_ms = 1000      # fast: live-state swap + SSE
+cache_catalog_cadence_ms = 30000  # slow: cache-catalog swap (/api/cache)
+
+# ── Boot-time authoritative sessions held as lifecycle anchors ─────────────
+# always_on = true keeps the stream (and its recording) running across client
+# churn. Omit [[startup_session]] entirely to bring sessions up on demand.
+[[startup_session]]
+provider = "alpaca-crypto"
+asset_class = "crypto"            # equity | crypto
+symbol = "BTC/USD"
+kind = "trade"                    # trade | quote | bar_1s|1m|5m|15m|1h|1d
+scope = "live"                    # live | live_backfill
+# backfill_from = "2026-06-01T00:00:00Z"   # required iff scope = live_backfill
+persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only | refresh | tap_only
+always_on = true                  # hold for the process lifetime regardless of clients
