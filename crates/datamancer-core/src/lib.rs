@@ -28,7 +28,10 @@ pub use event::{
 };
 pub use instrument::{AssetClass, Instrument, ProviderId};
 pub use price::Price;
-pub use snapshot::{ClientSessionId, ConnectionState};
+pub use snapshot::{
+    AuthoritativeSessionSnapshot, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
+    ConnectionState, ProviderSnapshot, ResumeBufferSnapshot, SubscriptionRef, SystemSnapshot,
+};
 pub use traits::{
     CacheCatalogEntry, CacheCoverage, CacheKey, EventSink, HistoricalCache, HistoryRequest,
     LiveHandle, Provider, ProviderMetrics, PublishOutcome, ReplayRequest, ReplaySource, TapLog,
