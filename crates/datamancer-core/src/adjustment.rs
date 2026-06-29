@@ -1,5 +1,7 @@
 //! Corporate-action adjustment mode for historical bar data.
 
+use serde::{Deserialize, Serialize};
+
 /// How corporate actions (splits, dividends, spin-offs) are folded into
 /// historical bar prices.
 ///
@@ -7,7 +9,7 @@
 /// the cache key so adjusted data can never be stored under a raw key (or vice
 /// versa). The default is [`Adjustment::All`]: fully adjusted bars, so charts
 /// built downstream do not fabricate phantom reversals at split boundaries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Adjustment {
     /// No adjustment; bars carry raw, as-traded prices.
     Raw,
@@ -33,6 +35,23 @@ impl Adjustment {
             Adjustment::Dividend => "dividend",
             Adjustment::SpinOff => "spinoff",
             Adjustment::All => "all",
+        }
+    }
+
+    /// Inverse of [`as_str`](Self::as_str): parse a stable token back into an
+    /// [`Adjustment`]. Returns `None` for an unrecognized token.
+    ///
+    /// Used to reconstruct a cache catalog entry's adjustment mode from the
+    /// `coverage` record id, where the mode is stored as its `as_str` token.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "raw" => Some(Adjustment::Raw),
+            "split" => Some(Adjustment::Split),
+            "dividend" => Some(Adjustment::Dividend),
+            "spinoff" => Some(Adjustment::SpinOff),
+            "all" => Some(Adjustment::All),
+            _ => None,
         }
     }
 }
@@ -61,5 +80,20 @@ mod tests {
         assert_eq!(tokens.len(), all.len(), "tokens must be unique");
         assert_eq!(Adjustment::All.as_str(), "all");
         assert_eq!(Adjustment::Raw.as_str(), "raw");
+    }
+
+    #[test]
+    fn from_token_inverts_as_str() {
+        for a in [
+            Adjustment::Raw,
+            Adjustment::Split,
+            Adjustment::Dividend,
+            Adjustment::SpinOff,
+            Adjustment::All,
+        ] {
+            assert_eq!(Adjustment::from_token(a.as_str()), Some(a));
+        }
+        assert_eq!(Adjustment::from_token("nonsense"), None);
+        assert_eq!(Adjustment::from_token(""), None);
     }
 }

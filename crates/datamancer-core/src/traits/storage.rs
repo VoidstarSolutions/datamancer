@@ -16,6 +16,7 @@
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     adjustment::Adjustment,
@@ -108,7 +109,7 @@ pub trait ReplaySource: Send + Sync {
 /// [`Instrument`] (see [`Instrument::provider`]) so a `CacheKey` is fully
 /// self-describing — backends derive their row keys from the qualifying
 /// tuple inside `instrument` without an external lookup.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CacheKey {
     pub instrument: Instrument,
     pub kind: EventKind,

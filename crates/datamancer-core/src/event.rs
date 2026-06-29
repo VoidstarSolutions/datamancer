@@ -33,7 +33,8 @@ use crate::{Instrument, Price};
 /// In a live session `seq` is assigned in arrival order; for historical fetch
 /// it is assigned in source-timestamp order during fetch, so `seq` order
 /// matches market order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Seq(pub u64);
 
 impl Seq {
@@ -66,7 +67,7 @@ pub enum BarInterval {
 
 /// Selector used in subscriptions. Each variant maps 1:1 with a [`MarketEvent`]
 /// data variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EventKind {
     Trade,
     Quote,
@@ -187,8 +188,43 @@ pub enum ControlKind {
     SessionClosing,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GapSpan {
     pub from_source_ts: Timestamp,
     pub to_source_ts: Timestamp,
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::{BarInterval, EventKind, GapSpan, Seq, Timestamp};
+
+    #[test]
+    fn seq_round_trips_transparently() {
+        let json = serde_json::to_string(&Seq(42)).unwrap();
+        assert_eq!(json, "42");
+        assert_eq!(serde_json::from_str::<Seq>(&json).unwrap(), Seq(42));
+    }
+
+    #[test]
+    fn event_kind_round_trips() {
+        for k in [
+            EventKind::Trade,
+            EventKind::Quote,
+            EventKind::Bar(BarInterval::OneMinute),
+            EventKind::Bar(BarInterval::OneDay),
+        ] {
+            let json = serde_json::to_string(&k).unwrap();
+            assert_eq!(serde_json::from_str::<EventKind>(&json).unwrap(), k);
+        }
+    }
+
+    #[test]
+    fn gap_span_round_trips() {
+        let g = GapSpan {
+            from_source_ts: Timestamp(100),
+            to_source_ts: Timestamp(200),
+        };
+        let json = serde_json::to_string(&g).unwrap();
+        assert_eq!(serde_json::from_str::<GapSpan>(&json).unwrap(), g);
+    }
 }
