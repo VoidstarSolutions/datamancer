@@ -65,13 +65,13 @@ cache_catalog_interval_ms = 30000
 [iceoryx2]
 max_clients = 64                  # per-client data-plane service cap
 
-[web_ui]                          # optional; served in Phase 6
-enabled = false
-bind = "127.0.0.1"
+[web_ui]                          # optional; requires the `web-ui` feature (default on)
+enabled = false                   # off unless explicitly enabled
+bind = "127.0.0.1"                # loopback only; a non-loopback bind is rejected
 port = 8080
-assets_dir = "/usr/share/datamancerd/ui"
-live_state_cadence_ms = 1000
-cache_catalog_cadence_ms = 30000
+assets_dir = "/usr/share/datamancerd/ui"   # optional static assets (missing dir → warn)
+live_state_cadence_ms = 1000      # fast cadence: live-state swap + SSE
+cache_catalog_cadence_ms = 30000  # slow cadence: cache-catalog swap (/api/cache)
 
 # Boot-time authoritative sessions held as lifecycle anchors.
 [[startup_session]]
@@ -109,6 +109,55 @@ across client churn. Other startup sessions are refcount-driven: with the shared
 authoritative registry they come up on first client subscribe and tear down at
 the last referrer.
 
+## Web introspection surface (feature `web-ui`)
+
+An optional **read-only** HTTP server, embedded in the daemon's shared tokio
+runtime, that renders the introspection `SystemSnapshot` for a single same-host
+operator. It is a pure consumer of the snapshot — the **same** snapshot the
+diagnostics plane carries to client processes — and adds no new ordering,
+transport, or domain state. Enable it with `[web_ui] enabled = true`.
+
+> **Security boundary:** **loopback bind only** (a non-loopback `bind` is
+> rejected at startup), **single-origin** (no CORS layer is added — never a
+> permissive `Any` origin), `nosniff` + `Content-Security-Policy` response
+> headers, and **`GET`-only** (no mutation route exists). Auth is **deferred**:
+> single operator, no network exposure. This mirrors the control-socket posture
+> — **not** a network-safe surface.
+
+The JSON contract **is** the `SystemSnapshot` `Serialize` output (shared with
+the diagnostics plane); the section endpoints are pure projections of it. Two
+independent refresh tasks publish into two `ArcSwap`s on independent cadences —
+a fast live-state swap (`live_state_cadence_ms`) and a slow cache-catalog swap
+(`cache_catalog_cadence_ms`) — both warmed before the listener binds, so a
+handler never serves an empty snapshot and never invokes the on-demand
+(potentially blocking) snapshot accessor.
+
+| Route | Body |
+| --- | --- |
+| `GET /` | server-rendered operator page (button-less; live via SSE) |
+| `GET /api/snapshot` | the entire live-state `SystemSnapshot` |
+| `GET /api/cache` | cache catalog (slow swap): keys + ranges + est. bytes |
+| `GET /api/providers` | provider accounting |
+| `GET /api/sessions` | authoritative + client sessions (per-symbol) |
+| `GET /api/health` | process-up + per-provider connection rollup |
+| `GET /api/stream` | SSE of the live-state snapshot, one event per refresh |
+| `GET /metrics` | Prometheus exposition (only with feature `metrics`) |
+
+**Per-symbol presentation (load-bearing):** every ordered quantity (`seq`,
+coverage, latency, gaps) is shown **per-`(instrument, kind)`**. The UI implies
+**no** cross-symbol order: there is no global event count, stream position, or
+merged sequence; `seq` is labelled per-symbol and `latency_ns` is observability
+only (the sanctioned `rx_ts` use).
+
+### Metrics (feature `metrics`)
+
+Off by default until a scraper is deployed; usable independently of `web-ui`
+(the recorder installs without the UI; the `/metrics` route registers only when
+`web-ui` is also enabled). Per-symbol series are labelled per `(instrument,
+kind)`, so cardinality is bounded by the number of actively-subscribed units.
+The Prometheus recorder is **process-global and one-shot** — installed exactly
+once at startup.
+
 ## Control protocol (newline-JSON)
 
 One JSON object per line; one reply line per request.
@@ -132,8 +181,10 @@ operator contract and are regression-guarded.
 
 ## Shutdown
 
-SIGTERM/SIGINT triggers a bounded, serialized drain: stop accepting control
-requests → stop the diagnostics ticker → per client flush the sink then close
-the session → drop the startup anchors → flush the tap log. The whole drain is
+SIGTERM/SIGINT triggers a bounded, serialized drain: drain the web server (if
+enabled) → stop accepting control requests → stop the diagnostics ticker → per
+client flush the sink then close the session → drop the startup anchors → flush
+the tap log. The web server is drained first so it stops reporting on a data
+plane that is about to be torn down. The whole drain is
 bounded by `server.shutdown_timeout_secs` so a disk-stalled tap-log flush cannot
 hang shutdown forever (it is logged and the process force-exits).

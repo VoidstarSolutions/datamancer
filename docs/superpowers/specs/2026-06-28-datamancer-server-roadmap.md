@@ -341,6 +341,10 @@ Embedders who want zero hops still link the library and use the in-process sink.
 
 ### Phase 6 — Introspection web UI
 
+**Status: implemented (2026-06-29).** Shipped in `datamancerd` behind the
+`web-ui` feature (default on; `metrics` off by default). See
+`crates/datamancerd/README.md` → "Web introspection surface".
+
 **Goal.** `datamancerd` hosts an HTTP server rendering the Phase-3 snapshot for
 operators — read-only.
 
@@ -357,13 +361,26 @@ operators — read-only.
 usage / throughput, and live state (client sessions, subscriptions, per-symbol
 latency, gaps, connection health).
 
-**Open questions (for the plan).**
-- ~~UI tech: server-rendered vs lightweight SPA.~~ **Locked 2026-06-28:**
-  server-rendered (`maud`/`askama`) + HTMX + SSE on `axum`, JS chart lib as a
-  static asset. (Template-engine and chart-lib picks left to implementation.)
-- Read-only now vs later unifying with the Phase-5 control surface (trigger fetch
-  / sub-unsub from the UI) — the HTMX approach makes this additive.
-- Auth **deferred** (same-host, single-operator).
+**Resolved open questions (at implementation).**
+- ~~UI tech: server-rendered vs lightweight SPA.~~ **Server-rendered:** `maud`
+  templates + SSE on `axum`. The live page uses an inline SSE bootstrap with a
+  per-symbol client-side circular buffer and a tiny inline canvas sparkline (no
+  external CDN / JS build step); HTMX and a vendored chart lib are deferred —
+  the read-only page needs neither yet, and the operator control surface (the
+  additive `hx-post` layer) is still future work.
+- ~~Read-only now vs unifying with the Phase-5 control surface.~~ **Read-only,
+  button-less templates;** `GET`-only routes. A future phase adds guarded
+  `post` handlers wired to the control surface (additive, no rewrite).
+- ~~Snapshot acquisition cadence.~~ **Daemon-refreshed `ArcSwap` ×2** (live-state
+  fast, cache-catalog slow), warmed before bind; handlers are lock-free and
+  never call the on-demand accessor.
+- ~~Assets on-disk vs embedded.~~ **On-disk** `ServeDir` rooted at the configured
+  `assets_dir` (missing dir → warn; dynamic routes still serve). Embedding is
+  deferred until a single-file binary is wanted.
+- ~~`/metrics` worth building now?~~ **Built behind the off-by-default `metrics`
+  feature**, per-`(instrument, kind)` labelled; enable once a scraper is
+  deployed.
+- Auth **deferred** (same-host, single-operator, loopback bind, no CORS).
 
 **Depends on:** Phase 5 (daemon to host it) + Phase 3 (the snapshot).
 
