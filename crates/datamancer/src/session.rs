@@ -1776,7 +1776,10 @@ impl Controller {
     /// event, in this authoritative session's canonical delivery order.
     fn stamp(&mut self, ev: MarketEvent) -> MarketEvent {
         let seq = Seq(self.next_seq);
-        self.next_seq += 1;
+        // `saturating_add` so the source counter can never wrap into the
+        // `Seq::SYNTHETIC` (`u64::MAX`) sentinel (practically unreachable, but
+        // honors the per-symbol-seq invariant).
+        self.next_seq = self.next_seq.saturating_add(1);
         stamp_seq(ev, seq)
     }
 
