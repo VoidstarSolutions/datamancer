@@ -17,6 +17,10 @@ pub enum TransportError {
     Send(String),
     /// An instrument could not be interned for transport (tuple too long).
     Interning(String),
+    /// A `MarketEvent` variant this transport build cannot encode reached the
+    /// sink (the core event model gained a data variant newer than this
+    /// transport). Surfaced rather than silently acknowledged as delivered.
+    Unsupported(String),
 }
 
 impl std::fmt::Display for TransportError {
@@ -26,6 +30,7 @@ impl std::fmt::Display for TransportError {
             Self::Service(m) => write!(f, "iceoryx2 service error: {m}"),
             Self::Send(m) => write!(f, "iceoryx2 send error: {m}"),
             Self::Interning(m) => write!(f, "symbol interning error: {m}"),
+            Self::Unsupported(m) => write!(f, "unsupported event for transport: {m}"),
         }
     }
 }

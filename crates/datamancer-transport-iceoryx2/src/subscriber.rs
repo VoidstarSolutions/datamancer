@@ -154,9 +154,14 @@ mod runtime {
                 .receive()
                 .map_err(|e| TransportError::Send(format!("{e:?}")))?
             {
-                if let Ok(resolved) = self.buffer.apply_announcement(&sample) {
-                    events.extend(resolved);
-                }
+                // Surface a malformed announcement instead of silently dropping
+                // it: discarding leaves every data sample for that symbol held in
+                // the buffer forever with no signal.
+                let resolved = self
+                    .buffer
+                    .apply_announcement(&sample)
+                    .map_err(|e| TransportError::Interning(e.to_string()))?;
+                events.extend(resolved);
             }
             while let Some(sample) = self
                 .data

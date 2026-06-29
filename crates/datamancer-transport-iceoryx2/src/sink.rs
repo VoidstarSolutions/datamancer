@@ -32,6 +32,14 @@ const DEFAULT_MAX_SUBSCRIBERS: usize = 8;
 /// Default retained-history depth for late-joiner catch-up on the data plane.
 const DEFAULT_DATA_HISTORY: usize = 16;
 
+/// Republish the full announcement table every this many data sends. With
+/// single-shot announcements a subscriber that joins after a symbol's
+/// announcement has aged out of the announcement-service history would hold its
+/// samples forever. A periodic idempotent republish keeps the recent history
+/// ring populated with the whole table, bounding the stranding window for late
+/// joiners to at most this many events (independent of `flush` cadence).
+const REANNOUNCE_INTERVAL: u64 = 256;
+
 /// Mutable interning state shared behind the sink's lock. `announced` tracks
 /// which interned ids have had their announcement published, so a new symbol is
 /// announced exactly once (plus periodic full-table republish via [`flush`]).
@@ -46,6 +54,9 @@ pub struct Iceoryx2DataSink {
     data: Publisher<ipc_threadsafe::Service, DataPayload, ()>,
     announcements: Publisher<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
     state: Mutex<State>,
+    /// Data-send counter driving the periodic announcement-table republish (see
+    /// [`REANNOUNCE_INTERVAL`]).
+    sends: std::sync::atomic::AtomicU64,
 }
 
 impl Iceoryx2DataSink {
@@ -101,6 +112,7 @@ impl Iceoryx2DataSink {
                 table: SymbolTable::new(),
                 announced: std::collections::HashSet::new(),
             }),
+            sends: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -126,21 +138,46 @@ impl Iceoryx2DataSink {
             let Some(pod) = to_pod(ev, &mut state.table)
                 .map_err(|e| TransportError::Interning(e.to_string()))?
             else {
-                // Suppressed (connection-scoped control): nothing on the data
-                // plane, but it is accounted via the diagnostics plane.
-                return Ok(true);
+                // `to_pod` returns `None` for two reasons, which must not be
+                // conflated. A `Control` is *intentional* suppression
+                // (connection-scoped controls ride the diagnostics plane) —
+                // legitimately "delivered". Any non-`Control` `None` is an
+                // unknown future `MarketEvent` data variant this transport build
+                // cannot encode (`control_to_pod` is exhaustive, so a Control is
+                // never the unknown case); surface it rather than silently
+                // acking it as delivered. (It becomes `Rejected` upstream; a
+                // build whose core outpaces its transport is the signal to
+                // update this crate.)
+                if matches!(ev, MarketEvent::Control(_)) {
+                    return Ok(true);
+                }
+                return Err(TransportError::Unsupported(format!(
+                    "MarketEvent variant not encodable by this transport build: {ev:?}"
+                )));
             };
-            let announcement =
-                if pod.symbol != SymbolId::CONNECTION && state.announced.insert(pod.symbol.0) {
-                    state.table.announcement(pod.symbol)
-                } else {
-                    None
-                };
+            // Decide whether to announce by *reading* the set — do not mark it
+            // announced yet. Marking before the send succeeds would, on a send
+            // failure, leave the symbol permanently flagged-but-unannounced
+            // (unresolvable by subscribers until the next flush).
+            let announcement = if pod.symbol != SymbolId::CONNECTION
+                && !state.announced.contains(&pod.symbol.0)
+            {
+                state.table.announcement(pod.symbol)
+            } else {
+                None
+            };
             (pod, announcement)
         };
 
         if let Some(announcement) = pending_announcement {
+            // Propagate a send failure (`?`) *before* marking announced, so a
+            // failed announcement is retried on the next event for this symbol.
             self.send_announcement(announcement)?;
+            self.state
+                .lock()
+                .expect("sink state poisoned")
+                .announced
+                .insert(pod.symbol.0);
         }
 
         let sample = self
@@ -151,6 +188,17 @@ impl Iceoryx2DataSink {
         sample
             .send()
             .map_err(|e| TransportError::Send(format!("{e:?}")))?;
+
+        // Periodically refresh the announcement history ring so a subscriber that
+        // joined after a symbol's one-shot announcement aged out can still
+        // resolve it (single-shot announcements would otherwise strand late
+        // joiners). Idempotent upserts; bounded by the symbol-table size.
+        let n = self
+            .sends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if (n + 1).is_multiple_of(REANNOUNCE_INTERVAL) {
+            self.republish_all_announcements()?;
+        }
         Ok(true)
     }
 
