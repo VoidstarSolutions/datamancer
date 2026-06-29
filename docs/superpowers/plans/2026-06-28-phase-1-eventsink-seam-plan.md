@@ -13,6 +13,24 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 > - **EventSink seam location (Issue 1):** the tee + resume ring stay core-side, so every sink inherits them. Only the sink *attachment point* moves — from the authoritative controller (this phase) to the **per-client output in Phase 2**.
 > - **seq sentinel (Issue 8):** the `event.rs` `Seq` doc rewrite owned by this phase also defines the synthetic-control sentinel constant `Seq::SYNTHETIC` (used by Phase 2) and documents it as exempt from per-symbol monotonicity, so the Phase 1/2/3 `event.rs` edits do not collide.
 
+> **Detailed-planning hardening (gotcha pass, 2026-06-28) — authoritative.** Adversarial code-level review against current `session.rs` / `event.rs` / `storage/surreal_tap_log.rs`. The items below supersede conflicting body text.
+>
+> **Locked decisions:**
+> - **Tap-log `seq` converges in Phase 1.** `seq` is stamped at the source *before* the tap-log tee, so `forward()` becomes **`stamp → tee → emit`** — the stamped event reaches both the tap log and the consumer. The surreal tap log **persists the provided `seq` (store the `u64`) and stops minting its own canonical `seq`.** Tap-log replay then reproduces the source `seq` verbatim, so Phase 2 fan-out inherits no mismatch. (This expands Phase 1 into `storage/surreal_tap_log.rs` + its tests.)
+> - **`Seq::SYNTHETIC = Seq(u64::MAX)`** — one `const` in `event.rs`, unreachable by the monotonic counter, documented exempt from per-symbol monotonicity.
+> - **`sink.flush()` at shutdown: log-and-swallow** in Phase 1 (in-process flush is a no-op); revisit propagation in Phase 4.
+>
+> **Single stamping site (Gotchas 1,2,4,12).** The controller assigns `seq` from a plain `Controller.next_seq: u64` (init `0`) at the one point an event is about to be forwarded/buffered — before `tee` and before any ring push. A plain `u64` suffices (single owning controller task; no atomic, no shared counter). **Remove `SessionInner.seq_counter` (session.rs:544, init 289), `EventStream.seq` (676) + its clone (599), and the `stamp_seq` call in `poll_next`** — `poll_next` becomes a pass-through. Consequences, now intended and documented:
+> - Control events get their real `seq` at this site; the `Seq(0)` placeholders (session.rs:873/909/932/1518 and tests 1876/1886/1896) are overwritten here, not at delivery.
+> - Evicted/undelivered events **are** numbered → an overflow is a real `seq` hole reported as `Control::Gap`. Flip the `EventRing` doc (1657) and `Seq` doc (event.rs:11) from "never a hole" → "a hole, reported as `Gap`".
+> - Backfill live arrivals stamp at the seam in reception order (per-symbol determinism, not `source_ts` order) — add a clarifying comment in `run_backfill`.
+>
+> **Explicitness / guards (Gotchas 3,5,6,8,10,11):** `debug_assert!(ev.seq().is_some())` in `emit_prestamped`; document the `EventRing` FIFO (`pop_front`) invariant behind `dropped_first_seq`; fix the `resume.rs` overflow test comment (survivors keep push-time `seq`; eviction `Gap` occupies `dropped_first_seq`; the hole is real); the `Seq` doc enumerates per-symbol / stamped-at-source / identical-across-a-symbol's-consumers / controls-occupy-slots / holes-are-real / `SYNTHETIC`-exempt.
+>
+> **Tests:** add (a) two in-process subscribers to one authoritative stream see identical `(seq, source_ts)`; (b) tap-log replay reproduces the source `seq` (convergence guard, round-trip through the surreal tap log); (c) the total-eviction (empty-survivor) assertion. Update the `resume.rs` overflow test to the real-hole invariant. Existing session/stream + tap-log suites are the regression guards.
+>
+> **Deferred-but-noted:** registry-mutex panic-safety (session.rs:245) is pre-existing and untouched.
+
 ## Context & goal
 
 Phase 1 of the standalone-server roadmap. Two coupled changes, both behind the
