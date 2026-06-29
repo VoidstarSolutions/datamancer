@@ -901,6 +901,7 @@ dependencies = [
  "async-trait",
  "datamancer-core",
  "iceoryx2",
+ "iceoryx2-bb-container",
  "serde",
  "serde_json",
  "tokio",
