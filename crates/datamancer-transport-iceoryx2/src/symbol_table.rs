@@ -126,7 +126,7 @@ fn decode_instrument(bytes: &[u8]) -> Result<Instrument, SymbolDecodeError> {
 /// Published on the low-rate announcement service so subscribers (including
 /// late joiners draining history) can resolve `SymbolId -> Instrument`.
 /// Treated as an idempotent upsert keyed by `id`.
-#[derive(Clone, Copy, ZeroCopySend)]
+#[derive(Debug, Clone, Copy, ZeroCopySend)]
 #[repr(C)]
 pub struct SymbolAnnouncement {
     pub id: SymbolId,

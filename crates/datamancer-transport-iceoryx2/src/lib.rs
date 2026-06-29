@@ -17,10 +17,21 @@
 //! `#![forbid(unsafe_code)]` like the two core crates.
 #![forbid(unsafe_code)]
 
+mod diagnostics;
+mod error;
 mod payload;
+mod sink;
+mod subscriber;
 mod symbol_table;
 
+pub use diagnostics::{
+    DIAGNOSTICS_PAYLOAD_CAPACITY, DiagnosticsError, Iceoryx2DiagnosticsPublisher,
+    Iceoryx2DiagnosticsSubscriber, decode_snapshot, encode_snapshot,
+};
+pub use error::{Result, TransportError};
 pub use payload::{ControlTag, DataPayload, FromPodError, PayloadKind, from_pod, to_pod};
+pub use sink::Iceoryx2DataSink;
+pub use subscriber::{DataSubscriber, HoldBuffer};
 pub use symbol_table::{
     InstrumentTooLong, SYMBOL_STRING_CAPACITY, SymbolAnnouncement, SymbolDecodeError, SymbolId,
     SymbolResolver, SymbolTable,
