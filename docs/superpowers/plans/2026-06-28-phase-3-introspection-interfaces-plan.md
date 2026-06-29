@@ -14,6 +14,26 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 > - **Resume-buffer snapshot placement (Issue 4):** the resume buffer is per-client; put `ResumeBufferSnapshot` and per-instrument `gap_count`/`dropped_events` on `ClientSessionSnapshot`, not `AuthoritativeSessionSnapshot`.
 > - **Split the snapshot (Issue 6 — decided: split):** provide a small, bounded **live-state snapshot** (sessions, subscriptions, `LiveStats`, latency, resume occupancy) distinct from the heavier **cache catalog** (`Vec<CacheCatalogEntry>`). Phase 4's fixed-size fast diagnostics service carries the live-state snapshot; the cache catalog goes on a separate slower/chunked service. Document an expected size bound for the live-state variant.
 
+> **Detailed-planning hardening (gotcha pass, 2026-06-28) — authoritative.** Adversarial code-level review against `traits/storage.rs`, `storage/surreal.rs`, `providers/alpaca*.rs`, `event.rs`. Supersedes conflicting body text.
+>
+> **Locked decision — provider metrics scope:** add `Provider::metrics(&self) -> Option<Arc<dyn ProviderMetrics>>` **defaulted to `None`** (object-safe; existing providers compile unchanged). Ship cold-site accounting + the seam now; **Alpaca's throughput/rate-limit impl is deferred** to a later provider pass (those fields read `None`).
+>
+> **Layering & serde:** `struct ClientSessionId(pub u64)` and all snapshot types live in `datamancer-core` (`snapshot.rs`), `#[non_exhaustive]`, serde-derived; forward-compat = add optional fields only. Add `Serialize/Deserialize` to `Seq`, `EventKind`, `GapSpan`, `BarInterval`, `Adjustment`, `CacheKey` (confirm/add for `Instrument`); add an `Adjustment` token-parse inverse (`from_token`) for catalog ids. Coordinate the `Seq` serde + `SYNTHETIC` const edits with Phase 1's `event.rs` change (one combined edit, no collision).
+>
+> **Two accessors (the split):** a **fast, infallible, in-memory live-state accessor** and a **slow, fallible cache-catalog accessor**; `snapshot()` composes both, but the fast path stands alone for Phase 4's fast diagnostics service and Phase 6's ArcSwap (no catalog I/O on the hot read).
+>
+> **`snapshot()` discipline:** hold the registry mutex only to upgrade `Weak`s, clone `Arc<LiveStats>`, read `strong_count`; **release before any `.await`** (never across `catalog().await`). Sampled per-symbol view (Relaxed atomics), non-transactional / no cross-symbol consistency — documented. Assembly must be panic-free under the lock (poisoning hazard, session.rs:245).
+>
+> **Cache catalog:** `async fn catalog(&self) -> Result<Vec<CacheCatalogEntry>>` on `HistoricalCache`, default `Ok(vec![])`; SurrealCache scans the `coverage` table; **volume is logical** (`event_count`/segments) — no filesystem byte-walk in Phase 3. Parse ids by splitting on `|` (expect 4 parts); **skip-and-log** malformed. Add `asset_class: Option<AssetClass>` to `CoverageDoc` so `Instrument` reconstructs faithfully (old rows → `None`). Verify the surrealdb 3.0 id deserialization shape during impl; benchmark a 1k-row scan and paginate if needed.
+>
+> **Stats wiring:** `LiveStats` = per-field atomics on the authoritative session (today's `RegistrySentinel` → `AuthoritativeSession` post-Phase-2); `seq_position` = last-assigned per symbol. `ProviderAccounting` = per-provider `Arc` in `DatamancerInner` (history_fetches, coalesced, live_starts, subscribes, unsubscribes, reconnects, connection_state, last_error), cloned into `SessionInner`; coalesced counted at the single-flight re-tile (backfill never coalesces — documented).
+>
+> **Live-state bound:** bounded by clients × subscriptions × const (few clients expected); document a concrete cap; Phase 4 sizes the fast service to it and chunks the catalog separately.
+>
+> **Sequencing:** reads Phase 2's client-session + authoritative registries → land after Phase 2. `LiveStats` can attach early (today's `RegistrySentinel`) so live-state lands even before client-session enumeration.
+>
+> **Tests:** provider-accounting increments (incl. coalesced; backfill non-coalesce); catalog round-trip vs known ranges + malformed-id skip + `asset_class` present; `SystemSnapshot` serde round-trip; snapshot reflects live sessions; lock-not-held-across-`await` (timeout-bounded under load); 1k-row catalog cost.
+
 ## Context & goal
 
 Phase 3 gives the datamancer library a programmatic, **serializable** view of its
