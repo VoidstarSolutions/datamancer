@@ -81,6 +81,17 @@ const CAP = 300; // ~5 min @ 1/s
 const hist = new Map(); // key -> [latency_ns,...]
 function key(s){ return s.instrument.provider + ':' + s.instrument.symbol + ':' + JSON.stringify(s.kind); }
 function esc(v){ return String(v).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+// Format a nanosecond duration as a signed, human-readable value. latency_ns is
+// rx_ts - source_ts across two clocks (ours and the provider's), so it can be
+// negative when the local clock lags the provider's (clock skew, not an error).
+function fmtNs(ns){
+  if(ns==null) return '—';
+  const a=Math.abs(ns), sign=ns<0?'-':'';
+  if(a<1e3) return ns+' ns';
+  if(a<1e6) return sign+(a/1e3).toFixed(1)+' µs';
+  if(a<1e9) return sign+(a/1e6).toFixed(1)+' ms';
+  return sign+(a/1e9).toFixed(2)+' s';
+}
 function spark(arr){
   const c = document.createElement('canvas'); c.width=120; c.height=24;
   const g = c.getContext('2d'); if(!arr.length) return c;
@@ -104,9 +115,9 @@ function paint(snap){
   const auth = document.getElementById('authoritative');
   const arows = (snap.authoritative_sessions||[]).map(s=>{
     const k = key(s); const h = hist.get(k) || []; if(s.latency_ns!=null){ h.push(s.latency_ns); if(h.length>CAP) h.shift(); hist.set(k,h); }
-    return [s.instrument.provider, s.instrument.symbol, JSON.stringify(s.kind), s.subscriber_refcount, (s.seq_position?.[0] ?? s.seq_position ?? '—'), (s.latency_ns ?? '—'), s.gap_count, spark(h)];
+    return [s.instrument.provider, s.instrument.symbol, JSON.stringify(s.kind), s.subscriber_refcount, (s.seq_position?.[0] ?? s.seq_position ?? '—'), fmtNs(s.latency_ns), s.gap_count, spark(h)];
   });
-  auth.replaceChildren(table(['provider','symbol','kind','refcount','seq (per-symbol)','latency_ns (obs)','gaps','latency'], arows));
+  auth.replaceChildren(table(['provider','symbol','kind','refcount','seq (per-symbol)','latency (obs, rx−src)','gaps','latency'], arows));
   const cl = document.getElementById('clients');
   cl.replaceChildren(table(['id','subscriptions','buffer occ/cap','dropped'],
     (snap.client_sessions||[]).map(c=>[c.id?.[0]??c.id, (c.subscriptions||[]).map(x=>x.instrument.provider+':'+x.instrument.symbol).join(', '), (c.resume_buffer.occupancy+'/'+c.resume_buffer.capacity), c.resume_buffer.dropped_events])));

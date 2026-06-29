@@ -126,7 +126,10 @@ pub struct AuthoritativeSessionSnapshot {
     pub seq_position: Option<Seq>,
     pub last_source_ts: Option<Timestamp>,
     pub last_rx_ts: Option<Timestamp>,
-    /// Last `rx_ts - source_ts` (observability only).
+    /// Last `rx_ts - source_ts` (observability only). It straddles two clocks —
+    /// the provider's `source_ts` and our wall-clock `rx_ts` — so it is **signed
+    /// and may be negative** when the local clock lags the provider's (clock
+    /// skew). It is not a pure network latency and must never feed engine logic.
     pub latency_ns: Option<i64>,
     /// Per-symbol provider/source `Control::Gap` count. Per-client resume-buffer
     /// drops live on [`ClientSessionSnapshot`] instead.
