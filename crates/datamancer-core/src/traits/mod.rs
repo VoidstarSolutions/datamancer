@@ -10,7 +10,12 @@
 //! contract surface, not the data surface.
 
 pub mod provider;
+pub mod sink;
 pub mod storage;
 
-pub use provider::{HistoryRequest, LiveHandle, Provider};
-pub use storage::{CacheCoverage, CacheKey, HistoricalCache, ReplayRequest, ReplaySource, TapLog};
+pub use provider::{HistoryRequest, LiveHandle, Provider, ProviderMetrics};
+pub use sink::{EventSink, PublishOutcome};
+pub use storage::{
+    CacheCatalogEntry, CacheCoverage, CacheKey, HistoricalCache, ReplayRequest, ReplaySource,
+    TapLog,
+};

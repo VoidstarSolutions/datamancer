@@ -14,6 +14,8 @@
 //! it. Consumers only see the dyn vtable when calling these cold methods or
 //! when polling the merged session stream — never per websocket frame.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
@@ -78,6 +80,49 @@ pub trait Provider: Send + Sync + 'static {
     async fn list_instruments(&self) -> Result<Vec<Instrument>> {
         Ok(Vec::new())
     }
+
+    /// Optional accounting sink for metrics datamancer cannot observe at the
+    /// cold boundary or from in-band [`crate::Control`] events — namely byte
+    /// throughput and rate-limit hits, which live inside the provider's
+    /// monomorphic decode loop / REST pagination.
+    ///
+    /// Default `None`: the provider reports nothing beyond what datamancer
+    /// counts at the cold boundary (start/subscribe/fetch call counts) and
+    /// derives from `Control` events (connection state, reconnects, gaps,
+    /// errors). The diagnostics snapshot folds a returned sink's counters in,
+    /// surfacing them as `Some` and leaving them `None` for providers that do
+    /// not override this. Implementations should record off the hot per-message
+    /// path (e.g. once per HTTP page or websocket frame batch).
+    ///
+    /// **Stability contract:** an implementation must return clones of one
+    /// stable, long-lived `Arc<dyn ProviderMetrics>` — not a freshly allocated
+    /// sink per call. `Datamancer::snapshot()` re-queries `metrics()` on every
+    /// sample; returning a new sink each time would reset the cumulative
+    /// counters (`bytes`, `rate_limit_hits`) to zero on each snapshot.
+    fn metrics(&self) -> Option<Arc<dyn ProviderMetrics>> {
+        None
+    }
+}
+
+/// Provider-side accounting sink for metrics invisible at datamancer's cold
+/// boundary. Returned by [`Provider::metrics`]; the diagnostics snapshot reads
+/// the accumulated counters via [`ProviderMetrics::bytes`] /
+/// [`ProviderMetrics::rate_limit_hits`].
+///
+/// Implementations use lock-free atomic adders (Relaxed); the snapshot is a
+/// sampled view with no cross-field consistency guarantee.
+pub trait ProviderMetrics: Send + Sync {
+    /// Record `n` bytes received from the upstream transport.
+    fn record_bytes(&self, n: u64);
+
+    /// Record one rate-limit hit (a throttle / 429 / backoff from upstream).
+    fn record_rate_limit(&self);
+
+    /// Cumulative bytes received.
+    fn bytes(&self) -> u64;
+
+    /// Cumulative rate-limit hits.
+    fn rate_limit_hits(&self) -> u64;
 }
 
 /// A handle to a running live provider session. Subscription mutation and
@@ -113,4 +158,51 @@ pub struct HistoryRequest {
     /// Descends from the session's single source of truth; the provider reads
     /// this rather than carrying its own mode.
     pub adjustment: Adjustment,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LiveHandle, Provider};
+    use crate::{
+        error::Result,
+        event::{EventKind, MarketEvent},
+        instrument::Instrument,
+    };
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
+    struct BareProvider;
+
+    #[async_trait]
+    impl Provider for BareProvider {
+        #[allow(
+            clippy::unnecessary_literal_bound,
+            reason = "trait signature fixes the return type to &str"
+        )]
+        fn id(&self) -> &str {
+            "bare"
+        }
+        fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+            false
+        }
+        async fn start_live(
+            &self,
+            _sink: mpsc::Sender<MarketEvent>,
+        ) -> Result<Box<dyn LiveHandle>> {
+            unreachable!("not used in this test")
+        }
+        async fn fetch_history(
+            &self,
+            _request: super::HistoryRequest,
+            _sink: mpsc::Sender<MarketEvent>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_provider_metrics_is_none() {
+        let p = BareProvider;
+        assert!(p.metrics().is_none());
+    }
 }

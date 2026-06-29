@@ -1,6 +1,6 @@
 # Datamancer
 
-A unified subscription and replay layer for financial market data. Datamancer talks to whatever providers it's configured against, normalizes their messages into typed events, and produces a single ordered event stream that downstream consumers (analysis engines, persistence sinks, UIs) consume without caring which provider any given event came from.
+A unified subscription and replay layer for financial market data. Datamancer talks to whatever providers it's configured against, normalizes their messages into typed events, and presents them through a multiplexed client-session stream that downstream consumers (analysis engines, persistence sinks, UIs) consume without caring which provider any given event came from. Ordering is **per symbol** — each instrument's substream is a source-stamped within-instrument total order (`(instrument, seq)`); across instruments the multiplex interleaves in arrival order rather than computing a global order.
 
 ## Status and Scope
 
@@ -23,7 +23,8 @@ The first supported provider is Alpaca. Provider integration is meant to be addi
 
 ## What Datamancer Does Not Do
 
-- **Per-instrument demultiplexing.** Datamancer emits one ordered stream of events; consumers that want per-instrument streams demux downstream.
+- **Per-instrument demultiplexing.** A client session presents one multiplexed stream over its subscription set (per-symbol deterministic, arrival-order across symbols); consumers that want per-instrument streams demux downstream.
+- **Global / cross-symbol ordering.** There is no total order across instruments. The multiplex interleaves (ordering key `(instrument, seq)`); a globally merged, cross-symbol-sorted stream is an explicit non-goal. Consumers needing strict global timestamp order buffer themselves.
 - **Semantic enrichment.** No "join this trade with the most recent quote to compute the trade side." Datamancer surfaces the events; analysis on top of them belongs to consumers.
 - **Provider-side time reordering.** Events are emitted in the order they were received, not re-sorted by source timestamp. Consumers that need strict timestamp ordering buffer themselves.
 - **Throttled or wall-clock-paced replay.** Replay produces events as fast as the consumer drains. Modeling latency or simulating real-time pacing is a research-tool concern, not a data-layer one.
@@ -40,7 +41,7 @@ Datamancer's public output is a stream of `MarketEvent`. Variants currently plan
 Every data variant carries three timestamp/identifier fields, with distinct roles that should not be conflated:
 
 - **`source_ts`** — the timestamp the provider reported for the event. Source of truth for "when did this happen in the market" and the **only** timestamp engine logic should reason about. Sourced verbatim from provider data; never assigned by datamancer.
-- **`seq: u64`** — a session-monotonic sequence number assigned by datamancer at receipt. **The sole ordering field** for the stream. Live mode assigns `seq` in arrival order, so replaying in `seq` order reproduces the consumer's original experience exactly. Historical fetch assigns `seq` in source-timestamp order during fetch, so `seq` order matches market order. Persistence sinks use `seq` gaps to detect drops.
+- **`seq: u64`** — a per-symbol ordering number stamped **once at the source** of the authoritative per-`(instrument, kind)` stream, in canonical delivery order, before any sink — so it is identical across all consumers of that symbol (not a per-consumer poll artifact). **The sole ordering field** for the stream, and per-symbol only (there is no cross-instrument order; the multiplex key is `(instrument, seq)`). Live mode stamps `seq` in arrival order, so replaying a symbol's substream in `seq` order reproduces that substream exactly (per-symbol; not the cross-symbol interleave of the multiplexed stream). Historical fetch stamps `seq` in source-timestamp order during fetch, so `seq` order matches market order. The delivered stream is contiguous *only while nothing is lost*: a consumer that misses events (resume-buffer eviction, late join) sees a real `seq` hole, surfaced in-band as a `Control::Gap`.
 - **`rx_ts`** — wall-clock at the moment the bytes were received from the provider, captured pre-parse. **Observability only.** Used for measuring provider-to-engine latency (`rx_ts - source_ts`), correlating engine state with external wall-clock events (logs, traces, debugger sessions), and operational monitoring. **Engine decision logic must never depend on `rx_ts`** — doing so re-introduces wall-clock as a determinism hazard. For replay-from-historical-fetch, where there is no live arrival to record, `rx_ts` collapses to `source_ts`.
 
 `Control` events ride the same stream as data events because connectivity changes are part of the session's truth: a gap can invalidate downstream signals, and forcing consumers to acknowledge it in-band is safer than offering it as a separate stream they may forget to subscribe to.
@@ -74,7 +75,7 @@ session.subscribe(Subscription {
 }).await?;
 ```
 
-Subscriptions accumulate; the single output stream multiplexes everything that has been requested. Adding the same instrument with a new event kind extends the existing subscription rather than duplicating it.
+Subscriptions accumulate; the client session's multiplexed stream **interleaves** everything that has been requested — per-symbol deterministic (`(instrument, seq)`, source-stamped within each instrument), arrival-order across symbols, never globally merge-sorted. Each `(instrument, kind)` pair is backed by a refcounted shared **authoritative session**, so two consumers of the same pair observe identical `(seq, source_ts)`. Adding the same instrument with a new event kind extends the subscription set rather than duplicating it.
 
 ## Configuration
 
@@ -163,9 +164,10 @@ multi-shot for live scope — drop the stream, re-take later, and delivery
 resumes from a bounded in-memory buffer (`DatamancerBuilder::resume_buffer_events`,
 default 65 536 events). If the buffer overflowed, one
 in-band `Control::Gap` reports exactly the evicted span before the survivors
-flow. `seq` is stamped at delivery from a counter shared across re-takes, so
-the delivered stream is always contiguous — an evicted event is a reported
-gap, never a `seq` hole.
+flow. `seq` is stamped once at the source (not per-consumer), so survivors keep
+their original `seq` and an evicted event is a reported gap **and** a real `seq`
+hole at the evicted span — the delivered stream is contiguous only while
+nothing is lost.
 
 `Scope::Live { backfill_from: Some(t) }` stitches history ahead of the live
 tail: the window `[t, live-edge)` is served through the historical
@@ -177,6 +179,90 @@ re-fetches the sliver instead of permanently masking it. The tap log captures
 only the live tail — backfill data belongs to the cache.
 
 See `examples/resume.rs` for a runnable, credential-free demo.
+
+## Introspection
+
+`Datamancer::snapshot()` (async, fallible) returns a `SystemSnapshot`: a
+consolidated, `Serialize + Deserialize` view of runtime state, with no
+transport or daemon. It composes three things:
+
+- **Provider accounting** (`ProviderSnapshot`) — per-provider counters:
+  `history_fetches` (counted per gap *segment*, not per `session()` call),
+  `history_fetch_coalesced` (single-flight dedups; backfill bypasses the
+  coalescer and never counts here), `live_starts`, `subscribes`/`unsubscribes`
+  (call counts, **not** active-subscription deltas — stock subscribe is a
+  full-snapshot and reconnect re-applies the full list), `reconnects`,
+  `connection_state`, `gaps_emitted`, `last_error`, and `messages` (live data
+  forwarded to consumers only — cache-replay/backfill is not provider traffic).
+  `bytes` and `rate_limit_hits` are `Option` and stay `None` until a provider
+  implements the optional `Provider::metrics()` hook.
+- **Cache catalog** (`CacheSnapshot.entries`, via `HistoricalCache::catalog()`)
+  — every stored `(provider, symbol, kind, adjustment)` key with its actual
+  covered segments and a *logical* volume estimate (`event_count ×
+  bytes_per_row`; it ignores index/MVCC overhead). The catalog reports the
+  adjustment rows are **stored** under, so trades/quotes always read `Raw`
+  regardless of the requested mode. It carries no `seq` (seq is a live,
+  per-symbol property, not a cache property).
+- **Live state** — per-`(instrument, kind)` `AuthoritativeSessionSnapshot`
+  (subscriber refcount, last source/rx timestamps, `latency_ns =
+  rx_ts − source_ts`, per-symbol gap count, seq position) and per-client
+  `ClientSessionSnapshot` (subscriptions + resume-buffer occupancy/drops).
+
+The snapshot is **sampled, not transactional**: per-symbol fields are read from
+`Relaxed` atomics and the session registry lock is held only to clone handles
+(never across an `.await`), so fields may skew by nanoseconds across symbols —
+fine, because determinism is per-symbol. `latency_ns`/`rx_ts` are
+**observability only** and must never feed engine logic.
+
+## Transports
+
+By default a `Session`'s events are consumed in-process. The optional
+`transport-iceoryx2` feature adds a **same-host, zero-copy** transport
+(`datamancer::transport`, the `datamancer-transport-iceoryx2` crate) that
+carries a client's multiplexed stream to a separate consumer process. Two planes
+ride one logical client connection:
+
+- **Data plane** — one iceoryx2 pub-sub service per client carrying that client's
+  multiplexed `(instrument, seq)` interleave as a flat `#[repr(C)]` POD
+  `DataPayload`. The payload carries a compact, **sink-local** `SymbolId` instead
+  of the heap-backed `Instrument`; a low-rate per-client *announcement* service
+  publishes the `SymbolId → Instrument` mapping. `SymbolId`/interning are a
+  transport compaction handle only — **not** a public-API or global-identity
+  concept (two clients may map the same id to different instruments). The data
+  plane carries the per-symbol-deterministic interleave and makes **no
+  cross-symbol ordering claim** — the multiplex is an interleave, never a global
+  merge-sort.
+- **Diagnostics plane** — a separate service publishing the serialized
+  `SystemSnapshot` (provider health/connectivity, cache catalog, live state).
+  Connection-scoped controls (`ProviderConnected`/`Disconnected`/`ProviderError`)
+  are **suppressed** on the data plane and surface here instead; remote consumers
+  read provider connectivity + last-error from `ProviderSnapshot`. Per-symbol
+  controls (`Gap`, `SubscriptionChanged`) and `SessionClosing` still ride the
+  data plane.
+
+The POD payload preserves the timestamp triple end-to-end — `rx_ts` stays
+**observability-only** and is never reconstructed/synthesized by the subscriber.
+
+### Standalone server
+
+The library stays primary: embedders that want zero hops consume a `Session` /
+`ClientSession` in-process. The `datamancerd` crate is the **thin standalone
+wrapper** — a same-host daemon that builds a `Datamancer` from a TOML config,
+serves multiple consumer processes (one iceoryx2 data-plane service per client),
+holds authoritative sessions alive as the cross-process lifecycle anchor, and
+exposes a Unix-socket + newline-JSON control surface. It adds no new semantics;
+see `crates/datamancerd/README.md`.
+
+**Subscriber rule.** The data and announcement services are two independent
+iceoryx2 services with **no mutual delivery-order guarantee**: a data sample can
+arrive before the `SymbolAnnouncement` for its `SymbolId`. The subscriber helper
+(`DataSubscriber`/`HoldBuffer`) therefore **holds** an unresolved sample and
+replays it once the announcement resolves it — never dropping or erroring.
+
+**Flush / shutdown ordering** (load-bearing): **tap-log flush before sink flush
+before service drop**. The sink never drops samples that `flush` promised to
+deliver, but makes no guarantee a crashed/slow subscriber consumed them
+(same-host best-effort; cross-process backpressure is a recorded deferral).
 
 ## Non-goals
 

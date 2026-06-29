@@ -61,9 +61,9 @@ use std::path::Path;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    Adjustment, Bar, BarInterval, CacheCoverage, CacheKey, Error, EventKind, GapSpan,
-    HistoricalCache, Instrument, MarketEvent, Price, Quote, ReplayRequest, ReplaySource, Result,
-    Seq, Timestamp, Trade,
+    Adjustment, AssetClass, Bar, BarInterval, CacheCatalogEntry, CacheCoverage, CacheKey, Error,
+    EventKind, GapSpan, HistoricalCache, Instrument, MarketEvent, Price, Quote, ReplayRequest,
+    ReplaySource, Result, Seq, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -166,6 +166,39 @@ impl SurrealCache {
         }
     }
 
+    /// Inverse of [`table_for`](Self::table_for): map a coverage-id table token
+    /// back to its [`EventKind`]. Returns `None` for an unrecognized token so a
+    /// malformed coverage id is skipped rather than panicking.
+    fn kind_for(table: &str) -> Option<EventKind> {
+        Some(match table {
+            "trades" => EventKind::Trade,
+            "quotes" => EventKind::Quote,
+            "bars_1s" => EventKind::Bar(BarInterval::OneSecond),
+            "bars_1m" => EventKind::Bar(BarInterval::OneMinute),
+            "bars_5m" => EventKind::Bar(BarInterval::FiveMinute),
+            "bars_15m" => EventKind::Bar(BarInterval::FifteenMinute),
+            "bars_1h" => EventKind::Bar(BarInterval::OneHour),
+            "bars_1d" => EventKind::Bar(BarInterval::OneDay),
+            _ => return None,
+        })
+    }
+
+    /// Logical bytes per stored row for a kind: the sum of the fixed
+    /// `i64`/`u64` numeric fields. A *logical* estimate of the serialized field
+    /// payload — it ignores the variable provider/symbol/adjustment strings,
+    /// index, coverage-doc, and MVCC overhead. SCHEMALESS rows have no true
+    /// on-disk size available from the SDK.
+    const fn bytes_per_row(kind: EventKind) -> u64 {
+        match kind {
+            // source_ts, rx_ts, price_raw, size
+            EventKind::Trade => 4 * 8,
+            // source_ts, rx_ts, bid_raw, bid_size, ask_raw, ask_size
+            EventKind::Quote => 6 * 8,
+            // source_ts, rx_ts, OHLC (4), volume
+            EventKind::Bar(_) => 7 * 8,
+        }
+    }
+
     /// Adjustment a row is actually stored under. Trades and quotes are never
     /// corporate-action adjusted, so they always key under `Raw` regardless of
     /// the session-wide mode carried on the key; only bars segregate by mode.
@@ -251,6 +284,11 @@ struct CoverageDoc {
     /// Sorted, non-overlapping [from, to] (in nanos).
     segments: Vec<(i64, i64)>,
     event_count: u64,
+    /// Asset class of the covered instrument, recorded so the catalog can
+    /// reconstruct a faithful `Instrument`. `None` for rows written before this
+    /// field existed (the id and row shapes do not otherwise carry it).
+    #[serde(default)]
+    asset_class: Option<String>,
 }
 
 impl CoverageDoc {
@@ -478,11 +516,98 @@ impl HistoricalCache for SurrealCache {
             .collect())
     }
 
+    async fn catalog(&self) -> Result<Vec<CacheCatalogEntry>> {
+        // The `coverage` table is the authoritative "what is cached" record.
+        // `meta::id(id)` returns just the string key (`provider|symbol|table|
+        // adjustment`), sidestepping any RecordId-shape coupling.
+        let mut response = self
+            .db
+            .query(
+                "SELECT meta::id(id) AS coverage_id, segments, event_count, asset_class \
+                 FROM coverage",
+            )
+            .await
+            .map_err(map_err)?;
+        let rows: Vec<CatalogRow> = response.take(0).map_err(map_err)?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let parts: Vec<&str> = row.coverage_id.split('|').collect();
+            let [provider, symbol, table, adjustment] = parts.as_slice() else {
+                tracing::warn!(
+                    coverage_id = %row.coverage_id,
+                    "skipping malformed coverage id (expected 4 |-separated parts)"
+                );
+                continue;
+            };
+            let Some(kind) = Self::kind_for(table) else {
+                tracing::warn!(
+                    coverage_id = %row.coverage_id,
+                    table = %table,
+                    "skipping coverage id with unknown table token"
+                );
+                continue;
+            };
+            let Some(adjustment) = Adjustment::from_token(adjustment) else {
+                tracing::warn!(
+                    coverage_id = %row.coverage_id,
+                    adjustment = %adjustment,
+                    "skipping coverage id with unknown adjustment token"
+                );
+                continue;
+            };
+            let segments = row
+                .segments
+                .into_iter()
+                .map(|(a, b)| GapSpan {
+                    from_source_ts: Timestamp(a),
+                    to_source_ts: Timestamp(b),
+                })
+                .collect();
+            let est_bytes = Some(row.event_count.saturating_mul(Self::bytes_per_row(kind)));
+            entries.push(
+                CacheCatalogEntry::new(
+                    datamancer_core::ProviderId::new((*provider).to_string()),
+                    (*symbol).to_string(),
+                    kind,
+                    adjustment,
+                    segments,
+                    row.event_count,
+                )
+                .with_asset_class(row.asset_class.as_deref().and_then(asset_class_from_str))
+                .with_est_bytes(est_bytes),
+            );
+        }
+        Ok(entries)
+    }
+
     fn as_replay_source(&self, key: CacheKey) -> Box<dyn ReplaySource> {
         Box::new(SurrealReplaySource {
             db: self.db.clone(),
             key,
         })
+    }
+}
+
+/// Row shape for the [`catalog`](SurrealCache::catalog) scan. `coverage_id` is
+/// the `meta::id(id)` string key; `asset_class` is absent for legacy rows.
+#[derive(Debug, Deserialize, SurrealValue)]
+struct CatalogRow {
+    coverage_id: String,
+    segments: Vec<(i64, i64)>,
+    event_count: u64,
+    #[serde(default)]
+    asset_class: Option<String>,
+}
+
+/// Inverse of [`AssetClass`]'s `Display`. Unknown tokens (or future variants
+/// from a newer writer) yield `None` rather than a fabricated identity.
+fn asset_class_from_str(s: &str) -> Option<AssetClass> {
+    match s {
+        "equity" => Some(AssetClass::Equity),
+        "etf" => Some(AssetClass::Etf),
+        "crypto" => Some(AssetClass::Crypto),
+        _ => None,
     }
 }
 
@@ -502,6 +627,24 @@ impl SurrealCache {
             .map_err(map_err)?;
         let mut doc = existing.unwrap_or_default();
         doc.merge_in(from, to, added_events);
+        // `merge_in` bumps `event_count` additively, which drifts upward on a
+        // re-store/refresh: `store` DELETEs the range then re-inserts, but the
+        // additive count never subtracts the removed rows. Recompute the count
+        // from the actual stored rows over the union of covered segments so the
+        // catalog reports current contents, not a running sum of every write.
+        // Segments are half-open [from, to) (see `intersect`/`gaps_within`) and
+        // `count_events_in` is likewise half-open, so each segment counts
+        // directly. Touching segments are merged, so no row is double-counted at
+        // a boundary.
+        let mut total: u64 = 0;
+        for &(seg_from, seg_to) in &doc.segments {
+            total =
+                total.saturating_add(self.count_events_in(key, seg_from, seg_to).await?);
+        }
+        doc.event_count = total;
+        // Record the asset class so the catalog can reconstruct a faithful
+        // `Instrument` (the id and row shapes do not otherwise carry it).
+        doc.asset_class = Some(key.instrument.asset_class().to_string());
         let _: Option<CoverageDoc> = self
             .db
             .upsert(("coverage", id))
@@ -745,5 +888,88 @@ mod tests {
         c.merge_in(200, 210, 1);
         assert_eq!(c.intersect(50, 150), Some((50, 100)));
         assert_eq!(c.intersect(150, 250), Some((200, 210)));
+    }
+
+    #[test]
+    fn kind_for_inverts_table_for() {
+        for kind in [
+            EventKind::Trade,
+            EventKind::Quote,
+            EventKind::Bar(BarInterval::OneSecond),
+            EventKind::Bar(BarInterval::OneMinute),
+            EventKind::Bar(BarInterval::FiveMinute),
+            EventKind::Bar(BarInterval::FifteenMinute),
+            EventKind::Bar(BarInterval::OneHour),
+            EventKind::Bar(BarInterval::OneDay),
+        ] {
+            assert_eq!(
+                SurrealCache::kind_for(SurrealCache::table_for(kind)),
+                Some(kind)
+            );
+        }
+        assert_eq!(SurrealCache::kind_for("not_a_table"), None);
+    }
+
+    #[tokio::test]
+    async fn catalog_skips_malformed_coverage_id() {
+        let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+            .await
+            .unwrap();
+
+        // One valid entry through the normal write path.
+        let key = CacheKey {
+            instrument: Instrument::new(
+                datamancer_core::ProviderId::from_static("alpaca"),
+                AssetClass::Equity,
+                "AAPL",
+            ),
+            kind: EventKind::Trade,
+            from: Timestamp(0),
+            to: Timestamp(100),
+            adjustment: Adjustment::Raw,
+        };
+        cache
+            .store(
+                &key,
+                &[MarketEvent::Trade(Trade {
+                    instrument: key.instrument.clone(),
+                    source_ts: Timestamp(10),
+                    rx_ts: Timestamp(10),
+                    seq: Seq(0),
+                    price: Price::from_f64_round(1.0),
+                    size: 1,
+                })],
+            )
+            .await
+            .unwrap();
+
+        // Inject a coverage row whose id is NOT `provider|symbol|table|adjustment`.
+        let _: Option<CoverageDoc> = cache
+            .db
+            .upsert(("coverage", "broken-id-without-pipes"))
+            .content(CoverageDoc {
+                segments: vec![(0, 50)],
+                event_count: 3,
+                asset_class: None,
+            })
+            .await
+            .unwrap();
+
+        // And one with the right shape but an unknown table token.
+        let _: Option<CoverageDoc> = cache
+            .db
+            .upsert(("coverage", "alpaca|AAPL|not_a_table|raw"))
+            .content(CoverageDoc {
+                segments: vec![(0, 50)],
+                event_count: 3,
+                asset_class: None,
+            })
+            .await
+            .unwrap();
+
+        let catalog = cache.catalog().await.unwrap();
+        assert_eq!(catalog.len(), 1, "malformed ids are skipped, not panicked");
+        assert_eq!(catalog[0].symbol, "AAPL");
+        assert_eq!(catalog[0].kind, EventKind::Trade);
     }
 }

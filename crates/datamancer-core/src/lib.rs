@@ -17,6 +17,7 @@ mod error;
 mod event;
 mod instrument;
 mod price;
+mod snapshot;
 pub mod traits;
 
 pub use adjustment::Adjustment;
@@ -27,7 +28,11 @@ pub use event::{
 };
 pub use instrument::{AssetClass, Instrument, ProviderId};
 pub use price::Price;
+pub use snapshot::{
+    AuthoritativeSessionSnapshot, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
+    ConnectionState, ProviderSnapshot, ResumeBufferSnapshot, SubscriptionRef, SystemSnapshot,
+};
 pub use traits::{
-    CacheCoverage, CacheKey, HistoricalCache, HistoryRequest, LiveHandle, Provider, ReplayRequest,
-    ReplaySource, TapLog,
+    CacheCatalogEntry, CacheCoverage, CacheKey, EventSink, HistoricalCache, HistoryRequest,
+    LiveHandle, Provider, ProviderMetrics, PublishOutcome, ReplayRequest, ReplaySource, TapLog,
 };

@@ -1,8 +1,10 @@
 //! SurrealDB-backed [`TapLog`] (and [`ReplaySource`]).
 //!
 //! Records the live event stream in **arrival order**. The sole ordering key
-//! is `seq`, assigned by this log (not the session-local seq). `seq` is a pure
-//! total order — contiguous by construction, never gapped for drop detection.
+//! is `seq` — the **source `seq`**, stamped by the session controller before
+//! the tap-log tee. The log persists that value verbatim and does **not** mint
+//! its own, so tap-log replay reproduces the delivered stream's `seq` exactly
+//! (Phase-1 convergence). `seq` is a per-symbol total order.
 //!
 //! # Schema (namespace `datamancer`, database `taplog`)
 //!
@@ -11,8 +13,8 @@
 //!   instrument's same-kind events live together, which compresses well.
 //! - `streams` — registry mapping each `(instrument, kind)` to its shard table
 //!   name. Drives write-path shard resolution and replay shard enumeration.
-//! - `meta` — a single row (`hwm`, `next_shard`) holding the global `seq`
-//!   high-water mark and the next shard ordinal to allocate.
+//! - `meta` — a single row holding the next shard ordinal (`next_shard`) and
+//!   the global append-ordinal high-water mark (`next_ord`) to allocate.
 //!
 //! # Durability
 //!
@@ -69,8 +71,20 @@ fn map_err(err: surrealdb::Error) -> Error {
 // rows minimal is the compression win.
 // ---------------------------------------------------------------------------
 
+// Each row carries `ord`: a tap-local, strictly monotonic append ordinal that
+// is unique across the whole log (every shard, every session/process lifetime).
+// The source `seq` is per-symbol and resets to 0 with each new controller, so it
+// is not unique within a long-lived shard and cannot order replay on its own.
+// `ord` is the replay ordering key; `seq` is preserved verbatim as the delivered
+// event's `seq`.
+
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct TapTradeRow {
+    // `Option` so rows written before `ord` existed deserialize as `None` (the
+    // `SurrealValue` derive does not honor `#[serde(default)]` for an absent
+    // field); such legacy rows read back as ordinal 0 at replay.
+    #[serde(default)]
+    ord: Option<u64>,
     seq: u64,
     source_ts: i64,
     rx_ts: i64,
@@ -80,6 +94,11 @@ struct TapTradeRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct TapQuoteRow {
+    // `Option` so rows written before `ord` existed deserialize as `None` (the
+    // `SurrealValue` derive does not honor `#[serde(default)]` for an absent
+    // field); such legacy rows read back as ordinal 0 at replay.
+    #[serde(default)]
+    ord: Option<u64>,
     seq: u64,
     source_ts: i64,
     rx_ts: i64,
@@ -91,6 +110,11 @@ struct TapQuoteRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 struct TapBarRow {
+    // `Option` so rows written before `ord` existed deserialize as `None` (the
+    // `SurrealValue` derive does not honor `#[serde(default)]` for an absent
+    // field); such legacy rows read back as ordinal 0 at replay.
+    #[serde(default)]
+    ord: Option<u64>,
     seq: u64,
     source_ts: i64,
     rx_ts: i64,
@@ -112,10 +136,16 @@ struct StreamRow {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, SurrealValue)]
 struct MetaRow {
-    /// Global `seq` high-water mark: the last seq assigned.
-    hwm: u64,
     /// Next shard ordinal to allocate.
     next_shard: u64,
+    /// High-water mark of the global append ordinal (`ord`). Persisted as a
+    /// reservation boundary, not per write, so a crash skips the unused tail of
+    /// the current batch (a harmless gap in `ord`) but never reuses an ordinal.
+    /// `Option` (not `#[serde(default)]`) so a `meta` row written before this
+    /// field existed deserializes as `None` under the `SurrealValue` derive
+    /// (which, unlike serde, does not honor `default` for an absent field).
+    #[serde(default)]
+    next_ord: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -299,8 +329,12 @@ impl SurrealTapLog {
         let (tx, rx) = mpsc::unbounded_channel();
         let writer = Writer {
             db: db.clone(),
-            hwm: meta.hwm,
             next_shard: meta.next_shard,
+            // Resume the append ordinal at the persisted high-water mark (0 for a
+            // legacy `meta` row predating the field). Any ordinals reserved but
+            // unused before the last shutdown are skipped, never reused.
+            next_ord: meta.next_ord.unwrap_or(0),
+            ord_high: meta.next_ord.unwrap_or(0),
             shards,
             last_error: None,
         };
@@ -342,10 +376,17 @@ impl TapLog for SurrealTapLog {
 // Background writer
 // ---------------------------------------------------------------------------
 
+/// Number of append ordinals reserved per persisted high-water bump. Larger =
+/// fewer meta writes but a larger gap skipped on an unclean shutdown.
+const ORD_BATCH: u64 = 1024;
+
 struct Writer {
     db: Surreal<Db>,
-    hwm: u64,
     next_shard: u64,
+    /// Next append ordinal to hand out; advances in memory per write.
+    next_ord: u64,
+    /// Exclusive upper bound of the currently reserved ordinal batch.
+    ord_high: u64,
     shards: HashMap<(Instrument, EventKind), String>,
     last_error: Option<Error>,
 }
@@ -385,17 +426,19 @@ impl Writer {
 
         let shard = self.resolve_shard(&instrument, kind).await?;
 
-        // Reserve seq and persist the high-water mark BEFORE inserting the row.
-        // A crash between persist and insert leaves an unused seq value — a
-        // harmless gap, since seq carries no drop-detection meaning — never a
-        // reused value that would corrupt ordering.
-        self.hwm += 1;
-        let seq = self.hwm;
-        self.persist_meta().await?;
+        // Persist the source `seq` verbatim — the session controller already
+        // stamped it before the tee. The tap log no longer mints its own seq,
+        // so replay reproduces the delivered stream's `seq` (convergence).
+        let seq = event_seq(&ev);
+        // Assign the global append ordinal that orders replay. Unlike `seq` (per
+        // symbol, resets per controller), `ord` is unique across every shard and
+        // session lifetime, so replay is a faithful, unambiguous append order.
+        let ord = self.allocate_ord().await?;
 
         match ev {
             MarketEvent::Trade(t) => {
                 let row = TapTradeRow {
+                    ord: Some(ord),
                     seq,
                     source_ts: t.source_ts.0,
                     rx_ts: t.rx_ts.0,
@@ -411,6 +454,7 @@ impl Writer {
             }
             MarketEvent::Quote(q) => {
                 let row = TapQuoteRow {
+                    ord: Some(ord),
                     seq,
                     source_ts: q.source_ts.0,
                     rx_ts: q.rx_ts.0,
@@ -428,6 +472,7 @@ impl Writer {
             }
             MarketEvent::Bar(b) => {
                 let row = TapBarRow {
+                    ord: Some(ord),
                     seq,
                     source_ts: b.source_ts.0,
                     rx_ts: b.rx_ts.0,
@@ -503,10 +548,25 @@ impl Writer {
         Ok(name)
     }
 
+    /// Reserve a fresh batch of append ordinals when the current one is spent,
+    /// persisting the new high-water mark first so a crash can only skip the
+    /// unused tail (a harmless `ord` gap), never reuse an ordinal. Returns the
+    /// next ordinal to assign.
+    async fn allocate_ord(&mut self) -> Result<u64> {
+        if self.next_ord >= self.ord_high {
+            self.ord_high = self.next_ord.saturating_add(ORD_BATCH);
+            self.persist_meta().await?;
+        }
+        let ord = self.next_ord;
+        self.next_ord = self.next_ord.saturating_add(1);
+        Ok(ord)
+    }
+
     async fn persist_meta(&self) -> Result<()> {
         let row = MetaRow {
-            hwm: self.hwm,
             next_shard: self.next_shard,
+            // Persist the reservation boundary, not the live counter.
+            next_ord: Some(self.ord_high),
         };
         let _: Option<MetaRow> = self
             .db
@@ -541,7 +601,7 @@ impl ReplaySource for SurrealTapReplaySource {
 
         let regs: Vec<StreamRow> = self.db.select("streams").await.map_err(map_err)?;
 
-        let mut all: Vec<MarketEvent> = Vec::new();
+        let mut all: Vec<(u64, MarketEvent)> = Vec::new();
         for row in &regs {
             let Some((instrument, kind)) = instrument_from_row(row) else {
                 continue;
@@ -562,7 +622,7 @@ impl ReplaySource for SurrealTapReplaySource {
                         .query(
                             "SELECT * FROM type::table($tbl) \
                              WHERE source_ts >= $from AND source_ts < $to \
-                             ORDER BY seq ASC",
+                             ORDER BY ord ASC",
                         )
                         .bind(("tbl", row.table.clone()))
                         .bind(("from", from))
@@ -572,14 +632,17 @@ impl ReplaySource for SurrealTapReplaySource {
                         .take(0)
                         .map_err(map_err)?;
                     all.extend(rows.into_iter().map(|r| {
-                        MarketEvent::Trade(Trade {
-                            instrument: instrument.clone(),
-                            source_ts: Timestamp(r.source_ts),
-                            rx_ts: Timestamp(r.rx_ts),
-                            seq: Seq(r.seq),
-                            price: Price::from_raw(r.price_raw),
-                            size: r.size,
-                        })
+                        (
+                            r.ord.unwrap_or(0),
+                            MarketEvent::Trade(Trade {
+                                instrument: instrument.clone(),
+                                source_ts: Timestamp(r.source_ts),
+                                rx_ts: Timestamp(r.rx_ts),
+                                seq: Seq(r.seq),
+                                price: Price::from_raw(r.price_raw),
+                                size: r.size,
+                            }),
+                        )
                     }));
                 }
                 EventKind::Quote => {
@@ -588,7 +651,7 @@ impl ReplaySource for SurrealTapReplaySource {
                         .query(
                             "SELECT * FROM type::table($tbl) \
                              WHERE source_ts >= $from AND source_ts < $to \
-                             ORDER BY seq ASC",
+                             ORDER BY ord ASC",
                         )
                         .bind(("tbl", row.table.clone()))
                         .bind(("from", from))
@@ -598,16 +661,19 @@ impl ReplaySource for SurrealTapReplaySource {
                         .take(0)
                         .map_err(map_err)?;
                     all.extend(rows.into_iter().map(|r| {
-                        MarketEvent::Quote(Quote {
-                            instrument: instrument.clone(),
-                            source_ts: Timestamp(r.source_ts),
-                            rx_ts: Timestamp(r.rx_ts),
-                            seq: Seq(r.seq),
-                            bid: Price::from_raw(r.bid_raw),
-                            bid_size: r.bid_size,
-                            ask: Price::from_raw(r.ask_raw),
-                            ask_size: r.ask_size,
-                        })
+                        (
+                            r.ord.unwrap_or(0),
+                            MarketEvent::Quote(Quote {
+                                instrument: instrument.clone(),
+                                source_ts: Timestamp(r.source_ts),
+                                rx_ts: Timestamp(r.rx_ts),
+                                seq: Seq(r.seq),
+                                bid: Price::from_raw(r.bid_raw),
+                                bid_size: r.bid_size,
+                                ask: Price::from_raw(r.ask_raw),
+                                ask_size: r.ask_size,
+                            }),
+                        )
                     }));
                 }
                 EventKind::Bar(interval) => {
@@ -616,7 +682,7 @@ impl ReplaySource for SurrealTapReplaySource {
                         .query(
                             "SELECT * FROM type::table($tbl) \
                              WHERE source_ts >= $from AND source_ts < $to \
-                             ORDER BY seq ASC",
+                             ORDER BY ord ASC",
                         )
                         .bind(("tbl", row.table.clone()))
                         .bind(("from", from))
@@ -626,28 +692,33 @@ impl ReplaySource for SurrealTapReplaySource {
                         .take(0)
                         .map_err(map_err)?;
                     all.extend(rows.into_iter().map(|r| {
-                        MarketEvent::Bar(Bar {
-                            instrument: instrument.clone(),
-                            interval,
-                            source_ts: Timestamp(r.source_ts),
-                            rx_ts: Timestamp(r.rx_ts),
-                            seq: Seq(r.seq),
-                            open: Price::from_raw(r.open_raw),
-                            high: Price::from_raw(r.high_raw),
-                            low: Price::from_raw(r.low_raw),
-                            close: Price::from_raw(r.close_raw),
-                            volume: r.volume,
-                        })
+                        (
+                            r.ord.unwrap_or(0),
+                            MarketEvent::Bar(Bar {
+                                instrument: instrument.clone(),
+                                interval,
+                                source_ts: Timestamp(r.source_ts),
+                                rx_ts: Timestamp(r.rx_ts),
+                                seq: Seq(r.seq),
+                                open: Price::from_raw(r.open_raw),
+                                high: Price::from_raw(r.high_raw),
+                                low: Price::from_raw(r.low_raw),
+                                close: Price::from_raw(r.close_raw),
+                                volume: r.volume,
+                            }),
+                        )
                     }));
                 }
             }
         }
 
-        // Merge the per-shard sorted runs into one globally seq-ordered stream.
-        // seq is a unique global total order, so a single sort by seq IS the
-        // k-way merge result. (Materialize-then-sort mirrors the cache's replay
-        // shape; a streaming cursor merge is a future memory optimization.)
-        all.sort_by_key(event_seq);
-        Ok(stream::iter(all).boxed())
+        // Merge the per-shard runs into one stream by the global append ordinal
+        // `ord`. `ord` is a unique, monotonic total order across every shard and
+        // session lifetime, so a single sort by `ord` IS the k-way merge result
+        // and reproduces the original delivered (arrival) order — including
+        // across symbols, which a sort by per-symbol `seq` could not. (Source
+        // `seq` is preserved on each event; it just is not the ordering key.)
+        all.sort_by_key(|(ord, _)| *ord);
+        Ok(stream::iter(all.into_iter().map(|(_, ev)| ev)).boxed())
     }
 }

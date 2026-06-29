@@ -397,6 +397,19 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                                 routes.remove(&(instrument.clone(), kind));
                                 apply_pair_to_list(&mut subs, &instrument, kind, false);
                             } else {
+                                // We are in the connected loop, so the provider is
+                                // up. `ProviderConnected` is otherwise only
+                                // broadcast on the connect *edge*, which a route
+                                // that subscribes afterward misses — leaving its
+                                // connection state Unknown even as data flows. Tell
+                                // the freshly-subscribed route the provider is up.
+                                broadcast_control_to(
+                                    routes.get(&(instrument.clone(), kind)),
+                                    ControlKind::ProviderConnected {
+                                        provider: PROVIDER_ID.to_string(),
+                                    },
+                                )
+                                .await;
                                 broadcast_control_to(
                                     routes.get(&(instrument.clone(), kind)),
                                     ControlKind::SubscriptionChanged {

@@ -8,15 +8,44 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Instrument, Price};
 
-/// A monotonically-increasing identifier assigned by datamancer at delivery into the consumer stream.
+/// A per-symbol ordering identifier stamped **once at the source** of an
+/// authoritative per-`(instrument, kind)` session, in that session's canonical
+/// delivery order, before any sink.
 ///
-/// **The sole ordering field for the stream.** In a live session `seq` is
-/// assigned in arrival order; replaying in `seq` order reproduces the
-/// consumer's original experience exactly. For historical fetch, `seq` is
-/// assigned in source-timestamp order during fetch, so `seq` order matches
-/// market order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// **The sole ordering field for the stream.** Invariants:
+///
+/// - **Per-symbol, not global.** `seq` orders one symbol's stream; there is no
+///   cross-instrument order. The multiplex ordering key is `(instrument, seq)`.
+/// - **Stamped at the source.** The authoritative controller assigns `seq` once,
+///   in delivery order, before the event reaches any sink — so it is a property
+///   of the shared stream, not of a particular consumer's poll timing.
+/// - **Identical across a symbol's consumers.** Every consumer of one symbol's
+///   authoritative stream observes the same `(seq, source_ts)` for each event.
+/// - **Controls occupy slots.** In-band [`Control`] events are stamped here too,
+///   so they consume a `seq` slot like data events.
+/// - **Holes are real.** A consumer that misses events (resume-buffer eviction,
+///   late join) observes a real `seq` hole, surfaced in-band as
+///   [`ControlKind::Gap`]. The delivered stream is contiguous *only while
+///   nothing is lost*.
+/// - **`SYNTHETIC` is exempt.** [`Seq::SYNTHETIC`] tags out-of-band synthetic
+///   control events and is exempt from per-symbol monotonicity.
+///
+/// In a live session `seq` is assigned in arrival order; for historical fetch
+/// it is assigned in source-timestamp order during fetch, so `seq` order
+/// matches market order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Seq(pub u64);
+
+impl Seq {
+    /// Sentinel `seq` for synthetic control events that do not belong to an
+    /// authoritative stream's monotonic order (e.g. per-client controls minted
+    /// outside the source counter). `Seq(u64::MAX)` is **reserved**: the source
+    /// counter stamps only in `[0, u64::MAX - 1]` and treats the reservation
+    /// boundary as counter exhaustion, so this value never collides with a
+    /// stamped event. It is exempt from per-symbol monotonicity.
+    pub const SYNTHETIC: Seq = Seq(u64::MAX);
+}
 
 /// A timestamp expressed in nanoseconds since the Unix epoch.
 ///
@@ -39,7 +68,7 @@ pub enum BarInterval {
 
 /// Selector used in subscriptions. Each variant maps 1:1 with a [`MarketEvent`]
 /// data variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EventKind {
     Trade,
     Quote,
@@ -52,7 +81,7 @@ pub enum EventKind {
 ///
 /// - `source_ts` — when the event happened in the market. The **only**
 ///   timestamp engine logic should reason about.
-/// - `seq` — datamancer's session-monotonic ordering field.
+/// - `seq` — datamancer's per-symbol, source-stamped ordering field.
 /// - `rx_ts` — wall-clock at byte receipt. **Observability only.** Engine
 ///   decision logic must never depend on `rx_ts`. For replay-from-historical,
 ///   `rx_ts` collapses to `source_ts`.
@@ -160,8 +189,43 @@ pub enum ControlKind {
     SessionClosing,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GapSpan {
     pub from_source_ts: Timestamp,
     pub to_source_ts: Timestamp,
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::{BarInterval, EventKind, GapSpan, Seq, Timestamp};
+
+    #[test]
+    fn seq_round_trips_transparently() {
+        let json = serde_json::to_string(&Seq(42)).unwrap();
+        assert_eq!(json, "42");
+        assert_eq!(serde_json::from_str::<Seq>(&json).unwrap(), Seq(42));
+    }
+
+    #[test]
+    fn event_kind_round_trips() {
+        for k in [
+            EventKind::Trade,
+            EventKind::Quote,
+            EventKind::Bar(BarInterval::OneMinute),
+            EventKind::Bar(BarInterval::OneDay),
+        ] {
+            let json = serde_json::to_string(&k).unwrap();
+            assert_eq!(serde_json::from_str::<EventKind>(&json).unwrap(), k);
+        }
+    }
+
+    #[test]
+    fn gap_span_round_trips() {
+        let g = GapSpan {
+            from_source_ts: Timestamp(100),
+            to_source_ts: Timestamp(200),
+        };
+        let json = serde_json::to_string(&g).unwrap();
+        assert_eq!(serde_json::from_str::<GapSpan>(&json).unwrap(), g);
+    }
 }

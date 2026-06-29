@@ -350,3 +350,83 @@ fn reexports_are_consistent() {
     let kind: EventKind = EventKind::Trade;
     let _ = (i, kind);
 }
+
+// --- catalog enumeration ----------------------------------------------------
+
+#[tokio::test]
+async fn catalog_empty_when_nothing_stored() {
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
+    assert!(cache.catalog().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn catalog_roundtrips_stored_ranges() {
+    use datamancer::CacheCatalogEntry;
+
+    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+        .await
+        .unwrap();
+
+    // A trade range (stored under Raw regardless of the key's mode) ...
+    let trade_key = key_adj(EventKind::Trade, 100, 400, Adjustment::All);
+    cache
+        .store(
+            &trade_key,
+            &[trade("AAPL", 100, 1.0, 1), trade("AAPL", 300, 2.0, 1)],
+        )
+        .await
+        .unwrap();
+
+    // ... and one bar range under each of two adjustment modes.
+    let bar_all = key_adj(
+        EventKind::Bar(BarInterval::OneMinute),
+        0,
+        200,
+        Adjustment::All,
+    );
+    let bar_raw = key_adj(
+        EventKind::Bar(BarInterval::OneMinute),
+        0,
+        200,
+        Adjustment::Raw,
+    );
+    cache
+        .store(&bar_all, &[bar("AAPL", 0, 1.0), bar("AAPL", 60, 2.0)])
+        .await
+        .unwrap();
+    cache.store(&bar_raw, &[bar("AAPL", 0, 1.0)]).await.unwrap();
+
+    let catalog = cache.catalog().await.unwrap();
+    assert_eq!(catalog.len(), 3, "trade + two bar-adjustment keys");
+
+    let find = |kind: EventKind, adj: Adjustment| -> CacheCatalogEntry {
+        catalog
+            .iter()
+            .find(|e| e.kind == kind && e.adjustment == adj)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing catalog entry for {kind:?} / {adj:?}"))
+    };
+
+    // Trades always store under Raw, even though the key requested All.
+    let t = find(EventKind::Trade, Adjustment::Raw);
+    assert_eq!(t.symbol, "AAPL");
+    assert_eq!(t.provider.as_str(), "alpaca");
+    assert_eq!(t.asset_class, Some(AssetClass::Equity));
+    assert_eq!(t.event_count, 2);
+    assert_eq!(
+        t.segments,
+        vec![GapSpan {
+            from_source_ts: Timestamp(100),
+            to_source_ts: Timestamp(400),
+        }]
+    );
+    assert!(t.est_bytes.is_some_and(|b| b > 0));
+
+    let b_all = find(EventKind::Bar(BarInterval::OneMinute), Adjustment::All);
+    assert_eq!(b_all.event_count, 2);
+    assert_eq!(b_all.asset_class, Some(AssetClass::Equity));
+    let b_raw = find(EventKind::Bar(BarInterval::OneMinute), Adjustment::Raw);
+    assert_eq!(b_raw.event_count, 1);
+}
