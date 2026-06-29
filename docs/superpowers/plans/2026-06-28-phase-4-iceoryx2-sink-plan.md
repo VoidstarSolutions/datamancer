@@ -6,6 +6,14 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 
 ---
 
+> **Reconciliation pass — authoritative; supersedes any conflicting text below.** Applied from the [cross-phase consistency report](2026-06-28-server-plan-consistency-report.md). Architect decisions: registry/ids/stats built in **Phase 2** (Issue 3); diagnostics snapshot **split** (Issue 6).
+>
+> Resolutions affecting this phase:
+> - **Serialize via `publish_borrowed` (Issue 2):** attach the data-plane sink through Phase 1's `publish_borrowed(&self, &MarketEvent)`. The owned `publish(MarketEvent) -> PublishOutcome` is the in-process path. No borrowed-`Result`.
+> - **Attach at the per-client output (Issue 1):** `Iceoryx2DataSink` attaches at the per-client `Box<dyn EventSink>` output Phase 2 exposes (one service per client), not at the authoritative controller.
+> - **Diagnostics sizing (Issue 6 — decided: split):** size the fixed-capacity fast diagnostics service to Phase 3's bounded **live-state snapshot**; publish the heavier **cache catalog** on a separate service (larger-cap / chunked / slower cadence). Do not size one fixed payload for the whole `SystemSnapshot`.
+> - **POD `seq` tolerates the sentinel (Issue 8):** the POD payload's `seq: u64` carries `Seq::SYNTHETIC` verbatim for synthetic controls; do not fold it into monotonicity assumptions.
+
 ## Context & goal
 
 Phase 4 delivers the `transport-iceoryx2` capability: same-host, zero-copy fan-out of

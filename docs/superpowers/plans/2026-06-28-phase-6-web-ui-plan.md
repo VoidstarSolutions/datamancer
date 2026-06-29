@@ -1,10 +1,17 @@
-# Phase 6 — Phase 6 — Introspection web UI
+# Phase 6 — Introspection web UI
 
 **Fidelity:** design-level (firms up after 3 + 5)
 
 _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2026-06-28-datamancer-server-roadmap.md`._
 
 ---
+
+> **Reconciliation pass — authoritative; supersedes any conflicting text below.** Applied from the [cross-phase consistency report](2026-06-28-server-plan-consistency-report.md). Architect decisions: registry/ids/stats built in **Phase 2** (Issue 3); diagnostics snapshot **split** (Issue 6).
+>
+> Resolutions affecting this phase:
+> - **Snapshot naming (Issue 5):** use `SystemSnapshot` and `Datamancer::snapshot() -> Result<SystemSnapshot>` (async, fallible) throughout — not `IntrospectionSnapshot`/`introspect()`. The ArcSwap-refresh task already plans off-thread acquisition, so async+fallible is mechanical; narrow CHECKPOINT A to the unit-identity-key question.
+> - **Reads the live-state snapshot (Issue 6):** the UI reads Phase 3's bounded live-state snapshot in-process; the heavier cache catalog comes from its separate accessor/cadence.
+> - **Per-symbol `seq` display tolerates the sentinel (Issue 8):** treat `Seq::SYNTHETIC` synthetic-control entries as exempt from per-symbol monotonicity in any gap/ordering display.
 
 > **Fidelity: design-level.** Concrete endpoint shapes and field names firm up
 > once Phase 3 fixes the snapshot type and Phase 5 fixes the daemon

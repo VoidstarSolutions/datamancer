@@ -85,3 +85,27 @@ Phase 2 invents a sentinel `seq` (`Seq::SYNTHETIC`/`u64::MAX`) for client-local 
 - Data-plane vs diagnostics-plane split: consistent across Phases 3 (content), 4 (two services), 5 (per-client data + one process-wide diagnostics), 6 (in-process snapshot reader).
 - `#![forbid(unsafe_code)]` handling: Phase 4 quarantines iceoryx2 in a new crate; Phases 1–3, 5, 6 keep the forbid.
 - Phase 2↔Phase 1 two-subscriber agreement test handoff, and Phase 2↔Phase 5 anchor-composes-via-refcount (P2-D): acknowledged in both directions.
+
+## Resolution status (reconciliation pass, 2026-06-28)
+
+All eight issues resolved via an authoritative **Reconciliation pass** block at the
+top of each affected plan (those blocks supersede conflicting body text). Two
+ownership questions were decided by the architect:
+
+- **Issue 3 → Phase 2** builds the client-session registry, `ClientSessionId`
+  (in `datamancer-core`), and per-symbol `LiveStats` on `AuthoritativeSession`;
+  Phase 3 only reads them.
+- **Issue 6 → split snapshot:** a bounded live-state snapshot on the fast
+  diagnostics service, the heavier cache catalog on a separate slower/chunked
+  service.
+
+| Issue | Resolution | Lands in |
+|---|---|---|
+| 1 EventSink attachment | seam migrates to per-client `Box<dyn EventSink>` output | Phase 2 (noted in 1) |
+| 2 publish signature | owned `publish(MarketEvent)->PublishOutcome` + `publish_borrowed(&MarketEvent)` | Phase 1 (used by 2,4,5) |
+| 3 registry/id/LiveStats | built in Phase 2; read in Phase 3 | Phase 2 |
+| 4 resume snapshot placement | on `ClientSessionSnapshot` | Phase 3 |
+| 5 Phase 6 naming | `SystemSnapshot`/`snapshot()` | Phase 6 |
+| 6 snapshot bounding | split live-state vs cache catalog | Phases 3 + 4 |
+| 7 backfill scope | creation-time; referrers attach to existing scope | Phases 2 + 5 |
+| 8 seq sentinel | `Seq::SYNTHETIC` defined in Phase 1's `event.rs` edit | Phase 1 (used by 2,4,6) |

@@ -1,10 +1,19 @@
-# Phase 2 — Phase 2 — Client session (multiplex + subscription management)
+# Phase 2 — Client session (multiplex + subscription management)
 
 **Fidelity:** high (some specifics pending Phase 1 EventSink shape)
 
 _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2026-06-28-datamancer-server-roadmap.md`._
 
 ---
+
+> **Reconciliation pass — authoritative; supersedes any conflicting text below.** Applied from the [cross-phase consistency report](2026-06-28-server-plan-consistency-report.md). Architect decisions: registry/ids/stats are built in **Phase 2 (this phase)** (Issue 3); the diagnostics snapshot is **split** (Issue 6).
+>
+> Resolutions affecting this phase:
+> - **EventSink seam migrates here (Issue 1):** generalize the per-client output `Sink::Attached` to hold `Box<dyn EventSink>` (or make the per-client controller generic over `EventSink`) so Phase 4/5 attach `Iceoryx2DataSink` at the per-client output. Add the checkpoint: *a `ClientSession` is constructed with an `EventSink`.* Tee + resume ring stay core-side; only the attachment point moves from authoritative (Phase 1) to per-client (here).
+> - **publish signature (Issue 2):** use `publish(MarketEvent) -> PublishOutcome` (owned) for in-process and `publish_borrowed(&MarketEvent)` for borrow-serializing sinks. No borrowed-`Result`.
+> - **Build registry/ids/stats here (Issue 3 — decided: Phase 2):** add a client-session registry to `DatamancerInner`; define `ClientSessionId` in `datamancer-core`; attach a per-symbol `Arc<LiveStats>` to `AuthoritativeSession` (the type absorbing the former `RegistrySentinel`). Phase 3 only reads these.
+> - **Backfill scope is creation-time (Issue 7):** backfill is fixed when the authoritative session is created; later referrers (a live `ClientSession::subscribe`, the daemon anchor) attach to the existing scope without re-specifying it. A pure-live subscribe may attach to a backfill-created authoritative session (it joins the live tail).
+> - **seq sentinel (Issue 8):** use Phase 1's `Seq::SYNTHETIC` constant for client-local synthetic controls; do not invent a separate value.
 
 ## Context & goal
 

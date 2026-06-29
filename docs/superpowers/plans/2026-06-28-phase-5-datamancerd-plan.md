@@ -1,10 +1,17 @@
-# Phase 5 — Phase 5: datamancerd binary
+# Phase 5 — datamancerd binary
 
 **Fidelity:** design-level (firms up after 4)
 
 _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2026-06-28-datamancer-server-roadmap.md`._
 
 ---
+
+> **Reconciliation pass — authoritative; supersedes any conflicting text below.** Applied from the [cross-phase consistency report](2026-06-28-server-plan-consistency-report.md). Architect decisions: registry/ids/stats built in **Phase 2** (Issue 3); diagnostics snapshot **split** (Issue 6).
+>
+> Resolutions affecting this phase:
+> - **Fallback pump signature (Issue 2):** the in-process pump uses `publish(MarketEvent) -> PublishOutcome` (owned) and matches on `PublishOutcome` rather than `?`-propagating a `Result`; use `publish_borrowed` only where serializing from a borrow.
+> - **Anchor attaches to existing scope (Issue 7):** the daemon's lifecycle anchor and any client `subscribe` attach to the authoritative session's creation-time scope without re-specifying backfill (compose-via-refcount). Backfill is set when the authoritative session is first created.
+> - **Diagnostics publishing (Issue 6):** publish Phase 3's bounded live-state snapshot on the fast diagnostics service and the cache catalog on the separate slower/chunked service.
 
 ## Fidelity
 

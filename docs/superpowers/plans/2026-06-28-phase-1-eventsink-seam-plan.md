@@ -6,6 +6,13 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 
 ---
 
+> **Reconciliation pass — authoritative; supersedes any conflicting text below.** Applied from the [cross-phase consistency report](2026-06-28-server-plan-consistency-report.md). Architect decisions: registry/ids/stats are built in **Phase 2** (Issue 3); the diagnostics snapshot is **split** into bounded live-state vs. cache catalog (Issue 6).
+>
+> Resolutions affecting this phase:
+> - **publish signature (Issue 2):** the canonical in-process method is `async fn publish(&self, MarketEvent) -> PublishOutcome` (owned). Also define `publish_borrowed(&self, &MarketEvent) -> PublishOutcome` for sinks that serialize from a borrow (Phase 4). The borrowed-`Result` shape some drafts assume is rejected.
+> - **EventSink seam location (Issue 1):** the tee + resume ring stay core-side, so every sink inherits them. Only the sink *attachment point* moves — from the authoritative controller (this phase) to the **per-client output in Phase 2**.
+> - **seq sentinel (Issue 8):** the `event.rs` `Seq` doc rewrite owned by this phase also defines the synthetic-control sentinel constant `Seq::SYNTHETIC` (used by Phase 2) and documents it as exempt from per-symbol monotonicity, so the Phase 1/2/3 `event.rs` edits do not collide.
+
 ## Context & goal
 
 Phase 1 of the standalone-server roadmap. Two coupled changes, both behind the

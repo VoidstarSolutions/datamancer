@@ -1,10 +1,18 @@
-# Phase 3 — Phase 3: Library introspection interfaces
+# Phase 3 — Library introspection interfaces
 
 **Fidelity:** high
 
 _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2026-06-28-datamancer-server-roadmap.md`._
 
 ---
+
+> **Reconciliation pass — authoritative; supersedes any conflicting text below.** Applied from the [cross-phase consistency report](2026-06-28-server-plan-consistency-report.md). Architect decisions: registry/ids/stats are built in **Phase 2** (Issue 3); the diagnostics snapshot is **split** (Issue 6).
+>
+> Resolutions affecting this phase:
+> - **Read registry/stats from Phase 2 (Issue 3):** Phase 2 owns the client-session registry, `ClientSessionId`, and the per-symbol `LiveStats` on `AuthoritativeSession`. This phase only iterates/reads them. Drop any "attach `LiveStats` to `RegistrySentinel`" instruction — `RegistrySentinel` no longer exists; target `AuthoritativeSession`.
+> - **Canonical snapshot names:** this phase produces `SystemSnapshot` and `Datamancer::snapshot() -> Result<SystemSnapshot>` (async, fallible). These are canonical; Phase 6 is corrected to match.
+> - **Resume-buffer snapshot placement (Issue 4):** the resume buffer is per-client; put `ResumeBufferSnapshot` and per-instrument `gap_count`/`dropped_events` on `ClientSessionSnapshot`, not `AuthoritativeSessionSnapshot`.
+> - **Split the snapshot (Issue 6 — decided: split):** provide a small, bounded **live-state snapshot** (sessions, subscriptions, `LiveStats`, latency, resume occupancy) distinct from the heavier **cache catalog** (`Vec<CacheCatalogEntry>`). Phase 4's fixed-size fast diagnostics service carries the live-state snapshot; the cache catalog goes on a separate slower/chunked service. Document an expected size bound for the live-state variant.
 
 ## Context & goal
 
