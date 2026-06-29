@@ -169,6 +169,10 @@ mod tests {
 
     #[async_trait]
     impl Provider for BareProvider {
+        #[allow(
+            clippy::unnecessary_literal_bound,
+            reason = "trait signature fixes the return type to &str"
+        )]
         fn id(&self) -> &str {
             "bare"
         }

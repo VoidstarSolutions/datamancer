@@ -27,6 +27,7 @@
 
 #![forbid(unsafe_code)]
 
+mod accounting;
 mod client;
 mod fetch_locks;
 pub mod providers;

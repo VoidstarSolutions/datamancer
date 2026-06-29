@@ -28,6 +28,21 @@ impl ClientSessionId {
     }
 }
 
+/// A provider's connection state, derived purely from in-band
+/// [`crate::Control`] events.
+///
+/// `Unknown` is the initial state before any connection event is observed.
+/// There is no `Reconnecting` variant: the `Control` model exposes only
+/// connected/disconnected, and a `ProviderDisconnected` already documents that
+/// a reconnect is scheduled or in flight.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionState {
+    Unknown,
+    Connected,
+    Disconnected,
+}
+
 #[cfg(test)]
 mod tests {
     use super::ClientSessionId;

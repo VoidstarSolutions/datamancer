@@ -49,6 +49,7 @@
 //!
 //! Explicit [`Session::close`] is always available for forced termination.
 
+use crate::accounting::ProviderAccounting;
 use crate::client::{
     AuthoritativeSession, ClientHandle, ClientSession, FanOut, LiveStats, SubscriberGuard,
     SubscriberId, spawn_client,
@@ -200,6 +201,26 @@ struct DatamancerInner {
     /// Per-`CacheKey` single-flight registry: at most one outstanding
     /// provider fetch per key (see `fetch_locks`).
     fetch_locks: FetchLocks,
+    /// Per-provider call/throughput accounting, keyed by provider id. Cloned
+    /// into each controller so the cold-site and stream-derived counters land
+    /// on the same handle the diagnostics snapshot reads.
+    provider_accounting: HashMap<datamancer_core::ProviderId, Arc<ProviderAccounting>>,
+}
+
+impl DatamancerInner {
+    /// The accounting handle for `provider_id`, creating nothing — every
+    /// registered provider gets a handle at build time, so an unknown id
+    /// (only test fakes routed outside the registry) falls back to a detached
+    /// handle whose counters are never read.
+    fn accounting_for(&self, provider_id: &str) -> Arc<ProviderAccounting> {
+        self.provider_accounting
+            .iter()
+            .find(|(id, _)| id.as_str() == provider_id)
+            .map_or_else(
+                || Arc::new(ProviderAccounting::default()),
+                |(_, a)| a.clone(),
+            )
+    }
 }
 
 pub(crate) type LiveSessionRegistry =
@@ -250,6 +271,7 @@ impl Datamancer {
                 // (concurrent reads for the same pair run independently) and keep
                 // the single-consumer controller verbatim.
                 let provider = self.route(&instrument, kind)?;
+                let accounting = self.inner.accounting_for(provider.id());
                 let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(8);
                 let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
                 let inner = Arc::new(SessionInner {
@@ -274,6 +296,7 @@ impl Datamancer {
                     next_seq: 0,
                     fanout: None,
                     stats: Arc::new(LiveStats::new()),
+                    accounting,
                 };
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
                 Ok(Session {
@@ -360,6 +383,7 @@ impl Datamancer {
         SubscriberGuard,
         mpsc::Receiver<MarketEvent>,
     )> {
+        let accounting = self.inner.accounting_for(provider.id());
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(default_buffer());
         let (remove_tx, remove_rx) = mpsc::unbounded_channel::<SubscriberId>();
         let stats = Arc::new(LiveStats::new());
@@ -431,12 +455,15 @@ impl Datamancer {
             next_seq: 0,
             fanout: Some(fanout),
             stats,
+            accounting: accounting.clone(),
         };
         let backfill_from = match scope {
             Scope::Live { backfill_from } => backfill_from,
             Scope::Historical { .. } => None,
         };
+        accounting.record_live_start();
         let live = provider.start_live(provider_tx).await?;
+        accounting.record_subscribe();
         live.subscribe(instrument, kind).await?;
         tokio::spawn(controller.run_live(live, backfill_from, provider_rx, cmd_rx, remove_rx));
 
@@ -606,6 +633,16 @@ impl DatamancerBuilder {
                 return Err(Error::Config(format!("duplicate provider id: {a}")));
             }
         }
+        let provider_accounting = self
+            .providers
+            .iter()
+            .map(|p| {
+                (
+                    datamancer_core::ProviderId::new(p.id().to_string()),
+                    Arc::new(ProviderAccounting::default()),
+                )
+            })
+            .collect();
         Ok(Datamancer {
             inner: Arc::new(DatamancerInner {
                 providers: self.providers,
@@ -618,6 +655,7 @@ impl DatamancerBuilder {
                     .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),
                 adjustment: self.adjustment,
                 fetch_locks: FetchLocks::default(),
+                provider_accounting,
             }),
         })
     }
@@ -927,6 +965,10 @@ struct Controller {
     /// Per-symbol live stats (lock-free atomics) read by the Phase 3 diagnostics
     /// plane. Updated on the fan-out path only; unused on the historical path.
     stats: Arc<LiveStats>,
+    /// Per-provider call/throughput accounting for the diagnostics snapshot.
+    /// Shared (cloned `Arc`) with `DatamancerInner` and every other controller
+    /// for the same provider.
+    accounting: Arc<ProviderAccounting>,
 }
 
 impl Controller {
@@ -984,6 +1026,7 @@ impl Controller {
         // Spawn the fetch with `provider_tx` so it owns the only producer
         // side; when the fetch returns, the channel closes and `recv` yields
         // `None`, signalling exhaustion to the loop below.
+        self.accounting.record_history_fetch();
         let fetch_task =
             tokio::spawn(async move { provider.fetch_history(request, provider_tx).await });
 
@@ -1216,6 +1259,7 @@ impl Controller {
                         to: t,
                         adjustment: self.inner.adjustment,
                     };
+                    self.accounting.record_history_fetch();
                     let fetch_task =
                         tokio::spawn(async move { provider.fetch_history(request, tx).await });
 
@@ -1399,7 +1443,13 @@ impl Controller {
                     );
                     whole_range()
                 });
-                if !regaps.is_empty() {
+                if regaps.is_empty() {
+                    // We intended to fetch (initial gaps non-empty) but a
+                    // concurrent single-flight winner filled the byte-identical
+                    // range while we waited for the slot: a coalesced fetch.
+                    // (Backfill bypasses FetchLocks, so it never coalesces.)
+                    self.accounting.record_history_fetch_coalesced();
+                } else {
                     fetch_guard = Some(guard);
                 }
                 regaps
@@ -1572,6 +1622,7 @@ impl Controller {
     /// referrer emits its own `SessionClosing` on `close`).
     async fn teardown_upstream(&mut self, live: &Arc<Mutex<Option<Box<dyn LiveHandle>>>>) {
         if let Some(h) = live.lock().await.take() {
+            self.accounting.record_unsubscribe();
             let _ = h
                 .unsubscribe(self.inner.instrument.clone(), self.inner.kind)
                 .await;
@@ -1641,6 +1692,11 @@ impl Controller {
     /// the live tail lands in the log (backfill data belongs to the cache).
     async fn forward(&mut self, ev: MarketEvent) {
         let ev = self.stamp(ev);
+        // Stream-derived provider accounting: messages count as live-data
+        // throughput only on the authoritative live path (fan-out present);
+        // connection/reconnect/gap/error state is derived from in-band Control
+        // regardless of scope.
+        self.accounting.record_forwarded(&ev, self.fanout.is_some());
         self.tee(&ev).await;
         self.deliver(ev).await;
     }
