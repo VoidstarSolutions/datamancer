@@ -393,14 +393,117 @@ impl Drop for ClientStats {
 // Fan-out (lives inside the authoritative controller)
 // ---------------------------------------------------------------------------
 
+/// A referrer's bounded channel plus any loss owed to it as a `Gap`. When the
+/// channel is full the dropped event is folded into `pending` (a per-instrument
+/// span) rather than discarded, and the accumulated `Gap` is flushed ahead of
+/// resumed live delivery once the channel drains.
+struct Referrer {
+    tx: mpsc::Sender<MarketEvent>,
+    pending: Option<PendingGap>,
+}
+
+/// Accumulated, undelivered loss for one backed-up referrer. `FanOut` is
+/// per-`(instrument, kind)`, so this is a single per-instrument span.
+struct PendingGap {
+    instrument: Instrument,
+    provider: String,
+    /// First lost `seq` — the hole start; the emitted `Gap` carries it (events
+    /// are source-stamped and never renumbered).
+    first_seq: Seq,
+    span: GapSpan,
+}
+
+impl PendingGap {
+    fn absorb(&mut self, from: Timestamp, to: Timestamp) {
+        self.span.from_source_ts = self.span.from_source_ts.min(from);
+        self.span.to_source_ts = self.span.to_source_ts.max(to);
+    }
+
+    fn to_event(&self) -> MarketEvent {
+        MarketEvent::Control(Control {
+            source_ts: self.span.from_source_ts,
+            rx_ts: self.span.from_source_ts,
+            seq: self.first_seq,
+            kind: ControlKind::Gap {
+                provider: self.provider.clone(),
+                instrument: self.instrument.clone(),
+                span: self.span.clone(),
+            },
+        })
+    }
+}
+
+/// Extract `(instrument, from, to, provider, seq)` for an event that can be
+/// represented as a per-instrument `Gap`. Data events span `[ts, ts+1)`; an
+/// already-`Gap` control contributes its embedded span. Connection-scoped
+/// controls carry no instrument and return `None` — a dropped one is not folded
+/// into a data gap (it is re-derivable from the diagnostics snapshot / on
+/// reconnect).
+fn gap_coords(ev: &MarketEvent) -> Option<(Instrument, Timestamp, Timestamp, String, Seq)> {
+    match ev {
+        MarketEvent::Control(Control {
+            kind:
+                ControlKind::Gap {
+                    instrument,
+                    span,
+                    provider,
+                },
+            seq,
+            ..
+        }) => Some((
+            instrument.clone(),
+            span.from_source_ts,
+            span.to_source_ts,
+            provider.clone(),
+            *seq,
+        )),
+        MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_) => {
+            let instrument = data_instrument(ev)?;
+            let ts = data_source_ts(ev)?;
+            let provider = instrument.provider().to_string();
+            Some((
+                instrument,
+                ts,
+                Timestamp(ts.0.saturating_add(1)),
+                provider,
+                ev.seq().unwrap_or(Seq::SYNTHETIC),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Fold a dropped event into a referrer's pending gap (starting one if needed).
+/// A drop with no per-instrument identity (a connection-scoped control) is not
+/// recorded here.
+fn absorb_drop(pending: &mut Option<PendingGap>, ev: &MarketEvent) {
+    let Some((instrument, from, to, provider, seq)) = gap_coords(ev) else {
+        return;
+    };
+    match pending {
+        Some(p) => p.absorb(from, to),
+        None => {
+            *pending = Some(PendingGap {
+                instrument,
+                provider,
+                first_seq: seq,
+                span: GapSpan {
+                    from_source_ts: from,
+                    to_source_ts: to,
+                },
+            });
+        }
+    }
+}
+
 /// The authoritative controller's consumer-facing side: one bounded channel per
 /// referrer. The controller **`try_send`s** so a slow/wedged referrer never
 /// stalls its co-subscribers or the provider. A referrer that closes its
 /// channel is removed; a referrer whose bounded channel is momentarily full has
-/// the event dropped *for it only* (its own per-client resume buffer is the
-/// backpressure-of-record).
+/// the dropped event folded into a pending per-instrument `Gap` (surfaced to it
+/// once the channel drains) — never silently lost.
 pub(crate) struct FanOut {
-    subscribers: HashMap<SubscriberId, mpsc::Sender<MarketEvent>>,
+    subscribers: HashMap<SubscriberId, Referrer>,
     /// Last per-symbol `SubscriptionChanged { active: true }` (a real,
     /// source-stamped event), replayed to each new subscriber so a late join
     /// sees the subscription state without a fresh provider ack.
@@ -425,7 +528,13 @@ impl FanOut {
         if let Some(ev) = &self.last_subscription_changed {
             let _ = sender.try_send(ev.clone());
         }
-        self.subscribers.insert(id, sender);
+        self.subscribers.insert(
+            id,
+            Referrer {
+                tx: sender,
+                pending: None,
+            },
+        );
     }
 
     pub(crate) fn remove(&mut self, id: SubscriberId) {
@@ -450,12 +559,30 @@ impl FanOut {
             self.last_subscription_changed = Some(ev.clone());
         }
         let mut dead: Vec<SubscriberId> = Vec::new();
-        for (id, tx) in &self.subscribers {
-            match tx.try_send(ev.clone()) {
-                // A momentarily-full channel means a slow referrer: drop for it
-                // only (its own per-client resume buffer is the
-                // backpressure-of-record). Never stall other referrers.
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+        for (id, r) in &mut self.subscribers {
+            // Flush any loss owed to this referrer first, so the `Gap` is ordered
+            // ahead of resumed live delivery. If the channel is still full, fold
+            // this event into the pending gap and move on — never stall a
+            // co-subscriber or the provider.
+            if let Some(p) = &r.pending {
+                match r.tx.try_send(p.to_event()) {
+                    Ok(()) => r.pending = None,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        absorb_drop(&mut r.pending, ev);
+                        continue;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        dead.push(*id);
+                        continue;
+                    }
+                }
+            }
+            match r.tx.try_send(ev.clone()) {
+                Ok(()) => {}
+                // A momentarily-full channel means a slow referrer: record the
+                // loss as a per-instrument `Gap` (delivered when it drains)
+                // rather than dropping it silently.
+                Err(mpsc::error::TrySendError::Full(_)) => absorb_drop(&mut r.pending, ev),
                 Err(mpsc::error::TrySendError::Closed(_)) => dead.push(*id),
             }
         }
@@ -1389,5 +1516,60 @@ mod client_ring_tests {
         assert_eq!(gaps[0].2.from_source_ts, Timestamp(100));
         assert_eq!(gaps[0].2.to_source_ts, Timestamp(201));
         assert_eq!(events.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod fanout_tests {
+    use super::{FanOut, SubscriberId};
+    use datamancer_core::{
+        AssetClass, ControlKind, Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
+    };
+    use tokio::sync::mpsc;
+
+    fn inst(symbol: &str) -> Instrument {
+        Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, symbol)
+    }
+
+    fn trade(ts: i64, seq: u64) -> MarketEvent {
+        MarketEvent::Trade(Trade {
+            instrument: inst("AAPL"),
+            source_ts: Timestamp(ts),
+            rx_ts: Timestamp(ts),
+            seq: Seq(seq),
+            price: Price::from_f64_round(1.0),
+            size: 1,
+        })
+    }
+
+    #[test]
+    fn full_channel_surfaces_loss_as_gap_not_silent_drop() {
+        // A slow referrer's full channel must not silently lose data: the dropped
+        // event becomes a per-instrument Gap, delivered ahead of resumed events.
+        let mut fo = FanOut::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        fo.add(SubscriberId(1), tx);
+
+        fo.fanout(&trade(100, 0)); // delivered; the single slot is now full
+        fo.fanout(&trade(200, 1)); // channel full -> recorded as pending loss
+
+        // Drain the delivered event, freeing the slot.
+        assert_eq!(rx.try_recv().unwrap().seq(), Some(Seq(0)));
+
+        // The next fan-out flushes the owed Gap before anything else.
+        fo.fanout(&trade(300, 2));
+        match rx.try_recv().unwrap() {
+            MarketEvent::Control(c) => match c.kind {
+                ControlKind::Gap {
+                    instrument, span, ..
+                } => {
+                    assert_eq!(c.seq, Seq(1)); // hole start = first lost seq
+                    assert_eq!(instrument, inst("AAPL"));
+                    assert_eq!(span.from_source_ts, Timestamp(200));
+                }
+                other => panic!("expected Gap, got {other:?}"),
+            },
+            other => panic!("expected a Control::Gap, got {other:?}"),
+        }
     }
 }

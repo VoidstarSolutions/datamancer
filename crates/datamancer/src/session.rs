@@ -305,6 +305,8 @@ impl Datamancer {
                     fanout: None,
                     stats: Arc::new(LiveStats::new()),
                     accounting,
+                    connection_up: false,
+                    connection_seen: false,
                 };
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
                 Ok(Session {
@@ -464,6 +466,8 @@ impl Datamancer {
             fanout: Some(fanout),
             stats,
             accounting: accounting.clone(),
+            connection_up: false,
+            connection_seen: false,
         };
         let backfill_from = match scope {
             Scope::Live { backfill_from } => backfill_from,
@@ -1107,6 +1111,14 @@ struct Controller {
     /// Shared (cloned `Arc`) with `DatamancerInner` and every other controller
     /// for the same provider.
     accounting: Arc<ProviderAccounting>,
+    /// This controller's own connection phase, used to drive provider-level
+    /// connection accounting correctly across substreams. `true` once a
+    /// `ProviderConnected` is seen without an intervening `ProviderDisconnected`.
+    connection_up: bool,
+    /// Whether this controller has ever been connected, so a later
+    /// `ProviderConnected` is classified as a reconnect rather than a first
+    /// connect.
+    connection_seen: bool,
 }
 
 impl Controller {
@@ -1847,10 +1859,27 @@ impl Controller {
     /// the live tail lands in the log (backfill data belongs to the cache).
     async fn forward(&mut self, ev: MarketEvent) {
         let ev = self.stamp(ev);
+        // Drive per-provider connection accounting from this controller's own
+        // up/down phase, so one substream's drop never marks the whole provider
+        // down and a second substream's first connect is never a reconnect.
+        if let MarketEvent::Control(c) = &ev {
+            match &c.kind {
+                ControlKind::ProviderConnected { .. } if !self.connection_up => {
+                    let reconnect = self.connection_seen;
+                    self.connection_up = true;
+                    self.connection_seen = true;
+                    self.accounting.record_connection_up(reconnect);
+                }
+                ControlKind::ProviderDisconnected { .. } if self.connection_up => {
+                    self.connection_up = false;
+                    self.accounting.record_connection_down();
+                }
+                _ => {}
+            }
+        }
         // Stream-derived provider accounting: messages count as live-data
         // throughput only on the authoritative live path (fan-out present);
-        // connection/reconnect/gap/error state is derived from in-band Control
-        // regardless of scope.
+        // gap/error state is derived from in-band Control regardless of scope.
         self.accounting.record_forwarded(&ev, self.fanout.is_some());
         self.tee(&ev).await;
         self.deliver(ev).await;
