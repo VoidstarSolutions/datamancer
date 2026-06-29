@@ -1,0 +1,1272 @@
+//! Client sessions, authoritative sessions, and the multiplex controller.
+//!
+//! Phase 2 introduces the **client session** as the primary consumer handle: it
+//! holds a mutable set of `(instrument, kind)` subscriptions and presents **one
+//! multiplexed stream** combining them. The authoritative per-`(instrument,
+//! kind)` session is the deterministic singleton that owns the provider
+//! connection and stamps `seq` at the source; client sessions (and the retained
+//! single-pair [`crate::Session`] on its live path) are **refcounted
+//! referrers** onto it.
+//!
+//! # Ordering
+//!
+//! The multiplex **interleaves** — it does not merge-sort. The ordering key is
+//! `(instrument, seq)`: monotonic *within* each instrument (source-stamped, from
+//! Phase 1), arrival-order across instruments. There is no cross-symbol order to
+//! compute, which is what makes the interleave cheap.
+//!
+//! # Lifecycle
+//!
+//! The authoritative session lives while at least one referrer holds a
+//! [`SubscriberGuard`]. The authoritative controller holds a **`Weak`** view of
+//! its own liveness — it never pins a strong `Arc<AuthoritativeSession>` (that
+//! would deadlock refcounted teardown) and instead treats **fan-out-map
+//! emptiness** as the teardown trigger. When the last referrer drops, the
+//! controller runs upstream `unsubscribe` + `close` and exits, and the
+//! `Arc<AuthoritativeSession>` drop clears the registry slot.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+
+use datamancer_core::{
+    ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, MarketEvent,
+    Result, Seq, Timestamp,
+};
+use futures::StreamExt as _;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::StreamMap;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::session::{
+    Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions, Scope, SessionCommand,
+    default_buffer,
+};
+
+// ---------------------------------------------------------------------------
+// Authoritative session
+// ---------------------------------------------------------------------------
+
+/// Identifies one fan-out subscriber on an [`AuthoritativeSession`]. Allocated
+/// from the session's `AtomicU64`; meaningful only within that session.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct SubscriberId(pub(crate) u64);
+
+/// The deterministic per-`(instrument, kind)` singleton. Owns the provider
+/// connection lifecycle (via its controller), stamps `seq` at the source, tees
+/// to the tap log once, and fans the stamped stream out to every referrer.
+///
+/// Held behind `Arc`; refcounted by [`SubscriberGuard`]s. The registry stores a
+/// `Weak` so a stale slot is distinguishable from a live one. This type absorbs
+/// the former `RegistrySentinel`: its `Drop` clears the registry slot when no
+/// successor has taken it.
+pub(crate) struct AuthoritativeSession {
+    // `instrument`/`kind`/`scope`/`stats` are the Phase 3 diagnostics read
+    // surface (the live-state snapshot iterates the registry and reads them);
+    // Phase 2 only writes them. See the phase-3 plan's "read registry/stats".
+    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    pub(crate) instrument: Instrument,
+    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    pub(crate) kind: EventKind,
+    pub(crate) provider_id: String,
+    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    pub(crate) scope: Scope,
+    /// Command channel to the authoritative controller (`AddSubscriber`,
+    /// `SetPersistence`).
+    cmd_tx: mpsc::Sender<SessionCommand>,
+    /// Subscriber-removal channel. Unbounded so the synchronous
+    /// [`SubscriberGuard::drop`] can signal removal without blocking.
+    remove_tx: mpsc::UnboundedSender<SubscriberId>,
+    next_subscriber_id: AtomicU64,
+    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    pub(crate) stats: Arc<LiveStats>,
+    registry: LiveSessionRegistry,
+    key: (Instrument, EventKind),
+}
+
+impl AuthoritativeSession {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "internal constructor wiring the authoritative session's collaborators"
+    )]
+    pub(crate) fn new(
+        instrument: Instrument,
+        kind: EventKind,
+        provider_id: String,
+        scope: Scope,
+        cmd_tx: mpsc::Sender<SessionCommand>,
+        remove_tx: mpsc::UnboundedSender<SubscriberId>,
+        stats: Arc<LiveStats>,
+        registry: LiveSessionRegistry,
+        key: (Instrument, EventKind),
+    ) -> Self {
+        Self {
+            instrument,
+            kind,
+            provider_id,
+            scope,
+            cmd_tx,
+            remove_tx,
+            next_subscriber_id: AtomicU64::new(0),
+            stats,
+            registry,
+            key,
+        }
+    }
+
+    /// Allocate a fresh subscriber id. Used to pre-seed the opener into the
+    /// fan-out *before* the controller is spawned, so events emitted during a
+    /// creation-time backfill are never fanned out to an empty set.
+    pub(crate) fn alloc_subscriber_id(&self) -> SubscriberId {
+        SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Register a new fan-out subscriber, returning its id and the receiver the
+    /// referrer drains. Fails with [`Error::SessionClosed`] if the controller
+    /// has already torn down.
+    pub(crate) async fn add_subscriber(
+        &self,
+    ) -> Result<(SubscriberId, mpsc::Receiver<MarketEvent>)> {
+        let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = mpsc::channel(default_buffer());
+        let (ack, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::AddSubscriber {
+                id,
+                sender: tx,
+                ack,
+            })
+            .await
+            .map_err(|_| Error::SessionClosed)?;
+        ack_rx.await.map_err(|_| Error::SessionClosed)?;
+        Ok((id, rx))
+    }
+
+    /// Signal removal of a subscriber. Best-effort and non-blocking — invoked
+    /// from [`SubscriberGuard::drop`].
+    fn remove_subscriber(&self, id: SubscriberId) {
+        let _ = self.remove_tx.send(id);
+    }
+
+    /// Replace the authoritative session's persistence options. Shared across
+    /// all referrers (the tap-log tee is a property of the singleton).
+    pub(crate) async fn set_persistence(&self, options: PersistenceOptions) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::SetPersistence(options, tx))
+            .await
+            .map_err(|_| Error::SessionClosed)?;
+        rx.await.map_err(|_| Error::SessionClosed)?
+    }
+}
+
+impl Drop for AuthoritativeSession {
+    fn drop(&mut self) {
+        // The folded `RegistrySentinel` logic: by the time this fires the strong
+        // count for this allocation is 0. If the slot still points at a `Weak`
+        // whose `strong_count() == 0`, it is still ours (no successor took it) —
+        // remove it. A successor's entry is a different allocation with
+        // `strong_count() >= 1`; leave it alone.
+        if let Ok(mut map) = self.registry.lock()
+            && let Some(weak) = map.get(&self.key)
+            && weak.strong_count() == 0
+        {
+            map.remove(&self.key);
+        }
+    }
+}
+
+/// RAII referrer onto an [`AuthoritativeSession`]. Holds a strong `Arc` (keeping
+/// the registry slot non-stale) and the subscriber id. On drop it queues a
+/// `RemoveSubscriber`; when the authoritative fan-out empties, the controller
+/// tears the upstream connection down.
+pub(crate) struct SubscriberGuard {
+    authoritative: Arc<AuthoritativeSession>,
+    id: SubscriberId,
+}
+
+impl SubscriberGuard {
+    pub(crate) fn new(authoritative: Arc<AuthoritativeSession>, id: SubscriberId) -> Self {
+        Self { authoritative, id }
+    }
+
+    pub(crate) fn provider(&self) -> &str {
+        &self.authoritative.provider_id
+    }
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        self.authoritative.remove_subscriber(self.id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live stats (per-symbol atomics; Phase 3 reads these)
+// ---------------------------------------------------------------------------
+
+/// Per-symbol, per-field atomic counters on an [`AuthoritativeSession`].
+///
+/// Lock-free reads for the Phase 3 diagnostics plane; **no composite-consistency
+/// guarantee** across fields (each is read independently). Phase 2 only updates
+/// them; Phase 3 adds the snapshot readers.
+pub(crate) struct LiveStats {
+    has_seq: AtomicBool,
+    last_seq: AtomicU64,
+    has_ts: AtomicBool,
+    last_source_ts: AtomicI64,
+    last_rx_ts: AtomicI64,
+    gap_count: AtomicU64,
+}
+
+impl LiveStats {
+    pub(crate) fn new() -> Self {
+        Self {
+            has_seq: AtomicBool::new(false),
+            last_seq: AtomicU64::new(0),
+            has_ts: AtomicBool::new(false),
+            last_source_ts: AtomicI64::new(0),
+            last_rx_ts: AtomicI64::new(0),
+            gap_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one fan-out event: advance the last-`seq`/timestamps and bump the
+    /// gap counter on a `Control::Gap`.
+    pub(crate) fn record_event(&self, ev: &MarketEvent) {
+        if let Some(seq) = ev.seq() {
+            self.last_seq.store(seq.0, Ordering::Relaxed);
+            self.has_seq.store(true, Ordering::Relaxed);
+        }
+        match ev {
+            MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_) => {
+                if let (Some(source), Some(rx)) = (data_source_ts(ev), data_rx_ts(ev)) {
+                    self.last_source_ts.store(source.0, Ordering::Relaxed);
+                    self.last_rx_ts.store(rx.0, Ordering::Relaxed);
+                    self.has_ts.store(true, Ordering::Relaxed);
+                }
+            }
+            MarketEvent::Control(c) => {
+                if matches!(c.kind, ControlKind::Gap { .. }) {
+                    self.gap_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Last source-stamped `seq` seen, or `None` before any event.
+    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    pub(crate) fn seq_position(&self) -> Option<Seq> {
+        self.has_seq
+            .load(Ordering::Relaxed)
+            .then(|| Seq(self.last_seq.load(Ordering::Relaxed)))
+    }
+
+    /// Last data-event `source_ts`, or `None` before any data event.
+    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    pub(crate) fn last_source_ts(&self) -> Option<Timestamp> {
+        self.has_ts
+            .load(Ordering::Relaxed)
+            .then(|| Timestamp(self.last_source_ts.load(Ordering::Relaxed)))
+    }
+
+    /// Last data-event `rx_ts`, or `None` before any data event.
+    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    pub(crate) fn last_rx_ts(&self) -> Option<Timestamp> {
+        self.has_ts
+            .load(Ordering::Relaxed)
+            .then(|| Timestamp(self.last_rx_ts.load(Ordering::Relaxed)))
+    }
+
+    /// Cumulative `Control::Gap` count for this symbol.
+    #[allow(dead_code, reason = "read by the Phase 3 diagnostics snapshot")]
+    pub(crate) fn gap_count(&self) -> u64 {
+        self.gap_count.load(Ordering::Relaxed)
+    }
+}
+
+fn data_source_ts(ev: &MarketEvent) -> Option<Timestamp> {
+    match ev {
+        MarketEvent::Trade(t) => Some(t.source_ts),
+        MarketEvent::Quote(q) => Some(q.source_ts),
+        MarketEvent::Bar(b) => Some(b.source_ts),
+        _ => None,
+    }
+}
+
+fn data_rx_ts(ev: &MarketEvent) -> Option<Timestamp> {
+    match ev {
+        MarketEvent::Trade(t) => Some(t.rx_ts),
+        MarketEvent::Quote(q) => Some(q.rx_ts),
+        MarketEvent::Bar(b) => Some(b.rx_ts),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fan-out (lives inside the authoritative controller)
+// ---------------------------------------------------------------------------
+
+/// The authoritative controller's consumer-facing side: one bounded channel per
+/// referrer. The controller **`try_send`s** so a slow/wedged referrer never
+/// stalls its co-subscribers or the provider. A referrer that closes its
+/// channel is removed; a referrer whose bounded channel is momentarily full has
+/// the event dropped *for it only* (its own per-client resume buffer is the
+/// backpressure-of-record).
+pub(crate) struct FanOut {
+    subscribers: HashMap<SubscriberId, mpsc::Sender<MarketEvent>>,
+    /// Last per-symbol `SubscriptionChanged { active: true }` (a real,
+    /// source-stamped event), replayed to each new subscriber so a late join
+    /// sees the subscription state without a fresh provider ack.
+    last_subscription_changed: Option<MarketEvent>,
+    /// Set once the first subscriber is added. Distinguishes "never had a
+    /// subscriber yet" (do not tear down) from "last subscriber left".
+    had_subscriber: bool,
+}
+
+impl FanOut {
+    pub(crate) fn new() -> Self {
+        Self {
+            subscribers: HashMap::new(),
+            last_subscription_changed: None,
+            had_subscriber: false,
+        }
+    }
+
+    pub(crate) fn add(&mut self, id: SubscriberId, sender: mpsc::Sender<MarketEvent>) {
+        self.had_subscriber = true;
+        // Replay the cached subscription state to the joiner (best-effort).
+        if let Some(ev) = &self.last_subscription_changed {
+            let _ = sender.try_send(ev.clone());
+        }
+        self.subscribers.insert(id, sender);
+    }
+
+    pub(crate) fn remove(&mut self, id: SubscriberId) {
+        self.subscribers.remove(&id);
+    }
+
+    /// True once a subscriber has been added and the fan-out is now empty —
+    /// the refcounted-teardown trigger.
+    pub(crate) fn should_teardown(&self) -> bool {
+        self.had_subscriber && self.subscribers.is_empty()
+    }
+
+    /// Deliver one fully-stamped event to every referrer. Caches a
+    /// `SubscriptionChanged { active: true }` for late-join replay. Removes any
+    /// referrer whose channel has closed.
+    pub(crate) fn fanout(&mut self, ev: &MarketEvent) {
+        if let MarketEvent::Control(Control {
+            kind: ControlKind::SubscriptionChanged { active: true, .. },
+            ..
+        }) = ev
+        {
+            self.last_subscription_changed = Some(ev.clone());
+        }
+        let mut dead: Vec<SubscriberId> = Vec::new();
+        for (id, tx) in &self.subscribers {
+            match tx.try_send(ev.clone()) {
+                // A momentarily-full channel means a slow referrer: drop for it
+                // only (its own per-client resume buffer is the
+                // backpressure-of-record). Never stall other referrers.
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => dead.push(*id),
+            }
+        }
+        for id in dead {
+            self.subscribers.remove(&id);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-client resume ring (per-instrument gap accounting)
+// ---------------------------------------------------------------------------
+
+/// One affected instrument's eviction record on flush: `(first_evicted_seq,
+/// instrument, span, provider)`.
+type InstrumentGap = (Seq, Instrument, GapSpan, String);
+
+/// The drained contents of a [`ClientRing`]: per-instrument gaps and the
+/// surviving events (each paired with its provider id).
+type RingParts = (Vec<InstrumentGap>, VecDeque<(MarketEvent, String)>);
+
+/// One instrument's eviction accounting inside a [`ClientRing`].
+struct DroppedSpan {
+    span: GapSpan,
+    first_seq: Seq,
+    provider: String,
+}
+
+/// Bounded per-client FIFO with **per-instrument** loss accounting.
+///
+/// A single per-client ring backs the multiplexed stream, but overflow must not
+/// conflate losses across symbols: each evicted data event (or evicted
+/// `Control::Gap`) extends *its instrument's* span and records the first-evicted
+/// `seq` (the hole start). Flush emits one `Control::Gap` per affected
+/// instrument in first-evicted-`seq` order, then replays survivors in arrival
+/// order — neither is renumbered (events are already source-stamped).
+pub(crate) struct ClientRing {
+    capacity: usize,
+    buf: VecDeque<(MarketEvent, String)>,
+    dropped: HashMap<Instrument, DroppedSpan>,
+}
+
+impl ClientRing {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            buf: VecDeque::new(),
+            dropped: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, ev: MarketEvent, provider: String) {
+        if self.buf.len() == self.capacity
+            && let Some((evicted, evicted_provider)) = self.buf.pop_front()
+        {
+            self.note_drop(&evicted, &evicted_provider);
+        }
+        self.buf.push_back((ev, provider));
+    }
+
+    /// Extend the dropped span for the evicted event's instrument. Data events
+    /// count as `[ts, ts+1)`; an evicted `Control::Gap` contributes its embedded
+    /// span (and its own provider id). Non-instrument controls are skipped —
+    /// they are coalesced upstream and carry no market-data span.
+    fn note_drop(&mut self, ev: &MarketEvent, provider: &str) {
+        let (instrument, from, to, gap_provider) = match ev {
+            MarketEvent::Control(Control {
+                kind:
+                    ControlKind::Gap {
+                        instrument,
+                        span,
+                        provider: gap_provider,
+                    },
+                ..
+            }) => (
+                instrument.clone(),
+                span.from_source_ts,
+                span.to_source_ts,
+                gap_provider.clone(),
+            ),
+            MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_) => {
+                let Some(instrument) = data_instrument(ev) else {
+                    return;
+                };
+                let Some(ts) = data_source_ts(ev) else {
+                    return;
+                };
+                (
+                    instrument,
+                    ts,
+                    Timestamp(ts.0.saturating_add(1)),
+                    provider.to_string(),
+                )
+            }
+            _ => return,
+        };
+        let seq = ev.seq().unwrap_or(Seq::SYNTHETIC);
+        match self.dropped.get_mut(&instrument) {
+            Some(existing) => {
+                existing.span.from_source_ts = existing.span.from_source_ts.min(from);
+                existing.span.to_source_ts = existing.span.to_source_ts.max(to);
+            }
+            None => {
+                self.dropped.insert(
+                    instrument,
+                    DroppedSpan {
+                        span: GapSpan {
+                            from_source_ts: from,
+                            to_source_ts: to,
+                        },
+                        first_seq: seq,
+                        provider: gap_provider,
+                    },
+                );
+            }
+        }
+    }
+
+    /// `(gaps, events)`. Gaps are `(first_seq, instrument, span, provider)`
+    /// sorted by first-evicted `seq`; events are the survivors in arrival order
+    /// paired with their provider id.
+    fn into_parts(self) -> RingParts {
+        let mut gaps: Vec<InstrumentGap> = self
+            .dropped
+            .into_iter()
+            .map(|(instrument, d)| (d.first_seq, instrument, d.span, d.provider))
+            .collect();
+        gaps.sort_by_key(|(seq, _, _, _)| seq.0);
+        (gaps, self.buf)
+    }
+}
+
+fn data_instrument(ev: &MarketEvent) -> Option<Instrument> {
+    match ev {
+        MarketEvent::Trade(t) => Some(t.instrument.clone()),
+        MarketEvent::Quote(q) => Some(q.instrument.clone()),
+        MarketEvent::Bar(b) => Some(b.instrument.clone()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client controller (the multiplex)
+// ---------------------------------------------------------------------------
+
+/// Recorded provider connection state for the connection-scoped control
+/// coalescer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnState {
+    Connected,
+    Disconnected,
+}
+
+/// One subscription's referrer state held by the [`ClientController`].
+struct SubEntry {
+    _guard: SubscriberGuard,
+    provider: String,
+}
+
+/// Item type for an interleaved substream: a stamped event, then a terminal
+/// `Ended` marker when the authoritative substream closes (so the controller can
+/// distinguish a closed substream from a merely idle one).
+enum SubMsg {
+    Event(MarketEvent),
+    Ended,
+}
+
+/// Commands to the [`ClientController`] task.
+enum ClientCommand {
+    Subscribe {
+        instrument: Instrument,
+        kind: EventKind,
+        scope: Scope,
+        options: PersistenceOptions,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Unsubscribe {
+        instrument: Instrument,
+        kind: EventKind,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Take(oneshot::Sender<Result<mpsc::Receiver<MarketEvent>>>),
+    Subscriptions(oneshot::Sender<Vec<(Instrument, EventKind)>>),
+    Close(oneshot::Sender<()>),
+}
+
+/// The client-facing delivery side: an attached consumer channel, or a detached
+/// per-client resume ring buffering until the next take.
+enum ClientSink {
+    Attached(mpsc::Sender<MarketEvent>),
+    Detached(ClientRing),
+}
+
+type SubStream = std::pin::Pin<Box<dyn futures::Stream<Item = SubMsg> + Send>>;
+
+/// The multiplex task. Owns the subscription set, the interleave, the
+/// per-client resume buffer, and the connection-scoped control coalescer.
+struct ClientController {
+    dm: Datamancer,
+    cmd_rx: mpsc::Receiver<ClientCommand>,
+    streams: StreamMap<(Instrument, EventKind), SubStream>,
+    entries: HashMap<(Instrument, EventKind), SubEntry>,
+    sink: ClientSink,
+    ring_capacity: usize,
+    seen_provider_state: HashMap<String, ConnState>,
+    last_provider_error: HashMap<String, String>,
+}
+
+fn substream(rx: mpsc::Receiver<MarketEvent>) -> SubStream {
+    Box::pin(
+        ReceiverStream::new(rx)
+            .map(SubMsg::Event)
+            .chain(futures::stream::once(async { SubMsg::Ended })),
+    )
+}
+
+impl ClientController {
+    async fn run(mut self) {
+        loop {
+            tokio::select! {
+                maybe = self.streams.next(), if !self.streams.is_empty() => {
+                    if let Some((key, msg)) = maybe {
+                        match msg {
+                            SubMsg::Event(ev) => self.route(key, ev).await,
+                            SubMsg::Ended => self.handle_substream_end(key).await,
+                        }
+                    }
+                }
+                cmd = self.cmd_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        // Handle dropped without an explicit close: shut down.
+                        self.emit_session_closing().await;
+                        break;
+                    };
+                    if !self.handle_command(cmd).await {
+                        break;
+                    }
+                }
+            }
+        }
+        // Dropping `entries` releases every SubscriberGuard -> authoritative
+        // teardown when each was the last referrer.
+    }
+
+    /// Returns false when the controller should exit.
+    async fn handle_command(&mut self, cmd: ClientCommand) -> bool {
+        match cmd {
+            ClientCommand::Subscribe {
+                instrument,
+                kind,
+                scope,
+                options,
+                reply,
+            } => {
+                let res = self.subscribe(instrument, kind, scope, options).await;
+                let _ = reply.send(res);
+                true
+            }
+            ClientCommand::Unsubscribe {
+                instrument,
+                kind,
+                reply,
+            } => {
+                let res = self.unsubscribe(instrument, kind).await;
+                let _ = reply.send(res);
+                true
+            }
+            ClientCommand::Take(reply) => {
+                match self.prepare_attach() {
+                    Ok((rx, prior)) => {
+                        let _ = reply.send(Ok(rx));
+                        if let Some(ring) = prior {
+                            self.flush_ring(ring).await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+                true
+            }
+            ClientCommand::Subscriptions(reply) => {
+                let _ = reply.send(self.entries.keys().cloned().collect());
+                true
+            }
+            ClientCommand::Close(reply) => {
+                self.emit_session_closing().await;
+                let _ = reply.send(());
+                false
+            }
+        }
+    }
+
+    async fn subscribe(
+        &mut self,
+        instrument: Instrument,
+        kind: EventKind,
+        scope: Scope,
+        options: PersistenceOptions,
+    ) -> Result<()> {
+        let key = (instrument.clone(), kind);
+        if self.entries.contains_key(&key) {
+            return Err(Error::DuplicateSubscription { instrument, kind });
+        }
+        // Phase 2: client subscriptions are pure-live. A shared authoritative
+        // session has one creation-time scope, so a per-client backfill /
+        // historical join would break the identical-`(seq, source_ts)`
+        // guarantee. Reject the unsupported variants with a clear error.
+        if !matches!(
+            scope,
+            Scope::Live {
+                backfill_from: None
+            }
+        ) {
+            return Err(Error::UnsupportedClientScope);
+        }
+        let (_auth, guard, rx) = self
+            .dm
+            .authoritative(instrument.clone(), kind, scope, options)
+            .await?;
+        let provider = guard.provider().to_string();
+        self.entries.insert(
+            key.clone(),
+            SubEntry {
+                _guard: guard,
+                provider,
+            },
+        );
+        self.streams.insert(key, substream(rx));
+        Ok(())
+    }
+
+    async fn unsubscribe(&mut self, instrument: Instrument, kind: EventKind) -> Result<()> {
+        let key = (instrument.clone(), kind);
+        let Some(entry) = self.entries.remove(&key) else {
+            return Err(Error::NotSubscribed { instrument, kind });
+        };
+        let provider = entry.provider.clone();
+        // Drop the guard (-> RemoveSubscriber -> maybe authoritative teardown)
+        // and the substream, then surface a client-local control. This one is
+        // genuinely client-local (the authoritative session stays up for other
+        // clients), so it is synthetic and rides `Seq::SYNTHETIC`.
+        drop(entry);
+        self.streams.remove(&key);
+        self.deliver(
+            subscription_changed(&instrument, kind, &provider, false),
+            provider,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// A substream closed without an explicit unsubscribe (authoritative
+    /// teardown or fan-out removal). Surface a per-symbol
+    /// `SubscriptionChanged { active: false }` and drop the entry. If the key is
+    /// already gone (explicit unsubscribe handled it), this is a no-op.
+    async fn handle_substream_end(&mut self, key: (Instrument, EventKind)) {
+        let Some(entry) = self.entries.remove(&key) else {
+            return;
+        };
+        let provider = entry.provider.clone();
+        drop(entry);
+        self.deliver(
+            subscription_changed(&key.0, key.1, &provider, false),
+            provider,
+        )
+        .await;
+    }
+
+    /// Route one substream event into the per-client stream. Per-symbol controls
+    /// (`Gap`, `SubscriptionChanged`) ride through unchanged; connection-scoped
+    /// controls are coalesced so each distinct transition appears once;
+    /// `SessionClosing` from a substream is suppressed (the client emits its own
+    /// on `close`). **No `seq` stamping, no sorting** — arrival order across
+    /// substreams; `seq` is already source-stamped.
+    async fn route(&mut self, key: (Instrument, EventKind), ev: MarketEvent) {
+        let ring_provider = self
+            .entries
+            .get(&key)
+            .map_or_else(|| key.0.provider().to_string(), |e| e.provider.clone());
+        if let MarketEvent::Control(c) = &ev {
+            match &c.kind {
+                ControlKind::SessionClosing => return,
+                ControlKind::ProviderConnected { provider } => {
+                    if !self.note_conn(provider, ConnState::Connected) {
+                        return;
+                    }
+                }
+                ControlKind::ProviderDisconnected { provider, .. } => {
+                    if !self.note_conn(provider, ConnState::Disconnected) {
+                        return;
+                    }
+                }
+                ControlKind::ProviderError { provider, message } => {
+                    if self.duplicate_error(provider, message) {
+                        return;
+                    }
+                }
+                ControlKind::SubscriptionChanged { .. } | ControlKind::Gap { .. } => {}
+            }
+        }
+        self.deliver(ev, ring_provider).await;
+    }
+
+    /// Returns true when the transition for `provider` is new (forward it).
+    fn note_conn(&mut self, provider: &str, new: ConnState) -> bool {
+        match self.seen_provider_state.get(provider) {
+            Some(current) if *current == new => false,
+            _ => {
+                self.seen_provider_state.insert(provider.to_string(), new);
+                true
+            }
+        }
+    }
+
+    /// Returns true when this `ProviderError` exactly repeats the last one for
+    /// the provider (suppress it).
+    fn duplicate_error(&mut self, provider: &str, message: &str) -> bool {
+        if self
+            .last_provider_error
+            .get(provider)
+            .is_some_and(|last| last == message)
+        {
+            true
+        } else {
+            self.last_provider_error
+                .insert(provider.to_string(), message.to_string());
+            false
+        }
+    }
+
+    /// Deliver one event to the client sink (emit-only — never tee; the tap-log
+    /// tee already ran once at the authoritative source). On a gone/closed
+    /// consumer the sink flips to a detached per-client ring.
+    async fn deliver(&mut self, ev: MarketEvent, provider: String) {
+        let ev = match &self.sink {
+            ClientSink::Attached(tx) if !tx.is_closed() => match tx.send(ev).await {
+                Ok(()) => return,
+                Err(mpsc::error::SendError(ev)) => ev,
+            },
+            _ => ev,
+        };
+        if matches!(self.sink, ClientSink::Attached(_)) {
+            self.sink = ClientSink::Detached(ClientRing::new(self.ring_capacity));
+        }
+        if let ClientSink::Detached(ring) = &mut self.sink {
+            ring.push(ev, provider);
+        }
+    }
+
+    fn prepare_attach(&mut self) -> Result<(mpsc::Receiver<MarketEvent>, Option<ClientRing>)> {
+        if let ClientSink::Attached(tx) = &self.sink
+            && !tx.is_closed()
+        {
+            return Err(Error::EventsAlreadyTaken);
+        }
+        let (tx, rx) = mpsc::channel(default_buffer());
+        let prior = std::mem::replace(&mut self.sink, ClientSink::Attached(tx));
+        Ok((
+            rx,
+            match prior {
+                ClientSink::Detached(ring) => Some(ring),
+                ClientSink::Attached(_) => None,
+            },
+        ))
+    }
+
+    /// Drain a detached ring on re-attach: one `Gap` per affected instrument
+    /// (first-evicted-`seq` order), then survivors in arrival order. Replayed
+    /// events keep their source-stamped `seq` — the eviction `Gap` rides the
+    /// first-evicted slot.
+    async fn flush_ring(&mut self, ring: ClientRing) {
+        let (gaps, events) = ring.into_parts();
+        for (first_seq, instrument, span, provider) in gaps {
+            self.deliver(
+                MarketEvent::Control(Control {
+                    source_ts: span.from_source_ts,
+                    rx_ts: span.from_source_ts,
+                    seq: first_seq,
+                    kind: ControlKind::Gap {
+                        provider: provider.clone(),
+                        instrument,
+                        span,
+                    },
+                }),
+                provider,
+            )
+            .await;
+        }
+        for (ev, provider) in events {
+            self.deliver(ev, provider).await;
+        }
+    }
+
+    async fn emit_session_closing(&mut self) {
+        self.deliver(
+            MarketEvent::Control(Control {
+                source_ts: wall_clock_ts(),
+                rx_ts: wall_clock_ts(),
+                seq: Seq::SYNTHETIC,
+                kind: ControlKind::SessionClosing,
+            }),
+            String::new(),
+        )
+        .await;
+    }
+}
+
+fn subscription_changed(
+    instrument: &Instrument,
+    kind: EventKind,
+    provider: &str,
+    active: bool,
+) -> MarketEvent {
+    MarketEvent::Control(Control {
+        source_ts: wall_clock_ts(),
+        rx_ts: wall_clock_ts(),
+        seq: Seq::SYNTHETIC,
+        kind: ControlKind::SubscriptionChanged {
+            provider: provider.to_string(),
+            instrument: instrument.clone(),
+            kind,
+            active,
+        },
+    })
+}
+
+fn wall_clock_ts() -> Timestamp {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i64 nanos since epoch representable until year 2262"
+        )]
+        let n = d.as_nanos() as i64;
+        n
+    });
+    Timestamp(nanos)
+}
+
+// ---------------------------------------------------------------------------
+// Client handle + public ClientSession
+// ---------------------------------------------------------------------------
+
+/// A seed subscription handed to [`spawn_client`]: the pair, its referrer guard,
+/// the authoritative substream receiver, and the provider id.
+type SeedSubscription = (
+    (Instrument, EventKind),
+    SubscriberGuard,
+    mpsc::Receiver<MarketEvent>,
+    String,
+);
+
+/// Internal handle to a spawned [`ClientController`]. Shared by the public
+/// [`ClientSession`] and the retained single-pair [`crate::Session`] on its live
+/// path.
+pub(crate) struct ClientHandle {
+    cmd_tx: mpsc::Sender<ClientCommand>,
+    id: ClientSessionId,
+}
+
+impl ClientHandle {
+    pub(crate) fn id(&self) -> ClientSessionId {
+        self.id
+    }
+
+    pub(crate) async fn take_events(&self) -> Result<EventStream> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ClientCommand::Take(tx))
+            .await
+            .map_err(|_| Error::SessionClosed)?;
+        let receiver = rx.await.map_err(|_| Error::SessionClosed)??;
+        Ok(EventStream::new(receiver))
+    }
+
+    pub(crate) async fn subscribe(
+        &self,
+        instrument: Instrument,
+        kind: EventKind,
+        scope: Scope,
+        options: PersistenceOptions,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ClientCommand::Subscribe {
+                instrument,
+                kind,
+                scope,
+                options,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| Error::SessionClosed)?;
+        rx.await.map_err(|_| Error::SessionClosed)?
+    }
+
+    pub(crate) async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ClientCommand::Unsubscribe {
+                instrument,
+                kind,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| Error::SessionClosed)?;
+        rx.await.map_err(|_| Error::SessionClosed)?
+    }
+
+    pub(crate) async fn subscriptions(&self) -> Vec<(Instrument, EventKind)> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ClientCommand::Subscriptions(tx))
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    pub(crate) async fn close(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.cmd_tx.send(ClientCommand::Close(tx)).await;
+        let _ = rx.await;
+        Ok(())
+    }
+}
+
+/// Spawn a [`ClientController`] with an optional seed subscription. The seed is
+/// used by the single-pair live [`crate::Session`] (which carries its own
+/// authoritative referrer); a bare [`ClientSession`] starts empty.
+pub(crate) fn spawn_client(
+    dm: Datamancer,
+    ring_capacity: usize,
+    seed: Option<SeedSubscription>,
+) -> ClientHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel(default_buffer());
+    let mut entries = HashMap::new();
+    let mut streams = StreamMap::new();
+    if let Some((key, guard, rx, provider)) = seed {
+        entries.insert(
+            key.clone(),
+            SubEntry {
+                _guard: guard,
+                provider,
+            },
+        );
+        streams.insert(key, substream(rx));
+    }
+    let controller = ClientController {
+        dm,
+        cmd_rx,
+        streams,
+        entries,
+        sink: ClientSink::Detached(ClientRing::new(ring_capacity)),
+        ring_capacity,
+        seen_provider_state: HashMap::new(),
+        last_provider_error: HashMap::new(),
+    };
+    tokio::spawn(controller.run());
+    ClientHandle {
+        cmd_tx,
+        id: ClientSessionId::next(),
+    }
+}
+
+/// The primary consumer handle: a mutable set of `(instrument, kind)`
+/// subscriptions presented as **one multiplexed stream**. Single-owner; not
+/// `Clone`, mirroring [`crate::Session`].
+///
+/// Determinism is **per symbol only**: each instrument's substream is
+/// `seq`-monotonic (source-stamped); there is no cross-instrument ordering
+/// (arrival order). Subscriptions are pure-live in Phase 2.
+pub struct ClientSession {
+    handle: ClientHandle,
+}
+
+impl ClientSession {
+    pub(crate) fn new(handle: ClientHandle) -> Self {
+        Self { handle }
+    }
+
+    /// Add a subscription to this client's set.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::DuplicateSubscription`] — `(instrument, kind)` is already in
+    ///   this client's set.
+    /// - [`Error::UnsupportedClientScope`] — Phase 2 client subscriptions are
+    ///   pure-live; `Scope::Historical` and `Live { backfill_from: Some(_) }`
+    ///   are rejected.
+    /// - [`Error::UnsupportedEventKind`] — no provider serves the pair.
+    /// - [`Error::SessionClosed`] — the controller has shut down.
+    pub async fn subscribe(
+        &self,
+        instrument: Instrument,
+        kind: EventKind,
+        scope: Scope,
+        options: PersistenceOptions,
+    ) -> Result<()> {
+        self.handle
+            .subscribe(instrument, kind, scope, options)
+            .await
+    }
+
+    /// Remove a subscription. Emits a client-local
+    /// `SubscriptionChanged { active: false }` for the symbol.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotSubscribed`] — the pair is not in this client's set.
+    /// - [`Error::SessionClosed`] — the controller has shut down.
+    pub async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
+        self.handle.unsubscribe(instrument, kind).await
+    }
+
+    /// Take the multiplexed event stream. Multi-shot: dropping the stream
+    /// detaches the consumer (events buffer into the per-client resume ring); a
+    /// later call re-attaches, first surfacing one `Gap` per affected instrument
+    /// for anything the buffer evicted.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::EventsAlreadyTaken`] — a previous stream is still open.
+    /// - [`Error::SessionClosed`] — the controller has shut down.
+    pub async fn take_events(&self) -> Result<EventStream> {
+        self.handle.take_events().await
+    }
+
+    /// The current subscription set (for introspection).
+    pub async fn subscriptions(&self) -> Vec<(Instrument, EventKind)> {
+        self.handle.subscriptions().await
+    }
+
+    /// This client session's process-scoped id.
+    #[must_use]
+    pub fn id(&self) -> ClientSessionId {
+        self.handle.id()
+    }
+
+    /// Explicit termination. Emits a single `Control::SessionClosing` then tears
+    /// down every subscription (releasing the authoritative refcounts).
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; the `Result` shape is reserved for future
+    /// flush-error reporting.
+    pub async fn close(self) -> Result<()> {
+        self.handle.close().await
+    }
+}
+
+#[cfg(test)]
+mod live_stats_tests {
+    use super::LiveStats;
+    use datamancer_core::{
+        AssetClass, Control, ControlKind, GapSpan, Instrument, MarketEvent, Price, ProviderId, Seq,
+        Timestamp, Trade,
+    };
+
+    fn trade(ts: i64, seq: u64) -> MarketEvent {
+        MarketEvent::Trade(Trade {
+            instrument: Instrument::new(ProviderId::from_static("t"), AssetClass::Equity, "X"),
+            source_ts: Timestamp(ts),
+            rx_ts: Timestamp(ts + 5),
+            seq: Seq(seq),
+            price: Price::from_f64_round(1.0),
+            size: 1,
+        })
+    }
+
+    fn gap() -> MarketEvent {
+        MarketEvent::Control(Control {
+            source_ts: Timestamp(0),
+            rx_ts: Timestamp(0),
+            seq: Seq(7),
+            kind: ControlKind::Gap {
+                provider: "t".to_string(),
+                instrument: Instrument::new(ProviderId::from_static("t"), AssetClass::Equity, "X"),
+                span: GapSpan {
+                    from_source_ts: Timestamp(1),
+                    to_source_ts: Timestamp(2),
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn starts_empty() {
+        let s = LiveStats::new();
+        assert_eq!(s.seq_position(), None);
+        assert_eq!(s.last_source_ts(), None);
+        assert_eq!(s.last_rx_ts(), None);
+        assert_eq!(s.gap_count(), 0);
+    }
+
+    #[test]
+    fn records_data_and_gaps() {
+        let s = LiveStats::new();
+        s.record_event(&trade(100, 0));
+        s.record_event(&trade(200, 1));
+        assert_eq!(s.seq_position(), Some(Seq(1)));
+        assert_eq!(s.last_source_ts(), Some(Timestamp(200)));
+        assert_eq!(s.last_rx_ts(), Some(Timestamp(205)));
+        assert_eq!(s.gap_count(), 0);
+        s.record_event(&gap());
+        assert_eq!(s.gap_count(), 1);
+        // The gap also occupies a seq slot.
+        assert_eq!(s.seq_position(), Some(Seq(7)));
+    }
+}
+
+#[cfg(test)]
+mod client_ring_tests {
+    use super::ClientRing;
+    use datamancer_core::{
+        AssetClass, Control, ControlKind, GapSpan, Instrument, MarketEvent, Price, ProviderId, Seq,
+        Timestamp, Trade,
+    };
+
+    fn inst(symbol: &str) -> Instrument {
+        Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, symbol)
+    }
+
+    fn trade(symbol: &str, ts: i64, seq: u64) -> MarketEvent {
+        MarketEvent::Trade(Trade {
+            instrument: inst(symbol),
+            source_ts: Timestamp(ts),
+            rx_ts: Timestamp(ts),
+            seq: Seq(seq),
+            price: Price::from_f64_round(1.0),
+            size: 1,
+        })
+    }
+
+    fn gap(symbol: &str, seq: u64, from: i64, to: i64) -> MarketEvent {
+        MarketEvent::Control(Control {
+            source_ts: Timestamp(from),
+            rx_ts: Timestamp(from),
+            seq: Seq(seq),
+            kind: ControlKind::Gap {
+                provider: "p".to_string(),
+                instrument: inst(symbol),
+                span: GapSpan {
+                    from_source_ts: Timestamp(from),
+                    to_source_ts: Timestamp(to),
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn under_capacity_records_no_gaps() {
+        let mut ring = ClientRing::new(4);
+        ring.push(trade("AAPL", 100, 0), "p".to_string());
+        ring.push(trade("MSFT", 200, 1), "p".to_string());
+        let (gaps, events) = ring.into_parts();
+        assert!(gaps.is_empty());
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn overflow_accounts_per_instrument() {
+        // Capacity 2; interleave two instruments and overflow so each loses one.
+        let mut ring = ClientRing::new(2);
+        ring.push(trade("AAPL", 100, 0), "p".to_string()); // evicted
+        ring.push(trade("MSFT", 200, 1), "p".to_string()); // evicted
+        ring.push(trade("AAPL", 300, 2), "p".to_string());
+        ring.push(trade("MSFT", 400, 3), "p".to_string());
+        let (gaps, events) = ring.into_parts();
+        // Two affected instruments -> two spans, in first-evicted-seq order.
+        assert_eq!(gaps.len(), 2);
+        assert_eq!(gaps[0].0, Seq(0)); // AAPL evicted first
+        assert_eq!(gaps[0].1, inst("AAPL"));
+        assert_eq!(gaps[0].2.from_source_ts, Timestamp(100));
+        assert_eq!(gaps[0].2.to_source_ts, Timestamp(101));
+        assert_eq!(gaps[1].0, Seq(1)); // MSFT evicted second
+        assert_eq!(gaps[1].1, inst("MSFT"));
+        assert_eq!(gaps[1].2.from_source_ts, Timestamp(200));
+        assert_eq!(gaps[1].2.to_source_ts, Timestamp(201));
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn evicted_gap_control_folds_into_its_instrument() {
+        let mut ring = ClientRing::new(1);
+        ring.push(gap("AAPL", 5, 100, 201), "p".to_string());
+        ring.push(trade("AAPL", 300, 6), "p".to_string()); // evicts the gap control
+        let (gaps, events) = ring.into_parts();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].1, inst("AAPL"));
+        assert_eq!(gaps[0].2.from_source_ts, Timestamp(100));
+        assert_eq!(gaps[0].2.to_source_ts, Timestamp(201));
+        assert_eq!(events.len(), 1);
+    }
+}

@@ -40,6 +40,10 @@
 //!
 //! Explicit [`Session::close`] is always available for forced termination.
 
+use crate::client::{
+    AuthoritativeSession, ClientHandle, ClientSession, FanOut, LiveStats, SubscriberGuard,
+    SubscriberId, spawn_client,
+};
 use crate::fetch_locks::FetchLocks;
 
 use std::collections::HashMap;
@@ -189,8 +193,8 @@ struct DatamancerInner {
     fetch_locks: FetchLocks,
 }
 
-type LiveSessionRegistry =
-    Arc<std::sync::Mutex<HashMap<(Instrument, EventKind), Weak<RegistrySentinel>>>>;
+pub(crate) type LiveSessionRegistry =
+    Arc<std::sync::Mutex<HashMap<(Instrument, EventKind), Weak<AuthoritativeSession>>>>;
 
 impl Datamancer {
     #[must_use]
@@ -231,110 +235,211 @@ impl Datamancer {
             return Err(Error::PersistenceRequired);
         }
 
-        let provider = self.route(&instrument, kind)?;
+        match scope {
+            Scope::Historical { from, to } => {
+                // Historical sessions do not participate in the live registry
+                // (concurrent reads for the same pair run independently) and keep
+                // the single-consumer controller verbatim.
+                let provider = self.route(&instrument, kind)?;
+                let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(8);
+                let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
+                let inner = Arc::new(SessionInner {
+                    instrument: instrument.clone(),
+                    kind,
+                    scope,
+                    events_holder: Mutex::new(Some(events_rx)),
+                    persistence: std::sync::Mutex::new(options),
+                    stream_taken: std::sync::atomic::AtomicBool::new(false),
+                    cmd_tx,
+                    adjustment: self.inner.adjustment,
+                });
+                let (provider_tx, provider_rx) = mpsc::channel::<MarketEvent>(default_buffer());
+                let controller = Controller {
+                    inner: inner.clone(),
+                    provider,
+                    tap_log: self.inner.tap_log.clone(),
+                    historical_cache: self.inner.historical_cache.clone(),
+                    sink: Sink::Attached(InProcessSink { tx: events_tx }),
+                    ring_capacity: self.inner.resume_buffer_events,
+                    fetch_locks: self.inner.fetch_locks.clone(),
+                    next_seq: 0,
+                    fanout: None,
+                    stats: Arc::new(LiveStats::new()),
+                };
+                tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
+                Ok(Session {
+                    variant: SessionVariant::Historical(HistoricalSession { inner }),
+                })
+            }
+            Scope::Live { .. } => {
+                // Live sessions are refcounted referrers onto the shared
+                // authoritative session: a second opener for the same pair shares
+                // it (no longer `LiveSessionConflict`). The single-pair `Session`
+                // is implemented as a one-subscription client referrer.
+                let (authoritative, guard, rx) = self
+                    .authoritative(instrument.clone(), kind, scope, options)
+                    .await?;
+                let provider = authoritative.provider_id.clone();
+                let handle = spawn_client(
+                    self.clone(),
+                    self.inner.resume_buffer_events,
+                    Some(((instrument.clone(), kind), guard, rx, provider)),
+                );
+                Ok(Session {
+                    variant: SessionVariant::Live(LiveSession {
+                        handle,
+                        authoritative,
+                        instrument,
+                        kind,
+                        scope,
+                        persistence: std::sync::Mutex::new(options),
+                    }),
+                })
+            }
+        }
+    }
 
-        // Probe-and-reserve the live-session registry slot. Only `Scope::Live`
-        // participates: concurrent historical fetches for the same pair are
-        // stateless reads with no conflict. The lock is held across probe and
-        // insert so two concurrent `session()` calls can't both reserve.
-        let registry_anchor = if matches!(scope, Scope::Live { .. }) {
-            let key = (instrument.clone(), kind);
+    /// Create-or-share the authoritative session for a live `(instrument, kind)`
+    /// pair and register one subscriber. The lock is held across probe-and-decide
+    /// so two concurrent openers cannot both create; the share path adds a
+    /// subscriber to the existing session, the create path starts a fresh
+    /// provider connection.
+    pub(crate) async fn authoritative(
+        &self,
+        instrument: Instrument,
+        kind: EventKind,
+        scope: Scope,
+        options: PersistenceOptions,
+    ) -> Result<(
+        Arc<AuthoritativeSession>,
+        SubscriberGuard,
+        mpsc::Receiver<MarketEvent>,
+    )> {
+        let provider = self.route(&instrument, kind)?;
+        let key = (instrument.clone(), kind);
+
+        // Probe under the lock; if a live session exists, try to share it.
+        let existing = {
+            let map = self
+                .inner
+                .live_sessions
+                .lock()
+                .expect("live-session registry mutex poisoned");
+            map.get(&key).and_then(Weak::upgrade)
+        };
+        if let Some(existing) = existing
+            && let Ok((id, rx)) = existing.add_subscriber().await
+        {
+            let guard = SubscriberGuard::new(existing.clone(), id);
+            return Ok((existing, guard, rx));
+        }
+
+        self.create_authoritative(provider, instrument, kind, scope, options, key)
+            .await
+    }
+
+    async fn create_authoritative(
+        &self,
+        provider: Arc<dyn Provider>,
+        instrument: Instrument,
+        kind: EventKind,
+        scope: Scope,
+        options: PersistenceOptions,
+        key: (Instrument, EventKind),
+    ) -> Result<(
+        Arc<AuthoritativeSession>,
+        SubscriberGuard,
+        mpsc::Receiver<MarketEvent>,
+    )> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(default_buffer());
+        let (remove_tx, remove_rx) = mpsc::unbounded_channel::<SubscriberId>();
+        let stats = Arc::new(LiveStats::new());
+        let authoritative = Arc::new(AuthoritativeSession::new(
+            instrument.clone(),
+            kind,
+            provider.id().to_string(),
+            scope,
+            cmd_tx.clone(),
+            remove_tx,
+            stats.clone(),
+            self.inner.live_sessions.clone(),
+            key.clone(),
+        ));
+
+        // Re-check under the lock and either defer to a racing winner or claim
+        // the slot. Our `authoritative` has spawned nothing yet, so discarding
+        // it on a lost race is free. The guard is dropped before any await.
+        let winner = {
             let mut map = self
                 .inner
                 .live_sessions
                 .lock()
                 .expect("live-session registry mutex poisoned");
-            if let Some(weak) = map.get(&key)
-                && weak.strong_count() > 0
-            {
-                return Err(Error::LiveSessionConflict { instrument, kind });
+            if let Some(winner) = map.get(&key).and_then(Weak::upgrade) {
+                Some(winner)
+            } else {
+                map.insert(key, Arc::downgrade(&authoritative));
+                None
             }
-            let anchor = Arc::new(RegistrySentinel {
-                registry: self.inner.live_sessions.clone(),
-                key: key.clone(),
-            });
-            map.insert(key, Arc::downgrade(&anchor));
-            // Drop the guard before any await: if `provider.start_live()` /
-            // `live.subscribe()` below errors, the local `anchor` drops as the
-            // function returns and `RegistrySentinel::drop` clears the entry.
-            drop(map);
-            Some(anchor)
-        } else {
-            None
         };
+        if let Some(winner) = winner {
+            let (id, rx) = winner.add_subscriber().await?;
+            let guard = SubscriberGuard::new(winner.clone(), id);
+            return Ok((winner, guard, rx));
+        }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(8);
+        // Pre-seed the opener as the first fan-out subscriber *before* spawning
+        // the controller, so events emitted during a creation-time backfill (a
+        // covered cache segment can stream immediately) are never lost to an
+        // empty fan-out. Later referrers join via `AddSubscriber`.
+        let first_id = authoritative.alloc_subscriber_id();
+        let (first_tx, first_rx) = mpsc::channel::<MarketEvent>(default_buffer());
+        let mut fanout = FanOut::new();
+        fanout.add(first_id, first_tx);
 
-        // Historical sessions pre-create the consumer channel (single-shot
-        // take from the slot). Live sessions start Detached and attach via
-        // SessionCommand::Take, so events before the first take are buffered.
-        let (sink, events_slot) = match scope {
-            Scope::Historical { .. } => {
-                let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
-                (
-                    Sink::Attached(InProcessSink { tx: events_tx }),
-                    Some(events_rx),
-                )
-            }
-            Scope::Live { .. } => (
-                Sink::Detached(EventRing::new(self.inner.resume_buffer_events)),
-                None,
-            ),
-        };
-
+        // Lock released. Start the provider connection and spawn the controller.
+        // On error, `authoritative` drops as we return and its `Drop` clears the
+        // registry slot.
         let inner = Arc::new(SessionInner {
             instrument: instrument.clone(),
             kind,
             scope,
-            events_holder: Mutex::new(events_slot),
+            events_holder: Mutex::new(None),
             persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
             cmd_tx,
             adjustment: self.inner.adjustment,
         });
-
-        // Provider tasks push raw events into `provider_tx`. The controller
-        // drains `provider_rx`, optionally tees to persistence, and forwards
-        // to the consumer-facing sink. Keeping these separate is what gives
-        // the controller a place to interpose.
         let (provider_tx, provider_rx) = mpsc::channel::<MarketEvent>(default_buffer());
-
         let controller = Controller {
-            inner: inner.clone(),
+            inner,
             provider: provider.clone(),
             tap_log: self.inner.tap_log.clone(),
             historical_cache: self.inner.historical_cache.clone(),
-            sink,
+            sink: Sink::Detached(EventRing::new(1)),
             ring_capacity: self.inner.resume_buffer_events,
             fetch_locks: self.inner.fetch_locks.clone(),
             next_seq: 0,
+            fanout: Some(fanout),
+            stats,
         };
-
-        let drop_guard = match scope {
-            Scope::Historical { from, to } => {
-                tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
-                None
-            }
-            Scope::Live { backfill_from } => {
-                let live = provider.start_live(provider_tx).await?;
-                live.subscribe(instrument.clone(), kind).await?;
-                let (drop_tx, drop_rx) = oneshot::channel::<()>();
-                tokio::spawn(controller.run_live(
-                    live,
-                    backfill_from,
-                    provider_rx,
-                    cmd_rx,
-                    drop_rx,
-                ));
-                Some(drop_tx)
-            }
+        let backfill_from = match scope {
+            Scope::Live { backfill_from } => backfill_from,
+            Scope::Historical { .. } => None,
         };
+        let live = provider.start_live(provider_tx).await?;
+        live.subscribe(instrument, kind).await?;
+        tokio::spawn(controller.run_live(live, backfill_from, provider_rx, cmd_rx, remove_rx));
 
-        Ok(Session {
-            inner,
-            _registry_anchor: registry_anchor,
-            _drop_guard: drop_guard,
-        })
+        let guard = SubscriberGuard::new(authoritative.clone(), first_id);
+        Ok((authoritative, guard, first_rx))
+    }
+
+    /// Open a new multiplexing [`ClientSession`] with an empty subscription set.
+    #[must_use]
+    pub fn client_session(&self) -> ClientSession {
+        let handle = spawn_client(self.clone(), self.inner.resume_buffer_events, None);
+        ClientSession::new(handle)
     }
 
     /// Look up a registered provider by id.
@@ -513,18 +618,36 @@ impl DatamancerBuilder {
 // Session handle
 // ---------------------------------------------------------------------------
 
-/// A handle to a running session. Single-owner; not `Clone`.
+/// A handle to a running session for one `(instrument, kind)` pair. Single-owner;
+/// not `Clone`.
+///
+/// `Scope::Historical` keeps the single-consumer controller (fetch/stream
+/// anchored). `Scope::Live` is a one-subscription **referrer** onto the shared
+/// authoritative session: dropping the handle releases the referrer, and the
+/// authoritative session tears down when its last referrer leaves.
 pub struct Session {
+    variant: SessionVariant,
+}
+
+enum SessionVariant {
+    Historical(HistoricalSession),
+    Live(LiveSession),
+}
+
+struct HistoricalSession {
     inner: Arc<SessionInner>,
-    /// Keeps the live-session registry slot occupied for the lifetime of this
-    /// `Session`. `None` for `Scope::Historical` (no registry participation).
-    /// On drop, [`RegistrySentinel::drop`] clears the slot if no successor has
-    /// taken it.
-    _registry_anchor: Option<Arc<RegistrySentinel>>,
-    /// Dropped (without firing) when this handle drops; the live controller
-    /// treats closure of this channel as the teardown signal. `None` for
-    /// `Scope::Historical`, whose lifecycle stays fetch/stream-anchored.
-    _drop_guard: Option<oneshot::Sender<()>>,
+}
+
+struct LiveSession {
+    handle: ClientHandle,
+    authoritative: Arc<AuthoritativeSession>,
+    instrument: Instrument,
+    kind: EventKind,
+    scope: Scope,
+    /// Locally cached persistence options for the synchronous getter. The
+    /// authoritative session is the source of truth (shared across referrers);
+    /// the single-owner live `Session` keeps this in step via `set_persistence`.
+    persistence: std::sync::Mutex<PersistenceOptions>,
 }
 
 struct SessionInner {
@@ -571,48 +694,59 @@ impl Session {
     ///   outstanding and open (live), or was already taken (historical).
     /// - [`Error::SessionClosed`] — the controller has shut down.
     pub async fn take_events(&self) -> Result<EventStream> {
-        let rx = match self.inner.scope {
-            Scope::Historical { .. } => self
-                .inner
-                .events_holder
-                .lock()
-                .await
-                .take()
-                .ok_or(Error::EventsAlreadyTaken)
-                .inspect(|_| {
-                    self.inner
-                        .stream_taken
-                        .store(true, std::sync::atomic::Ordering::Release);
-                })?,
-            Scope::Live { .. } => {
-                let (ack_tx, ack_rx) = oneshot::channel();
-                self.inner
-                    .cmd_tx
-                    .send(SessionCommand::Take(ack_tx))
+        match &self.variant {
+            SessionVariant::Historical(h) => {
+                let rx = h
+                    .inner
+                    .events_holder
+                    .lock()
                     .await
-                    .map_err(|_| Error::SessionClosed)?;
-                ack_rx.await.map_err(|_| Error::SessionClosed)??
+                    .take()
+                    .ok_or(Error::EventsAlreadyTaken)
+                    .inspect(|_| {
+                        h.inner
+                            .stream_taken
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    })?;
+                Ok(EventStream::new(rx))
             }
-        };
-        Ok(EventStream { rx })
+            SessionVariant::Live(l) => l.handle.take_events().await,
+        }
     }
 
     /// Replace the persistence options at runtime. Affects future writes;
     /// an in-flight historical fetch keeps the plan it started with.
+    ///
+    /// For a live session the tap-log tee is a property of the shared
+    /// authoritative session, so this updates it for every referrer.
     ///
     /// # Errors
     ///
     /// Returns `Error::PersistenceRequired` if the new options require a cache
     /// that is not configured; `Error::SessionClosed` if the controller has
     /// shut down.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persistence mutex is poisoned (a prior panic inside a
+    /// persistence-holding code path).
     pub async fn set_persistence(&self, options: PersistenceOptions) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .cmd_tx
-            .send(SessionCommand::SetPersistence(options, tx))
-            .await
-            .map_err(|_| Error::SessionClosed)?;
-        rx.await.map_err(|_| Error::SessionClosed)?
+        match &self.variant {
+            SessionVariant::Historical(h) => {
+                let (tx, rx) = oneshot::channel();
+                h.inner
+                    .cmd_tx
+                    .send(SessionCommand::SetPersistence(options, tx))
+                    .await
+                    .map_err(|_| Error::SessionClosed)?;
+                rx.await.map_err(|_| Error::SessionClosed)?
+            }
+            SessionVariant::Live(l) => {
+                l.authoritative.set_persistence(options).await?;
+                *l.persistence.lock().expect("persistence mutex poisoned") = options;
+                Ok(())
+            }
+        }
     }
 
     /// Returns the current persistence options for this session.
@@ -623,41 +757,57 @@ impl Session {
     /// inside a persistence-holding code path).
     #[must_use]
     pub fn persistence(&self) -> PersistenceOptions {
-        *self
-            .inner
-            .persistence
-            .lock()
-            .expect("persistence mutex poisoned")
+        match &self.variant {
+            SessionVariant::Historical(h) => *h
+                .inner
+                .persistence
+                .lock()
+                .expect("persistence mutex poisoned"),
+            SessionVariant::Live(l) => *l.persistence.lock().expect("persistence mutex poisoned"),
+        }
     }
 
     /// Explicit termination. Auto-cleanup also handles natural-completion
-    /// cases (historical fetch exhausted, or live + stream-dropped +
-    /// with no persistence configured).
+    /// cases (historical fetch exhausted, or live + handle-dropped).
     ///
     /// # Errors
     ///
     /// Currently infallible; the `Result` shape is reserved for future
     /// flush-error reporting from persistence sinks.
     pub async fn close(self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.inner.cmd_tx.send(SessionCommand::Close(tx)).await;
-        let _ = rx.await;
-        Ok(())
+        match &self.variant {
+            SessionVariant::Historical(h) => {
+                let (tx, rx) = oneshot::channel();
+                let _ = h.inner.cmd_tx.send(SessionCommand::Close(tx)).await;
+                let _ = rx.await;
+                Ok(())
+            }
+            SessionVariant::Live(l) => l.handle.close().await,
+        }
     }
 
     #[must_use]
     pub fn instrument(&self) -> &Instrument {
-        &self.inner.instrument
+        match &self.variant {
+            SessionVariant::Historical(h) => &h.inner.instrument,
+            SessionVariant::Live(l) => &l.instrument,
+        }
     }
 
     #[must_use]
     pub fn kind(&self) -> EventKind {
-        self.inner.kind
+        match &self.variant {
+            SessionVariant::Historical(h) => h.inner.kind,
+            SessionVariant::Live(l) => l.kind,
+        }
     }
 
     #[must_use]
     pub fn scope(&self) -> Scope {
-        self.inner.scope
+        match &self.variant {
+            SessionVariant::Historical(h) => h.inner.scope,
+            SessionVariant::Live(l) => l.scope,
+        }
     }
 }
 
@@ -671,6 +821,12 @@ pub struct EventStream {
     rx: mpsc::Receiver<MarketEvent>,
 }
 
+impl EventStream {
+    pub(crate) fn new(rx: mpsc::Receiver<MarketEvent>) -> Self {
+        Self { rx }
+    }
+}
+
 impl Stream for EventStream {
     type Item = MarketEvent;
 
@@ -682,18 +838,24 @@ impl Stream for EventStream {
     }
 }
 
-#[derive(Debug)]
-enum SessionCommand {
+pub(crate) enum SessionCommand {
     SetPersistence(PersistenceOptions, oneshot::Sender<Result<()>>),
-    Take(oneshot::Sender<Result<mpsc::Receiver<MarketEvent>>>),
     Close(oneshot::Sender<()>),
+    /// Register a fan-out subscriber on a live authoritative session. The
+    /// controller inserts `sender` into the fan-out (replaying the cached
+    /// `SubscriptionChanged`) and acks.
+    AddSubscriber {
+        id: SubscriberId,
+        sender: mpsc::Sender<MarketEvent>,
+        ack: oneshot::Sender<()>,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Controller
 // ---------------------------------------------------------------------------
 
-fn default_buffer() -> usize {
+pub(crate) fn default_buffer() -> usize {
     1024
 }
 
@@ -749,27 +911,16 @@ struct Controller {
     /// evicted-then-numbered events both consume slots, so a resume-buffer
     /// overflow is a real `seq` hole reported as `Control::Gap`.
     next_seq: u64,
+    /// `Some` for a live authoritative session: events fan out to every
+    /// referrer's bounded channel. `None` for a historical session, which
+    /// delivers to the single consumer `sink`.
+    fanout: Option<FanOut>,
+    /// Per-symbol live stats (lock-free atomics) read by the Phase 3 diagnostics
+    /// plane. Updated on the fan-out path only; unused on the historical path.
+    stats: Arc<LiveStats>,
 }
 
 impl Controller {
-    /// Validate and perform a (re)attach: refuse while a previous stream is
-    /// outstanding and open, otherwise swap in a fresh channel and hand back
-    /// the prior ring (if any) for flushing.
-    fn prepare_attach(&mut self) -> Result<(mpsc::Receiver<MarketEvent>, Option<EventRing>)> {
-        if let Sink::Attached(s) = &self.sink
-            && !s.tx.is_closed()
-        {
-            return Err(Error::EventsAlreadyTaken);
-        }
-        let (tx, rx) = mpsc::channel(default_buffer());
-        let prior = std::mem::replace(&mut self.sink, Sink::Attached(InProcessSink { tx }));
-        let ring = match prior {
-            Sink::Detached(ring) => Some(ring),
-            Sink::Attached(_) => None,
-        };
-        Ok((rx, ring))
-    }
-
     /// Drain the backfill `pending` ring at the seam. Its events were pushed
     /// **unstamped** (`buffer_live_arrival` does a raw push) so their `seq` is
     /// deferred to here — stamping at the seam places the live arrivals *after*
@@ -784,36 +935,6 @@ impl Controller {
         }
         for ev in events {
             self.emit(ev).await;
-        }
-    }
-
-    /// Drain the detached resume ring on re-attach **without renumbering**. Its
-    /// events were stamped at push (`emit` → `deliver` → detached push), so
-    /// replaying them must preserve those `seq` values, leaving a real hole
-    /// where evicted events were.
-    ///
-    /// If an eviction occurred, the `Gap` is stamped at `dropped_first_seq`
-    /// (the first-evicted slot) and delivered prestamped — **not** via
-    /// `emit_gap`, which would mint a fresh post-survivor `seq` and order the
-    /// gap after the survivors, breaking monotonicity. Delivered order:
-    /// `Gap(seq = first_evicted), survivors(seq = push-time)`.
-    async fn flush_resume_ring(&mut self, ring: EventRing) {
-        let (dropped, dropped_first_seq, events) = ring.into_parts();
-        if let (Some(span), Some(first)) = (dropped, dropped_first_seq) {
-            self.emit_prestamped(MarketEvent::Control(Control {
-                source_ts: span.from_source_ts,
-                rx_ts: span.from_source_ts,
-                seq: first,
-                kind: ControlKind::Gap {
-                    provider: self.provider.id().to_string(),
-                    instrument: self.inner.instrument.clone(),
-                    span,
-                },
-            }))
-            .await;
-        }
-        for ev in events {
-            self.emit_prestamped(ev).await;
         }
     }
 
@@ -1300,7 +1421,6 @@ impl Controller {
         from: Timestamp,
         provider_rx: &mut mpsc::Receiver<MarketEvent>,
         cmd_rx: &mut mpsc::Receiver<SessionCommand>,
-        drop_rx: &mut oneshot::Receiver<()>,
     ) -> bool {
         let edge = wall_clock_ts();
         if from >= edge {
@@ -1348,6 +1468,12 @@ impl Controller {
         let segments = tile(from, edge, &gaps);
 
         let mut pending = EventRing::new(self.ring_capacity);
+        // The live lifecycle anchor is now the subscriber refcount, not a
+        // Session drop guard. Keep a never-firing drop channel so the shared
+        // `stream_segments` backfill path compiles without a real anchor: a
+        // referrer that leaves mid-backfill is observed after the backfill seam
+        // (the controller's teardown check), not by aborting the fetch.
+        let (_drop_keepalive, mut drop_rx) = oneshot::channel::<()>();
         let outcome = self
             .stream_segments(
                 segments,
@@ -1356,7 +1482,7 @@ impl Controller {
                 Some(BackfillSide {
                     provider_rx,
                     pending: &mut pending,
-                    drop_rx,
+                    drop_rx: &mut drop_rx,
                     edge,
                 }),
             )
@@ -1373,64 +1499,77 @@ impl Controller {
         true
     }
 
-    /// Live scope: subscribe (already done by the caller), drain provider
-    /// events through the seq/forward pipeline, honor commands, auto-close
-    /// when the Session handle drops (via `drop_rx`).
+    /// Live scope (authoritative): subscribe (already done by the caller), run
+    /// any creation-time backfill, then drain provider events through the
+    /// seq/forward/fan-out pipeline. Honors `AddSubscriber`/`SetPersistence`
+    /// commands and subscriber removals; tears the upstream connection down when
+    /// the fan-out empties (the last referrer left).
     async fn run_live(
         mut self,
         live: Box<dyn LiveHandle>,
         backfill_from: Option<Timestamp>,
         mut provider_rx: mpsc::Receiver<MarketEvent>,
         mut cmd_rx: mpsc::Receiver<SessionCommand>,
-        mut drop_rx: oneshot::Receiver<()>,
+        mut remove_rx: mpsc::UnboundedReceiver<SubscriberId>,
     ) {
         let live = Arc::new(Mutex::new(Some(live)));
         if let Some(from) = backfill_from
-            && !self
-                .run_backfill(from, &mut provider_rx, &mut cmd_rx, &mut drop_rx)
-                .await
+            && !self.run_backfill(from, &mut provider_rx, &mut cmd_rx).await
         {
-            // `stream_segments` already ran shutdown() on the Closed path —
-            // only release the provider subscription here, never re-shutdown
-            // (a second SessionClosing would be emitted).
-            if let Some(h) = live.lock().await.take() {
-                let _ = h
-                    .unsubscribe(self.inner.instrument.clone(), self.inner.kind)
-                    .await;
-                let _ = h.close().await;
-            }
+            self.teardown_upstream(&live).await;
             return;
         }
         loop {
+            if self.live_should_teardown() {
+                break;
+            }
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     if !self.handle_command(cmd).await {
-                        if let Some(h) = live.lock().await.take() {
-                            let _ = h.unsubscribe(self.inner.instrument.clone(), self.inner.kind).await;
-                            let _ = h.close().await;
-                        }
-                        return;
+                        break;
+                    }
+                }
+                id = remove_rx.recv() => {
+                    match id {
+                        Some(id) => self.remove_subscriber(id),
+                        None => break,
                     }
                 }
                 ev = provider_rx.recv() => {
                     let Some(ev) = ev else {
-                        // Provider task exited unexpectedly.
-                        self.shutdown().await;
-                        return;
+                        break; // provider task exited
                     };
                     self.forward(ev).await;
                 }
-                _ = &mut drop_rx => {
-                    // Session handle dropped: the handle is the lifecycle
-                    // anchor, stream or no stream.
-                    if let Some(h) = live.lock().await.take() {
-                        let _ = h.unsubscribe(self.inner.instrument.clone(), self.inner.kind).await;
-                        let _ = h.close().await;
-                    }
-                    self.shutdown().await;
-                    return;
-                }
             }
+        }
+        self.teardown_upstream(&live).await;
+    }
+
+    /// The refcounted-teardown trigger: a subscriber has been added and the
+    /// fan-out is now empty (the last referrer left).
+    fn live_should_teardown(&self) -> bool {
+        self.fanout.as_ref().is_some_and(FanOut::should_teardown)
+    }
+
+    fn remove_subscriber(&mut self, id: SubscriberId) {
+        if let Some(fanout) = self.fanout.as_mut() {
+            fanout.remove(id);
+        }
+    }
+
+    /// Release the upstream provider subscription and flush the tap log. No
+    /// `SessionClosing` is emitted: by teardown the fan-out is empty (each
+    /// referrer emits its own `SessionClosing` on `close`).
+    async fn teardown_upstream(&mut self, live: &Arc<Mutex<Option<Box<dyn LiveHandle>>>>) {
+        if let Some(h) = live.lock().await.take() {
+            let _ = h
+                .unsubscribe(self.inner.instrument.clone(), self.inner.kind)
+                .await;
+            let _ = h.close().await;
+        }
+        if let Some(log) = &self.tap_log {
+            let _ = log.flush().await;
         }
     }
 
@@ -1451,6 +1590,16 @@ impl Controller {
     /// no other producer into the outbound order, so push order == canonical
     /// delivery order.
     async fn deliver(&mut self, ev: MarketEvent) {
+        // Live authoritative session: fan the stamped event out to every
+        // referrer. Each referrer owns its per-client resume buffer, so there is
+        // no core-side ring here.
+        if self.fanout.is_some() {
+            self.stats.record_event(&ev);
+            if let Some(fanout) = self.fanout.as_mut() {
+                fanout.fanout(&ev);
+            }
+            return;
+        }
         let ev = match &self.sink {
             Sink::Attached(s) if !s.tx.is_closed() => match s.publish(ev).await {
                 PublishOutcome::Delivered => return,
@@ -1472,17 +1621,6 @@ impl Controller {
     /// not tee.
     async fn emit(&mut self, ev: MarketEvent) {
         let ev = self.stamp(ev);
-        self.deliver(ev).await;
-    }
-
-    /// Replay an already-stamped buffered event without renumbering it. Used by
-    /// `flush_resume_ring` so survivors keep their push-time `seq` and the
-    /// eviction `Gap` sits at the first-evicted slot.
-    async fn emit_prestamped(&mut self, ev: MarketEvent) {
-        debug_assert!(
-            ev.seq().is_some(),
-            "emit_prestamped requires an already-stamped event"
-        );
         self.deliver(ev).await;
     }
 
@@ -1554,21 +1692,11 @@ impl Controller {
                 let _ = ack.send(res);
                 true
             }
-            Some(SessionCommand::Take(ack)) => {
-                match self.prepare_attach() {
-                    Ok((rx, prior_ring)) => {
-                        // Hand the receiver over BEFORE flushing: the flush
-                        // can exceed the fresh channel's capacity, and the
-                        // consumer must be able to drain it concurrently.
-                        let _ = ack.send(Ok(rx));
-                        if let Some(ring) = prior_ring {
-                            self.flush_resume_ring(ring).await;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = ack.send(Err(e));
-                    }
+            Some(SessionCommand::AddSubscriber { id, sender, ack }) => {
+                if let Some(fanout) = self.fanout.as_mut() {
+                    fanout.add(id, sender);
                 }
+                let _ = ack.send(());
                 true
             }
             Some(SessionCommand::Close(ack)) => {
@@ -1614,38 +1742,6 @@ impl Controller {
             && let Err(e) = s.flush().await
         {
             tracing::warn!(error = %e, "event sink flush failed at shutdown");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Live-session registry sentinel
-// ---------------------------------------------------------------------------
-
-/// Holds a live-session registry slot for one `(instrument, kind)` pair.
-///
-/// Each `Session` opened with `Scope::Live` owns an `Arc<RegistrySentinel>`;
-/// the registry stores a `Weak<RegistrySentinel>` so a stale entry can be
-/// distinguished from a live one. When the owning `Session` drops, the last
-/// `Arc` drops, this `Drop` fires, and the slot is cleared.
-struct RegistrySentinel {
-    registry: LiveSessionRegistry,
-    key: (Instrument, EventKind),
-}
-
-impl Drop for RegistrySentinel {
-    fn drop(&mut self) {
-        // By the time this fires, the strong count for *this* allocation is 0.
-        // If `weak.strong_count() == 0` the entry is still ours (no successor
-        // has registered); remove it. If a successor has replaced our entry,
-        // its sentinel is a different allocation with strong_count >= 1 and we
-        // leave it alone. Poisoned-lock is benign — a stale entry is replaced
-        // by the next `session()` call which sees `strong_count() == 0`.
-        if let Ok(mut map) = self.registry.lock()
-            && let Some(weak) = map.get(&self.key)
-            && weak.strong_count() == 0
-        {
-            map.remove(&self.key);
         }
     }
 }
@@ -2205,165 +2301,6 @@ mod sink_tests {
 
         // flush is a no-op for the in-process sink.
         sink.flush().await.unwrap();
-    }
-}
-
-#[cfg(test)]
-mod controller_tests {
-    use super::{
-        Controller, EventRing, InProcessSink, PersistenceOptions, Scope, SessionInner, Sink,
-        stamp_seq,
-    };
-    use crate::fetch_locks::FetchLocks;
-    use async_trait::async_trait;
-    use datamancer_core::{
-        Adjustment, AssetClass, ControlKind, EventKind, GapSpan, HistoryRequest, Instrument,
-        LiveHandle, MarketEvent, Price, Provider, ProviderId, Result, Seq, Timestamp, Trade,
-    };
-    use std::sync::Arc;
-    use tokio::sync::{Mutex, mpsc};
-
-    struct StubProvider;
-
-    #[async_trait]
-    impl Provider for StubProvider {
-        fn id(&self) -> &'static str {
-            "stub"
-        }
-        fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
-            true
-        }
-        async fn start_live(
-            &self,
-            _sink: mpsc::Sender<MarketEvent>,
-        ) -> Result<Box<dyn LiveHandle>> {
-            unreachable!("controller_tests never start a live session")
-        }
-        async fn fetch_history(
-            &self,
-            _request: HistoryRequest,
-            _sink: mpsc::Sender<MarketEvent>,
-        ) -> Result<()> {
-            unreachable!("controller_tests never fetch history")
-        }
-    }
-
-    fn instrument() -> Instrument {
-        Instrument::new(ProviderId::from_static("stub"), AssetClass::Equity, "X")
-    }
-
-    fn trade(ts: i64) -> MarketEvent {
-        MarketEvent::Trade(Trade {
-            instrument: instrument(),
-            source_ts: Timestamp(ts),
-            rx_ts: Timestamp(ts),
-            seq: Seq(0),
-            price: Price::from_f64_round(1.0),
-            size: 1,
-        })
-    }
-
-    fn controller(sink: Sink) -> Controller {
-        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
-        let inner = Arc::new(SessionInner {
-            instrument: instrument(),
-            kind: EventKind::Trade,
-            scope: Scope::Live {
-                backfill_from: None,
-            },
-            events_holder: Mutex::new(None),
-            persistence: std::sync::Mutex::new(PersistenceOptions::none()),
-            stream_taken: std::sync::atomic::AtomicBool::new(false),
-            cmd_tx,
-            adjustment: Adjustment::default(),
-        });
-        Controller {
-            inner,
-            provider: Arc::new(StubProvider),
-            tap_log: None,
-            historical_cache: None,
-            sink,
-            ring_capacity: 4,
-            fetch_locks: FetchLocks::default(),
-            next_seq: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn flush_resume_ring_places_gap_at_hole_start_and_keeps_push_time_seq() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let mut ctrl = controller(Sink::Attached(InProcessSink { tx }));
-        // Stamp at push (as `deliver` would on the detached path), capacity 2.
-        let mut ring = EventRing::new(2);
-        for (ts, seq) in [(100, 0u64), (200, 1), (300, 2), (400, 3)] {
-            ring.push(stamp_seq(trade(ts), Seq(seq)));
-        }
-        ctrl.flush_resume_ring(ring).await;
-
-        // First: the eviction Gap at the first-evicted slot (seq 0), span over
-        // the two evicted events [100, 201).
-        match rx.recv().await.expect("gap delivered") {
-            MarketEvent::Control(c) => {
-                assert_eq!(c.seq, Seq(0));
-                match c.kind {
-                    ControlKind::Gap { span, .. } => {
-                        assert_eq!(span.from_source_ts.0, 100);
-                        assert_eq!(span.to_source_ts.0, 201);
-                    }
-                    other => panic!("expected Gap, got {other:?}"),
-                }
-            }
-            other => panic!("expected Control, got {other:?}"),
-        }
-        // Survivors keep their push-time seq (2, 3) — the hole (seq 1) is real.
-        let mut got = Vec::new();
-        for _ in 0..2 {
-            match rx.recv().await.expect("survivor delivered") {
-                MarketEvent::Trade(t) => got.push((t.source_ts.0, t.seq.0)),
-                other => panic!("expected Trade, got {other:?}"),
-            }
-        }
-        assert_eq!(got, vec![(300, 2), (400, 3)]);
-        // emit_prestamped never advanced the source counter.
-        assert_eq!(ctrl.next_seq, 0);
-    }
-
-    #[tokio::test]
-    async fn flush_resume_ring_total_eviction_emits_gap_and_no_survivors() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let mut ctrl = controller(Sink::Attached(InProcessSink { tx }));
-        // Hand-build the empty-survivor case: a ring whose buffer is empty but
-        // whose eviction accounting is set. (The push path always retains
-        // `capacity` events, so this guards the otherwise-unreachable
-        // empty-survivor branch of flush_resume_ring.)
-        let ring = EventRing {
-            capacity: 4,
-            buf: std::collections::VecDeque::new(),
-            dropped: Some(GapSpan {
-                from_source_ts: Timestamp(100),
-                to_source_ts: Timestamp(601),
-            }),
-            dropped_first_seq: Some(Seq(0)),
-        };
-        ctrl.flush_resume_ring(ring).await;
-
-        match rx.recv().await.expect("gap delivered") {
-            MarketEvent::Control(c) => {
-                assert_eq!(c.seq, Seq(0));
-                match c.kind {
-                    ControlKind::Gap { span, .. } => {
-                        assert_eq!(span.from_source_ts.0, 100);
-                        assert_eq!(span.to_source_ts.0, 601);
-                    }
-                    other => panic!("expected Gap, got {other:?}"),
-                }
-            }
-            other => panic!("expected Control, got {other:?}"),
-        }
-        assert!(
-            rx.try_recv().is_err(),
-            "total eviction delivers the gap and zero survivors"
-        );
     }
 }
 

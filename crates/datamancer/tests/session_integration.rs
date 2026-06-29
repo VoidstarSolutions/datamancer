@@ -343,15 +343,29 @@ async fn persist_true_without_persistence_layer_errors() {
 }
 
 #[tokio::test]
-async fn live_session_conflict_rejects_second_live_session_for_same_pair() {
-    let (provider, _ctrl) = FakeProvider::new("fake");
+async fn second_live_open_shares_authoritative_session() {
+    // Phase 2: a second live open for the same pair no longer conflicts — it
+    // shares the one authoritative session. Both referrers observe the same
+    // events with identical (seq, source_ts), carrying the Phase-1 source-stamp
+    // guarantee through the share.
+    let (provider, ctrl) = FakeProvider::new("fake");
     let dm = Datamancer::builder()
         .provider_arc(provider)
         .build()
         .unwrap();
 
-    // First Live session reserves the (AAPL, Trade) registry slot.
-    let _first = dm
+    let first = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let second = dm
         .session(
             inst("AAPL"),
             EventKind::Trade,
@@ -363,25 +377,28 @@ async fn live_session_conflict_rejects_second_live_session_for_same_pair() {
         .await
         .unwrap();
 
-    // Second Live session for the same pair is rejected.
-    match dm
-        .session(
-            inst("AAPL"),
-            EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
-            PersistenceOptions::none(),
-        )
-        .await
-    {
-        Err(datamancer::Error::LiveSessionConflict { instrument, kind }) => {
-            assert_eq!(instrument.symbol(), "AAPL");
-            assert_eq!(kind, EventKind::Trade);
+    let mut sa = first.take_events().await.unwrap();
+    let mut sb = second.take_events().await.unwrap();
+
+    ctrl.push_live(trade("AAPL", 100, 1.0)).await;
+    ctrl.push_live(trade("AAPL", 200, 2.0)).await;
+
+    for stream in [&mut sa, &mut sb] {
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if let MarketEvent::Trade(t) = ev {
+                got.push((t.source_ts.0, t.seq.0));
+            }
         }
-        Err(other) => panic!("expected LiveSessionConflict, got {other:?}"),
-        Ok(_) => panic!("expected LiveSessionConflict, got Ok"),
+        // Identical (seq, source_ts) across both shared referrers.
+        assert_eq!(got, vec![(100, 0), (200, 1)]);
     }
+    let _ = first.close().await;
+    let _ = second.close().await;
 }
 
 #[tokio::test]

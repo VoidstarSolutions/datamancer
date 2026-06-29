@@ -17,6 +17,11 @@ version = "1"
 features = ["net", "macros", "rt-multi-thread", "sync", "time", "tracing"]
 default-features = false
 
+[workspace.dependencies.tokio-stream]
+version = "0.1"
+features = ["sync"]
+default-features = false
+
 # Workspace-wide lints. Member crates opt in via `[lints] workspace = true`.
 # `priority = -1` lets individual lints override the group level when needed.
 [workspace.lints.clippy]

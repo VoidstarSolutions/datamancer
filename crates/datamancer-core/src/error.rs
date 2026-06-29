@@ -39,6 +39,29 @@ pub enum Error {
     #[error("session closed")]
     SessionClosed,
 
+    /// A client session already holds a subscription for `(instrument, kind)`.
+    /// Subscribe once per pair; demux is a consumer concern.
+    #[error("client already subscribed to {kind:?} on {instrument}")]
+    DuplicateSubscription {
+        instrument: crate::Instrument,
+        kind: crate::EventKind,
+    },
+
+    /// A client session was asked to unsubscribe from a pair it does not hold.
+    #[error("client is not subscribed to {kind:?} on {instrument}")]
+    NotSubscribed {
+        instrument: crate::Instrument,
+        kind: crate::EventKind,
+    },
+
+    /// A client subscription requested an unsupported scope. Phase 2 client
+    /// subscriptions are pure-live (`Scope::Live { backfill_from: None }`); a
+    /// shared authoritative session has one creation-time scope, so a per-client
+    /// historical join or differing backfill would break the
+    /// identical-`(seq, source_ts)` guarantee.
+    #[error("client subscriptions are pure-live; historical and backfill scopes are unsupported")]
+    UnsupportedClientScope,
+
     /// The session's event stream has already been taken and is still live.
     /// After the previous `EventStream` is dropped, `take_events` can be called
     /// again.
