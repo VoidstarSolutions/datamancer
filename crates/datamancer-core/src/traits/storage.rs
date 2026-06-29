@@ -22,7 +22,7 @@ use crate::{
     adjustment::Adjustment,
     error::Result,
     event::{EventKind, GapSpan, MarketEvent, Seq, Timestamp},
-    instrument::Instrument,
+    instrument::{AssetClass, Instrument, ProviderId},
 };
 
 /// Append-only log of events received in a live session.
@@ -92,8 +92,95 @@ pub trait HistoricalCache: Send + Sync {
         Ok(spans)
     }
 
+    /// Enumerate everything this cache currently holds. Each entry describes one
+    /// stored `(provider, symbol, kind, adjustment)` key, the source-time
+    /// segments actually covered, the event count, and a best-effort logical
+    /// volume estimate.
+    ///
+    /// Distinct from [`gaps`](HistoricalCache::gaps) / [`lookup`](HistoricalCache::lookup),
+    /// which answer coverage for *one* key: `catalog` is a whole-cache
+    /// enumeration with each key's real covered segments. It carries **no
+    /// `seq`** — `seq` is a live, per-symbol property, never a cache property.
+    ///
+    /// Default returns an empty catalog; backends that cannot enumerate opt out.
+    async fn catalog(&self) -> Result<Vec<CacheCatalogEntry>> {
+        Ok(Vec::new())
+    }
+
     /// Open the cached range for `key` as a replay source.
     fn as_replay_source(&self, key: CacheKey) -> Box<dyn ReplaySource>;
+}
+
+/// One enumerated cache key, as reported by [`HistoricalCache::catalog`].
+///
+/// Carries the *recoverable* identity components rather than a fabricated
+/// [`Instrument`]: the legacy cache row/coverage shapes do not all store
+/// `asset_class`, so a faithful instrument cannot always be reconstructed.
+/// Consumers needing a full `Instrument` rebuild it only when `asset_class` is
+/// `Some`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheCatalogEntry {
+    pub provider: ProviderId,
+    pub symbol: String,
+    /// `Some` only when the backend records it; `None` for rows written before
+    /// the catalog write-path change.
+    pub asset_class: Option<AssetClass>,
+    pub kind: EventKind,
+    /// The adjustment the rows are *stored* under. Trades/quotes always store
+    /// under [`Adjustment::Raw`] regardless of the requested mode; only bars
+    /// segregate by mode.
+    pub adjustment: Adjustment,
+    /// Covered source-time segments `[from, to)`. Reuses the span type.
+    pub segments: Vec<GapSpan>,
+    pub event_count: u64,
+    /// Best-effort *logical* volume estimate in bytes (`event_count ×
+    /// bytes_per_row`); ignores index / coverage-doc / MVCC overhead. `None`
+    /// when unknown.
+    pub est_bytes: Option<u64>,
+}
+
+impl CacheCatalogEntry {
+    /// Construct an entry from its required identity + coverage components.
+    /// `asset_class` defaults to `None` and `est_bytes` to `None`; set them with
+    /// [`with_asset_class`](Self::with_asset_class) /
+    /// [`with_est_bytes`](Self::with_est_bytes). This constructor (rather than a
+    /// struct literal) lets backend crates build entries while the type stays
+    /// `#[non_exhaustive]` for forward-compatible field additions.
+    #[must_use]
+    pub fn new(
+        provider: ProviderId,
+        symbol: String,
+        kind: EventKind,
+        adjustment: Adjustment,
+        segments: Vec<GapSpan>,
+        event_count: u64,
+    ) -> Self {
+        Self {
+            provider,
+            symbol,
+            asset_class: None,
+            kind,
+            adjustment,
+            segments,
+            event_count,
+            est_bytes: None,
+        }
+    }
+
+    /// Set the recovered asset class (`None` for legacy rows that did not record it).
+    #[must_use]
+    pub fn with_asset_class(mut self, asset_class: Option<AssetClass>) -> Self {
+        self.asset_class = asset_class;
+        self
+    }
+
+    /// Set the best-effort logical volume estimate.
+    #[must_use]
+    pub fn with_est_bytes(mut self, est_bytes: Option<u64>) -> Self {
+        self.est_bytes = est_bytes;
+        self
+    }
 }
 
 /// Anything that can be opened as an ordered event stream.
@@ -140,4 +227,57 @@ pub struct ReplayRequest {
     pub kinds: Vec<EventKind>,
     pub from: Timestamp,
     pub to: Timestamp,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AssetClass, CacheCatalogEntry, CacheKey, EventKind, GapSpan, HistoricalCache, ProviderId,
+        ReplaySource, Result, Timestamp,
+    };
+    use crate::{Adjustment, BarInterval, MarketEvent};
+    use async_trait::async_trait;
+
+    struct BareCache;
+
+    #[async_trait]
+    impl HistoricalCache for BareCache {
+        async fn lookup(&self, _key: &CacheKey) -> Result<Option<super::CacheCoverage>> {
+            Ok(None)
+        }
+        async fn store(&self, _key: &CacheKey, _events: &[MarketEvent]) -> Result<()> {
+            Ok(())
+        }
+        fn as_replay_source(&self, _key: CacheKey) -> Box<dyn ReplaySource> {
+            unreachable!("not used in this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn default_catalog_is_empty() {
+        let cache = BareCache;
+        assert!(cache.catalog().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_catalog_entry_serde_round_trips() {
+        for asset_class in [None, Some(AssetClass::Equity)] {
+            let entry = CacheCatalogEntry {
+                provider: ProviderId::from_static("p"),
+                symbol: "AAPL".to_string(),
+                asset_class,
+                kind: EventKind::Bar(BarInterval::OneMinute),
+                adjustment: Adjustment::All,
+                segments: vec![GapSpan {
+                    from_source_ts: Timestamp(0),
+                    to_source_ts: Timestamp(100),
+                }],
+                event_count: 42,
+                est_bytes: Some(1024),
+            };
+            let json = serde_json::to_string(&entry).unwrap();
+            let back: CacheCatalogEntry = serde_json::from_str(&json).unwrap();
+            assert_eq!(entry, back);
+        }
+    }
 }

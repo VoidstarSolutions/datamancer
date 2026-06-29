@@ -30,6 +30,6 @@ pub use instrument::{AssetClass, Instrument, ProviderId};
 pub use price::Price;
 pub use snapshot::{ClientSessionId, ConnectionState};
 pub use traits::{
-    CacheCoverage, CacheKey, EventSink, HistoricalCache, HistoryRequest, LiveHandle, Provider,
-    ProviderMetrics, PublishOutcome, ReplayRequest, ReplaySource, TapLog,
+    CacheCatalogEntry, CacheCoverage, CacheKey, EventSink, HistoricalCache, HistoryRequest,
+    LiveHandle, Provider, ProviderMetrics, PublishOutcome, ReplayRequest, ReplaySource, TapLog,
 };
