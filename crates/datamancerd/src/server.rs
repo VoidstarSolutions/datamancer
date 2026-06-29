@@ -74,6 +74,31 @@ enum ServerCommand {
     Disconnect { client: String },
 }
 
+/// Live handles to the embedded web server: its `serve` task, a one-shot
+/// shutdown trigger, and the two snapshot-refresh tasks.
+#[cfg(feature = "web-ui")]
+struct WebHandles {
+    serve: JoinHandle<std::io::Result<()>>,
+    shutdown: oneshot::Sender<()>,
+    refreshers: crate::web::refresh::Refreshers,
+}
+
+#[cfg(feature = "web-ui")]
+impl WebHandles {
+    /// Trigger graceful shutdown: signal the serve task to drain, await it under
+    /// a short bound, then abort the refresh tasks.
+    async fn shutdown(self) {
+        let _ = self.shutdown.send(());
+        if tokio::time::timeout(Duration::from_secs(5), self.serve)
+            .await
+            .is_err()
+        {
+            tracing::warn!("web server did not drain within timeout");
+        }
+        self.refreshers.abort();
+    }
+}
+
 /// The daemon supervisor.
 pub struct Server {
     dm: Datamancer,
@@ -88,6 +113,10 @@ pub struct Server {
     admin_socket: PathBuf,
     shutdown_timeout: Duration,
     diag_interval: Duration,
+    /// Optional web-UI settings (Phase 6); `None` (or `enabled=false`) disables
+    /// the embedded HTTP introspection surface.
+    #[cfg(feature = "web-ui")]
+    web: Option<crate::config::WebUiConfig>,
     /// `true` once a shutdown signal has been observed; rejects new requests.
     draining: bool,
 }
@@ -108,20 +137,8 @@ impl Server {
         let diag_interval = Duration::from_millis(config.diagnostics.publish_interval_ms);
         let startup_sessions = config.startup_session.clone();
 
-        if let Some(web) = &config.web_ui {
-            // Phase 6 owns the HTTP/web introspection UI; Phase 5 only carries
-            // the config surface forward (each field is read here so the
-            // contract stays live until Phase 6 consumes it).
-            tracing::info!(
-                enabled = web.enabled,
-                bind = %web.bind,
-                port = web.port,
-                has_assets_dir = web.assets_dir.is_some(),
-                live_state_cadence_ms = web.live_state_cadence_ms,
-                cache_catalog_cadence_ms = web.cache_catalog_cadence_ms,
-                "web UI configured; serving is deferred to Phase 6"
-            );
-        }
+        #[cfg(feature = "web-ui")]
+        let web = config.web_ui.clone();
         tracing::debug!(
             live_state_ms = config.diagnostics.publish_interval_ms,
             cache_catalog_ms = config.diagnostics.cache_catalog_interval_ms,
@@ -175,6 +192,8 @@ impl Server {
             admin_socket,
             shutdown_timeout,
             diag_interval,
+            #[cfg(feature = "web-ui")]
+            web,
             draining: false,
         })
     }
@@ -193,6 +212,9 @@ impl Server {
         let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
             .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
         let diagnostics = spawn_diagnostics(self.dm.clone(), publisher, self.diag_interval);
+
+        #[cfg(feature = "web-ui")]
+        let mut web_handles = self.start_web().await?;
 
         tracing::info!(socket = %self.admin_socket.display(), "datamancerd listening");
 
@@ -217,6 +239,14 @@ impl Server {
         }
 
         self.draining = true;
+
+        // Drain the embedded web server first: stop serving introspection HTTP
+        // before tearing down the data plane it reports on.
+        #[cfg(feature = "web-ui")]
+        if let Some(handles) = web_handles.take() {
+            handles.shutdown().await;
+        }
+
         let recorder = DrainRecorder::default();
         let clients: Vec<Box<dyn DrainClient>> = self
             .clients
@@ -241,6 +271,62 @@ impl Server {
         let _ = std::fs::remove_file(&self.admin_socket);
         tracing::info!("datamancerd shutdown complete");
         Ok(())
+    }
+
+    /// Start the embedded web UI if it is configured and enabled: warm both
+    /// snapshot swaps, spawn the two refresh tasks, install the optional metrics
+    /// recorder, and spawn the loopback `serve` task. Returns `None` when the UI
+    /// is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a snapshot-warm failure or a bad bind address.
+    #[cfg(feature = "web-ui")]
+    async fn start_web(&self) -> Result<Option<WebHandles>> {
+        use std::net::SocketAddr;
+
+        let Some(web) = self.web.as_ref().filter(|w| w.enabled) else {
+            return Ok(None);
+        };
+
+        let addr: SocketAddr = format!("{}:{}", web.bind, web.port)
+            .parse()
+            .map_err(|e| DaemonError::ConfigInvalid(format!("web bind address: {e}")))?;
+        if !addr.ip().is_loopback() {
+            return Err(DaemonError::ConfigInvalid(format!(
+                "web bind {addr} is not a loopback address; the web UI is same-host only"
+            )));
+        }
+
+        #[cfg(feature = "metrics")]
+        if let Err(e) = crate::web::metrics::install() {
+            tracing::warn!(error = %e, "metrics recorder install failed; /metrics will 503");
+        }
+
+        // Warm both swaps before binding so a handler never serves an empty
+        // snapshot.
+        let mut refreshers = crate::web::refresh::Refreshers::warm(&self.dm).await?;
+        refreshers.spawn(
+            self.dm.clone(),
+            web.live_state_cadence_ms,
+            web.cache_catalog_cadence_ms,
+        );
+
+        let state = refreshers.state.clone();
+        let assets_dir = web.assets_dir.clone();
+        let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+        let serve = tokio::spawn(async move {
+            crate::web::serve(state, addr, assets_dir, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+
+        Ok(Some(WebHandles {
+            serve,
+            shutdown,
+            refreshers,
+        }))
     }
 
     fn bind_socket(&self) -> Result<UnixListener> {

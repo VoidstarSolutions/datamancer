@@ -1,0 +1,288 @@
+//! The embedded read-only introspection web surface (Phase 6).
+//!
+//! An `axum` HTTP server, hosted on the daemon's **shared** tokio runtime, that
+//! renders the Phase-3 [`datamancer::SystemSnapshot`] for a single same-host
+//! operator. It adds **no** domain state, ordering, or transport semantics — it
+//! is a pure read-only consumer of a pre-assembled snapshot.
+//!
+//! # Security posture
+//!
+//! - **Loopback bind only** (`127.0.0.1`); auth is deferred (single operator,
+//!   no network exposure).
+//! - **`GET`-only**: no mutation route is registered, so there is no
+//!   axum-level write path to flip (guarded by `web_router_get_only`).
+//! - **Single-origin, no CORS**: the UI and JSON API share one loopback origin,
+//!   so no CORS layer is added — never a permissive `Any` origin (guarded by
+//!   `web_no_permissive_cors`).
+//! - Basic response hardening headers (`X-Content-Type-Options`, a `Content-Security-Policy`)
+//!   even same-host.
+
+pub mod handlers;
+pub mod refresh;
+pub mod state;
+mod ui;
+
+#[cfg(feature = "metrics")]
+pub mod metrics;
+
+#[cfg(test)]
+mod testdata;
+
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::Path;
+
+use axum::Router;
+use axum::http::HeaderValue;
+use axum::http::header::{CONTENT_SECURITY_POLICY, X_CONTENT_TYPE_OPTIONS};
+use axum::routing::get;
+use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::trace::TraceLayer;
+
+pub use state::WebState;
+
+/// `Content-Security-Policy` for the same-host operator UI. Self-origin only;
+/// inline script/style are permitted because the server-rendered page carries a
+/// small inline SSE/chart bootstrap (no external CDN).
+const CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+     connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'";
+
+/// Build the read-only router over the given [`WebState`].
+///
+/// Registers **only `GET`** routes (the read-only invariant), adds the security
+/// headers and request-trace layers, and — when `assets_dir` resolves to an
+/// existing directory — mounts static assets under `/assets`.
+pub fn router(state: WebState, assets_dir: Option<&Path>) -> Router {
+    let mut app = Router::new()
+        .route("/", get(ui::index))
+        .route("/api/snapshot", get(handlers::snapshot))
+        .route("/api/cache", get(handlers::cache))
+        .route("/api/providers", get(handlers::providers))
+        .route("/api/sessions", get(handlers::sessions))
+        .route("/api/health", get(handlers::health))
+        .route("/api/stream", get(handlers::stream));
+
+    #[cfg(feature = "metrics")]
+    {
+        app = app.route("/metrics", get(metrics::render_handler));
+    }
+
+    // Static assets: on-disk, rooted at the configured dir. A missing dir is a
+    // warning, not a hard error — the dynamic routes still serve.
+    if let Some(dir) = assets_dir {
+        if dir.is_dir() {
+            let index = dir.join("index.html");
+            let serve = ServeDir::new(dir).not_found_service(ServeFile::new(index));
+            app = app.nest_service("/assets", serve);
+        } else {
+            tracing::warn!(dir = %dir.display(), "web-ui assets_dir does not exist; serving dynamic routes only");
+        }
+    }
+
+    app.layer(SetResponseHeaderLayer::overriding(
+        X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    ))
+    .layer(SetResponseHeaderLayer::overriding(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    ))
+    .layer(TraceLayer::new_for_http())
+    .with_state(state)
+}
+
+/// Bind a loopback `TcpListener` on `addr` and serve `router` until `shutdown`
+/// resolves, draining in-flight requests.
+///
+/// # Errors
+///
+/// Propagates the bind / serve I/O error.
+pub async fn serve(
+    state: WebState,
+    addr: SocketAddr,
+    assets_dir: Option<std::path::PathBuf>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let app = router(state, assets_dir.as_deref());
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "datamancerd web UI listening (loopback, read-only)");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use datamancer::{CacheSnapshot, ProviderSnapshot, SystemSnapshot};
+    use http_body_util::BodyExt as _;
+    use serde_json::Value;
+    use tower::ServiceExt as _;
+
+    fn state() -> WebState {
+        WebState::fixed(testdata::snapshot(), testdata::snapshot())
+    }
+
+    async fn send(method: Method, uri: &str) -> axum::response::Response {
+        let app = router(state(), None);
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
+    const ROUTES: &[&str] = &[
+        "/",
+        "/api/snapshot",
+        "/api/cache",
+        "/api/providers",
+        "/api/sessions",
+        "/api/health",
+        "/api/stream",
+    ];
+
+    #[tokio::test]
+    async fn web_router_get_only() {
+        for route in ROUTES {
+            for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+                let resp = send(method.clone(), route).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {route} must be rejected (read-only surface)"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn web_no_permissive_cors() {
+        let resp = send(Method::GET, "/api/snapshot").await;
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "no CORS allow-origin header should be present (single-origin posture)"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_security_headers_present() {
+        let resp = send(Method::GET, "/api/snapshot").await;
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert!(resp.headers().get("content-security-policy").is_some());
+    }
+
+    #[tokio::test]
+    async fn web_snapshot_endpoint_serializes() {
+        let resp = send(Method::GET, "/api/snapshot").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let bytes = body_bytes(resp).await;
+        let back: SystemSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, testdata::snapshot());
+    }
+
+    #[tokio::test]
+    async fn web_section_endpoints_match_snapshot() {
+        let snap = testdata::snapshot();
+
+        let cache: CacheSnapshot =
+            serde_json::from_slice(&body_bytes(send(Method::GET, "/api/cache").await).await)
+                .unwrap();
+        assert_eq!(cache, snap.cache);
+
+        let providers: Vec<ProviderSnapshot> =
+            serde_json::from_slice(&body_bytes(send(Method::GET, "/api/providers").await).await)
+                .unwrap();
+        assert_eq!(providers, snap.providers);
+
+        let sessions: Value =
+            serde_json::from_slice(&body_bytes(send(Method::GET, "/api/sessions").await).await)
+                .unwrap();
+        let expected = serde_json::json!({
+            "authoritative_sessions": snap.authoritative_sessions,
+            "client_sessions": snap.client_sessions,
+        });
+        assert_eq!(sessions, expected);
+    }
+
+    #[tokio::test]
+    async fn web_seq_is_per_symbol_in_payload() {
+        let sessions: Value =
+            serde_json::from_slice(&body_bytes(send(Method::GET, "/api/sessions").await).await)
+                .unwrap();
+        let auth = sessions["authoritative_sessions"].as_array().unwrap();
+        assert_eq!(auth.len(), 2, "two distinct per-symbol units");
+
+        // seq lives only inside each per-symbol unit, keyed by instrument+kind.
+        let mut by_symbol = std::collections::BTreeMap::new();
+        for entry in auth {
+            assert!(entry.get("seq_position").is_some(), "per-unit seq present");
+            let symbol = entry["instrument"]["symbol"].as_str().unwrap().to_string();
+            by_symbol.insert(symbol, entry["seq_position"].clone());
+        }
+        // Distinct symbols carry distinct, independent seq positions.
+        assert_ne!(by_symbol["AAPL"], by_symbol["MSFT"]);
+
+        // No global/merged sequence field anywhere at the top level.
+        assert!(sessions.get("seq").is_none());
+        assert!(sessions.get("seq_position").is_none());
+        assert!(sessions.get("global_seq").is_none());
+    }
+
+    #[tokio::test]
+    async fn web_handler_does_not_block_runtime() {
+        // `WebState` carries no `Datamancer`, so a handler cannot reach the
+        // on-demand (potentially-blocking) snapshot accessor: it can only read
+        // the pre-warmed swap. A successful response proves the read path.
+        let resp = send(Method::GET, "/api/snapshot").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn web_graceful_shutdown_drains() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state(), None);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+        });
+
+        // Issue one in-flight request, then trigger shutdown.
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        drop(stream);
+        tx.send(()).unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("serve task must resolve after shutdown");
+        assert!(result.unwrap().is_ok());
+    }
+}

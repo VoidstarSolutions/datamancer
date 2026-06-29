@@ -50,7 +50,9 @@ pub struct Config {
     /// iceoryx2 transport caps.
     #[serde(default)]
     pub iceoryx2: Iceoryx2Config,
-    /// Optional web UI (Phase 6 drives it; config surface lives here).
+    /// Optional web UI (Phase 6 drives it; config surface lives here). Always
+    /// parsed so configs stay portable; only read by the `web-ui` feature.
+    #[cfg_attr(not(feature = "web-ui"), allow(dead_code))]
     #[serde(default)]
     pub web_ui: Option<WebUiConfig>,
     /// Boot-time authoritative sessions held as lifecycle anchors.
@@ -274,6 +276,7 @@ const fn default_max_clients() -> usize {
 }
 
 /// Optional web UI (Phase 6).
+#[cfg_attr(not(feature = "web-ui"), allow(dead_code))]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebUiConfig {

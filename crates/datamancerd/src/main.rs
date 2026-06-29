@@ -23,6 +23,8 @@ mod control;
 mod error;
 mod server;
 mod shutdown;
+#[cfg(feature = "web-ui")]
+mod web;
 
 use std::path::PathBuf;
 

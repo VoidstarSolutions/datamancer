@@ -5,6 +5,23 @@ edition = "2024"
 publish = false
 description = "Standalone datamancer server: same-host multi-client market-data daemon"
 
+[features]
+default = ["web-ui"]
+# The embedded read-only introspection web UI + JSON API (Phase 6).
+web-ui = [
+    "dep:axum",
+    "dep:tower-http",
+    "dep:tower",
+    "dep:arc-swap",
+    "dep:maud",
+    "dep:tokio-stream",
+]
+# A Prometheus `/metrics` endpoint derived from the same snapshot. Off by
+# default until a scraper is deployed; usable independently of `web-ui` (the
+# recorder installs without the UI; the `/metrics` route only registers when
+# `web-ui` is also enabled).
+metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+
 [dependencies]
 datamancer = { path = "../datamancer", features = ["transport-iceoryx2"] }
 async-trait = "0.1"
@@ -19,8 +36,25 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
+# Web UI / JSON API (feature `web-ui`).
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["fs", "trace", "set-header"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+arc-swap = { version = "1", optional = true }
+maud = { version = "0.27", features = ["axum"], optional = true }
+tokio-stream = { workspace = true, optional = true }
+
+# Metrics (feature `metrics`).
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = [
+    "tracing",
+], optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+arc-swap = "1"
+http-body-util = "0.1"
 
 [lints]
 workspace = true
