@@ -1,6 +1,6 @@
 # Datamancer
 
-A unified subscription and replay layer for financial market data. Datamancer talks to whatever providers it's configured against, normalizes their messages into typed events, and produces a single ordered event stream that downstream consumers (analysis engines, persistence sinks, UIs) consume without caring which provider any given event came from.
+A unified subscription and replay layer for financial market data. Datamancer talks to whatever providers it's configured against, normalizes their messages into typed events, and presents them through a multiplexed client-session stream that downstream consumers (analysis engines, persistence sinks, UIs) consume without caring which provider any given event came from. Ordering is **per symbol** — each instrument's substream is a source-stamped within-instrument total order (`(instrument, seq)`); across instruments the multiplex interleaves in arrival order rather than computing a global order.
 
 ## Status and Scope
 
@@ -23,7 +23,8 @@ The first supported provider is Alpaca. Provider integration is meant to be addi
 
 ## What Datamancer Does Not Do
 
-- **Per-instrument demultiplexing.** Datamancer emits one ordered stream of events; consumers that want per-instrument streams demux downstream.
+- **Per-instrument demultiplexing.** A client session presents one multiplexed stream over its subscription set (per-symbol deterministic, arrival-order across symbols); consumers that want per-instrument streams demux downstream.
+- **Global / cross-symbol ordering.** There is no total order across instruments. The multiplex interleaves (ordering key `(instrument, seq)`); a globally merged, cross-symbol-sorted stream is an explicit non-goal. Consumers needing strict global timestamp order buffer themselves.
 - **Semantic enrichment.** No "join this trade with the most recent quote to compute the trade side." Datamancer surfaces the events; analysis on top of them belongs to consumers.
 - **Provider-side time reordering.** Events are emitted in the order they were received, not re-sorted by source timestamp. Consumers that need strict timestamp ordering buffer themselves.
 - **Throttled or wall-clock-paced replay.** Replay produces events as fast as the consumer drains. Modeling latency or simulating real-time pacing is a research-tool concern, not a data-layer one.
@@ -74,7 +75,7 @@ session.subscribe(Subscription {
 }).await?;
 ```
 
-Subscriptions accumulate; the single output stream multiplexes everything that has been requested. Adding the same instrument with a new event kind extends the existing subscription rather than duplicating it.
+Subscriptions accumulate; the client session's multiplexed stream **interleaves** everything that has been requested — per-symbol deterministic (`(instrument, seq)`, source-stamped within each instrument), arrival-order across symbols, never globally merge-sorted. Each `(instrument, kind)` pair is backed by a refcounted shared **authoritative session**, so two consumers of the same pair observe identical `(seq, source_ts)`. Adding the same instrument with a new event kind extends the subscription set rather than duplicating it.
 
 ## Configuration
 

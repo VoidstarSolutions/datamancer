@@ -33,7 +33,7 @@ Integration tests live in `crates/datamancer/tests/`. `alpaca_real.rs` is `#[ign
 These are load-bearing design rules — violating them breaks downstream consumers in subtle ways. The crate README (`crates/datamancer/README.md`) is the authoritative design doc; read it before changing public API.
 
 - **Source-agnostic output.** All provider-specific concerns stay inside `datamancer`. Once an event leaves the crate it must be indistinguishable across providers.
-- **Single ordered stream.** A `Session` exposes exactly one `events()` stream merging all subscriptions. Per-instrument demux is a consumer concern.
+- **Multiplexed stream, per-symbol determinism (not global merge).** A `ClientSession` is the primary consumer handle: it holds a mutable `(instrument, kind)` subscription set and presents **one multiplexed stream** over it. The ordering key is `(instrument, seq)` — monotonic *within* each instrument (source-stamped), arrival-order *across* instruments. It **interleaves**, it does not merge-sort, and there is no cross-symbol/global order (the never-realized global-merge model is an explicit non-goal). Per-instrument demux is a consumer concern. The single-pair `Session` is the one-subscription case (its live path is a referrer onto the same shared authoritative session that backs `ClientSession`). A second live open for a pair **shares** the authoritative session rather than conflicting.
 - **Three timestamp fields, distinct roles** (on every data event):
   - `source_ts` — provider-reported market time. **Only** field engine logic should reason about. Never assigned by datamancer.
   - `seq: u64` — **per-symbol** ordering field, stamped **once at the source**

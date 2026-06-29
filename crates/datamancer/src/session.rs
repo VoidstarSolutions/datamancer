@@ -1,10 +1,19 @@
 //! Sessions and the top-level [`Datamancer`] orchestrator.
 //!
-//! A session is the unit of consumption. Each session is scoped to exactly
-//! one `(instrument, kind)` pair and one [`Scope`] — bounded historical, pure
-//! live, or live with a historical backfill. Construction is eager: provider
-//! subscription / fetch starts immediately so the session begins capturing
-//! events even if the consumer hasn't taken the [`EventStream`] yet.
+//! A [`Session`] is scoped to exactly one `(instrument, kind)` pair and one
+//! [`Scope`] — bounded historical, pure live, or live with a historical
+//! backfill. Construction is eager: provider subscription / fetch starts
+//! immediately so the session begins capturing events even if the consumer
+//! hasn't taken the [`EventStream`] yet.
+//!
+//! The multiplexing handle is [`crate::ClientSession`] (a mutable subscription
+//! set behind one interleaved stream; see `client.rs`). Both it and the live
+//! [`Session`] are refcounted **referrers** onto a shared per-`(instrument,
+//! kind)` authoritative session, which owns the provider connection and stamps
+//! the per-symbol `seq` once at the source before any sink. `seq` is therefore
+//! identical across every consumer of a symbol; the multiplex orders by
+//! `(instrument, seq)` and never re-stamps. Historical sessions keep the
+//! single-consumer controller and do not participate in the registry.
 //!
 //! # Lifecycle
 //!

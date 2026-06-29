@@ -2,10 +2,12 @@
 //! data.
 //!
 //! Datamancer talks to whatever providers it's configured against, normalizes
-//! their messages into typed [`MarketEvent`]s, and produces a single ordered
-//! event stream that downstream consumers (analysis engines, persistence
-//! sinks, UIs) consume without caring which provider any given event came
-//! from.
+//! their messages into typed [`MarketEvent`]s, and presents them through a
+//! multiplexed [`ClientSession`] stream that downstream consumers (analysis
+//! engines, persistence sinks, UIs) consume without caring which provider any
+//! given event came from. Ordering is **per symbol** (`(instrument, seq)`,
+//! source-stamped within each instrument; arrival-order across instruments) —
+//! the multiplex interleaves rather than computing a global order.
 //!
 //! See `README.md` in this crate for the design rationale and intended scope.
 //! Provider and storage implementations live in sibling crates and depend on
@@ -20,7 +22,8 @@
 //!   upstream sources (dyn-dispatched at the cold boundary; per-message
 //!   decode loops stay monomorphic inside each provider), and [`TapLog`],
 //!   [`HistoricalCache`], [`ReplaySource`] for the persistence layer.
-//! - [`Datamancer`] / [`Session`] — orchestrator and session handle.
+//! - [`Datamancer`] / [`ClientSession`] / [`Session`] — orchestrator, the
+//!   primary multiplexing consumer handle, and the single-pair handle.
 
 #![forbid(unsafe_code)]
 
