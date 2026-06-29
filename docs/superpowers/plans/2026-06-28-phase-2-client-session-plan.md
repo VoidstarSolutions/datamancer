@@ -29,7 +29,9 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 > - **`ClientSessionId`:** `AtomicU64` `fetch_add` (in `datamancer-core`), process-scoped, not persisted. **Client-session registry:** lazy `Weak` cleanup at lookup.
 > - **`LiveStats`:** per-field atomics (lock-free reads for Phase 3); no composite-consistency guarantee (document).
 > - **Per-client `EventRing`:** `dropped: HashMap<Instrument, GapSpan>`; `note_drop` processes only data events + per-symbol controls (`Gap` embeds its instrument); connection-scoped controls never reach the per-client ring (coalesced upstream) — add a skip-guard + `debug_assert`. Flush emits one `Gap` per affected instrument in first-evicted-`seq` order (overlapping spans are correct).
-> - **`next_seq`:** `saturating_add` so it can never wrap into `Seq(u64::MAX)`.
+> - **`next_seq`:** advance with a **checked** add that rejects the `Seq(u64::MAX)`
+>   reservation (`Seq::SYNTHETIC`); stamps only `[0, u64::MAX - 1]`. (NB:
+>   `saturating_add` is wrong — it caps *at* `u64::MAX`, i.e. the sentinel.)
 > - **`SubscriptionChanged` cache:** one per symbol on `AuthoritativeSession` (bounded by live symbols), replayed to each new subscriber. Replay carries the real (older) `seq` → a real, possibly large per-symbol `seq` jump on late join; document as **not a loss**.
 > - **Connection-scoped Control dedup:** provider-string approximation retained (P2-E), documented as a Phase-2 limitation (multiple authoritative sessions can share a provider id); the per-symbol `SubscriptionChanged` signal above carries symbol-level visibility. Real connection identity deferred to Phase 3. **Sink-level handling:** the in-process multiplex emits connection-scoped controls in-band; a transport sink may treat them differently — the iceoryx2 sink (Phase 4) suppresses them from the POD wire and surfaces provider state via the diagnostics plane (a documented divergence, in-process in-band vs remote via diagnostics).
 >

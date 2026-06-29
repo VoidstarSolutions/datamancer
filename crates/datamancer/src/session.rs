@@ -1776,10 +1776,19 @@ impl Controller {
     /// event, in this authoritative session's canonical delivery order.
     fn stamp(&mut self, ev: MarketEvent) -> MarketEvent {
         let seq = Seq(self.next_seq);
-        // `saturating_add` so the source counter can never wrap into the
-        // `Seq::SYNTHETIC` (`u64::MAX`) sentinel (practically unreachable, but
-        // honors the per-symbol-seq invariant).
-        self.next_seq = self.next_seq.saturating_add(1);
+        // `Seq(u64::MAX)` is reserved as `Seq::SYNTHETIC` and must never be
+        // handed to a real event, so the source counter stamps only in
+        // `[0, u64::MAX - 1]`. `saturating_add` was wrong here: it caps *at*
+        // `u64::MAX`, i.e. exactly the sentinel. Advance with a checked add that
+        // rejects the reservation boundary; reaching it means 2^64 - 1 events on
+        // one symbol — true counter exhaustion, which we surface as the
+        // unrecoverable invariant breach it is rather than colliding with the
+        // synthetic sentinel.
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .filter(|&n| n != u64::MAX)
+            .expect("per-symbol source seq exhausted the Seq::SYNTHETIC reservation");
         stamp_seq(ev, seq)
     }
 

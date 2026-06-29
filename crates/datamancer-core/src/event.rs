@@ -40,9 +40,10 @@ pub struct Seq(pub u64);
 impl Seq {
     /// Sentinel `seq` for synthetic control events that do not belong to an
     /// authoritative stream's monotonic order (e.g. per-client controls minted
-    /// outside the source counter). `Seq(u64::MAX)` is unreachable by the
-    /// monotonic source counter, so it never collides with a stamped event, and
-    /// it is documented exempt from per-symbol monotonicity.
+    /// outside the source counter). `Seq(u64::MAX)` is **reserved**: the source
+    /// counter stamps only in `[0, u64::MAX - 1]` and treats the reservation
+    /// boundary as counter exhaustion, so this value never collides with a
+    /// stamped event. It is exempt from per-symbol monotonicity.
     pub const SYNTHETIC: Seq = Seq(u64::MAX);
 }
 
