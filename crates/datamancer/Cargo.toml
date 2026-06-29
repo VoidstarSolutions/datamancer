@@ -37,6 +37,10 @@ name = "crypto_ticker"
 required-features = ["provider-alpaca"]
 
 [[example]]
+name = "client_session"
+required-features = ["provider-alpaca"]
+
+[[example]]
 name = "cached_history"
 required-features = ["storage-surreal"]
 
