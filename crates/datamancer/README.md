@@ -243,6 +243,16 @@ ride one logical client connection:
 The POD payload preserves the timestamp triple end-to-end — `rx_ts` stays
 **observability-only** and is never reconstructed/synthesized by the subscriber.
 
+### Standalone server
+
+The library stays primary: embedders that want zero hops consume a `Session` /
+`ClientSession` in-process. The `datamancerd` crate is the **thin standalone
+wrapper** — a same-host daemon that builds a `Datamancer` from a TOML config,
+serves multiple consumer processes (one iceoryx2 data-plane service per client),
+holds authoritative sessions alive as the cross-process lifecycle anchor, and
+exposes a Unix-socket + newline-JSON control surface. It adds no new semantics;
+see `crates/datamancerd/README.md`.
+
 **Subscriber rule.** The data and announcement services are two independent
 iceoryx2 services with **no mutual delivery-order guarantee**: a data sample can
 arrive before the `SymbolAnnouncement` for its `SymbolId`. The subscriber helper

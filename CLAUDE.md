@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workspace
 
-Cargo workspace (resolver 3, edition 2024) with three crates:
+Cargo workspace (resolver 3, edition 2024) with four crates:
 
 - **`datamancer-core`** — pure types and trait surface (`Provider`, `LiveHandle`, `TapLog`, `HistoricalCache`, `ReplaySource`, `EventSink`) plus the event model (`MarketEvent`, `Trade`, `Bar`, `Quote`, `Control`), `Instrument`, `Price`. No I/O, minimal deps. Provider/storage/transport implementation crates depend only on this — never on the orchestrator.
 - **`datamancer`** — the session orchestrator. Re-exports the core surface and adds `Datamancer`, `DatamancerBuilder`, `Session`. Holds provider integrations (`providers/alpaca*`) and storage backends (`storage/surreal`) behind cargo features.
 - **`datamancer-transport-iceoryx2`** — optional same-host zero-copy iceoryx2 transport (data + diagnostics planes). Depends on `datamancer-core` only; isolates the heavy iceoryx2 dependency tree behind a hard crate boundary. `datamancer` pulls it in via the `transport-iceoryx2` feature and re-exports it as `datamancer::transport`. `SymbolId`/interning are sink-local, never core.
+- **`datamancerd`** — the standalone server: a thin **binary** (`#![forbid(unsafe_code)]`) that wraps `datamancer` (with `transport-iceoryx2`) and serves multiple same-host consumer processes. It adds **no** new ordering/transport/event semantics — only composition, process lifecycle, a UDS + newline-JSON control surface, and graceful shutdown. Operator contracts (TOML config schema, control protocol, stable JSON error codes) are documented in `crates/datamancerd/README.md`.
 
 Default features: `provider-alpaca`, `storage-surreal`. `transport-iceoryx2` is **off by default**. All optional; pulling in a new provider/transport should be additive and gated behind a feature.
 
@@ -25,9 +26,10 @@ cargo test some_test_name                # by name
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 cargo run --example crypto_ticker        # requires provider-alpaca (default)
+cargo run -p datamancerd -- --config datamancerd.toml   # the standalone server
 ```
 
-Integration tests live in `crates/datamancer/tests/`. `alpaca_real.rs` is `#[ignore]`d — it hits real Alpaca and needs credentials; run with `cargo test --test alpaca_real -- --ignored`.
+Integration tests live in `crates/datamancer/tests/`. `alpaca_real.rs` is `#[ignore]`d — it hits real Alpaca and needs credentials; run with `cargo test --test alpaca_real -- --ignored`. The daemon end-to-end tests (`crates/datamancerd/tests/daemon_e2e.rs`) are `#[ignore]`d — they spawn the binary and need a live iceoryx2 runtime; run with `cargo test -p datamancerd --test daemon_e2e -- --ignored`.
 
 ## Architectural invariants
 
