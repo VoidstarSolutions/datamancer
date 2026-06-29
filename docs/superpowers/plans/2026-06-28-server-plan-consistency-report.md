@@ -109,3 +109,21 @@ ownership questions were decided by the architect:
 | 6 snapshot bounding | split live-state vs cache catalog | Phases 3 + 4 |
 | 7 backfill scope | creation-time; referrers attach to existing scope | Phases 2 + 5 |
 | 8 seq sentinel | `Seq::SYNTHETIC` defined in Phase 1's `event.rs` edit | Phase 1 (used by 2,4,6) |
+
+## Final consistency sweep (post-hardening, 2026-06-28)
+
+After all six phases received their "Detailed-planning hardening" blocks, a second
+sweep re-checked the cross-phase couplings the hardening touched. **12 couplings
+verified consistent** (publish/`publish_borrowed` signatures; EventSink seam
+migration P1→P2→P4; `Seq::SYNTHETIC = Seq(u64::MAX)`; tap-log seq convergence;
+`ClientSessionId` in core; `LiveStats` build-vs-read; resume-buffer granularity;
+connection-control divergence; backpressure chain P4→P2; one-Node-per-process;
+the split-snapshot delivery chain P3→P4→P5→P6 incl. the in-process web-UI path;
+naming/types). **4 residual issues found and fixed:**
+
+1. *(major)* Phase 5 fallback-pump snippet used borrowed-`Result` `sink.publish(&ev)` — corrected to owned `publish(ev) -> PublishOutcome` matching (Phase 1's locked signature).
+2. *(major)* Phase 3 body struct still hung `resume_buffer` on `AuthoritativeSessionSnapshot` — moved to `ClientSessionSnapshot` (per-client, per the reconciliation); authoritative `gap_count` clarified as per-symbol provider/source gaps.
+3. *(minor)* Phase 2 now notes that a transport sink may handle connection-scoped controls differently (the Phase-4 diagnostics-only divergence).
+4. *(minor)* Phase 5 now states the control-protocol client-name ↔ ephemeral `ClientSessionId` mapping.
+
+No rearchitecture required. The hardened plan set is internally consistent.

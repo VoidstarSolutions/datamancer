@@ -383,8 +383,7 @@ pub struct AuthoritativeSessionSnapshot {
     pub last_source_ts: Option<Timestamp>,
     pub last_rx_ts: Option<Timestamp>,
     pub latency_ns: Option<i64>,           // last rx_ts - source_ts (observability)
-    pub resume_buffer: ResumeBufferSnapshot,
-    pub gap_count: u64,
+    pub gap_count: u64,                     // per-symbol provider/source Control::Gap count (LiveStats); per-client resume-buffer drops live on ClientSessionSnapshot
 }
 
 #[non_exhaustive]
@@ -400,6 +399,7 @@ pub struct ResumeBufferSnapshot {
 pub struct ClientSessionSnapshot {
     pub id: ClientSessionId,               // see P2-REG layering sub-checkpoint
     pub subscriptions: Vec<SubscriptionRef>,
+    pub resume_buffer: ResumeBufferSnapshot,   // per-client buffer (Phase 2); dropped_events = events this client missed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

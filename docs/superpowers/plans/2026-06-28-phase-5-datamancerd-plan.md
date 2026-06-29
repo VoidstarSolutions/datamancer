@@ -15,7 +15,7 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 
 > **Detailed-planning hardening (gotcha pass, 2026-06-28) — authoritative.** Adversarial design-level review vs the Datamancer/Session API + Phases 1-4. (Cross-phase "not coded yet" items are sequencing, not gotchas.) Supersedes conflicting body text.
 >
-> **Locked decision — control surface = Unix domain socket + newline-JSON.** Same-host, filesystem-permission access control, no extra transport dep, CLI-scriptable. **One long-lived control connection per client**; explicit graceful **`close`** op + connection-**EOF as emergency teardown** (tears down that client's `ClientSession` + iceoryx2 service, decrements authoritative refcounts). Subscribe/unsubscribe map to `ClientSession` mutators via an `mpsc` to a single-threaded server task (no lock held across `.await`). Library errors (`LiveSessionConflict`/`UnsupportedEventKind`/`PersistenceRequired`) map to **stable JSON error codes** (constants table, regression-guarded).
+> **Locked decision — control surface = Unix domain socket + newline-JSON.** Same-host, filesystem-permission access control, no extra transport dep, CLI-scriptable. **One long-lived control connection per client**; explicit graceful **`close`** op + connection-**EOF as emergency teardown** (tears down that client's `ClientSession` + iceoryx2 service, decrements authoritative refcounts). Subscribe/unsubscribe map to `ClientSession` mutators via an `mpsc` to a single-threaded server task (no lock held across `.await`). Library errors (`LiveSessionConflict`/`UnsupportedEventKind`/`PersistenceRequired`) map to **stable JSON error codes** (constants table, regression-guarded). The daemon maps each control-protocol client-name string (e.g. `"exec-1"`) to an ephemeral library `ClientSessionId` (per-process `u64`, never exposed on the wire).
 >
 > **Config (TOML):** provider creds (secret refs via env/file), cache/DB path, tap log, adjustment, `resume_buffer_events`, `[[startup_session]]` (+ `always_on: bool`, default `false`), iceoryx2 caps, diagnostics cadences, control-socket path, `[web_ui]` (enabled, localhost bind addr/port, `assets_dir`, `live_state_cadence_ms`=1000, `cache_catalog_cadence_ms`=30000), `[server] shutdown_timeout_secs`=30.
 >
@@ -346,7 +346,10 @@ let mut stream = client_session.take_events().await?;   // async + fallible toda
 let sink = client_data_sink;                            // one sink, this client
 let pump = tokio::spawn(async move {
     while let Some(ev) = stream.next().await {
-        if let Err(e) = sink.publish(&ev).await { warn!(?e, "sink publish"); break; }
+        match sink.publish(ev).await {            // owned arg -> PublishOutcome (Phase 1; no Result)
+            PublishOutcome::Delivered => {}
+            other => { warn!(?other, "sink did not deliver; stopping pump"); break; }
+        }
     }
     let _ = sink.flush().await;
 });
