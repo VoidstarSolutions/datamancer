@@ -92,21 +92,41 @@ pub fn router(state: WebState, assets_dir: Option<&Path>) -> Router {
     .with_state(state)
 }
 
-/// Bind a loopback `TcpListener` on `addr` and serve `router` until `shutdown`
-/// resolves, draining in-flight requests.
+/// Bind a `TcpListener` for the web UI, enforcing the loopback-only invariant
+/// here (not just at the caller): the introspection surface is unauthenticated
+/// and same-host only, so a non-loopback bind is rejected.
 ///
 /// # Errors
 ///
-/// Propagates the bind / serve I/O error.
+/// Returns `InvalidInput` for a non-loopback address; otherwise propagates the
+/// bind I/O error. Binding here (rather than inside the spawned serve task) lets
+/// a bind failure surface to the caller instead of being lost in a detached task.
+pub async fn bind(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    if !addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("web bind {addr} is not a loopback address; the web UI is same-host only"),
+        ));
+    }
+    tokio::net::TcpListener::bind(addr).await
+}
+
+/// Serve `router` on a pre-bound `listener` until `shutdown` resolves, draining
+/// in-flight requests.
+///
+/// # Errors
+///
+/// Propagates the serve I/O error.
 pub async fn serve(
     state: WebState,
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
     assets_dir: Option<std::path::PathBuf>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let app = router(state, assets_dir.as_deref());
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "datamancerd web UI listening (loopback, read-only)");
+    if let Ok(addr) = listener.local_addr() {
+        tracing::info!(%addr, "datamancerd web UI listening (loopback, read-only)");
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await

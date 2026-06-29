@@ -83,6 +83,7 @@ pub fn error_code(err: &datamancer::Error) -> &'static str {
 /// One target `(instrument, kind)` plus per-request scope/persistence
 /// preferences. Used by both `subscribe` and the `open-client` seed list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionSpec {
     pub provider: String,
     pub asset_class: AssetClassCfg,

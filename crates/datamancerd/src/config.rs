@@ -476,6 +476,11 @@ fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
     if t_parts.next().is_some() {
         return None;
     }
+    // Reject impossible clock components (e.g. `99:00:00`); a normalized-but-wrong
+    // instant must not pass validation. (Leap second `:60` is not supported.)
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
+        return None;
+    }
     let nanos_frac: i64 = match frac {
         Some(f) => {
             if f.is_empty() || f.len() > 9 || !f.bytes().all(|b| b.is_ascii_digit()) {
@@ -492,10 +497,21 @@ fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
 }
 
 /// Days since the Unix epoch for a civil (proleptic Gregorian) date. Returns
-/// `None` for out-of-range month/day. Algorithm from Howard Hinnant's
-/// `days_from_civil`.
+/// `None` for out-of-range month/day (per-month max, leap-year aware). Algorithm
+/// from Howard Hinnant's `days_from_civil`.
 fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=max_day).contains(&day) {
         return None;
     }
     let y = if month <= 2 { year - 1 } else { year };
@@ -833,6 +849,13 @@ persistence = "none"
         );
         assert_eq!(parse_rfc3339_nanos("not-a-date"), None);
         assert_eq!(parse_rfc3339_nanos("1970-01-01 00:00:00Z"), None);
+        // Impossible components are rejected, not silently normalized.
+        assert_eq!(parse_rfc3339_nanos("2026-02-31T00:00:00Z"), None); // Feb 31
+        assert_eq!(parse_rfc3339_nanos("2026-13-01T00:00:00Z"), None); // month 13
+        assert_eq!(parse_rfc3339_nanos("2026-06-01T99:00:00Z"), None); // hour 99
+        assert_eq!(parse_rfc3339_nanos("2026-06-01T00:60:00Z"), None); // minute 60
+        assert_eq!(parse_rfc3339_nanos("2025-02-29T00:00:00Z"), None); // not a leap year
+        assert!(parse_rfc3339_nanos("2024-02-29T00:00:00Z").is_some()); // leap year
     }
 
     #[test]

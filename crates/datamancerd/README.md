@@ -184,8 +184,12 @@ operator contract and are regression-guarded.
 
 SIGTERM/SIGINT triggers a bounded, serialized drain: drain the web server (if
 enabled) → stop accepting control requests → stop the diagnostics ticker → per
-client flush the sink then close the session → drop the startup anchors → flush
-the tap log. The web server is drained first so it stops reporting on a data
-plane that is about to be torn down. The whole drain is
-bounded by `server.shutdown_timeout_secs` so a disk-stalled tap-log flush cannot
-hang shutdown forever (it is logged and the process force-exits).
+client close the session and drain its pump (so a terminal `SessionClosing`
+reaches the sink instead of being severed) → drop the startup anchors → **flush
+the tap log** (the durable record) → per client flush the sink → drop the
+clients/sinks. The web server is drained first so it stops reporting on a data
+plane about to be torn down; the tap log flushes **before** the best-effort
+per-client sink flushes (the load-bearing tap-log-before-sink-flush contract) so
+a stall in those best-effort steps cannot lose durable writes. The whole drain
+is bounded by `server.shutdown_timeout_secs` so a disk-stalled tap-log flush
+cannot hang shutdown forever (it is logged and the process force-exits).

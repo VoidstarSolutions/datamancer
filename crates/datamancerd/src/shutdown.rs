@@ -5,16 +5,20 @@
 //!
 //! 1. stop accepting control requests,
 //! 2. stop the diagnostics ticker,
-//! 3. per client (in order): flush the per-client sink, then close the client
-//!    session (releasing its authoritative refcounts),
-//! 4. drop the startup anchors (releases the last authoritative refcounts),
-//! 5. flush the shared tap log.
+//! 3. per client: **close** the client session and drain its pump, so terminal
+//!    events the close emits (`SessionClosing`) actually reach the sink instead
+//!    of being severed by an immediate pump abort,
+//! 4. drop the startup anchors (releases the last authoritative refcounts, so
+//!    each authoritative session's final teed events land in the tap log),
+//! 5. **flush the shared tap log** (the durable record), *before* the
+//!    best-effort per-client sink flushes — the load-bearing
+//!    tap-log-before-sink-flush contract,
+//! 6. per client: flush the sink (deliver buffered events, incl. `SessionClosing`),
+//! 7. drop the clients/sinks (service drop, last).
 //!
 //! The whole drain is wrapped in a timeout by the caller so a disk-stalled
 //! tap-log flush cannot hang shutdown forever. The order is the load-bearing
-//! contract (sinks reach subscribers before teardown; the tap log flushes
-//! last), so it is exercised by [`tests::shutdown_drain_order`] with recording
-//! fakes.
+//! contract, exercised by [`tests::shutdown_drain_order`] with recording fakes.
 
 use std::sync::{Arc, Mutex};
 
@@ -44,17 +48,19 @@ impl DrainRecorder {
     }
 }
 
-/// A per-client handle the drain can flush and close. Implemented by the real
-/// `ClientEntry` (flushes its iceoryx2 sink, closes its client session) and by
-/// the test fake.
+/// A per-client handle the drain can close then flush. Implemented by the real
+/// `ClientEntry` (closes its client session + drains its pump, flushes its
+/// iceoryx2 sink) and by the test fake.
 #[async_trait]
 pub trait DrainClient: Send {
     /// The client's control-protocol name (for the recorder).
     fn name(&self) -> &str;
-    /// Flush the per-client sink so buffered events reach subscribers.
-    async fn flush_sink(&self);
-    /// Close the client session, releasing its authoritative refcounts.
+    /// Close the client session and drain its pump, so terminal events the close
+    /// emits (`SessionClosing`) reach the sink. Releases authoritative refcounts.
     async fn close(&mut self);
+    /// Flush the per-client sink so buffered events (incl. the terminal ones
+    /// drained above) reach subscribers. Called after the tap-log flush.
+    async fn flush_sink(&self);
 }
 
 /// Run the ordered drain. `stop_accept` and `stop_diagnostics` are run first
@@ -77,23 +83,36 @@ pub async fn drain<A: Send>(
     recorder.record("diagnostics-stop");
     stop_diagnostics();
 
+    // Close each session and drain its pump first, so a `SessionClosing` (or any
+    // event the close emits) is delivered into the sink rather than severed by an
+    // immediate pump abort.
     for client in &mut clients {
-        recorder.record(format!("client-flush:{}", client.name()));
-        client.flush_sink().await;
+        recorder.record(format!("client-close:{}", client.name()));
         client.close().await;
     }
-    // Sinks live until here; every one was flushed above before drop.
-    drop(clients);
 
+    // Drop the anchors so each authoritative session's final teed events land in
+    // the tap log before it is flushed.
     recorder.record("anchor-drop");
     drop(anchors);
 
+    // Flush the durable tap log BEFORE the best-effort per-client sink flushes
+    // (the load-bearing tap-log-before-sink-flush contract): if the remaining
+    // best-effort steps stall, the durable record is already safe.
     recorder.record("tap-log-flush");
     if let Some(tap_log) = &tap_log
         && let Err(e) = tap_log.flush().await
     {
         tracing::warn!(error = %e, "tap-log flush failed during shutdown");
     }
+
+    // Now flush the per-client sinks (delivering buffered events, incl. the
+    // terminal ones drained above), then drop them (service drop, last).
+    for client in &mut clients {
+        recorder.record(format!("client-flush:{}", client.name()));
+        client.flush_sink().await;
+    }
+    drop(clients);
 }
 
 #[cfg(test)]
@@ -111,11 +130,11 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
-        async fn flush_sink(&self) {
-            self.recorder.record(format!("sink-flush:{}", self.name));
-        }
         async fn close(&mut self) {
-            self.recorder.record(format!("client-close:{}", self.name));
+            self.recorder.record(format!("session-closed:{}", self.name));
+        }
+        async fn flush_sink(&self) {
+            self.recorder.record(format!("sink-flushed:{}", self.name));
         }
     }
 
@@ -187,16 +206,21 @@ mod tests {
                 "accept-stopped",
                 "diagnostics-stop",
                 "diagnostics-stopped",
-                "client-flush:a",
-                "sink-flush:a",
+                // Close + pump-drain every client first (terminal events reach sinks).
                 "client-close:a",
-                "client-flush:b",
-                "sink-flush:b",
+                "session-closed:a",
                 "client-close:b",
+                "session-closed:b",
+                // Anchors drop, then the durable tap log flushes BEFORE sink flushes.
                 "anchor-drop",
                 "anchor-dropped",
                 "tap-log-flush",
                 "taplog-flushed",
+                // Best-effort per-client sink flushes last, then service drop.
+                "client-flush:a",
+                "sink-flushed:a",
+                "client-flush:b",
+                "sink-flushed:b",
             ]
         );
     }

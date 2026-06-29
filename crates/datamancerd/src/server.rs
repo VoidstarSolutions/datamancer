@@ -57,9 +57,21 @@ impl DrainClient for ClientEntry {
 
     async fn close(&mut self) {
         if let Some(session) = self.session.take() {
+            // Closing emits a terminal `SessionClosing` into the client stream.
             let _ = session.close().await;
         }
-        self.pump.abort();
+        // Let the pump deliver the remaining stream (incl. `SessionClosing`) into
+        // the sink before the later flush, rather than severing it immediately.
+        // The session close ends the stream, so the pump finishes on its own;
+        // bound the wait so a wedged pump cannot hang shutdown, aborting only if
+        // it overruns.
+        let mut pump = std::mem::replace(&mut self.pump, tokio::spawn(async {}));
+        if tokio::time::timeout(Duration::from_secs(2), &mut pump)
+            .await
+            .is_err()
+        {
+            pump.abort();
+        }
     }
 }
 
@@ -261,10 +273,37 @@ impl Server {
             std::mem::take(&mut self.anchors),
             self.tap_log.clone(),
         );
-        if tokio::time::timeout(self.shutdown_timeout, drain_fut)
-            .await
-            .is_err()
-        {
+        tokio::pin!(drain_fut);
+
+        // Drop the supervisor's own `cmd_tx` clone so `cmd_rx` closes once the
+        // accept loop and connection tasks release theirs.
+        drop(cmd_tx);
+
+        // Keep servicing `cmd_rx` while the drain runs: the accept loop is
+        // aborted at the start of `drain`, but connection tasks already spawned
+        // may still send a request. Reply `shutting_down` promptly so a producer
+        // never blocks forever on its reply channel (which would otherwise leave
+        // a wedged connection task and could stall a clean exit).
+        let drained = tokio::time::timeout(self.shutdown_timeout, async {
+            let mut producers_open = true;
+            loop {
+                tokio::select! {
+                    () = &mut drain_fut => break,
+                    maybe = cmd_rx.recv(), if producers_open => match maybe {
+                        Some(ServerCommand::Request { reply, .. }) => {
+                            let _ = reply.send(Reply::error(
+                                codes::SHUTTING_DOWN,
+                                "daemon is shutting down",
+                            ));
+                        }
+                        Some(ServerCommand::Disconnect { .. }) => {}
+                        None => producers_open = false,
+                    },
+                }
+            }
+        })
+        .await;
+        if drained.is_err() {
             tracing::error!("shutdown drain exceeded timeout; forcing exit");
         }
         tracing::debug!(phases = ?recorder.entries(), "drain phases");
@@ -292,18 +331,18 @@ impl Server {
         let addr: SocketAddr = format!("{}:{}", web.bind, web.port)
             .parse()
             .map_err(|e| DaemonError::ConfigInvalid(format!("web bind address: {e}")))?;
-        if !addr.ip().is_loopback() {
-            return Err(DaemonError::ConfigInvalid(format!(
-                "web bind {addr} is not a loopback address; the web UI is same-host only"
-            )));
-        }
+
+        // Bind synchronously here (loopback enforced inside `bind`), so a bind
+        // failure surfaces to the caller instead of being swallowed in the
+        // detached serve task.
+        let listener = crate::web::bind(addr).await?;
 
         #[cfg(feature = "metrics")]
         if let Err(e) = crate::web::metrics::install() {
             tracing::warn!(error = %e, "metrics recorder install failed; /metrics will 503");
         }
 
-        // Warm both swaps before binding so a handler never serves an empty
+        // Warm both swaps before serving so a handler never serves an empty
         // snapshot.
         let mut refreshers = crate::web::refresh::Refreshers::warm(&self.dm).await?;
         refreshers.spawn(
@@ -316,7 +355,7 @@ impl Server {
         let assets_dir = web.assets_dir.clone();
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let serve = tokio::spawn(async move {
-            crate::web::serve(state, addr, assets_dir, async move {
+            crate::web::serve(state, listener, assets_dir, async move {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -335,9 +374,44 @@ impl Server {
         {
             std::fs::create_dir_all(parent)?;
         }
-        // Remove a stale socket from a prior unclean exit.
-        let _ = std::fs::remove_file(&self.admin_socket);
+        self.clear_stale_socket()?;
         Ok(UnixListener::bind(&self.admin_socket)?)
+    }
+
+    /// Remove only a *stale* admin socket. Refuses to delete a non-socket file
+    /// at that path (a misconfiguration must not clobber arbitrary files), and
+    /// refuses to steal a socket a live daemon is still listening on.
+    fn clear_stale_socket(&self) -> Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+        let meta = match std::fs::symlink_metadata(&self.admin_socket) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if !meta.file_type().is_socket() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "admin_socket path {} exists and is not a socket; refusing to remove it",
+                    self.admin_socket.display()
+                ),
+            )
+            .into());
+        }
+        // It is a socket. If a daemon is still listening, do not steal it.
+        if std::os::unix::net::UnixStream::connect(&self.admin_socket).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "admin_socket {} is already in use by a running daemon",
+                    self.admin_socket.display()
+                ),
+            )
+            .into());
+        }
+        // A socket with no listener is stale (unclean prior exit); safe to remove.
+        std::fs::remove_file(&self.admin_socket)?;
+        Ok(())
     }
 
     async fn handle(&mut self, cmd: ServerCommand) {
@@ -511,6 +585,27 @@ fn spec_instrument(spec: &SubscriptionSpec) -> Instrument {
     )
 }
 
+/// Reject a control request that carries unknown top-level JSON keys. `serde`'s
+/// `deny_unknown_fields` cannot cover `Request` directly (it is an
+/// internally-tagged enum, and `Subscribe` `#[serde(flatten)]`s its spec — both
+/// disable the attribute), so compare the input object's keys against the keys
+/// the parsed request round-trips to. Any input key absent from the canonical
+/// form was silently ignored and is reported as an error.
+fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(), String> {
+    let input: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("invalid request: {e}"))?;
+    let canonical =
+        serde_json::to_value(request).map_err(|e| format!("invalid request: {e}"))?;
+    if let (Some(input), Some(canonical)) = (input.as_object(), canonical.as_object()) {
+        for key in input.keys() {
+            if !canonical.contains_key(key) {
+                return Err(format!("unknown field `{key}`"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Pump a client's multiplexed stream into its per-client sink, in arrival
 /// order (`(instrument, seq)`; no cross-symbol order is created). A single
 /// sequential pump preserves the stream's existing order.
@@ -562,20 +657,34 @@ async fn handle_connection(stream: UnixStream, cmd_tx: mpsc::Sender<ServerComman
         }
         let reply = match serde_json::from_str::<Request>(&line) {
             Ok(request) => {
-                if let Request::OpenClient { client, .. } = &request {
-                    opened_client = Some(client.clone());
-                }
-                let (tx, rx) = oneshot::channel();
-                if cmd_tx
-                    .send(ServerCommand::Request { request, reply: tx })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                match rx.await {
-                    Ok(reply) => reply,
-                    Err(_) => break,
+                if let Err(detail) = reject_unknown_keys(&line, &request) {
+                    Reply::error(codes::BAD_REQUEST, detail)
+                } else {
+                    let open_client_name = match &request {
+                        Request::OpenClient { client, .. } => Some(client.clone()),
+                        _ => None,
+                    };
+                    let (tx, rx) = oneshot::channel();
+                    if cmd_tx
+                        .send(ServerCommand::Request { request, reply: tx })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    match rx.await {
+                        Ok(reply) => {
+                            // Arm EOF teardown only after a *successful* open, so a
+                            // rejected open (e.g. duplicate-name) never causes the
+                            // EOF path to tear down the existing client of that
+                            // name.
+                            if reply.ok && let Some(name) = open_client_name {
+                                opened_client = Some(name);
+                            }
+                            reply
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
             Err(e) => Reply::error(codes::BAD_REQUEST, format!("invalid request: {e}")),
