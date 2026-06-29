@@ -40,7 +40,7 @@ Datamancer's public output is a stream of `MarketEvent`. Variants currently plan
 Every data variant carries three timestamp/identifier fields, with distinct roles that should not be conflated:
 
 - **`source_ts`** — the timestamp the provider reported for the event. Source of truth for "when did this happen in the market" and the **only** timestamp engine logic should reason about. Sourced verbatim from provider data; never assigned by datamancer.
-- **`seq: u64`** — a session-monotonic sequence number assigned by datamancer at receipt. **The sole ordering field** for the stream. Live mode assigns `seq` in arrival order, so replaying in `seq` order reproduces the consumer's original experience exactly. Historical fetch assigns `seq` in source-timestamp order during fetch, so `seq` order matches market order. Persistence sinks use `seq` gaps to detect drops.
+- **`seq: u64`** — a per-symbol ordering number stamped **once at the source** of the authoritative per-`(instrument, kind)` stream, in canonical delivery order, before any sink — so it is identical across all consumers of that symbol (not a per-consumer poll artifact). **The sole ordering field** for the stream, and per-symbol only (there is no cross-instrument order; the multiplex key is `(instrument, seq)`). Live mode stamps `seq` in arrival order, so replaying in `seq` order reproduces the consumer's original experience exactly. Historical fetch stamps `seq` in source-timestamp order during fetch, so `seq` order matches market order. The delivered stream is contiguous *only while nothing is lost*: a consumer that misses events (resume-buffer eviction, late join) sees a real `seq` hole, surfaced in-band as a `Control::Gap`.
 - **`rx_ts`** — wall-clock at the moment the bytes were received from the provider, captured pre-parse. **Observability only.** Used for measuring provider-to-engine latency (`rx_ts - source_ts`), correlating engine state with external wall-clock events (logs, traces, debugger sessions), and operational monitoring. **Engine decision logic must never depend on `rx_ts`** — doing so re-introduces wall-clock as a determinism hazard. For replay-from-historical-fetch, where there is no live arrival to record, `rx_ts` collapses to `source_ts`.
 
 `Control` events ride the same stream as data events because connectivity changes are part of the session's truth: a gap can invalidate downstream signals, and forcing consumers to acknowledge it in-band is safer than offering it as a separate stream they may forget to subscribe to.
@@ -163,9 +163,10 @@ multi-shot for live scope — drop the stream, re-take later, and delivery
 resumes from a bounded in-memory buffer (`DatamancerBuilder::resume_buffer_events`,
 default 65 536 events). If the buffer overflowed, one
 in-band `Control::Gap` reports exactly the evicted span before the survivors
-flow. `seq` is stamped at delivery from a counter shared across re-takes, so
-the delivered stream is always contiguous — an evicted event is a reported
-gap, never a `seq` hole.
+flow. `seq` is stamped once at the source (not per-consumer), so survivors keep
+their original `seq` and an evicted event is a reported gap **and** a real `seq`
+hole at the evicted span — the delivered stream is contiguous only while
+nothing is lost.
 
 `Scope::Live { backfill_from: Some(t) }` stitches history ahead of the live
 tail: the window `[t, live-edge)` is served through the historical

@@ -36,10 +36,21 @@ These are load-bearing design rules — violating them breaks downstream consume
 - **Single ordered stream.** A `Session` exposes exactly one `events()` stream merging all subscriptions. Per-instrument demux is a consumer concern.
 - **Three timestamp fields, distinct roles** (on every data event):
   - `source_ts` — provider-reported market time. **Only** field engine logic should reason about. Never assigned by datamancer.
-  - `seq: u64` — session-monotonic, stamped by datamancer at delivery into
-    the consumer stream (`EventStream` stamps on poll from a counter shared
-    across re-takes; arrival order is preserved). **The sole ordering field.** Live: arrival order. Historical fetch: source-timestamp order. `seq` is a pure total-order key: contiguous by construction (datamancer numbers only events it received, so a provider-side drop is invisible at this layer — it is never a hole in `seq`). It carries no drop-detection role. Real gaps are a `source_ts`/coverage concept surfaced as in-band `Control::Gap` events, which themselves occupy a `seq` slot. Likewise resume-buffer overflow: evicted events are never numbered and
-    are surfaced as an in-band `Control::Gap`, never a `seq` hole. The tap log owns its own canonical `seq` and may rebase it on splice.
+  - `seq: u64` — **per-symbol** ordering field, stamped **once at the source**
+    of the authoritative per-`(instrument, kind)` session by a single-writer
+    controller counter, in canonical delivery order, before any sink (Phase 1:
+    `stamp → tee → emit`). Identical across all consumers of that symbol — it is
+    a property of the shared stream, not of per-consumer poll timing. **The sole
+    ordering field**, per-symbol only (there is no cross-instrument order; the
+    multiplex key is `(instrument, seq)` — true fan-out lands in Phase 2). Live:
+    arrival order. Historical fetch: source-timestamp order. Controls occupy
+    `seq` slots. Holes are **real**: evicted/late-join events are numbered, so a
+    resume-buffer overflow is a real `seq` hole, surfaced in-band as
+    `Control::Gap` at the evicted span; the delivered stream is contiguous only
+    while nothing is lost. The surreal tap log persists this source `seq`
+    verbatim (it no longer mints its own), so tap-log replay reproduces the
+    delivered stream's `seq`. `Seq::SYNTHETIC = Seq(u64::MAX)` tags out-of-band
+    synthetic controls and is exempt from per-symbol monotonicity.
   - `rx_ts` — wall-clock at byte receipt. **Observability only.** Engine decision logic must never depend on it (re-introduces wall-clock non-determinism). Collapses to `source_ts` in pure-historical replay.
 - **`Control` events ride the data stream.** Connectivity changes, gaps, subscription state — all in-band, not a side channel.
 - **No timestamp re-sort.** Events emit in arrival order, not re-sorted by `source_ts`. Consumers needing strict timestamp ordering buffer themselves.
@@ -51,6 +62,7 @@ These are load-bearing design rules — violating them breaks downstream consume
 
 Datamancer produces events; it is **not** an analysis framework, time-series store, or cross-venue reconciler. Persistence is wired: historical read-through cache, live tap-log
 write-through, and the resume primitive (multi-shot `take_events`,
-historical→live backfill seam) are implemented. Remaining deferred: cache
-volume/eviction and tap-log `seq` rebase (unexercised — appends are strictly
-end-of-log). Keep the session API free of choices that would preclude local replay-source integration.
+historical→live backfill seam) are implemented. The tap log persists the
+source `seq` verbatim (no longer mints its own; appends are strictly
+end-of-log). Remaining deferred: cache volume/eviction. Keep the session API
+free of choices that would preclude local replay-source integration.
