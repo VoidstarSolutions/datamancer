@@ -12,6 +12,12 @@ pub mod alpaca_crypto;
 pub use alpaca::{AlpacaProvider, AlpacaProviderConfig, AlpacaStreamFeed};
 #[cfg(feature = "provider-alpaca")]
 pub use alpaca_crypto::{AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue};
+/// Re-exported provider account selector (`Paper`/`Live`); the actual
+/// credentials are resolved from the environment by `oxidized_alpaca` keyed on
+/// this. Surfaced so embedders (e.g. `datamancerd`) can build provider configs
+/// without depending on `oxidized_alpaca` directly.
+#[cfg(feature = "provider-alpaca")]
+pub use oxidized_alpaca::AccountType;
 
 /// Saturating `f64 → u64` for provider wire-format sizes / volumes.
 ///
