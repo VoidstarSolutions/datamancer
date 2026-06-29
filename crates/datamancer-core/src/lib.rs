@@ -28,6 +28,6 @@ pub use event::{
 pub use instrument::{AssetClass, Instrument, ProviderId};
 pub use price::Price;
 pub use traits::{
-    CacheCoverage, CacheKey, HistoricalCache, HistoryRequest, LiveHandle, Provider, ReplayRequest,
-    ReplaySource, TapLog,
+    CacheCoverage, CacheKey, EventSink, HistoricalCache, HistoryRequest, LiveHandle, Provider,
+    PublishOutcome, ReplayRequest, ReplaySource, TapLog,
 };

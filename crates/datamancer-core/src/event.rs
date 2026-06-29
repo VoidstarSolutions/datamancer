@@ -8,15 +8,42 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Instrument, Price};
 
-/// A monotonically-increasing identifier assigned by datamancer at delivery into the consumer stream.
+/// A per-symbol ordering identifier stamped **once at the source** of an
+/// authoritative per-`(instrument, kind)` session, in that session's canonical
+/// delivery order, before any sink.
 ///
-/// **The sole ordering field for the stream.** In a live session `seq` is
-/// assigned in arrival order; replaying in `seq` order reproduces the
-/// consumer's original experience exactly. For historical fetch, `seq` is
-/// assigned in source-timestamp order during fetch, so `seq` order matches
-/// market order.
+/// **The sole ordering field for the stream.** Invariants:
+///
+/// - **Per-symbol, not global.** `seq` orders one symbol's stream; there is no
+///   cross-instrument order. The multiplex ordering key is `(instrument, seq)`.
+/// - **Stamped at the source.** The authoritative controller assigns `seq` once,
+///   in delivery order, before the event reaches any sink — so it is a property
+///   of the shared stream, not of a particular consumer's poll timing.
+/// - **Identical across a symbol's consumers.** Every consumer of one symbol's
+///   authoritative stream observes the same `(seq, source_ts)` for each event.
+/// - **Controls occupy slots.** In-band [`Control`] events are stamped here too,
+///   so they consume a `seq` slot like data events.
+/// - **Holes are real.** A consumer that misses events (resume-buffer eviction,
+///   late join) observes a real `seq` hole, surfaced in-band as
+///   [`ControlKind::Gap`]. The delivered stream is contiguous *only while
+///   nothing is lost*.
+/// - **`SYNTHETIC` is exempt.** [`Seq::SYNTHETIC`] tags out-of-band synthetic
+///   control events and is exempt from per-symbol monotonicity.
+///
+/// In a live session `seq` is assigned in arrival order; for historical fetch
+/// it is assigned in source-timestamp order during fetch, so `seq` order
+/// matches market order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Seq(pub u64);
+
+impl Seq {
+    /// Sentinel `seq` for synthetic control events that do not belong to an
+    /// authoritative stream's monotonic order (e.g. per-client controls minted
+    /// outside the source counter). `Seq(u64::MAX)` is unreachable by the
+    /// monotonic source counter, so it never collides with a stamped event, and
+    /// it is documented exempt from per-symbol monotonicity.
+    pub const SYNTHETIC: Seq = Seq(u64::MAX);
+}
 
 /// A timestamp expressed in nanoseconds since the Unix epoch.
 ///
@@ -52,7 +79,7 @@ pub enum EventKind {
 ///
 /// - `source_ts` — when the event happened in the market. The **only**
 ///   timestamp engine logic should reason about.
-/// - `seq` — datamancer's session-monotonic ordering field.
+/// - `seq` — datamancer's per-symbol, source-stamped ordering field.
 /// - `rx_ts` — wall-clock at byte receipt. **Observability only.** Engine
 ///   decision logic must never depend on `rx_ts`. For replay-from-historical,
 ///   `rx_ts` collapses to `source_ts`.
