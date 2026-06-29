@@ -1,8 +1,10 @@
 //! SurrealDB-backed [`TapLog`] (and [`ReplaySource`]).
 //!
 //! Records the live event stream in **arrival order**. The sole ordering key
-//! is `seq`, assigned by this log (not the session-local seq). `seq` is a pure
-//! total order — contiguous by construction, never gapped for drop detection.
+//! is `seq` — the **source `seq`**, stamped by the session controller before
+//! the tap-log tee. The log persists that value verbatim and does **not** mint
+//! its own, so tap-log replay reproduces the delivered stream's `seq` exactly
+//! (Phase-1 convergence). `seq` is a per-symbol total order.
 //!
 //! # Schema (namespace `datamancer`, database `taplog`)
 //!
@@ -11,8 +13,8 @@
 //!   instrument's same-kind events live together, which compresses well.
 //! - `streams` — registry mapping each `(instrument, kind)` to its shard table
 //!   name. Drives write-path shard resolution and replay shard enumeration.
-//! - `meta` — a single row (`hwm`, `next_shard`) holding the global `seq`
-//!   high-water mark and the next shard ordinal to allocate.
+//! - `meta` — a single row (`next_shard`) holding the next shard ordinal to
+//!   allocate.
 //!
 //! # Durability
 //!
@@ -112,8 +114,6 @@ struct StreamRow {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, SurrealValue)]
 struct MetaRow {
-    /// Global `seq` high-water mark: the last seq assigned.
-    hwm: u64,
     /// Next shard ordinal to allocate.
     next_shard: u64,
 }
@@ -299,7 +299,6 @@ impl SurrealTapLog {
         let (tx, rx) = mpsc::unbounded_channel();
         let writer = Writer {
             db: db.clone(),
-            hwm: meta.hwm,
             next_shard: meta.next_shard,
             shards,
             last_error: None,
@@ -344,7 +343,6 @@ impl TapLog for SurrealTapLog {
 
 struct Writer {
     db: Surreal<Db>,
-    hwm: u64,
     next_shard: u64,
     shards: HashMap<(Instrument, EventKind), String>,
     last_error: Option<Error>,
@@ -385,13 +383,10 @@ impl Writer {
 
         let shard = self.resolve_shard(&instrument, kind).await?;
 
-        // Reserve seq and persist the high-water mark BEFORE inserting the row.
-        // A crash between persist and insert leaves an unused seq value — a
-        // harmless gap, since seq carries no drop-detection meaning — never a
-        // reused value that would corrupt ordering.
-        self.hwm += 1;
-        let seq = self.hwm;
-        self.persist_meta().await?;
+        // Persist the source `seq` verbatim — the session controller already
+        // stamped it before the tee. The tap log no longer mints its own seq,
+        // so replay reproduces the delivered stream's `seq` (convergence).
+        let seq = event_seq(&ev);
 
         match ev {
             MarketEvent::Trade(t) => {
@@ -505,7 +500,6 @@ impl Writer {
 
     async fn persist_meta(&self) -> Result<()> {
         let row = MetaRow {
-            hwm: self.hwm,
             next_shard: self.next_shard,
         };
         let _: Option<MetaRow> = self

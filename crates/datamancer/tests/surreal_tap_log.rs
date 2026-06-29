@@ -20,24 +20,27 @@ fn inst(symbol: &str) -> Instrument {
     )
 }
 
-fn trade(symbol: &str, source_ts: i64, rx_ts: i64, price: f64, size: u64) -> MarketEvent {
+// The tap log persists the source `seq` verbatim (it no longer mints its own),
+// so test inputs carry the `seq` the controller would have stamped, and replay
+// reproduces exactly that value.
+fn trade(symbol: &str, source_ts: i64, rx_ts: i64, seq: u64, price: f64, size: u64) -> MarketEvent {
     MarketEvent::Trade(Trade {
         instrument: inst(symbol),
         source_ts: Timestamp(source_ts),
         rx_ts: Timestamp(rx_ts),
-        seq: Seq(0),
+        seq: Seq(seq),
         price: Price::from_f64_round(price),
         size,
     })
 }
 
-fn bar(symbol: &str, source_ts: i64, close: f64) -> MarketEvent {
+fn bar(symbol: &str, source_ts: i64, seq: u64, close: f64) -> MarketEvent {
     MarketEvent::Bar(Bar {
         instrument: inst(symbol),
         interval: BarInterval::OneMinute,
         source_ts: Timestamp(source_ts),
         rx_ts: Timestamp(source_ts),
-        seq: Seq(0),
+        seq: Seq(seq),
         open: Price::from_f64_round(close),
         high: Price::from_f64_round(close),
         low: Price::from_f64_round(close),
@@ -70,13 +73,13 @@ async fn append_then_flush_persists_and_replays_in_order() {
     let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
         .await
         .unwrap();
-    log.append(&trade("AAPL", 100, 100, 150.10, 1))
+    log.append(&trade("AAPL", 100, 100, 0, 150.10, 1))
         .await
         .unwrap();
-    log.append(&trade("AAPL", 250, 250, 150.25, 2))
+    log.append(&trade("AAPL", 250, 250, 1, 150.25, 2))
         .await
         .unwrap();
-    log.append(&trade("AAPL", 399, 399, 150.40, 3))
+    log.append(&trade("AAPL", 399, 399, 2, 150.40, 3))
         .await
         .unwrap();
     log.flush().await.unwrap();
@@ -92,8 +95,8 @@ async fn append_then_flush_persists_and_replays_in_order() {
             got.push((t.source_ts.0, t.size, t.seq.0));
         }
     }
-    // Arrival order preserved; seq is store-canonical and contiguous from 1.
-    assert_eq!(got, vec![(100, 1, 1), (250, 2, 2), (399, 3, 3)]);
+    // Arrival order preserved; the source `seq` is persisted verbatim.
+    assert_eq!(got, vec![(100, 1, 0), (250, 2, 1), (399, 3, 2)]);
 }
 
 #[tokio::test]
@@ -102,9 +105,9 @@ async fn writer_creates_one_shard_per_instrument_kind() {
         .await
         .unwrap();
     // Two instruments, one kind each, plus a bar for AAPL → 3 distinct shards.
-    log.append(&trade("AAPL", 1, 1, 10.0, 1)).await.unwrap();
-    log.append(&trade("MSFT", 2, 2, 20.0, 1)).await.unwrap();
-    log.append(&bar("AAPL", 3, 30.0)).await.unwrap();
+    log.append(&trade("AAPL", 1, 1, 0, 10.0, 1)).await.unwrap();
+    log.append(&trade("MSFT", 2, 2, 1, 20.0, 1)).await.unwrap();
+    log.append(&bar("AAPL", 3, 2, 30.0)).await.unwrap();
     log.flush().await.unwrap();
 
     // A second flush is a clean no-op (no buffered error).
@@ -144,12 +147,12 @@ async fn open_empty_log_replays_nothing() {
     assert!(stream.next().await.is_none());
 }
 
-fn quote(symbol: &str, source_ts: i64, rx_ts: i64, bid: f64, ask: f64) -> MarketEvent {
+fn quote(symbol: &str, source_ts: i64, rx_ts: i64, seq: u64, bid: f64, ask: f64) -> MarketEvent {
     MarketEvent::Quote(Quote {
         instrument: inst(symbol),
         source_ts: Timestamp(source_ts),
         rx_ts: Timestamp(rx_ts),
-        seq: Seq(0),
+        seq: Seq(seq),
         bid: Price::from_f64_round(bid),
         bid_size: 1,
         ask: Price::from_f64_round(ask),
@@ -164,13 +167,13 @@ async fn replay_preserves_arrival_order_not_source_ts_order() {
         .unwrap();
     // Arrival order: quote@300, trade@200, quote@250 — deliberately NOT sorted
     // by source_ts. Replay must reproduce arrival (seq) order.
-    log.append(&quote("AAPL", 300, 1000, 9.0, 11.0))
+    log.append(&quote("AAPL", 300, 1000, 0, 9.0, 11.0))
         .await
         .unwrap();
-    log.append(&trade("AAPL", 200, 1001, 10.0, 5))
+    log.append(&trade("AAPL", 200, 1001, 1, 10.0, 5))
         .await
         .unwrap();
-    log.append(&quote("AAPL", 250, 1002, 9.5, 10.5))
+    log.append(&quote("AAPL", 250, 1002, 2, 9.5, 10.5))
         .await
         .unwrap();
     log.flush().await.unwrap();
@@ -192,7 +195,7 @@ async fn replay_preserves_arrival_order_not_source_ts_order() {
         }
     }
     // Arrival/seq order, NOT source_ts order (which would be t@200,q@250,q@300).
-    assert_eq!(order, vec![("q", 300, 1), ("t", 200, 2), ("q", 250, 3)]);
+    assert_eq!(order, vec![("q", 300, 0), ("t", 200, 1), ("q", 250, 2)]);
 }
 
 #[tokio::test]
@@ -202,10 +205,10 @@ async fn replay_merges_shards_by_seq_across_instruments() {
         .unwrap();
     // Interleave two instruments; each lands in its own shard. Replay must
     // merge them back into global seq order.
-    log.append(&trade("AAPL", 10, 10, 1.0, 1)).await.unwrap(); // seq 1
-    log.append(&trade("MSFT", 11, 11, 2.0, 1)).await.unwrap(); // seq 2
-    log.append(&trade("AAPL", 12, 12, 3.0, 1)).await.unwrap(); // seq 3
-    log.append(&trade("MSFT", 13, 13, 4.0, 1)).await.unwrap(); // seq 4
+    log.append(&trade("AAPL", 10, 10, 1, 1.0, 1)).await.unwrap();
+    log.append(&trade("MSFT", 11, 11, 2, 2.0, 1)).await.unwrap();
+    log.append(&trade("AAPL", 12, 12, 3, 3.0, 1)).await.unwrap();
+    log.append(&trade("MSFT", 13, 13, 4, 4.0, 1)).await.unwrap();
     log.flush().await.unwrap();
 
     let source = log.as_replay_source();
@@ -238,9 +241,15 @@ async fn replay_windows_by_source_ts() {
     let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
         .await
         .unwrap();
-    log.append(&trade("AAPL", 100, 100, 1.0, 1)).await.unwrap();
-    log.append(&trade("AAPL", 200, 200, 2.0, 1)).await.unwrap();
-    log.append(&trade("AAPL", 300, 300, 3.0, 1)).await.unwrap();
+    log.append(&trade("AAPL", 100, 100, 0, 1.0, 1))
+        .await
+        .unwrap();
+    log.append(&trade("AAPL", 200, 200, 1, 2.0, 1))
+        .await
+        .unwrap();
+    log.append(&trade("AAPL", 300, 300, 2, 3.0, 1))
+        .await
+        .unwrap();
     log.flush().await.unwrap();
 
     let source = log.as_replay_source();
@@ -304,8 +313,8 @@ async fn embedded_round_trip_persists_and_continues_seq() {
 
     {
         let log = SurrealTapLog::open(cfg.clone()).await.unwrap();
-        log.append(&trade("AAPL", 1, 1, 10.0, 1)).await.unwrap(); // seq 1
-        log.append(&trade("AAPL", 2, 2, 11.0, 1)).await.unwrap(); // seq 2
+        log.append(&trade("AAPL", 1, 1, 1, 10.0, 1)).await.unwrap(); // seq 1
+        log.append(&trade("AAPL", 2, 2, 2, 11.0, 1)).await.unwrap(); // seq 2
         log.flush().await.unwrap();
     }
 
@@ -323,8 +332,9 @@ async fn embedded_round_trip_persists_and_continues_seq() {
             }
         }
     };
-    // A new append must continue the seq from the persisted high-water mark.
-    log.append(&trade("AAPL", 3, 3, 12.0, 1)).await.unwrap(); // seq 3
+    // A post-reopen append persists its own source seq; the shard registry and
+    // earlier rows survive the reopen.
+    log.append(&trade("AAPL", 3, 3, 3, 12.0, 1)).await.unwrap(); // seq 3
     log.flush().await.unwrap();
 
     let source = log.as_replay_source();
@@ -338,7 +348,11 @@ async fn embedded_round_trip_persists_and_continues_seq() {
             seqs.push(t.seq.0);
         }
     }
-    assert_eq!(seqs, vec![1, 2, 3], "seq continues across reopen, no reset");
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3],
+        "persisted source seqs survive reopen, no reset"
+    );
 }
 
 #[tokio::test]
@@ -346,7 +360,9 @@ async fn replay_empty_when_window_is_degenerate() {
     let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
         .await
         .unwrap();
-    log.append(&trade("AAPL", 100, 100, 1.0, 1)).await.unwrap();
+    log.append(&trade("AAPL", 100, 100, 0, 1.0, 1))
+        .await
+        .unwrap();
     log.flush().await.unwrap();
 
     let source = log.as_replay_source();
@@ -371,8 +387,10 @@ async fn replay_empty_kinds_matches_all_kinds() {
     let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
         .await
         .unwrap();
-    log.append(&trade("AAPL", 100, 100, 1.0, 1)).await.unwrap(); // seq 1
-    log.append(&bar("AAPL", 200, 5.0)).await.unwrap(); // seq 2
+    log.append(&trade("AAPL", 100, 100, 1, 1.0, 1))
+        .await
+        .unwrap(); // seq 1
+    log.append(&bar("AAPL", 200, 2, 5.0)).await.unwrap(); // seq 2
     log.flush().await.unwrap();
 
     let source = log.as_replay_source();

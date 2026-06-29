@@ -257,9 +257,12 @@ async fn overflow_reports_one_gap_and_tap_log_captures_everything() {
         vec![100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
     );
 
-    // Spec test 2 (overflow honesty): attach now. First a single Gap covering
-    // exactly the evicted span [100, 601), then the four survivors, with seq
-    // contiguous from 0 (evicted events were never stamped).
+    // Spec test 2 (overflow honesty): attach now. Under source-stamping the
+    // ten events are stamped seq 0..9 at push; seq 0..5 (source 100..600) are
+    // evicted, leaving a real seq hole. On re-attach the eviction Gap sits at
+    // the first-evicted slot (seq 0 = dropped_first_seq) covering exactly the
+    // evicted span [100, 601), then the four survivors keep their push-time
+    // seq 6..9 (the hole seq 1..5 is never re-delivered).
     let mut stream = session.take_events().await.unwrap();
     let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
@@ -289,7 +292,7 @@ async fn overflow_reports_one_gap_and_tap_log_captures_everything() {
             other => panic!("expected Trade, got {other:?}"),
         }
     }
-    assert_eq!(survivors, vec![(700, 1), (800, 2), (900, 3), (1000, 4)]);
+    assert_eq!(survivors, vec![(700, 6), (800, 7), (900, 8), (1000, 9)]);
     let _ = session.close().await;
 }
 
@@ -510,4 +513,147 @@ async fn tap_log_captures_only_the_live_tail_of_a_stitched_session() {
     // the tap log (live-tail-only decision; no seq rebase ever needed).
     assert_eq!(wait_for_tapped(&log, 1).await, vec![5_000]);
     let _ = session.close().await;
+}
+
+/// Replay the tap log and return captured trades as `(source_ts, seq)` pairs in
+/// seq order.
+async fn tapped_with_seq(log: &SurrealTapLog) -> Vec<(i64, u64)> {
+    log.flush().await.unwrap();
+    let source = log.as_replay_source();
+    let mut replay = source
+        .open(ReplayRequest {
+            instruments: vec![inst("AAPL")],
+            kinds: vec![EventKind::Trade],
+            from: Timestamp(i64::MIN),
+            to: Timestamp(i64::MAX),
+        })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(ev) = replay.next().await {
+        if let MarketEvent::Trade(t) = ev {
+            out.push((t.source_ts.0, t.seq.0));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn tap_log_replay_reproduces_the_source_seq() {
+    // Convergence guard: seq is stamped at the source before the tap-log tee,
+    // so the persisted (and replayed) seq is byte-identical to the delivered
+    // stream's seq — the tap log no longer mints its own.
+    let (provider, handles) = FakeProvider::new("fake");
+    let log = Arc::new(
+        SurrealTapLog::open(SurrealTapLogConfig::Memory)
+            .await
+            .unwrap(),
+    );
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .tap_log_arc(log.clone())
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none().with_tap_log(true),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+
+    for ts in [100, 200, 300] {
+        handles.push_live(trade(ts)).await;
+    }
+
+    let mut delivered = Vec::new();
+    for _ in 0..3 {
+        let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        match ev {
+            MarketEvent::Trade(t) => delivered.push((t.source_ts.0, t.seq.0)),
+            other => panic!("expected Trade, got {other:?}"),
+        }
+    }
+    // Source-stamped from 0 in delivery order.
+    assert_eq!(delivered, vec![(100, 0), (200, 1), (300, 2)]);
+
+    // Tap-log replay reproduces the same (source_ts, seq) verbatim.
+    let replayed = tapped_with_seq(&log).await;
+    assert_eq!(replayed, delivered);
+    let _ = session.close().await;
+}
+
+/// Drain a historical session to completion, returning data events as
+/// `(seq, source_ts)` pairs in delivery order.
+async fn drain_historical(session: &datamancer::Session) -> Vec<(u64, i64)> {
+    let mut stream = session.take_events().await.unwrap();
+    let mut out = Vec::new();
+    // Stop at SessionClosing: the historical controller emits it then waits for
+    // the consumer to drop the stream, so reading until `None` would deadlock.
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out draining historical stream")
+            .expect("stream ended before SessionClosing");
+        match ev {
+            MarketEvent::Trade(t) => out.push((t.seq.0, t.source_ts.0)),
+            MarketEvent::Control(c) if matches!(c.kind, ControlKind::SessionClosing) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn historical_seq_is_deterministic_across_independent_sessions() {
+    // Two independent historical sessions over the same instrument+range,
+    // backed by identical input, produce identical (seq, source_ts) sequences.
+    // Historical scope has no live-registry participation, so both run
+    // concurrently. Proves seq is now a function of source order, not of
+    // per-consumer poll timing.
+    let (provider, handles) = FakeProvider::new("fake");
+    handles
+        .set_history(vec![trade(100), trade(200), trade(300), trade(400)])
+        .await;
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .build()
+        .unwrap();
+
+    let scope = Scope::Historical {
+        from: Timestamp(0),
+        to: Timestamp(1_000),
+    };
+    let session_a = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            scope,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let session_b = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            scope,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+
+    let a = drain_historical(&session_a).await;
+    let b = drain_historical(&session_b).await;
+
+    assert_eq!(a, vec![(0, 100), (1, 200), (2, 300), (3, 400)]);
+    assert_eq!(a, b, "seq is a deterministic function of source order");
 }

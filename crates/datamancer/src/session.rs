@@ -45,10 +45,11 @@ use crate::fetch_locks::FetchLocks;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
+use async_trait::async_trait;
 use datamancer_core::{
-    Adjustment, Bar, CacheKey, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
-    HistoryRequest, Instrument, LiveHandle, MarketEvent, Provider, Quote, ReplayRequest, Result,
-    Seq, TapLog, Timestamp, Trade,
+    Adjustment, Bar, CacheKey, Control, ControlKind, Error, EventKind, EventSink, GapSpan,
+    HistoricalCache, HistoryRequest, Instrument, LiveHandle, MarketEvent, Provider, PublishOutcome,
+    Quote, ReplayRequest, Result, Seq, TapLog, Timestamp, Trade,
 };
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -270,7 +271,10 @@ impl Datamancer {
         let (sink, events_slot) = match scope {
             Scope::Historical { .. } => {
                 let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
-                (Sink::Attached(events_tx), Some(events_rx))
+                (
+                    Sink::Attached(InProcessSink { tx: events_tx }),
+                    Some(events_rx),
+                )
             }
             Scope::Live { .. } => (
                 Sink::Detached(EventRing::new(self.inner.resume_buffer_events)),
@@ -286,7 +290,6 @@ impl Datamancer {
             persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
             cmd_tx,
-            seq_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             adjustment: self.inner.adjustment,
         });
 
@@ -304,6 +307,7 @@ impl Datamancer {
             sink,
             ring_capacity: self.inner.resume_buffer_events,
             fetch_locks: self.inner.fetch_locks.clone(),
+            next_seq: 0,
         };
 
         let drop_guard = match scope {
@@ -538,10 +542,6 @@ struct SessionInner {
     /// shuts down immediately rather than hanging on `events_tx.closed()`.
     stream_taken: std::sync::atomic::AtomicBool,
     cmd_tx: mpsc::Sender<SessionCommand>,
-    /// Feeds `seq` stamping in `EventStream::poll_next`. Shared across
-    /// re-takes so the delivered stream's seq is contiguous by construction;
-    /// events that are never delivered are never numbered.
-    seq_counter: Arc<std::sync::atomic::AtomicU64>,
     /// Corporate-action adjustment mode for this session, copied from
     /// `DatamancerInner.adjustment`. Stamped into every `HistoryRequest` and
     /// `CacheKey` the controller builds.
@@ -594,10 +594,7 @@ impl Session {
                 ack_rx.await.map_err(|_| Error::SessionClosed)??
             }
         };
-        Ok(EventStream {
-            rx,
-            seq: self.inner.seq_counter.clone(),
-        })
+        Ok(EventStream { rx })
     }
 
     /// Replace the persistence options at runtime. Affects future writes;
@@ -667,13 +664,11 @@ impl Session {
 /// The session's output stream. Drop it to stop emission; re-take from the
 /// owning [`Session`] if you want events again.
 ///
-/// `seq` is stamped here, at delivery, from a counter shared across re-takes:
-/// the delivered stream is contiguous by construction, and events that never
-/// reach a consumer (ring overflow, undelivered channel residue at drop) are
-/// never numbered.
+/// `seq` is **not** stamped here. The authoritative controller stamps each
+/// event once at the source, in canonical delivery order, before it reaches
+/// the sink (see [`Controller::stamp`]); this stream is a pass-through.
 pub struct EventStream {
     rx: mpsc::Receiver<MarketEvent>,
-    seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Stream for EventStream {
@@ -683,15 +678,7 @@ impl Stream for EventStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        match self.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(ev)) => {
-                // Relaxed: a single consumer polls sequentially; the channel
-                // already provides the cross-task happens-before edge.
-                let seq = Seq(self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-                std::task::Poll::Ready(Some(stamp_seq(ev, seq)))
-            }
-            other => other,
-        }
+        self.rx.poll_recv(cx)
     }
 }
 
@@ -716,10 +703,34 @@ const DEFAULT_RESUME_BUFFER_EVENTS: usize = 65_536;
 
 /// The controller's consumer-facing side. `Attached` delivers into the
 /// outstanding [`EventStream`]'s channel (with backpressure); `Detached`
-/// buffers into a bounded [`EventRing`] until the next `take_events`.
+/// buffers into a bounded [`EventRing`] until the next `take_events`. The
+/// resume buffer is core-side (the `Detached` arm); the [`EventSink`] only
+/// delivers.
 enum Sink {
-    Attached(mpsc::Sender<MarketEvent>),
+    Attached(InProcessSink),
     Detached(EventRing),
+}
+
+/// In-process [`EventSink`]: wraps the consumer-facing channel. `publish`
+/// hands back a rejected event (consumer dropped its stream) so the controller
+/// can divert it to the resume buffer. `flush` is a no-op — the channel has no
+/// transport-side buffer to drain.
+struct InProcessSink {
+    tx: mpsc::Sender<MarketEvent>,
+}
+
+#[async_trait]
+impl EventSink for InProcessSink {
+    async fn publish(&self, ev: MarketEvent) -> PublishOutcome {
+        match self.tx.send(ev).await {
+            Ok(()) => PublishOutcome::Delivered,
+            Err(tokio::sync::mpsc::error::SendError(ev)) => PublishOutcome::Rejected(ev),
+        }
+    }
+
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct Controller {
@@ -731,6 +742,13 @@ struct Controller {
     /// Capacity for rings created on detach (from the builder knob).
     ring_capacity: usize,
     fetch_locks: FetchLocks,
+    /// Single-writer `seq` counter. The controller is the only task that
+    /// stamps, so a plain `u64` (no atomic, no sharing) structurally encodes
+    /// "stamped once at the source." Initialized to `0` at construction;
+    /// [`Controller::stamp`] reads and increments it. Control events and
+    /// evicted-then-numbered events both consume slots, so a resume-buffer
+    /// overflow is a real `seq` hole reported as `Control::Gap`.
+    next_seq: u64,
 }
 
 impl Controller {
@@ -738,13 +756,13 @@ impl Controller {
     /// outstanding and open, otherwise swap in a fresh channel and hand back
     /// the prior ring (if any) for flushing.
     fn prepare_attach(&mut self) -> Result<(mpsc::Receiver<MarketEvent>, Option<EventRing>)> {
-        if let Sink::Attached(tx) = &self.sink
-            && !tx.is_closed()
+        if let Sink::Attached(s) = &self.sink
+            && !s.tx.is_closed()
         {
             return Err(Error::EventsAlreadyTaken);
         }
         let (tx, rx) = mpsc::channel(default_buffer());
-        let prior = std::mem::replace(&mut self.sink, Sink::Attached(tx));
+        let prior = std::mem::replace(&mut self.sink, Sink::Attached(InProcessSink { tx }));
         let ring = match prior {
             Sink::Detached(ring) => Some(ring),
             Sink::Attached(_) => None,
@@ -752,18 +770,50 @@ impl Controller {
         Ok((rx, ring))
     }
 
-    /// Drain a ring into the (just-attached) sink: one `Gap` for anything the
-    /// ring evicted, then the buffered events in arrival order. Buffered
-    /// events were already teed at receipt, so this goes through `emit`, not
-    /// `forward`.
-    async fn flush_ring(&mut self, ring: EventRing) {
-        let (dropped, events) = ring.into_parts();
+    /// Drain the backfill `pending` ring at the seam. Its events were pushed
+    /// **unstamped** (`buffer_live_arrival` does a raw push) so their `seq` is
+    /// deferred to here — stamping at the seam places the live arrivals *after*
+    /// all backfill segments in canonical order and preserves monotonicity.
+    /// One `Gap` for anything the ring evicted, then the survivors, all through
+    /// `emit` (which stamps). Behavior-identical to the pre-split `flush_ring`.
+    async fn flush_backfill_pending(&mut self, ring: EventRing) {
+        let (dropped, _dropped_first_seq, events) = ring.into_parts();
         if let Some(span) = dropped {
             self.emit_gap(span.from_source_ts, span.from_source_ts, span.to_source_ts)
                 .await;
         }
         for ev in events {
             self.emit(ev).await;
+        }
+    }
+
+    /// Drain the detached resume ring on re-attach **without renumbering**. Its
+    /// events were stamped at push (`emit` → `deliver` → detached push), so
+    /// replaying them must preserve those `seq` values, leaving a real hole
+    /// where evicted events were.
+    ///
+    /// If an eviction occurred, the `Gap` is stamped at `dropped_first_seq`
+    /// (the first-evicted slot) and delivered prestamped — **not** via
+    /// `emit_gap`, which would mint a fresh post-survivor `seq` and order the
+    /// gap after the survivors, breaking monotonicity. Delivered order:
+    /// `Gap(seq = first_evicted), survivors(seq = push-time)`.
+    async fn flush_resume_ring(&mut self, ring: EventRing) {
+        let (dropped, dropped_first_seq, events) = ring.into_parts();
+        if let (Some(span), Some(first)) = (dropped, dropped_first_seq) {
+            self.emit_prestamped(MarketEvent::Control(Control {
+                source_ts: span.from_source_ts,
+                rx_ts: span.from_source_ts,
+                seq: first,
+                kind: ControlKind::Gap {
+                    provider: self.provider.id().to_string(),
+                    instrument: self.inner.instrument.clone(),
+                    span,
+                },
+            }))
+            .await;
+        }
+        for ev in events {
+            self.emit_prestamped(ev).await;
         }
     }
 
@@ -877,7 +927,7 @@ impl Controller {
         // Wait for the consumer to drain (channel closes on drop). If the
         // consumer already detached, there is nobody left to drain to.
         let tx = match &self.sink {
-            Sink::Attached(tx) if !tx.is_closed() => tx.clone(),
+            Sink::Attached(s) if !s.tx.is_closed() => s.tx.clone(),
             _ => {
                 self.shutdown().await;
                 return;
@@ -1315,8 +1365,11 @@ impl Controller {
             return false;
         }
         // The seam: live arrivals buffered during the backfill, in arrival
-        // order (already teed at receipt — flush_ring goes through emit).
-        self.flush_ring(pending).await;
+        // order (already teed at receipt — flush_backfill_pending stamps them
+        // here via emit). Stamping at the seam (in reception order, not
+        // source_ts order) places these live arrivals after all backfill
+        // segments in canonical delivery order and keeps `seq` monotonic.
+        self.flush_backfill_pending(pending).await;
         true
     }
 
@@ -1381,16 +1434,27 @@ impl Controller {
         }
     }
 
-    /// Deliver an event toward the consumer. Attached: send (blocking on
-    /// backpressure); if the consumer dropped the stream, flip to Detached
-    /// and buffer. Detached: push into the bounded ring. Never stamps `seq` —
-    /// that happens at delivery in `EventStream::poll_next`, so an event that
-    /// ends up evicted from the ring is never numbered.
-    async fn emit(&mut self, ev: MarketEvent) {
+    /// Assign the next source `seq`, advancing the single-writer counter. The
+    /// one site that touches `next_seq`, so `seq` is stamped exactly once per
+    /// event, in this authoritative session's canonical delivery order.
+    fn stamp(&mut self, ev: MarketEvent) -> MarketEvent {
+        let seq = Seq(self.next_seq);
+        self.next_seq += 1;
+        stamp_seq(ev, seq)
+    }
+
+    /// Hand a fully-formed event to the sink; on rejection (consumer dropped
+    /// its stream) or while detached, buffer into the resume ring. Does **not**
+    /// stamp — callers stamp (or not) first. Because the stamp happens before
+    /// the ring push, an evicted event is already numbered, so a ring overflow
+    /// is a real `seq` hole reported as `Control::Gap`. While detached there is
+    /// no other producer into the outbound order, so push order == canonical
+    /// delivery order.
+    async fn deliver(&mut self, ev: MarketEvent) {
         let ev = match &self.sink {
-            Sink::Attached(tx) if !tx.is_closed() => match tx.send(ev).await {
-                Ok(()) => return,
-                Err(tokio::sync::mpsc::error::SendError(ev)) => ev,
+            Sink::Attached(s) if !s.tx.is_closed() => match s.publish(ev).await {
+                PublishOutcome::Delivered => return,
+                PublishOutcome::Rejected(ev) => ev,
             },
             _ => ev,
         };
@@ -1403,14 +1467,35 @@ impl Controller {
         }
     }
 
-    /// Tee a data event to the tap log (when configured for live capture),
-    /// then hand it toward the consumer. `seq` is stamped downstream at
-    /// delivery, in `EventStream::poll_next`. Replayed/backfill data must
-    /// not come through here — `stream_segments` emits it directly, so only
+    /// Stamp `seq` at the source, then deliver toward the consumer. Used by the
+    /// direct-emit paths (cache replay, gap fetch, `SessionClosing`) that do
+    /// not tee.
+    async fn emit(&mut self, ev: MarketEvent) {
+        let ev = self.stamp(ev);
+        self.deliver(ev).await;
+    }
+
+    /// Replay an already-stamped buffered event without renumbering it. Used by
+    /// `flush_resume_ring` so survivors keep their push-time `seq` and the
+    /// eviction `Gap` sits at the first-evicted slot.
+    async fn emit_prestamped(&mut self, ev: MarketEvent) {
+        debug_assert!(
+            ev.seq().is_some(),
+            "emit_prestamped requires an already-stamped event"
+        );
+        self.deliver(ev).await;
+    }
+
+    /// Stamp `seq` at the source, tee the (stamped) data event to the tap log
+    /// (when configured for live capture), then deliver it. Stamping **before**
+    /// the tee means the tap log records the source `seq` verbatim, so tap-log
+    /// replay reproduces the delivered stream's `seq`. Replayed/backfill data
+    /// must not come through here — `stream_segments` emits it directly, so only
     /// the live tail lands in the log (backfill data belongs to the cache).
     async fn forward(&mut self, ev: MarketEvent) {
+        let ev = self.stamp(ev);
         self.tee(&ev).await;
-        self.emit(ev).await;
+        self.deliver(ev).await;
     }
 
     /// Backfill seam: a live arrival during the backfill is teed at receipt
@@ -1477,7 +1562,7 @@ impl Controller {
                         // consumer must be able to drain it concurrently.
                         let _ = ack.send(Ok(rx));
                         if let Some(ring) = prior_ring {
-                            self.flush_ring(ring).await;
+                            self.flush_resume_ring(ring).await;
                         }
                     }
                     Err(e) => {
@@ -1521,6 +1606,14 @@ impl Controller {
         .await;
         if let Some(log) = &self.tap_log {
             let _ = log.flush().await;
+        }
+        // Flush the transport-side buffer of the attached sink (no-op for the
+        // in-process sink; forward-compat for buffering transports). Log and
+        // swallow — in-process flush cannot fail and shutdown must not stall.
+        if let Sink::Attached(s) = &self.sink
+            && let Err(e) = s.flush().await
+        {
+            tracing::warn!(error = %e, "event sink flush failed at shutdown");
         }
     }
 }
@@ -1654,12 +1747,22 @@ fn tile(from: Timestamp, to: Timestamp, gaps: &[datamancer_core::GapSpan]) -> Ve
 /// cover the evicted event's `source_ts` (an evicted [`ControlKind::Gap`]
 /// contributes its embedded span instead, so eviction never erases loss
 /// accounting); the span is surfaced as one in-band [`ControlKind::Gap`] when
-/// a consumer (re)attaches. Evicted events are never `seq`-stamped, so an
-/// overflow is a reported gap — never a `seq` hole.
+/// a consumer (re)attaches.
+///
+/// On the resume path events are stamped at push (`emit` → `deliver` → push),
+/// so eviction is both a reported gap **and** a real `seq` hole. `note_drop`
+/// records the first-evicted event's `seq` in `dropped_first_seq` — FIFO
+/// eviction (`pop_front`) guarantees the first eviction is the lowest `seq`, so
+/// that is where the hole starts. The backfill `pending` ring pushes unstamped
+/// events and never consults `dropped_first_seq`.
 struct EventRing {
     capacity: usize,
     buf: std::collections::VecDeque<MarketEvent>,
     dropped: Option<GapSpan>,
+    /// `seq` of the first event this ring evicted (the hole start), set once on
+    /// the first eviction. `None` until an eviction occurs. Read only on the
+    /// resume path, whose events are stamped at push.
+    dropped_first_seq: Option<Seq>,
 }
 
 impl EventRing {
@@ -1668,6 +1771,7 @@ impl EventRing {
             capacity: capacity.max(1),
             buf: std::collections::VecDeque::new(),
             dropped: None,
+            dropped_first_seq: None,
         }
     }
 
@@ -1686,6 +1790,15 @@ impl EventRing {
     /// Other controls are skipped: their wall-clock `source_ts` would skew
     /// the market-data span.
     fn note_drop(&mut self, ev: &MarketEvent) {
+        // Capture the hole start on the first eviction (any variant — controls
+        // occupy `seq` slots too). FIFO eviction makes this the lowest `seq`.
+        // Every variant the ring can hold is `seq`-stamped, so `seq()` is
+        // `Some`; the `.expect` documents that a future metadata-only control
+        // with `seq() == None` would be a deliberate re-plan point.
+        self.dropped_first_seq.get_or_insert_with(|| {
+            ev.seq()
+                .expect("buffered data/control events are seq-stamped")
+        });
         let (from, to) = if let MarketEvent::Control(Control {
             kind: ControlKind::Gap { span, .. },
             ..
@@ -1710,8 +1823,14 @@ impl EventRing {
         }
     }
 
-    fn into_parts(self) -> (Option<GapSpan>, std::collections::VecDeque<MarketEvent>) {
-        (self.dropped, self.buf)
+    fn into_parts(
+        self,
+    ) -> (
+        Option<GapSpan>,
+        Option<Seq>,
+        std::collections::VecDeque<MarketEvent>,
+    ) {
+        (self.dropped, self.dropped_first_seq, self.buf)
     }
 }
 
@@ -1735,8 +1854,8 @@ fn provider_error_message(e: &Error) -> String {
     }
 }
 
-/// Overwrite an event's `seq`. Called exactly once per delivered event, in
-/// `EventStream::poll_next`.
+/// Overwrite an event's `seq`. Called exactly once per event, at the source,
+/// via [`Controller::stamp`] (the single counter site).
 fn stamp_seq(ev: MarketEvent, seq: Seq) -> MarketEvent {
     match ev {
         MarketEvent::Trade(t) => MarketEvent::Trade(Trade { seq, ..t }),
@@ -1862,7 +1981,7 @@ mod tile_tests {
 
 #[cfg(test)]
 mod event_ring_tests {
-    use super::EventRing;
+    use super::{EventRing, stamp_seq};
     use datamancer_core::{
         AssetClass, Control, ControlKind, Instrument, MarketEvent, Price, ProviderId, Seq,
         Timestamp, Trade,
@@ -1877,6 +1996,10 @@ mod event_ring_tests {
             price: Price::from_f64_round(1.0),
             size: 1,
         })
+    }
+
+    fn stamped_trade(ts: i64, seq: u64) -> MarketEvent {
+        stamp_seq(trade(ts), Seq(seq))
     }
 
     fn control(ts: i64) -> MarketEvent {
@@ -1922,7 +2045,7 @@ mod event_ring_tests {
         for ts in [100, 200, 300] {
             ring.push(trade(ts));
         }
-        let (dropped, events) = ring.into_parts();
+        let (dropped, _first, events) = ring.into_parts();
         assert!(dropped.is_none());
         assert_eq!(tss(&events), vec![100, 200, 300]);
     }
@@ -1933,7 +2056,7 @@ mod event_ring_tests {
         for ts in [100, 200, 300, 400] {
             ring.push(trade(ts));
         }
-        let (dropped, events) = ring.into_parts();
+        let (dropped, _first, events) = ring.into_parts();
         // 100 and 200 evicted; half-open span keeps 200 inside.
         let span = dropped.expect("overflow must record a span");
         assert_eq!(span.from_source_ts.0, 100);
@@ -1948,7 +2071,7 @@ mod event_ring_tests {
         for ts in [300, 100, 200, 50] {
             ring.push(trade(ts));
         }
-        let (dropped, events) = ring.into_parts();
+        let (dropped, _first, events) = ring.into_parts();
         let span = dropped.expect("span");
         assert_eq!(span.from_source_ts.0, 100); // min of evicted {300, 100, 200}
         assert_eq!(span.to_source_ts.0, 301); // max of evicted + 1
@@ -1961,7 +2084,7 @@ mod event_ring_tests {
         ring.push(control(999));
         ring.push(trade(100)); // evicts the control
         ring.push(trade(200)); // evicts trade 100
-        let (dropped, events) = ring.into_parts();
+        let (dropped, _first, events) = ring.into_parts();
         let span = dropped.expect("span");
         assert_eq!(span.from_source_ts.0, 100);
         assert_eq!(span.to_source_ts.0, 101);
@@ -1976,7 +2099,7 @@ mod event_ring_tests {
         let mut ring = EventRing::new(1);
         ring.push(gap_control(999, 100, 201));
         ring.push(trade(500)); // evicts the gap control
-        let (dropped, events) = ring.into_parts();
+        let (dropped, _first, events) = ring.into_parts();
         let span = dropped.expect("evicted gap control must preserve its span");
         assert_eq!(span.from_source_ts.0, 100);
         assert_eq!(span.to_source_ts.0, 201);
@@ -1989,7 +2112,7 @@ mod event_ring_tests {
         ring.push(gap_control(999, 100, 201));
         ring.push(trade(300)); // evicts the gap control
         ring.push(trade(400)); // evicts trade 300
-        let (dropped, events) = ring.into_parts();
+        let (dropped, _first, events) = ring.into_parts();
         let span = dropped.expect("span");
         // Union of the gap control's [100, 201) and evicted trade's [300, 301).
         assert_eq!(span.from_source_ts.0, 100);
@@ -2001,9 +2124,246 @@ mod event_ring_tests {
     fn zero_capacity_is_clamped_to_one() {
         let mut ring = EventRing::new(0);
         ring.push(trade(100));
-        let (dropped, events) = ring.into_parts();
+        let (dropped, _first, events) = ring.into_parts();
         assert!(dropped.is_none());
         assert_eq!(tss(&events), vec![100]);
+    }
+
+    #[test]
+    fn records_first_evicted_seq_on_overflow() {
+        // Push stamped events past capacity: the first eviction's seq is the
+        // hole start (FIFO eviction == lowest seq). Survivors keep push-time
+        // seq; into_parts surfaces the first-evicted seq and the data span.
+        let mut ring = EventRing::new(2);
+        for (ts, seq) in [(100, 0), (200, 1), (300, 2), (400, 3)] {
+            ring.push(stamped_trade(ts, seq));
+        }
+        let (dropped, first, events) = ring.into_parts();
+        assert_eq!(first, Some(Seq(0)), "hole starts at the first-evicted seq");
+        let span = dropped.expect("overflow must record a span");
+        assert_eq!(span.from_source_ts.0, 100);
+        assert_eq!(span.to_source_ts.0, 201);
+        assert_eq!(tss(&events), vec![300, 400]);
+    }
+
+    #[test]
+    fn no_first_evicted_seq_without_overflow() {
+        let mut ring = EventRing::new(4);
+        for (ts, seq) in [(100, 0), (200, 1), (300, 2)] {
+            ring.push(stamped_trade(ts, seq));
+        }
+        let (dropped, first, events) = ring.into_parts();
+        assert!(dropped.is_none());
+        assert!(first.is_none(), "no eviction means no hole");
+        assert_eq!(tss(&events), vec![100, 200, 300]);
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::InProcessSink;
+    use datamancer_core::{
+        AssetClass, EventSink, Instrument, MarketEvent, Price, ProviderId, PublishOutcome, Seq,
+        Timestamp, Trade,
+    };
+    use tokio::sync::mpsc;
+
+    fn trade(ts: i64) -> MarketEvent {
+        MarketEvent::Trade(Trade {
+            instrument: Instrument::new(ProviderId::from_static("t"), AssetClass::Equity, "X"),
+            source_ts: Timestamp(ts),
+            rx_ts: Timestamp(ts),
+            seq: Seq(0),
+            price: Price::from_f64_round(1.0),
+            size: 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn event_sink_in_process_round_trips() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let sink = InProcessSink { tx };
+
+        // Delivered while the receiver is live; the same event arrives.
+        match sink.publish(trade(100)).await {
+            PublishOutcome::Delivered => {}
+            rejected @ PublishOutcome::Rejected(_) => {
+                panic!("expected Delivered, got {rejected:?}")
+            }
+        }
+        match rx.recv().await {
+            Some(MarketEvent::Trade(t)) => assert_eq!(t.source_ts.0, 100),
+            other => panic!("expected the delivered trade, got {other:?}"),
+        }
+
+        // After the receiver is dropped, publish hands the event back.
+        drop(rx);
+        match sink.publish(trade(200)).await {
+            PublishOutcome::Rejected(MarketEvent::Trade(t)) => assert_eq!(t.source_ts.0, 200),
+            other => panic!("expected Rejected(same event), got {other:?}"),
+        }
+
+        // flush is a no-op for the in-process sink.
+        sink.flush().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod controller_tests {
+    use super::{
+        Controller, EventRing, InProcessSink, PersistenceOptions, Scope, SessionInner, Sink,
+        stamp_seq,
+    };
+    use crate::fetch_locks::FetchLocks;
+    use async_trait::async_trait;
+    use datamancer_core::{
+        Adjustment, AssetClass, ControlKind, EventKind, GapSpan, HistoryRequest, Instrument,
+        LiveHandle, MarketEvent, Price, Provider, ProviderId, Result, Seq, Timestamp, Trade,
+    };
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+
+    struct StubProvider;
+
+    #[async_trait]
+    impl Provider for StubProvider {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+        fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+            true
+        }
+        async fn start_live(
+            &self,
+            _sink: mpsc::Sender<MarketEvent>,
+        ) -> Result<Box<dyn LiveHandle>> {
+            unreachable!("controller_tests never start a live session")
+        }
+        async fn fetch_history(
+            &self,
+            _request: HistoryRequest,
+            _sink: mpsc::Sender<MarketEvent>,
+        ) -> Result<()> {
+            unreachable!("controller_tests never fetch history")
+        }
+    }
+
+    fn instrument() -> Instrument {
+        Instrument::new(ProviderId::from_static("stub"), AssetClass::Equity, "X")
+    }
+
+    fn trade(ts: i64) -> MarketEvent {
+        MarketEvent::Trade(Trade {
+            instrument: instrument(),
+            source_ts: Timestamp(ts),
+            rx_ts: Timestamp(ts),
+            seq: Seq(0),
+            price: Price::from_f64_round(1.0),
+            size: 1,
+        })
+    }
+
+    fn controller(sink: Sink) -> Controller {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let inner = Arc::new(SessionInner {
+            instrument: instrument(),
+            kind: EventKind::Trade,
+            scope: Scope::Live {
+                backfill_from: None,
+            },
+            events_holder: Mutex::new(None),
+            persistence: std::sync::Mutex::new(PersistenceOptions::none()),
+            stream_taken: std::sync::atomic::AtomicBool::new(false),
+            cmd_tx,
+            adjustment: Adjustment::default(),
+        });
+        Controller {
+            inner,
+            provider: Arc::new(StubProvider),
+            tap_log: None,
+            historical_cache: None,
+            sink,
+            ring_capacity: 4,
+            fetch_locks: FetchLocks::default(),
+            next_seq: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_resume_ring_places_gap_at_hole_start_and_keeps_push_time_seq() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut ctrl = controller(Sink::Attached(InProcessSink { tx }));
+        // Stamp at push (as `deliver` would on the detached path), capacity 2.
+        let mut ring = EventRing::new(2);
+        for (ts, seq) in [(100, 0u64), (200, 1), (300, 2), (400, 3)] {
+            ring.push(stamp_seq(trade(ts), Seq(seq)));
+        }
+        ctrl.flush_resume_ring(ring).await;
+
+        // First: the eviction Gap at the first-evicted slot (seq 0), span over
+        // the two evicted events [100, 201).
+        match rx.recv().await.expect("gap delivered") {
+            MarketEvent::Control(c) => {
+                assert_eq!(c.seq, Seq(0));
+                match c.kind {
+                    ControlKind::Gap { span, .. } => {
+                        assert_eq!(span.from_source_ts.0, 100);
+                        assert_eq!(span.to_source_ts.0, 201);
+                    }
+                    other => panic!("expected Gap, got {other:?}"),
+                }
+            }
+            other => panic!("expected Control, got {other:?}"),
+        }
+        // Survivors keep their push-time seq (2, 3) — the hole (seq 1) is real.
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            match rx.recv().await.expect("survivor delivered") {
+                MarketEvent::Trade(t) => got.push((t.source_ts.0, t.seq.0)),
+                other => panic!("expected Trade, got {other:?}"),
+            }
+        }
+        assert_eq!(got, vec![(300, 2), (400, 3)]);
+        // emit_prestamped never advanced the source counter.
+        assert_eq!(ctrl.next_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn flush_resume_ring_total_eviction_emits_gap_and_no_survivors() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut ctrl = controller(Sink::Attached(InProcessSink { tx }));
+        // Hand-build the empty-survivor case: a ring whose buffer is empty but
+        // whose eviction accounting is set. (The push path always retains
+        // `capacity` events, so this guards the otherwise-unreachable
+        // empty-survivor branch of flush_resume_ring.)
+        let ring = EventRing {
+            capacity: 4,
+            buf: std::collections::VecDeque::new(),
+            dropped: Some(GapSpan {
+                from_source_ts: Timestamp(100),
+                to_source_ts: Timestamp(601),
+            }),
+            dropped_first_seq: Some(Seq(0)),
+        };
+        ctrl.flush_resume_ring(ring).await;
+
+        match rx.recv().await.expect("gap delivered") {
+            MarketEvent::Control(c) => {
+                assert_eq!(c.seq, Seq(0));
+                match c.kind {
+                    ControlKind::Gap { span, .. } => {
+                        assert_eq!(span.from_source_ts.0, 100);
+                        assert_eq!(span.to_source_ts.0, 601);
+                    }
+                    other => panic!("expected Gap, got {other:?}"),
+                }
+            }
+            other => panic!("expected Control, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "total eviction delivers the gap and zero survivors"
+        );
     }
 }
 
