@@ -31,5 +31,5 @@ pub use price::Price;
 pub use snapshot::ClientSessionId;
 pub use traits::{
     CacheCoverage, CacheKey, EventSink, HistoricalCache, HistoryRequest, LiveHandle, Provider,
-    PublishOutcome, ReplayRequest, ReplaySource, TapLog,
+    ProviderMetrics, PublishOutcome, ReplayRequest, ReplaySource, TapLog,
 };
