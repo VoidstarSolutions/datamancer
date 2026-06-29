@@ -180,6 +180,40 @@ only the live tail — backfill data belongs to the cache.
 
 See `examples/resume.rs` for a runnable, credential-free demo.
 
+## Introspection
+
+`Datamancer::snapshot()` (async, fallible) returns a `SystemSnapshot`: a
+consolidated, `Serialize + Deserialize` view of runtime state, with no
+transport or daemon. It composes three things:
+
+- **Provider accounting** (`ProviderSnapshot`) — per-provider counters:
+  `history_fetches` (counted per gap *segment*, not per `session()` call),
+  `history_fetch_coalesced` (single-flight dedups; backfill bypasses the
+  coalescer and never counts here), `live_starts`, `subscribes`/`unsubscribes`
+  (call counts, **not** active-subscription deltas — stock subscribe is a
+  full-snapshot and reconnect re-applies the full list), `reconnects`,
+  `connection_state`, `gaps_emitted`, `last_error`, and `messages` (live data
+  forwarded to consumers only — cache-replay/backfill is not provider traffic).
+  `bytes` and `rate_limit_hits` are `Option` and stay `None` until a provider
+  implements the optional `Provider::metrics()` hook.
+- **Cache catalog** (`CacheSnapshot.entries`, via `HistoricalCache::catalog()`)
+  — every stored `(provider, symbol, kind, adjustment)` key with its actual
+  covered segments and a *logical* volume estimate (`event_count ×
+  bytes_per_row`; it ignores index/MVCC overhead). The catalog reports the
+  adjustment rows are **stored** under, so trades/quotes always read `Raw`
+  regardless of the requested mode. It carries no `seq` (seq is a live,
+  per-symbol property, not a cache property).
+- **Live state** — per-`(instrument, kind)` `AuthoritativeSessionSnapshot`
+  (subscriber refcount, last source/rx timestamps, `latency_ns =
+  rx_ts − source_ts`, per-symbol gap count, seq position) and per-client
+  `ClientSessionSnapshot` (subscriptions + resume-buffer occupancy/drops).
+
+The snapshot is **sampled, not transactional**: per-symbol fields are read from
+`Relaxed` atomics and the session registry lock is held only to clone handles
+(never across an `.await`), so fields may skew by nanoseconds across symbols —
+fine, because determinism is per-symbol. `latency_ns`/`rx_ts` are
+**observability only** and must never feed engine logic.
+
 ## Non-goals
 
 - A trading or analysis framework. Datamancer produces events; what to do with them is the consumer's problem.
