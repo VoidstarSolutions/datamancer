@@ -214,6 +214,46 @@ The snapshot is **sampled, not transactional**: per-symbol fields are read from
 fine, because determinism is per-symbol. `latency_ns`/`rx_ts` are
 **observability only** and must never feed engine logic.
 
+## Transports
+
+By default a `Session`'s events are consumed in-process. The optional
+`transport-iceoryx2` feature adds a **same-host, zero-copy** transport
+(`datamancer::transport`, the `datamancer-transport-iceoryx2` crate) that
+carries a client's multiplexed stream to a separate consumer process. Two planes
+ride one logical client connection:
+
+- **Data plane** — one iceoryx2 pub-sub service per client carrying that client's
+  multiplexed `(instrument, seq)` interleave as a flat `#[repr(C)]` POD
+  `DataPayload`. The payload carries a compact, **sink-local** `SymbolId` instead
+  of the heap-backed `Instrument`; a low-rate per-client *announcement* service
+  publishes the `SymbolId → Instrument` mapping. `SymbolId`/interning are a
+  transport compaction handle only — **not** a public-API or global-identity
+  concept (two clients may map the same id to different instruments). The data
+  plane carries the per-symbol-deterministic interleave and makes **no
+  cross-symbol ordering claim** — the multiplex is an interleave, never a global
+  merge-sort.
+- **Diagnostics plane** — a separate service publishing the serialized
+  `SystemSnapshot` (provider health/connectivity, cache catalog, live state).
+  Connection-scoped controls (`ProviderConnected`/`Disconnected`/`ProviderError`)
+  are **suppressed** on the data plane and surface here instead; remote consumers
+  read provider connectivity + last-error from `ProviderSnapshot`. Per-symbol
+  controls (`Gap`, `SubscriptionChanged`) and `SessionClosing` still ride the
+  data plane.
+
+The POD payload preserves the timestamp triple end-to-end — `rx_ts` stays
+**observability-only** and is never reconstructed/synthesized by the subscriber.
+
+**Subscriber rule.** The data and announcement services are two independent
+iceoryx2 services with **no mutual delivery-order guarantee**: a data sample can
+arrive before the `SymbolAnnouncement` for its `SymbolId`. The subscriber helper
+(`DataSubscriber`/`HoldBuffer`) therefore **holds** an unresolved sample and
+replays it once the announcement resolves it — never dropping or erroring.
+
+**Flush / shutdown ordering** (load-bearing): **tap-log flush before sink flush
+before service drop**. The sink never drops samples that `flush` promised to
+deliver, but makes no guarantee a crashed/slow subscriber consumed them
+(same-host best-effort; cross-process backpressure is a recorded deferral).
+
 ## Non-goals
 
 - A trading or analysis framework. Datamancer produces events; what to do with them is the consumer's problem.
