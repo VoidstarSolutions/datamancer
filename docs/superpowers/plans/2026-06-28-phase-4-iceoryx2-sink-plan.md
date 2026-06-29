@@ -14,6 +14,24 @@ _Part of the datamancer standalone-server roadmap. See `docs/superpowers/specs/2
 > - **Diagnostics sizing (Issue 6 — decided: split):** size the fixed-capacity fast diagnostics service to Phase 3's bounded **live-state snapshot**; publish the heavier **cache catalog** on a separate service (larger-cap / chunked / slower cadence). Do not size one fixed payload for the whole `SystemSnapshot`.
 > - **POD `seq` tolerates the sentinel (Issue 8):** the POD payload's `seq: u64` carries `Seq::SYNTHETIC` verbatim for synthetic controls; do not fold it into monotonicity assumptions.
 
+> **Detailed-planning hardening (gotcha pass, 2026-06-28) — authoritative.** Adversarial review against the iceoryx2 research + `event.rs`/`price.rs`/`instrument.rs`. `Price` is POD-safe (`i64`); `Instrument` already derives serde; the `String` inside `Instrument` is what forces `SymbolId`. Supersedes conflicting body text.
+>
+> **Locked decisions:**
+> - **Connection-scoped controls are DIAGNOSTICS-PLANE ONLY.** `ProviderConnected`/`Disconnected`/`ProviderError` are **suppressed at the per-client iceoryx2 sink** — never on the POD data service. Remote consumers read provider connectivity + last-error from the diagnostics live-state snapshot (`ProviderSnapshot`). Per-symbol controls (`Gap`, `SubscriptionChanged`) still ride the data plane (they carry a `SymbolId`). **Documented divergence:** in-process consumers (Phase 2) get connection controls in-band; remote consumers get them via diagnostics. **Bonus:** the POD `Control` variant now needs **no free-text fields** — only `Gap`(span) and `SubscriptionChanged`(active bool).
+> - **Backpressure = blocking** (`enable_safe_overflow=false`). A full subscriber queue backpressures the per-client publisher → stalls the per-client controller → Phase 2's "drop this client with a `Control::Gap`" isolation fires. Loss is always accounted, never silent. Cross-process backpressure tuning deferred.
+>
+> **Spike-gate (EXT-1) before committing the POD design:** pin the iceoryx2 version; verify the `#![forbid(unsafe_code)]` gate — a `#[repr(C)] Copy` payload deriving `ZeroCopySend` compiles with **no caller-side `unsafe`**. If yes → sink stays under `forbid`; if no → a new **`datamancer-transport-iceoryx2`** crate (deps: `datamancer-core` + iceoryx2 only) with a scoped `allow`. Also verify: pub-sub builder/loan/send/receive surface; `send` semantics under `overflow=false` (blocks vs errors); `history_size` (publisher-alive-only); request-response API; slice payloads; `max_subscribers`/history config; WaitSet ↔ tokio integration.
+>
+> **POD payload:** flat `#[repr(C)]`, `Copy`, fixed-size tagged record sized to the largest variant; `SymbolId` (not `Instrument`); `seq: u64` carries `Seq::SYNTHETIC` verbatim. No `FixedSizeByteString` needed (connection controls are off the data plane). Spike a `#[repr(C)] union` (scoped `unsafe`) only if padding cost proves real.
+>
+> **Symbol table:** intern `Instrument ↔ SymbolId` at the source on first subscribe; one announcement service; republish the full table every **5s** + on `flush`. The **subscriber helper is public API** in the transport crate (Phase 5 reuses it) and **holds** data referencing an unresolved `SymbolId` until the announcement resolves it (the two services have no mutual ordering); a no-history late joiner tolerates ≤~5s startup — test with a timeout.
+>
+> **Diagnostics plane:** live-state snapshot via **periodic pub-sub** (`history_size(1)`, bounded fixed payload to Phase 3's live-state cap); **cache catalog via request-response pull** (per-request chunking). Provider connectivity/last-error surface here.
+>
+> **Service lifecycle:** the sink owns its `Node` + per-client service; not cloneable; dropped on client-session close. Per-client service **over-provisions** `max_subscribers`/history — document the symbol-cap assumption; dynamic service recreation on cap-exceed is a Phase-5 concern.
+>
+> **Tests (feature-gated; likely `#[ignore]` in CI):** POD round-trip per variant; `SymbolId → Instrument` resolution incl. **data-before-announcement hold**; no-history late-joiner recovery (timeout-bounded); blocking-backpressure → Phase-2 drop-to-Gap; diagnostics snapshot pub + catalog request-response chunk reassembly; flush/shutdown drain; synthetic-`seq` sentinel survives round-trip.
+
 ## Context & goal
 
 Phase 4 delivers the `transport-iceoryx2` capability: same-host, zero-copy fan-out of
