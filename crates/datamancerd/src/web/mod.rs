@@ -24,6 +24,7 @@ pub mod handlers;
 pub mod refresh;
 pub mod state;
 mod ui;
+mod settings;
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -80,6 +81,7 @@ const CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-
 pub fn router(state: AppState, assets_dir: Option<&Path>) -> Router {
     let mut app = Router::new()
         .route("/", get(ui::index))
+        .route("/config", get(settings::page))
         .route("/api/snapshot", get(handlers::snapshot))
         .route("/api/cache", get(handlers::cache))
         .route("/api/providers", get(handlers::providers))
@@ -484,5 +486,14 @@ mod tests {
             .await
             .expect("serve task must resolve after shutdown");
         assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn settings_page_serves_form_shell() {
+        let resp = send(Method::GET, "/config").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(body.contains("id=\"settings\""), "form container present");
+        assert!(body.contains("/api/config"), "wired to the config API");
     }
 }
