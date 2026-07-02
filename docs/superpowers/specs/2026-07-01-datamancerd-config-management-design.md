@@ -24,7 +24,9 @@ Changes take effect on restart only — no hot-reload.
 ### Path resolution
 
 - New dependency: `directories` (in `datamancerd` only).
-- Default path: `ProjectDirs::from("", "Voidstar", "datamancerd")` →
+- Default path: `ProjectDirs::from("", "", "datamancerd")` (an organization
+  segment would become part of the macOS bundle path, e.g.
+  `Voidstar.datamancerd/` — caught in final review) →
   `config_dir().join("config.toml")`.
   - macOS: `~/Library/Application Support/datamancerd/config.toml`
   - Linux: `~/.config/datamancerd/config.toml` (respects `$XDG_CONFIG_HOME`)
