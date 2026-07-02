@@ -26,23 +26,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{DaemonError, Result};
 
-// Helper functions for skip_serializing_if
-fn is_default_session(s: &SessionConfig) -> bool {
-    s == &SessionConfig::default()
-}
-
-fn is_default_server(s: &ServerConfig) -> bool {
-    s == &ServerConfig::default()
-}
-
-fn is_default_diagnostics(s: &DiagnosticsConfig) -> bool {
-    s == &DiagnosticsConfig::default()
-}
-
-fn is_default_iceoryx2(s: &Iceoryx2Config) -> bool {
-    s == &Iceoryx2Config::default()
-}
-
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,16 +39,16 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tap_log: Option<StorageConfig>,
     /// Session knobs (resume buffer, adjustment).
-    #[serde(default, skip_serializing_if = "is_default_session")]
+    #[serde(default)]
     pub session: SessionConfig,
     /// Control surface + service-naming knobs.
-    #[serde(default, skip_serializing_if = "is_default_server")]
+    #[serde(default)]
     pub server: ServerConfig,
     /// Diagnostics-plane cadence.
-    #[serde(default, skip_serializing_if = "is_default_diagnostics")]
+    #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
     /// iceoryx2 transport caps.
-    #[serde(default, skip_serializing_if = "is_default_iceoryx2")]
+    #[serde(default)]
     pub iceoryx2: Iceoryx2Config,
     /// Optional web UI (Phase 6 drives it; config surface lives here). Always
     /// parsed so configs stay portable; only read by the `web-ui` feature.
@@ -73,7 +56,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_ui: Option<WebUiConfig>,
     /// Boot-time authoritative sessions held as lifecycle anchors.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub startup_session: Vec<StartupSession>,
 }
 
@@ -946,7 +929,9 @@ always_on = true
         // `None` options must be skipped, not serialized (TOML has no null).
         let config = Config::parse(MINIMAL).expect("parse");
         let text = toml::to_string_pretty(&config).expect("serialize");
-        assert!(!text.contains("cache"), "absent [cache] must not serialize: {text}");
+        assert!(!text.contains("[cache]"), "absent [cache] must not serialize: {text}");
+        assert!(!text.contains("[tap_log]"), "absent [tap_log] must not serialize: {text}");
+        assert!(!text.contains("[web_ui]"), "absent [web_ui] must not serialize: {text}");
         let back = Config::parse(&text).expect("reparse");
         assert_eq!(config, back);
     }
