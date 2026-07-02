@@ -17,7 +17,9 @@ use std::path::Path;
 /// file is untouched (the temp file is best-effort removed).
 #[allow(dead_code)]
 pub fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("toml.tmp");
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
     let result = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents.as_bytes())?;
@@ -71,6 +73,34 @@ mod tests {
             let name = entry.file_name();
             assert!(
                 !name.to_string_lossy().ends_with(".tmp"),
+                "temp file left behind: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_write_appends_tmp_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yml");
+        atomic_write(&path, "a = 1\n").expect("atomic_write");
+        // Verify the target file exists.
+        assert!(path.exists(), "target file should exist");
+        // Verify no .toml.tmp was created (old buggy behavior).
+        let toml_tmp = dir.path().join("config.toml.tmp");
+        assert!(
+            !toml_tmp.exists(),
+            "old-style temp file should not exist: {toml_tmp:?}"
+        );
+        // Verify no other .tmp files are left.
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .expect("read_dir")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("entries");
+        for entry in entries {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            assert!(
+                !name_str.ends_with(".tmp"),
                 "temp file left behind: {name:?}"
             );
         }
