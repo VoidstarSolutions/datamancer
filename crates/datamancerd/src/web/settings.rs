@@ -63,20 +63,22 @@ const JS: &str = r#"
 const $ = (id) => document.getElementById(id);
 let current = null;
 
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
 const SEL = (name, options, value) =>
-  `<select name="${name}">` + options.map(o => `<option value="${o}"${o===value?' selected':''}>${o}</option>`).join('') + `</select>`;
-const TXT = (name, value, ph) => `<input type="text" name="${name}" value="${value ?? ''}" placeholder="${ph ?? ''}">`;
-const NUM = (name, value) => `<input type="number" name="${name}" value="${value}">`;
+  `<select name="${esc(name)}">` + options.map(o => `<option value="${esc(o)}"${o===value?' selected':''}>${esc(o)}</option>`).join('') + `</select>`;
+const TXT = (name, value, ph) => `<input type="text" name="${esc(name)}" value="${esc(value)}" placeholder="${esc(ph)}">`;
+const NUM = (name, value) => `<input type="number" name="${esc(name)}" value="${esc(value)}">`;
 const CHK = (name, value) => `<input type="checkbox" name="${name}"${value?' checked':''}>`;
 const L = (text, control) => `<label>${text} ${control}</label>`;
 
-const KINDS = ['trade','quote','bar_1s','bar_1m','bar_5m','bar_15m','bar_1h','bar_1d'];
+const KINDS = ['trade','quote','bar1s','bar1m','bar5m','bar15m','bar1h','bar1d'];
 const PERSIST = ['none','cached','cached_with_tap','read_only','refresh','tap_only'];
 
 function sessionRow(s, i) {
   s = s || {provider:'alpaca-crypto', asset_class:'crypto', symbol:'', kind:'trade',
             scope:'live', persistence:'none', always_on:false};
-  return `<div class="session-row" data-i="${i}">`
+  return `<div class="session-row" data-i="${esc(i)}">`
     + L('provider', TXT(`ss-provider-${i}`, s.provider))
     + L('asset_class', SEL(`ss-asset-${i}`, ['equity','crypto'], s.asset_class))
     + L('symbol', TXT(`ss-symbol-${i}`, s.symbol))

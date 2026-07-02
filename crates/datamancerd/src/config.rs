@@ -712,6 +712,21 @@ account_type = "paper"
         assert_eq!(config.diagnostics.publish_interval_ms, 1000);
     }
 
+    /// Pins the `EventKindCfg` wire form consumed by the `/config` settings
+    /// page's JS `KINDS` constant (`crates/datamancerd/src/web/settings.rs`):
+    /// `snake_case` does **not** insert an underscore before a leading digit.
+    #[test]
+    fn event_kind_wire_values() {
+        assert_eq!(serde_json::to_string(&EventKindCfg::Trade).unwrap(), "\"trade\"");
+        assert_eq!(serde_json::to_string(&EventKindCfg::Quote).unwrap(), "\"quote\"");
+        assert_eq!(serde_json::to_string(&EventKindCfg::Bar1s).unwrap(), "\"bar1s\"");
+        assert_eq!(serde_json::to_string(&EventKindCfg::Bar1m).unwrap(), "\"bar1m\"");
+        assert_eq!(serde_json::to_string(&EventKindCfg::Bar5m).unwrap(), "\"bar5m\"");
+        assert_eq!(serde_json::to_string(&EventKindCfg::Bar15m).unwrap(), "\"bar15m\"");
+        assert_eq!(serde_json::to_string(&EventKindCfg::Bar1h).unwrap(), "\"bar1h\"");
+        assert_eq!(serde_json::to_string(&EventKindCfg::Bar1d).unwrap(), "\"bar1d\"");
+    }
+
     #[test]
     fn config_rejects_no_provider() {
         let config = Config::parse("[provider]\n").expect("parse");
