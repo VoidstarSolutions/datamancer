@@ -15,7 +15,6 @@ use crate::config::Config;
 use crate::error::{DaemonError, Result};
 
 /// Cheap-`Clone` (Arc-backed) config-file handle for web handlers.
-#[allow(dead_code)] // Public API for Tasks 6-7.
 #[derive(Clone)]
 pub struct ConfigState {
     inner: Arc<Inner>,
@@ -29,7 +28,6 @@ struct Inner {
 
 impl ConfigState {
     /// Build from the resolved config path and the boot-time config.
-    #[allow(dead_code)] // Public API for Tasks 6-7.
     #[must_use]
     pub fn new(path: PathBuf, boot: Config) -> Self {
         Self {
@@ -42,21 +40,21 @@ impl ConfigState {
     }
 
     /// The config file path.
-    #[allow(dead_code)] // Public API for Tasks 6-7.
+    #[allow(dead_code)] // Public API for Task 7.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.inner.path
     }
 
     /// The config the daemon booted with.
-    #[allow(dead_code)] // Public API for Tasks 6-7.
+    #[allow(dead_code)] // Public API for Task 7.
     #[must_use]
     pub fn boot(&self) -> &Config {
         &self.inner.boot
     }
 
     /// Latest known restart-required flag (recomputed by `read_disk`/`write`).
-    #[allow(dead_code)] // Public API for Tasks 6-7.
+    #[allow(dead_code)] // Public API for Task 7.
     #[must_use]
     pub fn restart_required(&self) -> bool {
         self.inner.restart_required.load(Ordering::Relaxed)
@@ -68,7 +66,7 @@ impl ConfigState {
     /// # Errors
     ///
     /// [`DaemonError::ConfigRead`] / [`DaemonError::ConfigParse`] on failure.
-    #[allow(dead_code)] // Public API for Tasks 6-7.
+    #[allow(dead_code)] // Public API for Task 7.
     pub async fn read_disk(&self) -> Result<Config> {
         let text = tokio::fs::read_to_string(&self.inner.path)
             .await
@@ -87,7 +85,7 @@ impl ConfigState {
     /// # Errors
     ///
     /// Propagates [`Config::save`] errors.
-    #[allow(dead_code)] // Public API for Tasks 6-7.
+    #[allow(dead_code)] // Public API for Task 7.
     pub async fn write(&self, config: &Config) -> Result<()> {
         let config = config.clone();
         let path = self.inner.path.clone();

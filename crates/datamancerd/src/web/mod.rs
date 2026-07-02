@@ -34,6 +34,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use axum::Router;
+use axum::extract::FromRef;
 use axum::http::HeaderValue;
 use axum::http::header::{CONTENT_SECURITY_POLICY, X_CONTENT_TYPE_OPTIONS};
 use axum::routing::get;
@@ -41,7 +42,27 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
+pub use config_api::ConfigState;
 pub use state::WebState;
+
+/// Combined router state: snapshot reads plus the config-file handle.
+#[derive(Clone)]
+pub struct AppState {
+    pub snapshots: WebState,
+    pub config: ConfigState,
+}
+
+impl FromRef<AppState> for WebState {
+    fn from_ref(state: &AppState) -> Self {
+        state.snapshots.clone()
+    }
+}
+
+impl FromRef<AppState> for ConfigState {
+    fn from_ref(state: &AppState) -> Self {
+        state.config.clone()
+    }
+}
 
 /// `Content-Security-Policy` for the same-host operator UI. Self-origin only;
 /// inline script/style are permitted because the server-rendered page carries a
@@ -54,7 +75,7 @@ const CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-
 /// Registers **only `GET`** routes (the read-only invariant), adds the security
 /// headers and request-trace layers, and — when `assets_dir` resolves to an
 /// existing directory — mounts static assets under `/assets`.
-pub fn router(state: WebState, assets_dir: Option<&Path>) -> Router {
+pub fn router(state: AppState, assets_dir: Option<&Path>) -> Router {
     let mut app = Router::new()
         .route("/", get(ui::index))
         .route("/api/snapshot", get(handlers::snapshot))
@@ -119,7 +140,7 @@ pub async fn bind(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> 
 ///
 /// Propagates the serve I/O error.
 pub async fn serve(
-    state: WebState,
+    state: AppState,
     listener: tokio::net::TcpListener,
     assets_dir: Option<std::path::PathBuf>,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -144,8 +165,18 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tower::ServiceExt as _;
 
-    fn state() -> WebState {
-        WebState::fixed(testdata::snapshot(), testdata::snapshot())
+    fn state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let boot = crate::config::Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n")
+            .expect("parse");
+        boot.save(&path).expect("seed config");
+        // Leak the tempdir so the file outlives the helper (test-only).
+        std::mem::forget(dir);
+        AppState {
+            snapshots: WebState::fixed(testdata::snapshot(), testdata::snapshot()),
+            config: ConfigState::new(path, boot),
+        }
     }
 
     async fn send(method: Method, uri: &str) -> axum::response::Response {
