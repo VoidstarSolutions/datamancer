@@ -43,6 +43,19 @@ pub fn default_config_path() -> Option<PathBuf> {
         .map(|dirs| dirs.config_dir().join("config.toml"))
 }
 
+/// The platform-native default **data** directory for embedded storage
+/// (the cache and tap log): `<data_dir>/datamancerd`
+/// (macOS: `~/Library/Application Support/datamancerd`;
+/// Linux: `~/.local/share/datamancerd`, `$XDG_DATA_HOME` respected).
+///
+/// This is the data-dir analog of [`default_config_path`]'s config dir — a
+/// growing embedded database belongs in the data dir, not the config dir (they
+/// coincide on macOS but not on Linux).
+#[must_use]
+pub fn default_data_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "datamancerd").map(|dirs| dirs.data_dir().to_path_buf())
+}
+
 /// The commented first-run scaffold. `config_dir` anchors the user-writable
 /// admin socket (the compiled-in `/run/datamancerd` default needs root and
 /// does not exist on macOS).
@@ -70,11 +83,15 @@ account_type = "paper"
 # venue = "us"
 
 # Historical read-through cache; required by cache-using persistence presets.
+# `path` is optional for surreal-embedded: it defaults to the platform data dir
+# (macOS ~/Library/Application Support/datamancerd/cache, Linux
+# ~/.local/share/datamancerd/cache) and is created on first use.
 # [cache]
 # backend = "surreal-embedded"
 # path = "/path/to/cache"
 
 # Live tap-log write-through; required by tap-writing persistence presets.
+# `path` is optional for surreal-embedded (defaults to <data dir>/taplog).
 # [tap_log]
 # backend = "surreal-embedded"
 # path = "/path/to/taplog"
@@ -85,6 +102,11 @@ account_type = "paper"
 admin_socket = "{socket}"
 
 # Read-mostly operator UI + JSON API + the config settings page. Loopback only.
+# `bind` picks ONE address family. Reach the UI at the literal http://<bind>:<port>
+# (e.g. http://127.0.0.1:8080), not http://localhost — on a dual-stack host
+# `localhost` also resolves to IPv6 ::1, and a browser preferring that family can
+# land on an unrelated service sharing the port. If :8080 collides with another
+# app, change `port` here.
 [web_ui]
 enabled = true
 bind = "127.0.0.1"

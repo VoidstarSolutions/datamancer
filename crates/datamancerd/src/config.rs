@@ -665,14 +665,30 @@ pub struct BuiltRuntime {
     pub tap_log: Option<std::sync::Arc<dyn datamancer::TapLog>>,
 }
 
+/// Resolve the on-disk path for a `surreal-embedded` backend: the explicit
+/// `path`, or the platform-native data dir under `subdir` when omitted. The
+/// embedded storage engine (`SurrealKV`) creates the directory if absent, so the
+/// default path behaves exactly like an explicit one — no scaffolding here.
+///
+/// The only remaining failure is a headless host with no derivable home
+/// directory; there the operator must set `path` explicitly.
+fn embedded_path(cfg: &StorageConfig, section: &str, subdir: &str) -> Result<PathBuf> {
+    if let Some(path) = &cfg.path {
+        return Ok(path.clone());
+    }
+    let dir = crate::paths::default_data_dir().ok_or_else(|| {
+        DaemonError::ConfigInvalid(format!(
+            "[{section}] surreal-embedded needs a `path`: no home directory to derive a default"
+        ))
+    })?;
+    Ok(dir.join(subdir))
+}
+
 fn storage_to_cache_config(cfg: &StorageConfig) -> Result<SurrealCacheConfig> {
     match cfg.backend {
         StorageBackend::SurrealMemory => Ok(SurrealCacheConfig::Memory),
         StorageBackend::SurrealEmbedded => {
-            let path = cfg.path.as_ref().ok_or_else(|| {
-                DaemonError::ConfigInvalid("[cache] surreal-embedded requires `path`".to_string())
-            })?;
-            Ok(SurrealCacheConfig::embedded(path))
+            Ok(SurrealCacheConfig::embedded(embedded_path(cfg, "cache", "cache")?))
         }
     }
 }
@@ -680,12 +696,9 @@ fn storage_to_cache_config(cfg: &StorageConfig) -> Result<SurrealCacheConfig> {
 fn storage_to_tap_config(cfg: &StorageConfig) -> Result<SurrealTapLogConfig> {
     match cfg.backend {
         StorageBackend::SurrealMemory => Ok(SurrealTapLogConfig::Memory),
-        StorageBackend::SurrealEmbedded => {
-            let path = cfg.path.as_ref().ok_or_else(|| {
-                DaemonError::ConfigInvalid("[tap_log] surreal-embedded requires `path`".to_string())
-            })?;
-            Ok(SurrealTapLogConfig::embedded(path))
-        }
+        StorageBackend::SurrealEmbedded => Ok(SurrealTapLogConfig::embedded(embedded_path(
+            cfg, "tap_log", "taplog",
+        )?)),
     }
 }
 
@@ -710,6 +723,44 @@ account_type = "paper"
         assert_eq!(config.server.service_prefix, "datamancerd");
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.diagnostics.publish_interval_ms, 1000);
+    }
+
+    #[test]
+    fn embedded_path_uses_explicit_when_present() {
+        let cfg = StorageConfig {
+            backend: StorageBackend::SurrealEmbedded,
+            path: Some(PathBuf::from("/tmp/explicit-cache")),
+        };
+        let path = embedded_path(&cfg, "cache", "cache").expect("explicit path");
+        assert_eq!(path, PathBuf::from("/tmp/explicit-cache"));
+    }
+
+    #[test]
+    fn embedded_path_defaults_to_platform_data_dir() {
+        let cfg = StorageConfig {
+            backend: StorageBackend::SurrealEmbedded,
+            path: None,
+        };
+        // Home dir exists in the test env, so a default is derivable.
+        let cache = embedded_path(&cfg, "cache", "cache").expect("default cache path");
+        let tap = embedded_path(&cfg, "tap_log", "taplog").expect("default tap path");
+        let data_dir = crate::paths::default_data_dir().expect("data dir");
+        assert_eq!(cache, data_dir.join("cache"));
+        assert_eq!(tap, data_dir.join("taplog"));
+        // The two backends never share a directory.
+        assert_ne!(cache, tap);
+    }
+
+    #[test]
+    fn embedded_config_omitting_path_builds_default() {
+        // A `[cache]`/`[tap_log]` with no `path` must resolve, not error —
+        // enabling caching should never make the server impossible to start.
+        let cfg = StorageConfig {
+            backend: StorageBackend::SurrealEmbedded,
+            path: None,
+        };
+        storage_to_cache_config(&cfg).expect("cache config resolves without explicit path");
+        storage_to_tap_config(&cfg).expect("tap config resolves without explicit path");
     }
 
     /// Pins the `EventKindCfg` wire form consumed by the `/config` settings

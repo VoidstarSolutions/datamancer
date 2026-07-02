@@ -61,11 +61,11 @@ venue = "us"                      # us | us_kraken | eu_kraken
 
 [cache]
 backend = "surreal-embedded"      # surreal-embedded | surreal-memory
-path = "/var/lib/datamancerd/cache"
+path = "/var/lib/datamancerd/cache"   # optional; default: <data dir>/cache
 
 [tap_log]
 backend = "surreal-embedded"
-path = "/var/lib/datamancerd/taplog"
+path = "/var/lib/datamancerd/taplog"  # optional; default: <data dir>/taplog
 
 [session]
 resume_buffer_events = 65536
@@ -108,6 +108,14 @@ session using a cache preset requires `[cache]`; one writing the tap log
 requires `[tap_log]`; `scope = live_backfill` requires a parseable
 `backfill_from`.
 
+For `surreal-embedded`, `path` is optional and defaults to the platform-native
+data directory (`<data dir>` above): macOS
+`~/Library/Application Support/datamancerd`, Linux
+`~/.local/share/datamancerd` (`$XDG_DATA_HOME` respected), with `cache` and
+`taplog` subdirectories created on first use. Set `path` explicitly for a
+system location like `/var/lib/datamancerd`, or on a headless host with no home
+directory (where no default can be derived).
+
 ## Connection model
 
 One **long-lived control connection per client**. The client names itself with
@@ -135,6 +143,14 @@ exposes one settings surface for the config file. It is otherwise a pure
 consumer of the snapshot — the **same** snapshot the diagnostics plane carries
 to client processes — and adds no new ordering, transport, or domain state.
 Enable it with `[web_ui] enabled = true`.
+
+> **Reach it at the literal bind address, not `localhost`.** The server binds a
+> single address family (`bind = "127.0.0.1"` → IPv4 `127.0.0.1:8080`). On a
+> dual-stack host `localhost` resolves to both `127.0.0.1` and `::1`, and a
+> browser preferring IPv6 (Happy Eyeballs) can silently land on an unrelated
+> service listening on `::1:<port>` — the bind still succeeds, so nothing looks
+> wrong. Open `http://127.0.0.1:8080` explicitly, or change `port` if it
+> collides. The startup log prints the exact URL to use.
 
 > **Security boundary:** **loopback bind only** (a non-loopback `bind` is
 > rejected at startup), **single-origin** (no CORS layer is added — never a
