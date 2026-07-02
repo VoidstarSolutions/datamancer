@@ -584,6 +584,32 @@ impl Config {
         Ok(())
     }
 
+    /// Serialize to pretty TOML.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::ConfigSerialize`] if serialization fails.
+    #[allow(dead_code)]
+    pub fn to_toml(&self) -> Result<String> {
+        Ok(toml::to_string_pretty(self)?)
+    }
+
+    /// Validate, serialize, and atomically write this config to `path`.
+    /// Nothing is written when validation or serialization fails.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::ConfigInvalid`] on validation failure,
+    /// [`DaemonError::ConfigSerialize`] on serialization failure, or an I/O
+    /// error from the atomic write.
+    #[allow(dead_code)]
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        let text = self.to_toml()?;
+        crate::paths::atomic_write(path, &text)?;
+        Ok(())
+    }
+
     /// Build the full daemon runtime: construct the configured providers, open
     /// the cache + tap log, assemble the [`Datamancer`], and retain the tap-log
     /// `Arc` so the shutdown path can flush it (the builder takes ownership, so
@@ -866,6 +892,33 @@ account_type = "paper"
 bogus = true
 "#;
         assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn save_writes_atomically_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let config = Config::parse(FULL).expect("parse");
+        config.save(&path).expect("save");
+        let loaded = Config::load(&path).expect("load");
+        assert_eq!(config, loaded);
+        // No temp droppings left behind.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.toml")]);
+    }
+
+    #[test]
+    fn save_rejects_invalid_config_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // No provider configured -> validation failure.
+        let config = Config::parse("[provider]\n").expect("parse");
+        let err = config.save(&path).expect_err("must reject");
+        assert!(matches!(err, DaemonError::ConfigInvalid(_)));
+        assert!(!path.exists(), "invalid config must not be written");
     }
 
     const FULL: &str = r#"

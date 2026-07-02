@@ -21,6 +21,7 @@
 mod config;
 mod control;
 mod error;
+mod paths;
 mod server;
 mod shutdown;
 #[cfg(feature = "web-ui")]
