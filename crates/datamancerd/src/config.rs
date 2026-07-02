@@ -26,43 +26,60 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{DaemonError, Result};
 
+// Helper functions for skip_serializing_if
+fn is_default_session(s: &SessionConfig) -> bool {
+    s == &SessionConfig::default()
+}
+
+fn is_default_server(s: &ServerConfig) -> bool {
+    s == &ServerConfig::default()
+}
+
+fn is_default_diagnostics(s: &DiagnosticsConfig) -> bool {
+    s == &DiagnosticsConfig::default()
+}
+
+fn is_default_iceoryx2(s: &Iceoryx2Config) -> bool {
+    s == &Iceoryx2Config::default()
+}
+
 /// Top-level daemon configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Provider selection. At least one provider must be configured.
     pub provider: ProviderConfig,
     /// Historical-cache backend (optional unless a session uses the cache).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<StorageConfig>,
     /// Tap-log backend (optional unless a session writes the tap log).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tap_log: Option<StorageConfig>,
     /// Session knobs (resume buffer, adjustment).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_session")]
     pub session: SessionConfig,
     /// Control surface + service-naming knobs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_server")]
     pub server: ServerConfig,
     /// Diagnostics-plane cadence.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_diagnostics")]
     pub diagnostics: DiagnosticsConfig,
     /// iceoryx2 transport caps.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_iceoryx2")]
     pub iceoryx2: Iceoryx2Config,
     /// Optional web UI (Phase 6 drives it; config surface lives here). Always
     /// parsed so configs stay portable; only read by the `web-ui` feature.
     #[cfg_attr(not(feature = "web-ui"), allow(dead_code))]
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_ui: Option<WebUiConfig>,
     /// Boot-time authoritative sessions held as lifecycle anchors.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub startup_session: Vec<StartupSession>,
 }
 
 /// Provider selection block. Each provider is optional, but at least one must
 /// be present (enforced in [`Config::validate`]).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     #[serde(default)]
@@ -72,7 +89,7 @@ pub struct ProviderConfig {
 }
 
 /// Alpaca equities provider section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlpacaSection {
     #[serde(default)]
@@ -80,7 +97,7 @@ pub struct AlpacaSection {
 }
 
 /// Alpaca crypto provider section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlpacaCryptoSection {
     #[serde(default)]
@@ -90,7 +107,7 @@ pub struct AlpacaCryptoSection {
 }
 
 /// Which environment credential pair `oxidized_alpaca` loads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountTypeCfg {
     #[default]
@@ -108,7 +125,7 @@ impl From<AccountTypeCfg> for AccountType {
 }
 
 /// Alpaca crypto venue selector.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CryptoVenueCfg {
     #[default]
@@ -128,17 +145,17 @@ impl From<CryptoVenueCfg> for AlpacaCryptoVenue {
 }
 
 /// A persistence backend (cache or tap log).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub backend: StorageBackend,
     /// Filesystem path for embedded backends; ignored for `surreal-memory`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 }
 
 /// Supported storage backends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageBackend {
     SurrealEmbedded,
@@ -146,7 +163,7 @@ pub enum StorageBackend {
 }
 
 /// Session-level knobs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     #[serde(default = "default_resume_buffer")]
@@ -169,7 +186,7 @@ const fn default_resume_buffer() -> usize {
 }
 
 /// Corporate-action adjustment mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdjustmentCfg {
     Raw,
@@ -193,7 +210,7 @@ impl From<AdjustmentCfg> for Adjustment {
 }
 
 /// Control surface + iceoryx2 naming.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_admin_socket")]
@@ -227,7 +244,7 @@ const fn default_shutdown_timeout() -> u64 {
 }
 
 /// Diagnostics-plane cadence.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticsConfig {
     #[serde(default = "default_live_cadence")]
@@ -256,7 +273,7 @@ const fn default_catalog_cadence() -> u64 {
 /// iceoryx2 transport caps. The per-client data-plane service is fixed-size at
 /// creation; `max_clients` bounds how many per-client services the daemon will
 /// create before rejecting `open-client` with a service-cap error.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Iceoryx2Config {
     #[serde(default = "default_max_clients")]
@@ -277,7 +294,7 @@ const fn default_max_clients() -> usize {
 
 /// Optional web UI (Phase 6).
 #[cfg_attr(not(feature = "web-ui"), allow(dead_code))]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebUiConfig {
     #[serde(default)]
@@ -286,7 +303,7 @@ pub struct WebUiConfig {
     pub bind: String,
     #[serde(default = "default_web_port")]
     pub port: u16,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assets_dir: Option<PathBuf>,
     #[serde(default = "default_live_cadence")]
     pub live_state_cadence_ms: u64,
@@ -303,7 +320,7 @@ const fn default_web_port() -> u16 {
 }
 
 /// A boot-time authoritative session held as a lifecycle anchor.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartupSession {
     pub provider: String,
@@ -312,7 +329,7 @@ pub struct StartupSession {
     pub kind: EventKindCfg,
     #[serde(default)]
     pub scope: ScopeCfg,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_from: Option<String>,
     #[serde(default)]
     pub persistence: PersistenceCfg,
@@ -866,5 +883,71 @@ account_type = "paper"
 bogus = true
 "#;
         assert!(Config::parse(text).is_err());
+    }
+
+    const FULL: &str = r#"
+[provider.alpaca]
+account_type = "paper"
+
+[provider.alpaca_crypto]
+account_type = "live"
+venue = "us_kraken"
+
+[cache]
+backend = "surreal-embedded"
+path = "/tmp/dmc-cache"
+
+[tap_log]
+backend = "surreal-memory"
+
+[session]
+resume_buffer_events = 1024
+adjustment = "split"
+
+[server]
+admin_socket = "/tmp/dmc/admin.sock"
+service_prefix = "dmc"
+shutdown_timeout_secs = 5
+
+[diagnostics]
+publish_interval_ms = 500
+cache_catalog_interval_ms = 10000
+
+[iceoryx2]
+max_clients = 8
+
+[web_ui]
+enabled = true
+bind = "127.0.0.1"
+port = 8091
+
+[[startup_session]]
+provider = "alpaca-crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+scope = "live_backfill"
+backfill_from = "2026-06-01T00:00:00Z"
+persistence = "cached_with_tap"
+always_on = true
+"#;
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let config = Config::parse(FULL).expect("parse");
+        config.validate().expect("validate");
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        let back = Config::parse(&text).expect("reparse");
+        assert_eq!(config, back);
+    }
+
+    #[test]
+    fn minimal_config_round_trips_without_none_fields() {
+        // `None` options must be skipped, not serialized (TOML has no null).
+        let config = Config::parse(MINIMAL).expect("parse");
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        assert!(!text.contains("cache"), "absent [cache] must not serialize: {text}");
+        let back = Config::parse(&text).expect("reparse");
+        assert_eq!(config, back);
     }
 }
