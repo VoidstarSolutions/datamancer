@@ -155,7 +155,14 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let app = router(state, assets_dir.as_deref());
     if let Ok(addr) = listener.local_addr() {
-        tracing::info!(%addr, "datamancerd web UI listening (loopback; single mutating route /api/config)");
+        // Emit the literal IPv4/IPv6 URL, not a `localhost` form: the bind is
+        // to one address family only, and `localhost` resolves to both on a
+        // dual-stack host, so a browser preferring the other family (Happy
+        // Eyeballs) can silently land on an unrelated service sharing the port.
+        tracing::info!(
+            url = %format_args!("http://{addr}/"),
+            "datamancerd web UI listening (loopback; single mutating route /api/config) — open this exact URL, not localhost"
+        );
     }
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
