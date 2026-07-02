@@ -86,9 +86,12 @@ impl ConfigState {
         let config = config.clone();
         let path = self.inner.path.clone();
         // `save` is small-file blocking I/O; keep it off the shared runtime.
-        let config_result = tokio::task::spawn_blocking(move || config.save(&path).map(|()| config))
-            .await
-            .map_err(|e| DaemonError::ConfigInvalid(format!("config write task failed: {e}")))?;
+        let config_result =
+            tokio::task::spawn_blocking(move || config.save(&path).map(|()| config))
+                .await
+                .map_err(|e| {
+                    DaemonError::ConfigInvalid(format!("config write task failed: {e}"))
+                })?;
         let saved = config_result?;
         self.store_flag(&saved);
         Ok(())
@@ -183,7 +186,11 @@ pub(crate) async fn put_config(
     match state.write(&config).await {
         Ok(()) => view(&state, config),
         Err(e @ (DaemonError::ConfigInvalid(_) | DaemonError::ConfigSerialize(_))) => {
-            error_response(StatusCode::UNPROCESSABLE_ENTITY, codes::CONFIG, e.to_string())
+            error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                codes::CONFIG,
+                e.to_string(),
+            )
         }
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -253,13 +260,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (state, _boot) = boot_state(dir.path());
         // Hand-edit on disk behind the daemon's back.
-        std::fs::write(
-            state.path(),
-            "[provider.alpaca]\naccount_type = \"live\"\n",
-        )
-        .expect("hand edit");
+        std::fs::write(state.path(), "[provider.alpaca]\naccount_type = \"live\"\n")
+            .expect("hand edit");
         let disk = state.read_disk().await.expect("read");
-        assert_eq!(disk.provider.alpaca.expect("alpaca").account_type, AccountTypeCfg::Live);
+        assert_eq!(
+            disk.provider.alpaca.expect("alpaca").account_type,
+            AccountTypeCfg::Live
+        );
         assert!(state.restart_required(), "external edit shows up");
     }
 

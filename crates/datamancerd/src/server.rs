@@ -606,8 +606,7 @@ fn spec_instrument(spec: &SubscriptionSpec) -> Instrument {
 fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(), String> {
     let input: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("invalid request: {e}"))?;
-    let canonical =
-        serde_json::to_value(request).map_err(|e| format!("invalid request: {e}"))?;
+    let canonical = serde_json::to_value(request).map_err(|e| format!("invalid request: {e}"))?;
     if let (Some(input), Some(canonical)) = (input.as_object(), canonical.as_object()) {
         for key in input.keys() {
             if !canonical.contains_key(key) {
@@ -690,7 +689,9 @@ async fn handle_connection(stream: UnixStream, cmd_tx: mpsc::Sender<ServerComman
                             // rejected open (e.g. duplicate-name) never causes the
                             // EOF path to tear down the existing client of that
                             // name.
-                            if reply.ok && let Some(name) = open_client_name {
+                            if reply.ok
+                                && let Some(name) = open_client_name
+                            {
                                 opened_client = Some(name);
                             }
                             reply

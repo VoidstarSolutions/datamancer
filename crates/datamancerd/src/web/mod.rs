@@ -9,10 +9,10 @@
 //!
 //! - **Loopback bind only** (`127.0.0.1`); auth is deferred (single operator,
 //!   no network exposure).
-//! - **Single mutating route**: `PUT /api/config` is the only mutation route
-//!   registered; every other route stays `GET`-only, and `/api/config` itself
-//!   is guarded by content-type and same-origin checks (guarded by
-//!   `web_router_single_mutating_route`).
+//! - **One mutating route**: `PUT /api/config` (validated, atomic, loopback +
+//!   same-origin + JSON-content-type guarded) writes the config *file*;
+//!   apply-on-restart, the running daemon is never mutated. Everything else is
+//!   `GET`-only (guarded by `web_router_single_mutating_route`).
 //! - **Single-origin, no CORS**: the UI and JSON API share one loopback origin,
 //!   so no CORS layer is added — never a permissive `Any` origin (guarded by
 //!   `web_no_permissive_cors`).
@@ -22,9 +22,9 @@
 pub mod config_api;
 pub mod handlers;
 pub mod refresh;
+mod settings;
 pub mod state;
 mod ui;
-mod settings;
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -314,7 +314,13 @@ mod tests {
     #[tokio::test]
     async fn config_put_cross_origin_is_rejected() {
         let body = r#"{"provider": {"alpaca": {"account_type": "paper"}}}"#;
-        let resp = send_json(Method::PUT, "/api/config", body, Some("http://evil.example")).await;
+        let resp = send_json(
+            Method::PUT,
+            "/api/config",
+            body,
+            Some("http://evil.example"),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 

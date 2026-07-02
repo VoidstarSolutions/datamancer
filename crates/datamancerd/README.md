@@ -32,6 +32,23 @@ environment credential pair `oxidized_alpaca` loads
 (`paper` → `ALPACA_PAPER_API_KEY_ID`/`ALPACA_PAPER_API_SECRET_KEY`,
 `live` → `ALPACA_LIVE_API_KEY_ID`/`ALPACA_LIVE_API_SECRET_KEY`).
 
+### Config file location
+
+`--config <path>` is **optional**. When given, that path is used verbatim: a
+missing explicit path is an error (it is never scaffolded — you asked for a
+specific file). When omitted, the daemon resolves the platform-native default:
+
+- macOS: `~/Library/Application Support/datamancerd/config.toml`
+- Linux: `~/.config/datamancerd/config.toml` (`$XDG_CONFIG_HOME` respected)
+
+On first run at the **default path only**, if no file exists there, the daemon
+creates the parent directory and atomically writes a commented starter config
+(paper Alpaca provider, web UI enabled on `127.0.0.1:8080`, a user-writable
+admin socket next to the config file). Subsequent runs load the existing file
+unchanged. Config-file writes (scaffolding and UI saves) are atomic: the new
+contents land in a sibling `<path>.tmp` file that is fsynced then renamed over
+the target, so a reader never observes a torn file.
+
 ## Config (TOML)
 
 ```toml
@@ -79,7 +96,7 @@ cache_catalog_cadence_ms = 30000  # slow cadence: cache-catalog swap (/api/cache
 provider = "alpaca-crypto"
 asset_class = "crypto"            # equity | crypto
 symbol = "BTC/USD"
-kind = "trade"                    # trade | quote | bar_1s | bar_1m | bar_5m | bar_15m | bar_1h | bar_1d
+kind = "trade"                    # trade | quote | bar1s | bar1m | bar5m | bar15m | bar1h | bar1d
 scope = "live"                    # live | live_backfill
 backfill_from = "2026-06-01T00:00:00Z"   # required iff scope = live_backfill
 persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only | refresh | tap_only
@@ -112,16 +129,19 @@ the last referrer.
 
 ## Web introspection surface (feature `web-ui`)
 
-An optional **read-only** HTTP server, embedded in the daemon's shared tokio
-runtime, that renders the introspection `SystemSnapshot` for a single same-host
-operator. It is a pure consumer of the snapshot — the **same** snapshot the
-diagnostics plane carries to client processes — and adds no new ordering,
-transport, or domain state. Enable it with `[web_ui] enabled = true`.
+An optional HTTP server, embedded in the daemon's shared tokio runtime, that
+renders the introspection `SystemSnapshot` for a single same-host operator and
+exposes one settings surface for the config file. It is otherwise a pure
+consumer of the snapshot — the **same** snapshot the diagnostics plane carries
+to client processes — and adds no new ordering, transport, or domain state.
+Enable it with `[web_ui] enabled = true`.
 
 > **Security boundary:** **loopback bind only** (a non-loopback `bind` is
 > rejected at startup), **single-origin** (no CORS layer is added — never a
 > permissive `Any` origin), `nosniff` + `Content-Security-Policy` response
-> headers, and **`GET`-only** (no mutation route exists). Auth is **deferred**:
+> headers, and **one mutating route** — `PUT /api/config`, guarded by
+> content-type (JSON only, 415 otherwise) and an Origin/Host same-origin check
+> (403 otherwise). Every other route is `GET`-only. Auth is **deferred**:
 > single operator, no network exposure. This mirrors the control-socket posture
 > — **not** a network-safe surface.
 
@@ -136,13 +156,56 @@ handler never serves an empty snapshot and never invokes the on-demand
 | Route | Body |
 | --- | --- |
 | `GET /` | server-rendered operator page (button-less; live via SSE) |
+| `GET /config` | server-rendered settings page (reads/writes the config file) |
 | `GET /api/snapshot` | the entire live-state `SystemSnapshot` |
 | `GET /api/cache` | cache catalog (slow swap): keys + ranges + est. bytes |
 | `GET /api/providers` | provider accounting |
 | `GET /api/sessions` | authoritative + client sessions (per-symbol) |
 | `GET /api/health` | process-up + per-provider connection rollup |
-| `GET /api/stream` | SSE of the live-state snapshot, one event per refresh |
+| `GET /api/stream` | SSE of the live-state envelope, one event per refresh |
+| `GET /api/config` | the on-disk config file + restart-required flag + path |
+| `PUT /api/config` | validate and atomically rewrite the config file |
 | `GET /metrics` | Prometheus exposition (only with feature `metrics`) |
+
+### Config settings surface (`GET`/`PUT /api/config`)
+
+`GET /api/config` returns the config **as currently on disk** (so external
+hand-edits show up, not just UI-driven ones), plus bookkeeping:
+
+```jsonc
+{"config": { /* full Config, same schema as the TOML file */ },
+ "restart_required": false,
+ "path": "/home/op/.config/datamancerd/config.toml"}
+```
+
+`PUT /api/config` takes a full `Config` JSON body, validates it (the same
+`Config::validate` the daemon runs at boot), and — on success — atomically
+rewrites the file and returns the same envelope shape with the recomputed
+`restart_required`. On failure nothing is written and the file is untouched.
+Errors are `{"code": "...", "message": "..."}` with stable codes: `config`
+(read/parse/validate/serialize failures, `422`/`500`) and `bad_request`
+(missing/invalid JSON content-type → `415`, malformed JSON → `400`,
+cross-origin write → `403`).
+
+**`restart_required` semantics:** the daemon's runtime is immutable after boot
+(apply-on-restart, no hot reload) — `Server::bootstrap` is handed an owned
+`Config` clone and never re-reads the file. `restart_required` is **parsed**
+config inequality between the on-disk file and the boot-time config, not a
+byte diff: writing back exactly the boot config (even through a save that
+drops comments) clears the flag. The same flag streams live over
+`GET /api/stream`'s SSE envelope:
+
+```jsonc
+{"snapshot": { /* SystemSnapshot */ }, "restart_required": true}
+```
+
+so the `/config` settings page (and any other client watching the stream) can
+show a restart banner without polling.
+
+**UI saves drop TOML comments.** The `/config` page's save button `PUT`s the
+full validated config back; `Config::save` re-serializes it, so hand-written
+comments in the file are lost on the first UI-driven save (values survive,
+prose doesn't).
 
 **Per-symbol presentation (load-bearing):** every ordered quantity (`seq`,
 coverage, latency, gaps) is shown **per-`(instrument, kind)`**. The UI implies

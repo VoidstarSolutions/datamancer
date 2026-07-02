@@ -184,8 +184,8 @@ mod tests {
         let refreshers = Refreshers::warm(&dm).await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let boot = crate::config::Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n")
-            .unwrap();
+        let boot =
+            crate::config::Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n").unwrap();
         boot.save(&path).unwrap();
         let state = crate::web::AppState {
             snapshots: refreshers.state.clone(),

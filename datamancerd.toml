@@ -70,7 +70,7 @@ cache_catalog_cadence_ms = 30000  # slow: cache-catalog swap (/api/cache)
 provider = "alpaca-crypto"
 asset_class = "crypto"            # equity | crypto
 symbol = "BTC/USD"
-kind = "trade"                    # trade | quote | bar_1s|1m|5m|15m|1h|1d
+kind = "trade"                    # trade | quote | bar1s | bar1m | bar5m | bar15m | bar1h | bar1d
 scope = "live"                    # live | live_backfill
 # backfill_from = "2026-06-01T00:00:00Z"   # required iff scope = live_backfill
 persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only | refresh | tap_only

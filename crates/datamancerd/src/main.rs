@@ -68,5 +68,8 @@ async fn run() -> Result<()> {
     let config_path = paths::resolve_config_path(args.config)?;
     tracing::info!(path = %config_path.display(), "loading config");
     let config = Config::load(&config_path)?;
-    server::Server::bootstrap(config, config_path).await?.run().await
+    server::Server::bootstrap(config, config_path)
+        .await?
+        .run()
+        .await
 }

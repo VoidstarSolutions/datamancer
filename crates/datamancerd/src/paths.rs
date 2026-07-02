@@ -245,10 +245,7 @@ mod tests {
         assert!(config.provider.alpaca.is_some());
         let web = config.web_ui.expect("web_ui section");
         assert!(web.enabled);
-        assert_eq!(
-            config.server.admin_socket,
-            dir.path().join("admin.sock")
-        );
+        assert_eq!(config.server.admin_socket, dir.path().join("admin.sock"));
     }
 
     #[test]
@@ -275,6 +272,9 @@ mod tests {
         let resolved2 = resolve_in(None, default.clone()).expect("resolve again");
         assert_eq!(resolved2, default);
         let second = std::fs::read_to_string(&default).unwrap();
-        assert!(second.contains("live"), "existing config must not be overwritten");
+        assert!(
+            second.contains("live"),
+            "existing config must not be overwritten"
+        );
     }
 }

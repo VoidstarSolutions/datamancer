@@ -717,14 +717,38 @@ account_type = "paper"
     /// `snake_case` does **not** insert an underscore before a leading digit.
     #[test]
     fn event_kind_wire_values() {
-        assert_eq!(serde_json::to_string(&EventKindCfg::Trade).unwrap(), "\"trade\"");
-        assert_eq!(serde_json::to_string(&EventKindCfg::Quote).unwrap(), "\"quote\"");
-        assert_eq!(serde_json::to_string(&EventKindCfg::Bar1s).unwrap(), "\"bar1s\"");
-        assert_eq!(serde_json::to_string(&EventKindCfg::Bar1m).unwrap(), "\"bar1m\"");
-        assert_eq!(serde_json::to_string(&EventKindCfg::Bar5m).unwrap(), "\"bar5m\"");
-        assert_eq!(serde_json::to_string(&EventKindCfg::Bar15m).unwrap(), "\"bar15m\"");
-        assert_eq!(serde_json::to_string(&EventKindCfg::Bar1h).unwrap(), "\"bar1h\"");
-        assert_eq!(serde_json::to_string(&EventKindCfg::Bar1d).unwrap(), "\"bar1d\"");
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Trade).unwrap(),
+            "\"trade\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Quote).unwrap(),
+            "\"quote\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar1s).unwrap(),
+            "\"bar1s\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar1m).unwrap(),
+            "\"bar1m\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar5m).unwrap(),
+            "\"bar5m\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar15m).unwrap(),
+            "\"bar15m\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar1h).unwrap(),
+            "\"bar1h\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar1d).unwrap(),
+            "\"bar1d\""
+        );
     }
 
     #[test]
@@ -997,9 +1021,18 @@ always_on = true
         // `None` options must be skipped, not serialized (TOML has no null).
         let config = Config::parse(MINIMAL).expect("parse");
         let text = toml::to_string_pretty(&config).expect("serialize");
-        assert!(!text.contains("[cache]"), "absent [cache] must not serialize: {text}");
-        assert!(!text.contains("[tap_log]"), "absent [tap_log] must not serialize: {text}");
-        assert!(!text.contains("[web_ui]"), "absent [web_ui] must not serialize: {text}");
+        assert!(
+            !text.contains("[cache]"),
+            "absent [cache] must not serialize: {text}"
+        );
+        assert!(
+            !text.contains("[tap_log]"),
+            "absent [tap_log] must not serialize: {text}"
+        );
+        assert!(
+            !text.contains("[web_ui]"),
+            "absent [web_ui] must not serialize: {text}"
+        );
         let back = Config::parse(&text).expect("reparse");
         assert_eq!(config, back);
     }
