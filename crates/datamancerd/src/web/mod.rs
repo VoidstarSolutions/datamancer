@@ -17,6 +17,7 @@
 //! - Basic response hardening headers (`X-Content-Type-Options`, a `Content-Security-Policy`)
 //!   even same-host.
 
+pub mod config_api;
 pub mod handlers;
 pub mod refresh;
 pub mod state;
