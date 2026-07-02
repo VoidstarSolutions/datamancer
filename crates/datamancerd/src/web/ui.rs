@@ -29,7 +29,8 @@ pub(crate) async fn index() -> Markup {
                 header {
                     h1 { "datamancerd" }
                     p.sub { "read-only introspection · same-host · per-symbol" }
-                    p.status { "stream: " span #conn { "connecting…" } }
+                    p.status { "stream: " span #conn { "connecting…" } " · " a href="/config" { "settings" } }
+                    div #banner hidden { "Configuration changed on disk — restart datamancerd to apply." }
                 }
                 main {
                     section {
@@ -62,6 +63,7 @@ header h1 { margin: 0; font-size: 1.4rem; }
 .sub { margin: .15rem 0; opacity: .7; }
 .status { margin: .15rem 0 1rem; }
 #conn { font-weight: 600; }
+#banner { background: #b45309; color: #fff; padding: .4rem .6rem; border-radius: 4px; margin: .4rem 0; }
 section { margin-bottom: 1.5rem; }
 h2 { font-size: 1.05rem; border-bottom: 1px solid currentColor; padding-bottom: .2rem; }
 .note { font-weight: 400; font-size: .8rem; opacity: .6; }
@@ -128,7 +130,13 @@ function paint(snap){
 const es = new EventSource('/api/stream');
 es.onopen = () => { conn.textContent = 'live'; };
 es.onerror = () => { conn.textContent = 'reconnecting…'; };
-es.onmessage = (ev) => { try { paint(JSON.parse(ev.data)); } catch (e) {} };
+es.onmessage = (ev) => {
+  try {
+    const d = JSON.parse(ev.data);
+    document.getElementById('banner').hidden = !d.restart_required;
+    paint(d.snapshot);
+  } catch (e) {}
+};
 // The live-state stream already carries the (slow-cadence) cache catalog; the
 // dedicated /api/cache endpoint exists for machine consumers.
 ";

@@ -26,6 +26,7 @@ use futures::StreamExt as _;
 use serde::Serialize;
 use tokio_stream::wrappers::WatchStream;
 
+use crate::web::config_api::ConfigState;
 use crate::web::state::WebState;
 
 /// `GET /api/snapshot` — the entire live-state [`SystemSnapshot`] as JSON.
@@ -105,32 +106,61 @@ pub(crate) async fn health(State(state): State<WebState>) -> Json<HealthView> {
     Json(HealthView::from_snapshot(&state.live_snapshot()))
 }
 
-/// Build the underlying stream of serialized live-state snapshots. Emits the
+/// The SSE event payload: the live snapshot plus the config restart flag, so
+/// the banner updates without a page reload.
+#[derive(Serialize)]
+struct StreamEvent<'a> {
+    snapshot: &'a SystemSnapshot,
+    restart_required: bool,
+}
+
+/// Build the underlying stream of serialized live-state envelopes. Emits the
 /// current snapshot immediately, then again on every live-refresh publish.
 /// Factored out of the SSE handler so it can be unit-tested without HTTP.
-pub(crate) fn live_json_stream(state: &WebState) -> impl Stream<Item = String> + use<> {
+pub(crate) fn live_json_stream(
+    state: &WebState,
+    config: ConfigState,
+) -> impl Stream<Item = String> + use<> {
     let state = state.clone();
     WatchStream::new(state.live_version()).map(move |_version| {
         let snap = state.live_snapshot();
-        serde_json::to_string(&*snap).unwrap_or_else(|_| "{}".to_string())
+        let event = StreamEvent {
+            snapshot: &snap,
+            restart_required: config.restart_required(),
+        };
+        serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string())
     })
 }
 
-/// `GET /api/stream` — SSE of the live-state snapshot, one event per refresh.
+/// `GET /api/stream` — SSE of the live-state envelope, one event per refresh.
 pub(crate) async fn stream(
     State(state): State<WebState>,
+    State(config): State<ConfigState>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let events = live_json_stream(&state).map(|json| Ok(Event::default().data(json)));
+    let events = live_json_stream(&state, config).map(|json| Ok(Event::default().data(json)));
     Sse::new(events).keep_alive(KeepAlive::default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::config_api::ConfigState;
     use crate::web::testdata;
     use arc_swap::ArcSwap;
     use datamancer::Timestamp;
+    use serde_json::Value;
     use tokio::sync::watch;
+
+    fn config_state() -> ConfigState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let boot = crate::config::Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n")
+            .expect("parse");
+        boot.save(&path).expect("seed config");
+        // Leak the tempdir so the file outlives the helper (test-only).
+        std::mem::forget(dir);
+        ConfigState::new(path, boot)
+    }
 
     #[tokio::test]
     async fn sse_stream_emits_initial_then_on_change() {
@@ -138,13 +168,16 @@ mod tests {
         let cache = Arc::new(ArcSwap::from_pointee(testdata::snapshot()));
         let (tx, rx) = watch::channel(0u64);
         let state = WebState::new(live.clone(), cache, rx);
+        let config = config_state();
 
-        let mut stream = Box::pin(live_json_stream(&state));
+        let mut stream = Box::pin(live_json_stream(&state, config));
 
-        // Initial element: reflects the warmed snapshot.
+        // Initial element: reflects the warmed snapshot, wrapped in the envelope.
         let first = stream.next().await.expect("initial SSE sample");
-        let first_snap: SystemSnapshot = serde_json::from_str(&first).unwrap();
+        let first: Value = serde_json::from_str(&first).unwrap();
+        let first_snap: SystemSnapshot = serde_json::from_value(first["snapshot"].clone()).unwrap();
         assert_eq!(first_snap, testdata::snapshot());
+        assert_eq!(first["restart_required"], Value::Bool(false));
 
         // Publish a changed snapshot and bump the version: SSE emits again.
         let mut changed = testdata::snapshot();
@@ -153,8 +186,11 @@ mod tests {
         tx.send_modify(|v| *v = v.wrapping_add(1));
 
         let second = stream.next().await.expect("post-change SSE sample");
-        let second_snap: SystemSnapshot = serde_json::from_str(&second).unwrap();
+        let second: Value = serde_json::from_str(&second).unwrap();
+        let second_snap: SystemSnapshot =
+            serde_json::from_value(second["snapshot"].clone()).unwrap();
         assert_eq!(second_snap, changed);
+        assert_eq!(second["restart_required"], Value::Bool(false));
         assert_ne!(first, second);
     }
 }
