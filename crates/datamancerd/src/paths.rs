@@ -38,7 +38,6 @@ pub fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
 /// (macOS: `~/Library/Application Support/datamancerd/config.toml`;
 /// Linux: `$XDG_CONFIG_HOME/datamancerd/config.toml`).
 #[must_use]
-#[allow(dead_code)] // will be called by config loading in a later task
 pub fn default_config_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "Voidstar", "datamancerd")
         .map(|dirs| dirs.config_dir().join("config.toml"))
@@ -48,7 +47,6 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// admin socket (the compiled-in `/run/datamancerd` default needs root and
 /// does not exist on macOS).
 #[must_use]
-#[allow(dead_code)] // will be called by config loading in a later task
 pub fn default_config_toml(config_dir: &Path) -> String {
     let socket = config_dir.join("admin.sock");
     format!(
@@ -116,7 +114,6 @@ port = 8080
 ///
 /// [`DaemonError::ConfigInvalid`] when no home directory exists to derive the
 /// default path; I/O errors from scaffolding.
-#[allow(dead_code)] // will be called by config loading in a later task
 pub fn resolve_config_path(explicit: Option<PathBuf>) -> DaemonResult<PathBuf> {
     if let Some(path) = explicit {
         Ok(path)
@@ -133,7 +130,6 @@ pub fn resolve_config_path(explicit: Option<PathBuf>) -> DaemonResult<PathBuf> {
 
 /// Testable core of [`resolve_config_path`]: `default` is injected so tests
 /// never touch the real home directory.
-#[allow(dead_code)] // called by resolve_config_path which is currently dead code
 fn resolve_in(explicit: Option<PathBuf>, default: PathBuf) -> DaemonResult<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);

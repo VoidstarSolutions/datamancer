@@ -27,8 +27,6 @@ mod shutdown;
 #[cfg(feature = "web-ui")]
 mod web;
 
-use std::path::PathBuf;
-
 use clap::Parser;
 
 use crate::config::Config;
@@ -41,9 +39,10 @@ use crate::error::Result;
     about = "Standalone datamancer market-data server"
 )]
 struct Args {
-    /// Path to the TOML config file.
+    /// Path to the TOML config file. Defaults to the platform config
+    /// directory (scaffolded with a commented default on first run).
     #[arg(long, short)]
-    config: PathBuf,
+    config: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -66,6 +65,8 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
-    let config = Config::load(&args.config)?;
+    let config_path = paths::resolve_config_path(args.config)?;
+    tracing::info!(path = %config_path.display(), "loading config");
+    let config = Config::load(&config_path)?;
     server::Server::bootstrap(config).await?.run().await
 }
