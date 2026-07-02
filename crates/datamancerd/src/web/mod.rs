@@ -9,8 +9,10 @@
 //!
 //! - **Loopback bind only** (`127.0.0.1`); auth is deferred (single operator,
 //!   no network exposure).
-//! - **`GET`-only**: no mutation route is registered, so there is no
-//!   axum-level write path to flip (guarded by `web_router_get_only`).
+//! - **Single mutating route**: `PUT /api/config` is the only mutation route
+//!   registered; every other route stays `GET`-only, and `/api/config` itself
+//!   is guarded by content-type and same-origin checks (guarded by
+//!   `web_router_single_mutating_route`).
 //! - **Single-origin, no CORS**: the UI and JSON API share one loopback origin,
 //!   so no CORS layer is added — never a permissive `Any` origin (guarded by
 //!   `web_no_permissive_cors`).
@@ -83,7 +85,11 @@ pub fn router(state: AppState, assets_dir: Option<&Path>) -> Router {
         .route("/api/providers", get(handlers::providers))
         .route("/api/sessions", get(handlers::sessions))
         .route("/api/health", get(handlers::health))
-        .route("/api/stream", get(handlers::stream));
+        .route("/api/stream", get(handlers::stream))
+        .route(
+            "/api/config",
+            get(config_api::get_config).put(config_api::put_config),
+        );
 
     #[cfg(feature = "metrics")]
     {
@@ -201,6 +207,26 @@ mod tests {
             .to_vec()
     }
 
+    async fn send_json(
+        method: Method,
+        uri: &str,
+        body: &str,
+        origin: Option<&str>,
+    ) -> axum::response::Response {
+        let app = router(state(), None);
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("host", "127.0.0.1:8080");
+        if let Some(o) = origin {
+            req = req.header("origin", o);
+        }
+        app.oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
     const ROUTES: &[&str] = &[
         "/",
         "/api/snapshot",
@@ -212,17 +238,100 @@ mod tests {
     ];
 
     #[tokio::test]
-    async fn web_router_get_only() {
+    async fn web_router_single_mutating_route() {
         for route in ROUTES {
             for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
                 let resp = send(method.clone(), route).await;
                 assert_eq!(
                     resp.status(),
                     StatusCode::METHOD_NOT_ALLOWED,
-                    "{method} {route} must be rejected (read-only surface)"
+                    "{method} {route} must be rejected"
                 );
             }
         }
+        // /api/config: PUT is allowed (guarded), all other mutations rejected.
+        for method in [Method::POST, Method::DELETE, Method::PATCH] {
+            let resp = send(method.clone(), "/api/config").await;
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+    }
+
+    #[tokio::test]
+    async fn config_get_returns_config_and_flag() {
+        let resp = send(Method::GET, "/api/config").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["restart_required"], Value::Bool(false));
+        assert!(v["config"]["provider"]["alpaca"].is_object());
+        assert!(v["path"].as_str().unwrap().ends_with("config.toml"));
+    }
+
+    #[tokio::test]
+    async fn config_put_writes_and_flags_restart() {
+        let app = router(state(), None);
+        let body = serde_json::json!({
+            "provider": {"alpaca": {"account_type": "live"}},
+            "session": {"resume_buffer_events": 128, "adjustment": "all"}
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/config")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:8080")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["restart_required"], Value::Bool(true));
+        assert_eq!(v["config"]["provider"]["alpaca"]["account_type"], "live");
+    }
+
+    #[tokio::test]
+    async fn config_put_invalid_writes_nothing() {
+        // No provider at all -> validation failure with the stable `config` code.
+        let resp = send_json(Method::PUT, "/api/config", r#"{"provider": {}}"#, None).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["code"], "config");
+    }
+
+    #[tokio::test]
+    async fn config_put_malformed_json_is_bad_request() {
+        let resp = send_json(Method::PUT, "/api/config", "{not json", None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn config_put_cross_origin_is_rejected() {
+        let body = r#"{"provider": {"alpaca": {"account_type": "paper"}}}"#;
+        let resp = send_json(Method::PUT, "/api/config", body, Some("http://evil.example")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn config_put_wrong_content_type_is_rejected() {
+        let app = router(state(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/config")
+                    .header("content-type", "text/plain")
+                    .header("host", "127.0.0.1:8080")
+                    .body(Body::from("x=1"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]
