@@ -39,7 +39,7 @@ pub fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
 /// Linux: `$XDG_CONFIG_HOME/datamancerd/config.toml`).
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "Voidstar", "datamancerd")
+    directories::ProjectDirs::from("", "", "datamancerd")
         .map(|dirs| dirs.config_dir().join("config.toml"))
 }
 
@@ -256,6 +256,19 @@ mod tests {
         let resolved = resolve_in(Some(explicit.clone()), default).expect("resolve");
         assert_eq!(resolved, explicit);
         assert!(!explicit.exists(), "explicit paths are never scaffolded");
+    }
+
+    #[test]
+    fn default_config_path_matches_documented_location() {
+        let path = default_config_path().expect("home dir exists in test env");
+        let s = path.to_string_lossy();
+        #[cfg(target_os = "macos")]
+        assert!(
+            s.ends_with("Library/Application Support/datamancerd/config.toml"),
+            "documented macOS path drifted: {s}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(s.ends_with("datamancerd/config.toml"), "{s}");
     }
 
     #[test]

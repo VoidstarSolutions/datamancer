@@ -24,6 +24,9 @@ struct Inner {
     path: PathBuf,
     boot: Config,
     restart_required: AtomicBool,
+    // Serializes read-disk/write so concurrent `PUT /api/config` calls don't
+    // race on the shared `<path>.tmp` sibling file or interleave flag updates.
+    io_lock: tokio::sync::Mutex<()>,
 }
 
 impl ConfigState {
@@ -35,6 +38,7 @@ impl ConfigState {
                 path,
                 boot,
                 restart_required: AtomicBool::new(false),
+                io_lock: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -65,6 +69,7 @@ impl ConfigState {
     ///
     /// [`DaemonError::ConfigRead`] / [`DaemonError::ConfigParse`] on failure.
     pub async fn read_disk(&self) -> Result<Config> {
+        let _guard = self.inner.io_lock.lock().await;
         let text = tokio::fs::read_to_string(&self.inner.path)
             .await
             .map_err(|source| DaemonError::ConfigRead {
@@ -79,10 +84,16 @@ impl ConfigState {
     /// Validate and atomically write `config` to the file, then recompute the
     /// restart flag. Nothing is written (and the flag is unchanged) on failure.
     ///
+    /// Serialized against concurrent `read_disk`/`write` calls: two in-flight
+    /// `PUT /api/config` requests would otherwise share the fixed
+    /// `<path>.tmp` sibling file and could tear each other's write or race
+    /// the restart-required flag.
+    ///
     /// # Errors
     ///
     /// Propagates [`Config::save`] errors.
     pub async fn write(&self, config: &Config) -> Result<()> {
+        let _guard = self.inner.io_lock.lock().await;
         let config = config.clone();
         let path = self.inner.path.clone();
         // `save` is small-file blocking I/O; keep it off the shared runtime.
@@ -90,7 +101,9 @@ impl ConfigState {
             tokio::task::spawn_blocking(move || config.save(&path).map(|()| config))
                 .await
                 .map_err(|e| {
-                    DaemonError::ConfigInvalid(format!("config write task failed: {e}"))
+                    DaemonError::Io(std::io::Error::other(format!(
+                        "config write task failed: {e}"
+                    )))
                 })?;
         let saved = config_result?;
         self.store_flag(&saved);

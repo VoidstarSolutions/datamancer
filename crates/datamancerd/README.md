@@ -200,7 +200,10 @@ drops comments) clears the flag. The same flag streams live over
 ```
 
 so the `/config` settings page (and any other client watching the stream) can
-show a restart banner without polling.
+show a restart banner without polling. The flag is only recomputed by
+`GET`/`PUT /api/config`, not by the SSE stream itself: external hand-edits are
+reflected after the next settings-page load (`GET /api/config`); the stream
+does not re-stat the file itself.
 
 **UI saves drop TOML comments.** The `/config` page's save button `PUT`s the
 full validated config back; `Config::save` re-serializes it, so hand-written
