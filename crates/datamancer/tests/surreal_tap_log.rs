@@ -30,7 +30,9 @@ fn trade(symbol: &str, source_ts: i64, rx_ts: i64, seq: u64, price: f64, size: u
         rx_ts: Timestamp(rx_ts),
         seq: Seq(seq),
         price: Price::from_f64_round(price),
-        size: Quantity::from_raw(size),
+        // `size` is whole shares (fractional sizes are covered explicitly by
+        // `awkward_symbol_round_trips`).
+        size: Quantity::from_units(size),
     })
 }
 
@@ -92,11 +94,18 @@ async fn append_then_flush_persists_and_replays_in_order() {
     let mut got = Vec::new();
     while let Some(ev) = stream.next().await {
         if let MarketEvent::Trade(t) = ev {
-            got.push((t.source_ts.0, t.size.raw(), t.seq.0));
+            got.push((t.source_ts.0, t.size, t.seq.0));
         }
     }
     // Arrival order preserved; the source `seq` is persisted verbatim.
-    assert_eq!(got, vec![(100, 1, 0), (250, 2, 1), (399, 3, 2)]);
+    assert_eq!(
+        got,
+        vec![
+            (100, Quantity::from_units(1), 0),
+            (250, Quantity::from_units(2), 1),
+            (399, Quantity::from_units(3), 2),
+        ]
+    );
 }
 
 #[tokio::test]
