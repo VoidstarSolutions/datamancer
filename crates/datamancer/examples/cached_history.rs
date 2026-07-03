@@ -53,7 +53,7 @@ impl SyntheticProvider {
                     high: Price::from_units(101 + i),
                     low: Price::from_units(99 + i),
                     close: Price::from_units(100 + i),
-                    volume: 1_000,
+                    volume: datamancer::Quantity::from_units(1_000),
                 })
             })
             .collect();

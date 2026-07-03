@@ -38,7 +38,7 @@ fn bar(symbol: &str, ts: i64, close: f64) -> MarketEvent {
         high: Price::from_f64_round(close),
         low: Price::from_f64_round(close),
         close: Price::from_f64_round(close),
-        volume: 1,
+        volume: datamancer::Quantity::from_units(1),
     })
 }
 
@@ -49,7 +49,7 @@ fn trade(symbol: &str, source_ts: i64, rx_ts: i64) -> MarketEvent {
         rx_ts: Timestamp(rx_ts),
         seq: Seq(0),
         price: Price::from_f64_round(1.0),
-        size: 1,
+        size: datamancer::Quantity::from_units(1),
     })
 }
 

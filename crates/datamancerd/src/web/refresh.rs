@@ -152,7 +152,7 @@ mod tests {
             high: Price::from_f64_round(1.0),
             low: Price::from_f64_round(1.0),
             close: Price::from_f64_round(1.0),
-            volume: 1,
+            volume: datamancer::Quantity::from_units(1),
         })
     }
 

@@ -88,7 +88,7 @@ fn trade(source_ts: i64, price: i64) -> MarketEvent {
         // the tap log records that canonical seq — Seq(0) here is never stored.
         seq: Seq(0),
         price: Price::from_units(price),
-        size: 1,
+        size: datamancer::Quantity::from_units(1),
     })
 }
 

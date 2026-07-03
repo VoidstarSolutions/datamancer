@@ -1430,7 +1430,7 @@ mod live_stats_tests {
             rx_ts: Timestamp(ts + 5),
             seq: Seq(seq),
             price: Price::from_f64_round(1.0),
-            size: 1,
+            size: datamancer_core::Quantity::from_units(1),
         })
     }
 
@@ -1494,7 +1494,7 @@ mod client_ring_tests {
             rx_ts: Timestamp(ts),
             seq: Seq(seq),
             price: Price::from_f64_round(1.0),
-            size: 1,
+            size: datamancer_core::Quantity::from_units(1),
         })
     }
 
@@ -1579,7 +1579,7 @@ mod fanout_tests {
             rx_ts: Timestamp(ts),
             seq: Seq(seq),
             price: Price::from_f64_round(1.0),
-            size: 1,
+            size: datamancer_core::Quantity::from_units(1),
         })
     }
 

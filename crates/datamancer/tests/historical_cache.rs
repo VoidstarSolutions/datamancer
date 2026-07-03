@@ -131,7 +131,7 @@ fn bar(ts: i64, close: f64) -> MarketEvent {
         high: Price::from_f64_round(close),
         low: Price::from_f64_round(close),
         close: Price::from_f64_round(close),
-        volume: 1,
+        volume: datamancer::Quantity::from_units(1),
     })
 }
 

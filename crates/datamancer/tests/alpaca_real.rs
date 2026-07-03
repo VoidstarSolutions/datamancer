@@ -139,7 +139,10 @@ async fn live_test_feed_delivers_a_trade() {
 
     eprintln!("first trade: {trade:?}");
     assert_eq!(trade.instrument.symbol(), "FAKEPACA");
-    assert!(trade.size > 0, "trade size should be positive");
+    assert!(
+        trade.size > datamancer::Quantity::ZERO,
+        "trade size should be positive"
+    );
     assert!(
         trade.price.raw() > 0,
         "trade price should be positive in raw units"
