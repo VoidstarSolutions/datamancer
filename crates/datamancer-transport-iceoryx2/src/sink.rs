@@ -69,8 +69,8 @@ impl Iceoryx2DataSink {
     /// Returns [`TransportError`] if a service name is invalid or a service /
     /// publisher port cannot be created.
     pub fn new(node: &Node<ipc_threadsafe::Service>, client_id: u64) -> Result<Self> {
-        let data_name = service_name(&format!("datamancer/data/{client_id}"))?;
-        let ann_name = service_name(&format!("datamancer/symbols/{client_id}"))?;
+        let data_name = service_name(&crate::naming::data_service_name(client_id))?;
+        let ann_name = service_name(&crate::naming::announcement_service_name(client_id))?;
 
         let data_service = node
             .service_builder(&data_name)
