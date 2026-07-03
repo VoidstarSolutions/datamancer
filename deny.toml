@@ -22,14 +22,30 @@ allow = [
     "Unlicense",            # ext-sort (via surrealdb-core)
     "CDLA-Permissive-2.0",  # webpki-root-certs (via rustls-platform-verifier -> reqwest -> oxidized_alpaca)
     "BSL-1.0",              # xxhash-rust (via surrealkv -> surrealdb-core); Boost Software License, permissive - do not confuse with BUSL-1.1
+    "MPL-2.0",              # option-ext (via directories); file-level copyleft, unmodified use imposes nothing on this project (decision 2026-07-03)
 ]
 
-# NOTE: BUSL-1.1 (surrealdb, surrealdb-core, surrealdb-types, surrealdb-protocol)
-# and MPL-2.0 (cssparser, dtoa-short via ammonia; option-ext via directories)
-# are deliberately NOT in the allow list above: they are source-available/
-# copyleft and require a project-level decision, not a config edit. See
-# .superpowers/sdd/task-4-report.md for the full dependency chains.
-# `cargo deny check` is expected to fail on these until that decision is made.
+# TRANSITIONAL (decision 2026-07-03): the SurrealDB storage backend is being
+# replaced by a Turso (SQLite-compatible, MIT) backend - see
+# docs/superpowers/specs/2026-07-03-turso-storage-design.md. Until that port
+# lands and storage-surreal is removed, the surrealdb crates' BUSL-1.1
+# license is tolerated via the scoped exceptions below. Remove this whole
+# block (and the two advisory ignores referencing it) with the port.
+[[licenses.exceptions]]
+allow = ["BUSL-1.1"]
+name = "surrealdb"
+[[licenses.exceptions]]
+allow = ["BUSL-1.1"]
+name = "surrealdb-core"
+[[licenses.exceptions]]
+allow = ["BUSL-1.1"]
+name = "surrealdb-types"
+[[licenses.exceptions]]
+allow = ["BUSL-1.1"]
+name = "surrealdb-protocol"
+[[licenses.exceptions]]
+allow = ["BUSL-1.1"]
+name = "surrealdb-types-derive"
 
 [licenses.private]
 # The three unpublished workspace binaries/libs (publish = false) don't carry
@@ -40,6 +56,12 @@ ignore = true
 
 [advisories]
 yanked = "deny"
+# Both ignores are TRANSITIONAL, rooted in the surrealdb tree, and leave with
+# it (see the licenses.exceptions block above). Neither has an upstream fix.
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained; via surrealmx -> surrealdb-core; removed with the Turso storage port" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side-channel, no patched release; via jsonwebtoken -> surrealdb-core; not network-exposed by datamancer (cache auth is local); removed with the Turso storage port" },
+]
 
 [bans]
 multiple-versions = "warn"
