@@ -85,6 +85,20 @@ port = {port}
         .expect("spawn datamancerd")
 }
 
+/// Build a client request for the daemon: the event-frame wire version rides
+/// the handshake as a required subprotocol.
+fn ws_request(url: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let mut request = url.into_client_request().expect("build request");
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        datamancer::transport_ws::WS_SUBPROTOCOL
+            .parse()
+            .expect("header"),
+    );
+    request
+}
+
 /// Retry `connect_async` until the ws listener is up or the deadline elapses.
 async fn connect_when_ready(
     port: u16,
@@ -92,7 +106,7 @@ async fn connect_when_ready(
     let url = format!("ws://127.0.0.1:{port}/");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match connect_async(&url).await {
+        match connect_async(ws_request(&url)).await {
             Ok((ws, _resp)) => return ws,
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -291,6 +305,46 @@ async fn missing_bearer_token_is_rejected() {
     let _ = child.wait();
 }
 
+/// A client that does not offer the event-frame wire-version subprotocol must
+/// be rejected at the handshake with 400 — it would otherwise misinterpret
+/// every size/volume field. (Pre-versioning clients are exactly this shape.)
+#[tokio::test]
+#[ignore = "spawns the binary; needs a live iceoryx2 runtime; run with --ignored"]
+async fn missing_subprotocol_is_rejected() {
+    let _guard = DAEMON_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = 19016;
+    let mut child = spawn_daemon(dir.path(), port, None);
+
+    let url = format!("ws://127.0.0.1:{port}/");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut rejected = false;
+    while Instant::now() < deadline {
+        // Bare connect: no `Sec-WebSocket-Protocol` offer.
+        match connect_async(&url).await {
+            Ok(_) => panic!("handshake succeeded without the wire-version subprotocol"),
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(
+                    resp.status(),
+                    tokio_tungstenite::tungstenite::http::StatusCode::BAD_REQUEST,
+                    "expected 400"
+                );
+                rejected = true;
+                break;
+            }
+            // Connection refused / io error while the daemon is still booting.
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    assert!(
+        rejected,
+        "server never rejected the subprotocol-less handshake"
+    );
+
+    child.kill().expect("kill");
+    let _ = child.wait();
+}
+
 /// Happy-path auth: with a configured bearer token AND a correct
 /// `Authorization: Bearer secret` header, the upgrade succeeds and a `snapshot`
 /// request returns `ok`. Complements `missing_bearer_token_is_rejected` (reject
@@ -298,8 +352,6 @@ async fn missing_bearer_token_is_rejected() {
 #[tokio::test]
 #[ignore = "spawns the binary; needs a live iceoryx2 runtime; run with --ignored"]
 async fn correct_bearer_token_is_accepted() {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let port = 19014;
@@ -310,7 +362,7 @@ async fn correct_bearer_token_is_accepted() {
     let url = format!("ws://127.0.0.1:{port}/");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut ws = loop {
-        let mut request = url.as_str().into_client_request().expect("build request");
+        let mut request = ws_request(&url);
         request
             .headers_mut()
             .insert("authorization", "Bearer secret".parse().expect("header"));
@@ -377,8 +429,6 @@ async fn correct_bearer_token_is_accepted() {
 #[tokio::test]
 #[ignore = "spawns the binary; needs a live iceoryx2 runtime + live market activity; run with --ignored"]
 async fn slow_consumer_overrun_tears_down_connection() {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-
     // A single lone trade does NOT prove the feed is producing fast enough to
     // overrun the depth-1 channel + tiny rcvbuf; require a small sustained burst
     // in warm-up before trusting the teardown assertion (else soft-pass).
@@ -400,9 +450,7 @@ async fn slow_consumer_overrun_tears_down_connection() {
         let _ = socket.set_recv_buffer_size(2048); // best-effort; kernel clamps to its min
         match socket.connect(sock_addr).await {
             Ok(tcp) => {
-                let request = format!("ws://127.0.0.1:{port}/")
-                    .into_client_request()
-                    .expect("request");
+                let request = ws_request(&format!("ws://127.0.0.1:{port}/"));
                 match tokio_tungstenite::client_async(request, tcp).await {
                     Ok((ws, _resp)) => break ws,
                     Err(_) if Instant::now() < deadline => {

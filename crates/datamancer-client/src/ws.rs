@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use datamancer_core::{InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
-use datamancer_transport_ws::{EventFrame, from_wire};
+use datamancer_transport_ws::{EventFrame, WS_SUBPROTOCOL, from_wire};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt as _, StreamExt as _};
 use serde::Deserialize;
@@ -210,9 +210,28 @@ impl Client for WsClient {
             })?;
             request.headers_mut().insert("authorization", value);
         }
-        let (ws, _resp) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(WsClientError::from)?;
+        // Offer the event-frame wire version as a subprotocol. The daemon
+        // rejects the handshake outright on a mismatch; a pre-versioning
+        // daemon instead silently ignores the offer, which tungstenite's own
+        // echo validation turns into a handshake error — remapped here to
+        // name the actual problem.
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            WS_SUBPROTOCOL
+                .parse()
+                .expect("static token is a valid header value"),
+        );
+        let (ws, _resp) = tokio_tungstenite::connect_async(request).await.map_err(
+            |e| match e {
+                tokio_tungstenite::tungstenite::Error::Protocol(
+                    tokio_tungstenite::tungstenite::error::ProtocolError::SecWebSocketSubProtocolError(_),
+                ) => WsClientError::Protocol(format!(
+                    "server did not accept event-frame subprotocol {WS_SUBPROTOCOL}; \
+                     it likely speaks an older wire version"
+                )),
+                other => WsClientError::from(other),
+            },
+        )?;
         let (write, read) = ws.split();
         let (ev_tx, ev_rx) = mpsc::channel(cfg.event_buffer.max(1));
         let pending: Pending = Arc::new(Mutex::new(PendingTable::default()));
@@ -304,7 +323,27 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // Echo the wire-version subprotocol like the real daemon does when
+            // (and only when) the client offers it, so tests that dial in with
+            // a raw `connect_async` (no offer) still handshake cleanly.
+            // `Callback::on_request`'s `Err` is the tungstenite `Response` type
+            // itself (large); test-only handshake plumbing.
+            #[allow(clippy::result_large_err)]
+            let ws = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    if req.headers().contains_key("sec-websocket-protocol") {
+                        resp.headers_mut().insert(
+                            "sec-websocket-protocol",
+                            datamancer_transport_ws::WS_SUBPROTOCOL.parse().unwrap(),
+                        );
+                    }
+                    Ok(resp)
+                },
+            )
+            .await
+            .unwrap();
             role(ws).await;
         });
         format!("ws://{addr}")
@@ -405,6 +444,29 @@ mod tests {
                 assert_eq!(code, crate::codes::DUPLICATE_SUBSCRIPTION);
             }
             other => panic!("expected Control error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_a_server_that_does_not_echo_the_subprotocol() {
+        // A pre-versioning daemon completes the handshake but ignores the
+        // `Sec-WebSocket-Protocol` offer; the missing echo must fail `connect`
+        // rather than let mixed-version peers exchange misread sizes.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _ = ws; // hold until the client gives up
+        });
+        match WsClient::connect(cfg(format!("ws://{addr}"))).await {
+            Err(ClientError::Transport(super::WsClientError::Protocol(msg))) => {
+                assert!(msg.contains("subprotocol"), "unexpected message: {msg}");
+            }
+            Err(other) => {
+                panic!("expected a protocol error on missing subprotocol echo, got {other:?}")
+            }
+            Ok(_) => panic!("connect must fail when the subprotocol echo is missing"),
         }
     }
 

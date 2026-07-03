@@ -61,10 +61,31 @@ socket.
 
 Unlike the iceoryx2 POD, the `Instrument` is carried **inline** on every
 frame — JSON is self-describing, so there is no `SymbolId` interning or
-announcement-ordering race to manage. Prices cross the wire as raw `i64`
-(core `Price` does not derive `Serialize`). The timestamp triple
+announcement-ordering race to manage. Prices cross the wire as raw `i64` and
+sizes/volumes as raw `u64` `Quantity` units, both `1e-9` fixed-point (core
+`Price`/`Quantity` do not derive `Serialize`). The timestamp triple
 (`source_ts`/`seq`/`rx_ts`) is preserved end-to-end; `rx_ts` is never
 synthesized on decode, and `Seq::SYNTHETIC` (`u64::MAX`) round-trips verbatim.
+
+### Wire version negotiation
+
+The event-frame version is negotiated as the WebSocket subprotocol
+(`Sec-WebSocket-Protocol: datamancer.v2`, `WS_SUBPROTOCOL`). The daemon
+rejects a handshake that does not offer it (HTTP 400) and echoes it on
+acceptance; tungstenite-based clients get the echo validated for free. This
+exists because the JSON shape alone cannot reject a *reinterpretation* of a
+field: v1 (implicit — no subprotocol) carried sizes/volumes as whole base
+units, v2 carries raw `1e-9` units, and `{"size":100}` parses fine under
+either reading — off by 1e9x under the wrong one.
+
+### 64-bit integers, exactly
+
+Raw fixed-point fields are full-range 64-bit integers. Routine values exceed
+2^53 — a 10M-share daily bar volume is `1e16` raw — so any client that parses
+JSON numbers into IEEE-754 doubles (e.g. JavaScript's `JSON.parse`) silently
+corrupts low-order digits. Clients must decode these fields with 64-bit
+integer support (Rust `serde_json` does; JS needs a BigInt-aware parser).
+`datamancer-client` is the supported consumer.
 
 Tagged JSON, `type` field, snake_case: `trade`, `quote`, `bar`, `gap`,
 `subscription_changed`, `session_closing`.

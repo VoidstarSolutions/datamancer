@@ -15,6 +15,19 @@ use datamancer_core::{
 };
 use serde::{Deserialize, Serialize};
 
+/// WebSocket subprotocol token naming this wire format's version, negotiated
+/// on the handshake (`Sec-WebSocket-Protocol`) so mixed-version peers are
+/// rejected before any frame crosses. The JSON field names alone cannot
+/// protect against a *reinterpretation* of a field (`size: 100` parses fine
+/// whether it means whole units or raw 1e-9 units). History: v1 (implicit —
+/// no subprotocol) carried sizes/volumes as whole base units; v2 carries them
+/// as raw 1e-9 `Quantity` units.
+///
+/// Servers must require and echo this token; clients must offer it and verify
+/// the echo (a pre-versioning server silently ignores the offer, so the
+/// missing echo is the only mismatch signal on the client side).
+pub const WS_SUBPROTOCOL: &str = "datamancer.v2";
+
 /// The tagged JSON event frame. One `type` per data/control kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -366,6 +379,29 @@ mod tests {
             });
             assert_eq!(round_trip(&ev), ev, "interval {interval:?}");
         }
+    }
+
+    #[test]
+    fn volumes_beyond_2_pow_53_round_trip_exactly() {
+        // Raw fixed-point u64 values routinely exceed the IEEE-754 double
+        // exact-integer range (a 10M-share daily bar volume is 1e16 raw).
+        // serde_json must carry them exactly — a double-based JSON parser
+        // cannot, which is why the README requires 64-bit integer decoding.
+        let volume = Quantity::from_units(50_000_000); // 5e16 raw > 2^53
+        assert!(volume.raw() > (1u64 << 53));
+        let ev = MarketEvent::Bar(Bar {
+            instrument: inst("AAPL"),
+            interval: BarInterval::OneDay,
+            source_ts: Timestamp(10),
+            rx_ts: Timestamp(20),
+            seq: Seq(5),
+            open: Price(1),
+            high: Price(4),
+            low: Price(0),
+            close: Price(3),
+            volume,
+        });
+        assert_eq!(round_trip(&ev), ev);
     }
 
     #[test]
