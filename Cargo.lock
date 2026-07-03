@@ -990,6 +990,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "datamancer-client"
+version = "0.1.0"
+dependencies = [
+ "datamancer-core",
+ "datamancer-transport-iceoryx2",
+ "datamancer-transport-ws",
+ "futures",
+ "iceoryx2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.29.0",
+]
+
+[[package]]
 name = "datamancer-core"
 version = "0.1.0"
 dependencies = [
@@ -1036,6 +1054,7 @@ dependencies = [
  "axum",
  "clap",
  "datamancer",
+ "datamancer-client",
  "directories",
  "futures",
  "http-body-util",

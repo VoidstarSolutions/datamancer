@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/datamancer",
+    "crates/datamancer-client",
     "crates/datamancer-core",
     "crates/datamancer-transport-iceoryx2",
     "crates/datamancer-transport-ws",

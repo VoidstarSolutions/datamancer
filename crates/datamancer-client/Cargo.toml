@@ -1,0 +1,48 @@
+[package]
+name = "datamancer-client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Consumer-side client trait and control vocabulary for datamancerd (WebSocket and iceoryx2 transports)"
+
+[features]
+# The WebSocket client (network-reachable, single-socket).
+ws = [
+    "dep:datamancer-transport-ws",
+    "dep:tokio-tungstenite",
+    "dep:tokio",
+    "dep:tokio-stream",
+]
+# The same-host iceoryx2 client (UDS control + shared-memory data).
+iceoryx2 = [
+    "dep:datamancer-transport-iceoryx2",
+    "dep:iceoryx2",
+    "dep:tokio",
+    "dep:tokio-stream",
+]
+
+[dependencies]
+datamancer-core = { path = "../datamancer-core" }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# ws
+datamancer-transport-ws = { path = "../datamancer-transport-ws", optional = true }
+tokio-tungstenite = { version = "0.29.0", optional = true }
+
+# iceoryx2
+datamancer-transport-iceoryx2 = { path = "../datamancer-transport-iceoryx2", optional = true }
+iceoryx2 = { version = "0.9.2", optional = true }
+
+# shared by both client impls
+tokio = { workspace = true, features = ["io-util"], optional = true }
+tokio-stream = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util"] }
+tempfile = "3"
+
+[lints]
+workspace = true

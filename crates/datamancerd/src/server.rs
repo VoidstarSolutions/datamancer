@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
-use crate::control::{Reply, Request, SubscriptionSpec, codes};
+use crate::control::{Reply, Request, SubscriptionSpec, codes, reply_from_library_error};
 use crate::error::{DaemonError, Result};
 use crate::shutdown::{DrainClient, DrainRecorder, drain};
 
@@ -198,7 +198,7 @@ impl Server {
                     s.instrument(),
                     s.kind.into(),
                     scope,
-                    s.persistence.options(),
+                    crate::config::persistence_options(s.persistence),
                 )
                 .await?;
             tracing::info!(symbol = %s.symbol, "anchored always_on startup session");
@@ -497,16 +497,14 @@ impl Server {
                 subscriptions,
             } => self.open_client(client, subscriptions).await,
             Request::Subscribe { client, spec } => self.subscribe(&client, spec).await,
-            Request::Unsubscribe {
-                client,
-                provider,
-                asset_class,
-                symbol,
-                kind,
-            } => {
-                let instrument =
-                    Instrument::new(ProviderId::new(provider), asset_class.into(), symbol);
-                self.unsubscribe(&client, instrument, kind.into()).await
+            Request::Unsubscribe { client, spec } => {
+                let instrument = Instrument::new(
+                    ProviderId::new(spec.provider),
+                    spec.asset_class.into(),
+                    spec.symbol,
+                );
+                self.unsubscribe(&client, instrument, spec.kind.into())
+                    .await
             }
             Request::CloseClient { client } => {
                 if self.clients.contains_key(&client) {
@@ -519,7 +517,7 @@ impl Server {
             Request::ListClients => Reply::clients(self.clients.keys().cloned().collect()),
             Request::Snapshot => match self.dm.snapshot().await {
                 Ok(snapshot) => Reply::snapshot(snapshot),
-                Err(e) => Reply::from_library_error(&e),
+                Err(e) => reply_from_library_error(&e),
             },
         }
     }
@@ -558,17 +556,17 @@ impl Server {
                     Scope::Live {
                         backfill_from: None,
                     },
-                    spec.persistence.options(),
+                    crate::config::persistence_options(spec.persistence),
                 )
                 .await
             {
-                return Reply::from_library_error(&e);
+                return reply_from_library_error(&e);
             }
         }
 
         let stream = match session.take_events().await {
             Ok(stream) => stream,
-            Err(e) => return Reply::from_library_error(&e),
+            Err(e) => return reply_from_library_error(&e),
         };
         let pump = spawn_pump(stream, sink.clone());
 
@@ -601,12 +599,12 @@ impl Server {
                 Scope::Live {
                     backfill_from: None,
                 },
-                spec.persistence.options(),
+                crate::config::persistence_options(spec.persistence),
             )
             .await
         {
             Ok(()) => Reply::ok(),
-            Err(e) => Reply::from_library_error(&e),
+            Err(e) => reply_from_library_error(&e),
         }
     }
 
@@ -624,7 +622,7 @@ impl Server {
         };
         match session.unsubscribe(instrument, kind).await {
             Ok(()) => Reply::ok(),
-            Err(e) => Reply::from_library_error(&e),
+            Err(e) => reply_from_library_error(&e),
         }
     }
 
