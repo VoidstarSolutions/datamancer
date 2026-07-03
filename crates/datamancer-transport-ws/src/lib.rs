@@ -15,4 +15,6 @@ mod wire;
 mod writer;
 
 pub use error::{Result, WsTransportError};
+pub use sink::WsDataSink;
 pub use wire::{EventFrame, from_wire, to_wire};
+pub use writer::run_writer;
