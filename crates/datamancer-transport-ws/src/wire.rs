@@ -220,6 +220,17 @@ pub fn from_wire(f: &EventFrame) -> MarketEvent {
             close: Price(*close),
             volume: *volume,
         }),
+        frame @ (EventFrame::Gap { .. }
+        | EventFrame::SubscriptionChanged { .. }
+        | EventFrame::SessionClosing { .. }) => control_from_wire(frame),
+    }
+}
+
+/// Reconstruct the `Control` variants of [`from_wire`]. Split out purely to
+/// keep `from_wire` under clippy's `too_many_lines`; the two together form
+/// one exhaustive frame-to-event mapping.
+fn control_from_wire(frame: &EventFrame) -> MarketEvent {
+    match frame {
         EventFrame::Gap {
             instrument,
             provider,
@@ -270,6 +281,9 @@ pub fn from_wire(f: &EventFrame) -> MarketEvent {
             seq: *seq,
             kind: ControlKind::SessionClosing,
         }),
+        EventFrame::Trade { .. } | EventFrame::Quote { .. } | EventFrame::Bar { .. } => {
+            unreachable!("data variants are handled by from_wire before dispatch")
+        }
     }
 }
 
