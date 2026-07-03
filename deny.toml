@@ -9,6 +9,10 @@ all-features = true
 # (BSD-family, ISC, Zlib, Unicode) is routine; adding any copyleft or
 # source-available license (GPL/AGPL/LGPL/MPL/BUSL/SSPL) is a project
 # decision - stop and raise it, do not just append.
+#
+# Entries below that carry a "(decision YYYY-MM-DD)" comment are
+# already-decided project decisions (e.g. MPL-2.0 for option-ext), not
+# routine appends - do not treat their presence as license alone.
 allow = [
     "MIT",
     "Apache-2.0",

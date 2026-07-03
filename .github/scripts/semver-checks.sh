@@ -6,6 +6,11 @@
 set -euo pipefail
 
 BASELINE_REV="${1:?usage: semver-checks.sh <baseline-rev>}"
+
+# A missing baseline must fail the gate, not silently skip every crate below.
+git rev-parse --verify --quiet "${BASELINE_REV}^{commit}" >/dev/null \
+  || { echo "::error::baseline rev '${BASELINE_REV}' not found"; exit 1; }
+
 CRATES=(
   datamancer-core
   datamancer-transport-ws

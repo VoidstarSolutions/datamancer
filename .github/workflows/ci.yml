@@ -17,6 +17,7 @@ jobs:
   core:
     name: fmt + clippy + tests (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       # Reads rust-toolchain.toml; the @stable ref is the action version,
@@ -33,6 +34,7 @@ jobs:
   features:
     name: feature matrix (cargo-hack)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,6 +48,7 @@ jobs:
   gates:
     name: licenses + advisories + semver
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,6 +76,7 @@ jobs:
     # decision, not a CI edit (see the open-sourcing design spec).
     name: ws-portable subset (Windows)
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
