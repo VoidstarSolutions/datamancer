@@ -173,7 +173,12 @@ async fn accept_with_auth(
                 .and_then(|v| v.split_once(' '))
                 .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
                 .map(|(_, token)| token);
-            if presented != Some(expected.as_str()) {
+            // Compare the secret in constant time: a short-circuiting `!=` leaks
+            // the length of the matching prefix as a timing side-channel on a
+            // network-facing auth boundary. A missing/mis-scheme header (no
+            // secret involved) rejects immediately.
+            let authorized = presented.is_some_and(|t| ct_eq(t.as_bytes(), expected.as_bytes()));
+            if !authorized {
                 let mut err = ErrorResponse::new(Some("missing or invalid bearer token".into()));
                 *err.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
                 return Err(err);
@@ -182,6 +187,22 @@ async fn accept_with_auth(
         Ok(resp)
     })
     .await
+}
+
+/// Constant-time byte-slice equality. Runs in time proportional to the input
+/// length regardless of where (or whether) the bytes first differ, so a
+/// bearer-token comparison leaks no timing signal about the secret's contents.
+/// Length is not itself secret here (an attacker controls their own presented
+/// token), so an early length check is acceptable.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Dispatch one parsed control frame against the connection's session. Returns
@@ -265,4 +286,22 @@ fn spawn_pump(
         }
         let _ = sink.flush().await;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ct_eq;
+
+    #[test]
+    fn ct_eq_matches_only_identical_bytes() {
+        assert!(ct_eq(b"s3cr3t-token", b"s3cr3t-token"));
+        assert!(ct_eq(b"", b""));
+        // Differing content of equal length.
+        assert!(!ct_eq(b"s3cr3t-token", b"s3cr3t-toke_"));
+        // Differing lengths (prefix match) must not compare equal.
+        assert!(!ct_eq(b"s3cr3t", b"s3cr3t-token"));
+        assert!(!ct_eq(b"s3cr3t-token", b"s3cr3t"));
+        // A wrong token that shares no prefix.
+        assert!(!ct_eq(b"correct-horse", b"battery-staple"));
+    }
 }
