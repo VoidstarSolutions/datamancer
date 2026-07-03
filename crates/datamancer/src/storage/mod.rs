@@ -14,3 +14,6 @@ pub mod surreal_tap_log;
 
 #[cfg(feature = "storage-surreal")]
 pub use surreal_tap_log::{SurrealTapLog, SurrealTapLogConfig};
+
+#[cfg(feature = "storage-turso")]
+pub(crate) mod turso_common;
