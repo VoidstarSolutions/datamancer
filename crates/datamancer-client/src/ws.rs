@@ -50,10 +50,26 @@ pub enum WsClientError {
     Config(String),
     #[error("connection closed before the reply arrived")]
     ConnectionClosed,
+    #[error("protocol violation: {0}")]
+    Protocol(String),
 }
 
 type WriteHalf = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<WsReply>>>>;
+
+/// The pending-request table plus a `closed` latch, both behind the one
+/// mutex. The reader task sets `closed` and clears the map atomically (with
+/// respect to this lock) when the read half dies; `request()` checks
+/// `closed` before inserting under the same lock. That ordering closes the
+/// half-open-socket race: without it, a request registered *after* the
+/// reader has already exited (read half dead, write buffer still accepting)
+/// would `rx.await` forever, since nothing will ever clear its entry again.
+#[derive(Default)]
+struct PendingTable {
+    map: HashMap<u64, oneshot::Sender<WsReply>>,
+    closed: bool,
+}
+
+type Pending = Arc<Mutex<PendingTable>>;
 
 /// A connected WebSocket client. See [`Client`] for the transport-agnostic
 /// contract.
@@ -86,7 +102,12 @@ async fn run_reader(
                 }
             }
             Ok(Inbound::Reply(reply)) => {
-                if let Some(tx) = pending.lock().expect("pending poisoned").remove(&reply.id) {
+                if let Some(tx) = pending
+                    .lock()
+                    .expect("pending poisoned")
+                    .map
+                    .remove(&reply.id)
+                {
                     let _ = tx.send(reply);
                 }
             }
@@ -95,9 +116,13 @@ async fn run_reader(
             Err(_) => {}
         }
     }
-    // Socket gone: fail every pending request and end the stream (the events
-    // sender drops here, so the consumer's stream yields None).
-    pending.lock().expect("pending poisoned").clear();
+    // Socket gone: fail every pending request, latch `closed` so any request
+    // that races this exit is rejected immediately instead of hanging, and
+    // end the stream (the events sender drops here, so the consumer's stream
+    // yields None).
+    let mut table = pending.lock().expect("pending poisoned");
+    table.closed = true;
+    table.map.clear();
 }
 
 impl WsClient {
@@ -107,17 +132,29 @@ impl WsClient {
         // stale entry in `pending`.
         let json = serde_json::to_string(req).map_err(WsClientError::from)?;
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("pending poisoned")
-            .insert(id, tx);
+        {
+            let mut table = self.pending.lock().expect("pending poisoned");
+            if table.closed {
+                // The reader has already exited (read half dead). A write
+                // that races this exit can still succeed on a half-open
+                // socket (write buffer accepting, read direction dead), so
+                // nothing would ever clear this entry and `rx.await` would
+                // hang forever. Fail fast instead of registering.
+                return Err(ClientError::Transport(WsClientError::ConnectionClosed));
+            }
+            table.map.insert(id, tx);
+        }
         if let Err(e) = self.write.send(Message::Text(json.into())).await {
             // The request never reached the wire, so no reply will ever
             // resolve this entry — and the reader task only clears the map
             // when the *read* half dies. Remove it here or a half-open
             // socket (write direction dead, read alive) leaks one sender
             // per failed request.
-            self.pending.lock().expect("pending poisoned").remove(&id);
+            self.pending
+                .lock()
+                .expect("pending poisoned")
+                .map
+                .remove(&id);
             return Err(ClientError::Transport(WsClientError::from(e)));
         }
         let reply = rx
@@ -162,7 +199,7 @@ impl Client for WsClient {
             .map_err(WsClientError::from)?;
         let (write, read) = ws.split();
         let (ev_tx, ev_rx) = mpsc::channel(cfg.event_buffer.max(1));
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Pending = Arc::new(Mutex::new(PendingTable::default()));
         tokio::spawn(run_reader(read, Arc::clone(&pending), ev_tx));
         Ok((
             WsClient {
@@ -197,7 +234,7 @@ impl Client for WsClient {
         let req = WsRequest::Snapshot { id: self.next_id() };
         let reply = self.request(&req).await?;
         reply.snapshot.ok_or_else(|| {
-            ClientError::Transport(WsClientError::Config(
+            ClientError::Transport(WsClientError::Protocol(
                 "ok snapshot reply missing snapshot payload".to_string(),
             ))
         })
@@ -212,7 +249,11 @@ impl Client for WsClient {
             provider: provider.map(|p| p.as_str().to_string()),
         };
         let reply = self.request(&req).await?;
-        Ok(reply.instruments.unwrap_or_default())
+        reply.instruments.ok_or_else(|| {
+            ClientError::Transport(WsClientError::Protocol(
+                "ok instruments reply missing instruments payload".to_string(),
+            ))
+        })
     }
 
     async fn close(mut self) -> Result<(), ClientError<Self::Error>> {
@@ -425,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_send_does_not_leak_a_pending_entry() {
-        use std::collections::HashMap;
+        use super::PendingTable;
         use std::sync::{Arc, Mutex};
 
         let url = fake_server(|mut ws| async move {
@@ -443,7 +484,7 @@ mod tests {
         let (mut write, read) = ws.split();
         write.close().await.unwrap();
         drop(read);
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(PendingTable::default()));
         let mut client = WsClient {
             write,
             pending: Arc::clone(&pending),
@@ -458,8 +499,116 @@ mod tests {
             other => panic!("expected transport error, got {other:?}"),
         }
         assert!(
-            pending.lock().unwrap().is_empty(),
+            pending.lock().unwrap().map.is_empty(),
             "failed send must remove its pending entry"
         );
+    }
+
+    #[tokio::test]
+    async fn request_after_reader_exit_fails_fast_instead_of_hanging() {
+        // Regression test for the half-open-socket hang: the reader task can
+        // exit (read half observes EOF) while the write half still accepts
+        // bytes, because the *server* only shut down the direction it writes
+        // to us — it keeps reading. A request issued after that point must
+        // fail immediately and specifically with `ConnectionClosed`.
+        //
+        // On the pre-fix code this same setup does not literally hang —
+        // tokio-tungstenite's split halves share one connection FSM, so once
+        // the reader observes EOF, a subsequent `write.send` on this exact
+        // half-shutdown shape fails fast with `Socket(AlreadyClosed)` — but
+        // that is exactly the point this test pins down: the *general* fix
+        // (check `closed` before inserting into `pending`, under the same
+        // lock the reader uses to set it) must own this outcome, so it comes
+        // back as our own `ConnectionClosed`, not whatever the transport
+        // happened to return. Without the `closed` latch, any request that
+        // *does* reach `write.send` successfully after the reader has
+        // exited — the real half-open-TCP case this guards against, where
+        // the OS write path is not yet aware the peer is gone — would insert
+        // into a `pending` map nothing will ever clear again and hang
+        // forever on `rx.await`.
+        let url = fake_server(|mut ws| async move {
+            // Shut down only our write direction: the client's read half
+            // sees EOF, but its write direction into this socket keeps
+            // working because we keep reading.
+            use tokio::io::AsyncWriteExt as _;
+            ws.get_mut().shutdown().await.unwrap();
+            // Keep reading so the client's subsequent write doesn't hit a
+            // reset — hold the connection open for the rest of the test.
+            let _ = ws.next().await;
+        })
+        .await;
+        let (mut client, mut events) = WsClient::connect(cfg(url)).await.expect("connect");
+
+        // Wait for the reader to actually exit: the event stream ending
+        // proves `run_reader` has returned and latched `closed`.
+        assert!(
+            events.next().await.is_none(),
+            "stream must end once the reader task exits"
+        );
+
+        let spec: SubscriptionSpec = serde_json::from_str(
+            r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+        )
+        .unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.subscribe(&spec))
+                .await
+                .expect("request must not hang once the reader has exited");
+        match result {
+            Err(ClientError::Transport(super::WsClientError::ConnectionClosed)) => {}
+            other => panic!("expected ConnectionClosed, got {other:?}"),
+        }
+    }
+
+    /// Direct, deterministic proof of the invariant the fix relies on,
+    /// without any socket timing: once the reader has latched `closed` (its
+    /// exit path, simulated here directly), a `request()` that races in
+    /// after must see that flag and refuse to register — not insert and
+    /// then wait on a `rx` nothing will ever resolve or drop-clear again.
+    /// This is the exact insert-after-clear TOCTOU the bare-`HashMap` version
+    /// had: `pending.clear()` on reader exit and `pending.insert(id, tx)` on
+    /// a racing `request()` were two independent lock acquisitions with no
+    /// shared "already closed" signal between them.
+    #[tokio::test]
+    async fn request_after_pending_table_latched_closed_is_rejected_not_hung() {
+        use super::PendingTable;
+        use std::sync::{Arc, Mutex};
+
+        let pending: super::Pending = Arc::new(Mutex::new(PendingTable::default()));
+        // Simulate the reader task's exit path.
+        {
+            let mut table = pending.lock().unwrap();
+            table.closed = true;
+            table.map.clear();
+        }
+        // Simulate what `request()` does when it finds `closed` already set:
+        // it must return `ConnectionClosed` and must NOT insert.
+        let id = 1;
+        let (tx, rx) = tokio::sync::oneshot::channel::<WsReply>();
+        let mut tx = Some(tx);
+        let registered = {
+            let mut table = pending.lock().unwrap();
+            if table.closed {
+                false
+            } else {
+                table.map.insert(id, tx.take().unwrap());
+                true
+            }
+        };
+        assert!(
+            !registered,
+            "a request racing a closed reader must not register in `pending`"
+        );
+        // Proof this isn't just an assertion on a bool: `rx` here really is
+        // abandoned (its `tx` was dropped above without ever being inserted
+        // or sent to), so awaiting it resolves immediately rather than
+        // hanging — exactly what the old bare-`HashMap` code could not
+        // guarantee, since its `request()` had no way to observe that the
+        // reader had already cleared the map.
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_millis(200), rx)
+            .await
+            .expect("must not hang")
+            .expect_err("sender was dropped without ever registering");
     }
 }

@@ -53,6 +53,12 @@ pub enum Iceoryx2ClientError {
     /// The iceoryx2 transport crate failed.
     #[error("iceoryx2 transport: {0}")]
     Transport(#[from] datamancer_transport_iceoryx2::TransportError),
+    /// Creating the iceoryx2 `Node` (the shared-memory attach) failed. This is
+    /// distinct from `Transport`: it originates in the `iceoryx2` crate
+    /// itself (`NodeCreationFailure`), one layer below the service/port
+    /// errors `datamancer-transport-iceoryx2` funnels into `Transport`.
+    #[error("iceoryx2 node creation failed: {0}")]
+    Node(String),
 }
 
 /// Extract the numeric client id from the `open-client` reply's service name.
@@ -149,23 +155,40 @@ impl Client for Iceoryx2Client {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         let poll_interval = cfg.poll_interval;
-        // The poll loop owns the node (keeping the shm attach alive) and runs
-        // on the blocking pool: `DataSubscriber::poll` is sync by design.
+        // Shm attach (node create + subscriber open) must surface as a
+        // `connect` failure, not an eprintln plus a silently-ended stream —
+        // the spec's error contract treats it as a `ClientError::Transport`.
+        // The attach itself has to happen on the blocking task (the `Node`
+        // has to live on the same thread that then polls it), so the result
+        // is signaled back over this oneshot; `connect` awaits it before
+        // returning, and the blocking task falls through into the poll loop
+        // on success without needing a second handoff.
+        let (attach_tx, attach_rx) =
+            tokio::sync::oneshot::channel::<Result<(), Iceoryx2ClientError>>();
         tokio::task::spawn_blocking(move || {
             let node = match NodeBuilder::new().create::<ipc_threadsafe::Service>() {
                 Ok(node) => node,
                 Err(e) => {
-                    tracing_or_eprintln(&format!("iceoryx2 node create failed: {e:?}"));
+                    let _ = attach_tx.send(Err(Iceoryx2ClientError::Node(e.to_string())));
                     return;
                 }
             };
             let mut subscriber = match DataSubscriber::open(&node, client_id) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing_or_eprintln(&format!("iceoryx2 subscriber open failed: {e}"));
+                    let _ = attach_tx.send(Err(Iceoryx2ClientError::from(e)));
                     return;
                 }
             };
+            // Attach succeeded: tell `connect` it can return `Ok`, then fall
+            // through into the poll loop on this same thread/Node.
+            if attach_tx.send(Ok(())).is_err() {
+                // `connect` gave up waiting (e.g. it was cancelled) — nothing
+                // else can observe this stream, so there is no point in
+                // polling. `subscriber`/`node` drop here, releasing the
+                // attach.
+                return;
+            }
             while !stop_flag.load(Ordering::Relaxed) {
                 match subscriber.poll() {
                     Ok(events) if events.is_empty() => std::thread::sleep(poll_interval),
@@ -180,6 +203,18 @@ impl Client for Iceoryx2Client {
                 }
             }
         });
+
+        match attach_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(ClientError::Transport(e)),
+            Err(_) => {
+                // The blocking task ended (e.g. panicked) without reporting
+                // either outcome.
+                return Err(ClientError::Transport(Iceoryx2ClientError::Node(
+                    "shm-attach task ended without reporting a result".to_string(),
+                )));
+            }
+        }
 
         Ok((
             Iceoryx2Client {
@@ -244,7 +279,11 @@ impl Client for Iceoryx2Client {
             .await
             .map_err(ClientError::Transport)?;
         let reply = check(reply)?;
-        Ok(reply.instruments.unwrap_or_default())
+        reply.instruments.ok_or_else(|| {
+            ClientError::Transport(Iceoryx2ClientError::Protocol(
+                "ok instruments reply missing instruments payload".to_string(),
+            ))
+        })
     }
 
     /// Graceful close. **Known race:** the daemon emits a terminal
@@ -271,13 +310,6 @@ impl Client for Iceoryx2Client {
             .map_err(ClientError::Transport)?;
         check(reply).map(|_| ())
     }
-}
-
-/// The crate has no tracing dependency; startup failures in the blocking poll
-/// task surface on stderr (they also surface to the consumer as an
-/// immediately-ended event stream).
-fn tracing_or_eprintln(msg: &str) {
-    eprintln!("datamancer-client(iceoryx2): {msg}");
 }
 
 #[cfg(test)]
