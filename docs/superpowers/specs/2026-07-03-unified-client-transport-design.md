@@ -108,6 +108,8 @@ pub trait Client: Sized + Send {
         -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
     fn snapshot(&mut self)
         -> impl Future<Output = Result<SystemSnapshot, ClientError<Self::Error>>> + Send;
+    fn instruments(&mut self, provider: Option<&ProviderId>)
+        -> impl Future<Output = Result<Vec<InstrumentInfo>, ClientError<Self::Error>>> + Send;
     fn close(self)
         -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
 }
@@ -154,6 +156,46 @@ impls uphold:
 - No client-side synthesis: the client never invents events the wire did not
   carry (consistent with `rx_ts` never being reconstructed).
 
+### Instrument & capability discovery
+
+Clients must be able to ask *which instruments each provider offers, and which
+event kinds each supports* (trades / quotes / bars per interval — EOD is
+`EventKind::Bar(BarInterval::OneDay)` in the existing model; no new kind).
+This is a request/reply peer of `snapshot`, threaded through every layer:
+
+- **Core (`datamancer-core`):** a new pure type,
+
+  ```rust
+  pub struct InstrumentInfo {
+      pub instrument: Instrument,
+      pub kinds: Vec<EventKind>,
+  }
+  ```
+
+  plus an `EventKind` enumeration helper (Trade, Quote, Bar × each
+  `BarInterval` — the kind space is finite and closed). The `Provider` trait
+  is **unchanged**: `list_instruments()` already exists (both Alpaca providers
+  implement it against their live assets endpoints, active/tradable only),
+  and per-instrument kinds are derived by probing the existing
+  `supports(instrument, kind)` predicate over the enumerated kinds.
+- **Orchestrator (`datamancer`):** a public
+  `Datamancer::instrument_catalog(provider: Option<&ProviderId>) -> Result<Vec<InstrumentInfo>>`
+  that fans over the registered providers (or the named one —
+  `unknown_provider` otherwise), calling `list_instruments` and deriving each
+  instrument's kind list via `supports`.
+- **Control surfaces:** a new `instruments` op on both UDS
+  (`{"op":"instruments","provider":?}`) and WS
+  (`{"id":N,"op":"instruments","provider":?}`); `Reply`/`WsReply` gain an
+  optional `instruments: Vec<InstrumentInfo>` field. The optional `provider`
+  filter bounds reply size (a full equities catalog is ~10k rows; JSON replies
+  in the megabytes are acceptable on both transports but should not be the
+  only option). Existing stable codes cover the failure modes
+  (`unknown_provider`, `provider`).
+- **Freshness: pass-through in v1.** Every catalog request hits the
+  provider's reference-data path live. Instrument lists change rarely and
+  requests are startup/operator-time, not hot-path. A daemon-side TTL cache
+  is deferred until request volume demands it.
+
 ## The two implementations
 
 ### `WsClient` (new)
@@ -197,10 +239,18 @@ protocols, and attach sequences that exist today.
 
 ## `datamancerd` changes
 
-Mechanical relocation only. `control.rs` / `ws/protocol.rs` re-import the
-moved types; `config.rs` re-imports the moved enums; behavior, wire bytes,
-stable codes, and the operator contract in `crates/datamancerd/README.md` are
-unchanged (README gains a pointer to the client crate).
+Mostly mechanical relocation. `control.rs` / `ws/protocol.rs` re-import the
+moved types; `config.rs` re-imports the moved enums; existing behavior, wire
+bytes, stable codes, and the operator contract in
+`crates/datamancerd/README.md` are unchanged (README gains a pointer to the
+client crate and documents the new op).
+
+One additive change: the `instruments` op on both control surfaces,
+dispatching to `Datamancer::instrument_catalog`. Planning note: the UDS
+dispatcher is a single-actor loop, and a catalog request awaits live provider
+REST calls — it must not stall unrelated control requests behind a slow
+reference-data fetch (dispatch it off-actor, the way per-connection WS
+dispatch already is naturally).
 
 ## Testing
 
@@ -224,9 +274,19 @@ unchanged (README gains a pointer to the client crate).
 
   run against **both** impls in the gated daemon e2e suite. This test is the
   "end user doesn't care which transport" guarantee, stated executably.
+- **Discovery:** `InstrumentInfo` serde round-trip; orchestrator
+  kind-derivation test against a fake provider whose `supports` varies by
+  instrument (guarding the per-instrument shape); `instruments` op parity
+  across UDS and WS; the generic `exercise` gains a catalog step (list →
+  subscribe to a listed instrument+kind → events arrive).
 
 ## Deferred
 
+- Daemon-side TTL cache for the instrument catalog (v1 is pass-through to
+  the provider's reference-data endpoint per request).
+- A distinct EOD event kind (official close / adjusted settlement) if
+  `Bar(OneDay)` ever proves insufficient — an event-model question, not a
+  transport one.
 - Runtime transport selection helper (enum over the two clients) — write it
   when a consumer actually needs it.
 - Server-side listener/glue seam — waits for a third transport.
