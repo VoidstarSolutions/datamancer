@@ -8,6 +8,12 @@
 //! breaking-change review — they are regression-guarded by tests.
 #![forbid(unsafe_code)]
 
+mod client;
+mod error;
+
 pub mod codes;
 pub mod protocol;
 pub mod spec;
+
+pub use client::Client;
+pub use error::ClientError;
