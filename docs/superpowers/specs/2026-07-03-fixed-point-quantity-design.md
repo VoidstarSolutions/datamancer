@@ -161,5 +161,12 @@ The actual bug fix — conversions stop truncating:
 
 - Fractional **order** sizes in executioner (its own concern, its own types).
 - Changing `Price` in any way.
-- Wire version negotiation for the WS transport.
-- In-place migration of previously cached rows.
+- In-place migration of previously cached rows. (Pre-migration databases are
+  instead refused at open via a schema-version marker, added in review —
+  loud error rather than silent decode failures.)
+
+Wire version negotiation was originally a non-goal here, but review found
+that reinterpreting the size fields under unchanged layouts/field names lets
+mixed-version peers silently exchange 1e9x-wrong sizes, so both transports
+gained version gating: the iceoryx2 service names embed `WIRE_VERSION`, and
+the WS transport negotiates the `datamancer.v2` subprotocol on the handshake.

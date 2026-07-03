@@ -191,15 +191,18 @@ async fn accept_with_auth(
                 return Err(err);
             }
         }
-        // `Sec-WebSocket-Protocol` is a comma-separated offer list; require our
-        // wire-version token among them and echo it (RFC 6455 §4.2.2 — the
-        // chosen subprotocol must appear in the response). Checked after auth
-        // so an unauthenticated peer learns nothing beyond 401.
+        // `Sec-WebSocket-Protocol` is a comma-separated offer list that RFC
+        // 7230 also allows split across repeated header lines, so scan every
+        // field instance (`get_all`), not just the first. Require our
+        // wire-version token among the offers and echo it (RFC 6455 §4.2.2 —
+        // the chosen subprotocol must appear in the response). Checked after
+        // auth so an unauthenticated peer learns nothing beyond 401.
         let offered = req
             .headers()
-            .get("sec-websocket-protocol")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.split(',').any(|p| p.trim() == WS_SUBPROTOCOL));
+            .get_all("sec-websocket-protocol")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.split(',').any(|p| p.trim() == WS_SUBPROTOCOL));
         if !offered {
             let mut err = ErrorResponse::new(Some(format!(
                 "unsupported event-frame wire version: this server speaks \
