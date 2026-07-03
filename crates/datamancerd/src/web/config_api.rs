@@ -104,17 +104,23 @@ impl ConfigState {
         // Preserve-on-write: a caller that echoed back the redacted GET view
         // sends the placeholder in place of the real token. Restore it from the
         // current on-disk config (read under the same lock as the write, so it
-        // is consistent with what we are about to overwrite). If no stored token
-        // is recoverable, the token is cleared rather than persisting the
-        // literal placeholder as a secret.
+        // is consistent with what we are about to overwrite). Read/parse
+        // failures **propagate** — the write aborts rather than silently
+        // clearing the token (which would disable WS auth) just because the
+        // file we are about to overwrite could not be read. A successful parse
+        // that simply has no stored token yields `None` (nothing to preserve),
+        // so the literal placeholder is still never persisted as a secret.
         if let Some(ws) = config.ws.as_mut()
             && ws.auth_token.as_deref() == Some(REDACTED_SECRET)
         {
-            ws.auth_token = tokio::fs::read_to_string(&self.inner.path)
+            let text = tokio::fs::read_to_string(&self.inner.path)
                 .await
-                .ok()
-                .and_then(|text| Config::parse(&text).ok())
-                .and_then(|current| current.ws.and_then(|w| w.auth_token));
+                .map_err(|source| DaemonError::ConfigRead {
+                    path: self.inner.path.clone(),
+                    source,
+                })?;
+            let current = Config::parse(&text)?;
+            ws.auth_token = current.ws.and_then(|w| w.auth_token);
         }
         let path = self.inner.path.clone();
         // `save` is small-file blocking I/O; keep it off the shared runtime.
@@ -409,5 +415,31 @@ mod tests {
         state.write(&echoed).await.expect("write");
         // No token to restore -> cleared, never the literal placeholder.
         assert_eq!(token_of(&state.read_disk().await.expect("read")), None);
+    }
+
+    #[tokio::test]
+    async fn write_aborts_rather_than_clearing_token_when_disk_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let boot = Config::parse(WITH_TOKEN).expect("parse");
+        boot.save(&path).expect("seed");
+        let state = ConfigState::new(path.clone(), boot.clone());
+
+        // The on-disk file is corrupted behind the daemon's back, so the real
+        // token can no longer be recovered for a placeholder round-trip.
+        std::fs::write(&path, "this is not valid toml {{{").expect("corrupt");
+
+        let mut echoed = boot.clone();
+        echoed.ws.as_mut().unwrap().auth_token = Some(REDACTED_SECRET.to_string());
+        // The write must fail loudly, not silently clear auth on save.
+        state
+            .write(&echoed)
+            .await
+            .expect_err("must not silently disable auth");
+
+        // Nothing was written: the file is left exactly as it was, so no
+        // cleared-auth config replaced it.
+        let raw = std::fs::read_to_string(&path).expect("read raw");
+        assert_eq!(raw, "this is not valid toml {{{");
     }
 }
