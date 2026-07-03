@@ -159,13 +159,12 @@ impl Iceoryx2DataSink {
             // announced yet. Marking before the send succeeds would, on a send
             // failure, leave the symbol permanently flagged-but-unannounced
             // (unresolvable by subscribers until the next flush).
-            let announcement = if pod.symbol != SymbolId::CONNECTION
-                && !state.announced.contains(&pod.symbol.0)
-            {
-                state.table.announcement(pod.symbol)
-            } else {
-                None
-            };
+            let announcement =
+                if pod.symbol != SymbolId::CONNECTION && !state.announced.contains(&pod.symbol.0) {
+                    state.table.announcement(pod.symbol)
+                } else {
+                    None
+                };
             (pod, announcement)
         };
 

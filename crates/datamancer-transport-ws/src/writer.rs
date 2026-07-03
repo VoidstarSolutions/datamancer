@@ -41,9 +41,12 @@ mod tests {
         run_writer(rx, sink_tx).await;
 
         let got: Vec<Message> = sink_rx.collect().await;
-        assert_eq!(got, vec![
-            Message::Text("hello".to_string().into()),
-            Message::Text("world".to_string().into()),
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                Message::Text("hello".to_string().into()),
+                Message::Text("world".to_string().into()),
+            ]
+        );
     }
 }

@@ -383,7 +383,10 @@ mod tests {
         // The real token is restored on disk, and the round-trip is a no-op.
         let disk = state.read_disk().await.expect("read");
         assert_eq!(token_of(&disk), Some("super-secret-token"));
-        assert!(!state.restart_required(), "placeholder round-trip must not flag restart");
+        assert!(
+            !state.restart_required(),
+            "placeholder round-trip must not flag restart"
+        );
     }
 
     #[tokio::test]
@@ -397,7 +400,10 @@ mod tests {
         let mut changed = boot.clone();
         changed.ws.as_mut().unwrap().auth_token = Some("rotated-token".to_string());
         state.write(&changed).await.expect("write");
-        assert_eq!(token_of(&state.read_disk().await.expect("read")), Some("rotated-token"));
+        assert_eq!(
+            token_of(&state.read_disk().await.expect("read")),
+            Some("rotated-token")
+        );
     }
 
     #[tokio::test]
@@ -405,8 +411,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         // Seed with NO stored token.
-        let boot = Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\n")
-            .expect("parse");
+        let boot =
+            Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\n")
+                .expect("parse");
         boot.save(&path).expect("seed");
         let state = ConfigState::new(path, boot.clone());
 

@@ -66,7 +66,11 @@ mod tests {
 
     fn trade() -> MarketEvent {
         MarketEvent::Trade(Trade {
-            instrument: Instrument::new(ProviderId::from_static("alpaca"), AssetClass::Crypto, "BTC/USD"),
+            instrument: Instrument::new(
+                ProviderId::from_static("alpaca"),
+                AssetClass::Crypto,
+                "BTC/USD",
+            ),
             source_ts: Timestamp(1),
             rx_ts: Timestamp(2),
             seq: Seq(1),
@@ -79,7 +83,10 @@ mod tests {
     async fn publish_delivers_json_into_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
         let sink = WsDataSink::new(tx);
-        assert!(matches!(sink.publish(trade()).await, PublishOutcome::Delivered));
+        assert!(matches!(
+            sink.publish(trade()).await,
+            PublishOutcome::Delivered
+        ));
         let line = rx.recv().await.expect("frame");
         assert!(line.contains("\"type\":\"trade\""));
         assert!(line.contains("\"price\":42"));
@@ -90,7 +97,10 @@ mod tests {
         // Capacity 1, no reader draining: second publish finds the channel full.
         let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
         let sink = WsDataSink::new(tx);
-        assert!(matches!(sink.publish(trade()).await, PublishOutcome::Delivered));
+        assert!(matches!(
+            sink.publish(trade()).await,
+            PublishOutcome::Delivered
+        ));
         match sink.publish(trade()).await {
             PublishOutcome::Rejected(MarketEvent::Trade(t)) => assert_eq!(t.price, Price(42)),
             other => panic!("expected Rejected, got {other:?}"),
@@ -105,10 +115,15 @@ mod tests {
             source_ts: Timestamp(1),
             rx_ts: Timestamp(2),
             seq: Seq(3),
-            kind: ControlKind::ProviderConnected { provider: "alpaca".to_string() },
+            kind: ControlKind::ProviderConnected {
+                provider: "alpaca".to_string(),
+            },
         });
         // Suppressed frames are acked as Delivered but put nothing on the wire.
         assert!(matches!(sink.publish(ev).await, PublishOutcome::Delivered));
-        assert!(rx.try_recv().is_err(), "no frame emitted for suppressed control");
+        assert!(
+            rx.try_recv().is_err(),
+            "no frame emitted for suppressed control"
+        );
     }
 }

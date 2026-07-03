@@ -716,7 +716,11 @@ async fn accept_loop(listener: UnixListener, cmd_tx: mpsc::Sender<ServerCommand>
 /// `Request::Instruments` is dispatched here, off-actor, rather than forwarded
 /// to the actor: it awaits a live provider REST call and must not stall
 /// unrelated control traffic on the single-actor loop.
-async fn handle_connection(stream: UnixStream, cmd_tx: mpsc::Sender<ServerCommand>, dm: Datamancer) {
+async fn handle_connection(
+    stream: UnixStream,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+    dm: Datamancer,
+) {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut opened_client: Option<String> = None;

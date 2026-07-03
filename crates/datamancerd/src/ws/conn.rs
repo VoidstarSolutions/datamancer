@@ -145,7 +145,10 @@ pub async fn handle_connection(
     // the stream), let the pump drain under a bound, then drop the writer so
     // `run_writer` emits the clean WS Close frame once the channel empties.
     let _ = session.close().await;
-    if tokio::time::timeout(Duration::from_secs(2), pump).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(2), pump)
+        .await
+        .is_err()
+    {
         tracing::warn!(%peer, "ws pump did not drain in time");
     }
     // Dropping `tx` lets `run_writer` finish once the channel empties.

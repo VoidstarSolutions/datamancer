@@ -165,19 +165,13 @@ impl AuthoritativeSession {
             .await
             .map_err(|_| Error::SessionClosed)?;
         rx.await.map_err(|_| Error::SessionClosed)??;
-        *self
-            .persistence
-            .lock()
-            .expect("persistence mutex poisoned") = options;
+        *self.persistence.lock().expect("persistence mutex poisoned") = options;
         Ok(())
     }
 
     /// The session's current persistence options (shared across referrers).
     pub(crate) fn persistence(&self) -> PersistenceOptions {
-        *self
-            .persistence
-            .lock()
-            .expect("persistence mutex poisoned")
+        *self.persistence.lock().expect("persistence mutex poisoned")
     }
 }
 
