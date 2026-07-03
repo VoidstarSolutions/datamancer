@@ -142,10 +142,12 @@ mod tests {
     async fn control_errors_carry_the_stable_code() {
         let (mut client, _events) = FakeClient::connect(()).await.unwrap();
         match client
-            .unsubscribe(&serde_json::from_str::<UnsubscribeSpec>(
-                r#"{"provider":"p","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+            .unsubscribe(
+                &serde_json::from_str::<UnsubscribeSpec>(
+                    r#"{"provider":"p","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+                )
+                .unwrap(),
             )
-            .unwrap())
             .await
         {
             Err(ClientError::Control { code, .. }) => {

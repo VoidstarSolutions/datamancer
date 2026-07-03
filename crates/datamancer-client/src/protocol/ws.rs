@@ -73,7 +73,14 @@ pub struct WsReply {
 impl WsReply {
     #[must_use]
     pub fn ok(id: u64) -> Self {
-        Self { id, ok: true, code: None, message: None, snapshot: None, instruments: None }
+        Self {
+            id,
+            ok: true,
+            code: None,
+            message: None,
+            snapshot: None,
+            instruments: None,
+        }
     }
 
     #[must_use]
@@ -90,12 +97,26 @@ impl WsReply {
 
     #[must_use]
     pub fn snapshot(id: u64, snapshot: SystemSnapshot) -> Self {
-        Self { id, ok: true, code: None, message: None, snapshot: Some(snapshot), instruments: None }
+        Self {
+            id,
+            ok: true,
+            code: None,
+            message: None,
+            snapshot: Some(snapshot),
+            instruments: None,
+        }
     }
 
     #[must_use]
     pub fn instruments(id: u64, catalog: Vec<datamancer_core::InstrumentInfo>) -> Self {
-        Self { id, ok: true, code: None, message: None, snapshot: None, instruments: Some(catalog) }
+        Self {
+            id,
+            ok: true,
+            code: None,
+            message: None,
+            snapshot: None,
+            instruments: Some(catalog),
+        }
     }
 }
 
@@ -158,7 +179,13 @@ mod tests {
             matches!(&req, WsRequest::Instruments { id: 4, provider: Some(p) } if p == "alpaca-crypto")
         );
         let all: WsRequest = serde_json::from_str(r#"{"id":5,"op":"instruments"}"#).unwrap();
-        assert!(matches!(all, WsRequest::Instruments { id: 5, provider: None }));
+        assert!(matches!(
+            all,
+            WsRequest::Instruments {
+                id: 5,
+                provider: None
+            }
+        ));
     }
 
     #[test]
@@ -167,7 +194,10 @@ mod tests {
         // guarding the "one control vocabulary" claim.
         let spec_json = r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#;
         let uds: crate::spec::SubscriptionSpec = serde_json::from_str(spec_json).unwrap();
-        let ws_line = format!(r#"{{"id":1,"op":"subscribe",{}}}"#, &spec_json[1..spec_json.len() - 1]);
+        let ws_line = format!(
+            r#"{{"id":1,"op":"subscribe",{}}}"#,
+            &spec_json[1..spec_json.len() - 1]
+        );
         let ws: WsRequest = serde_json::from_str(&ws_line).unwrap();
         match ws {
             WsRequest::Subscribe { spec, .. } => assert_eq!(spec, uds),
