@@ -322,6 +322,11 @@ pub struct WsConfig {
     pub auth_token: Option<String>,
     #[serde(default = "default_ws_channel_depth")]
     pub channel_depth: usize,
+    /// Hard cap on concurrent client connections. New accepts past this are
+    /// closed immediately, bounding memory/FD/session growth from an abusive or
+    /// runaway client (mirrors the iceoryx2 transport's `max_clients`).
+    #[serde(default = "default_ws_max_connections")]
+    pub max_connections: usize,
     #[serde(default = "default_ws_keepalive")]
     pub keepalive_secs: u64,
 }
@@ -336,6 +341,10 @@ const fn default_ws_port() -> u16 {
 
 const fn default_ws_channel_depth() -> usize {
     1024
+}
+
+const fn default_ws_max_connections() -> usize {
+    64
 }
 
 const fn default_ws_keepalive() -> u64 {
@@ -777,6 +786,7 @@ account_type = "paper"
         assert_eq!(ws.port, 9001);
         assert_eq!(ws.auth_token, None);
         assert_eq!(ws.channel_depth, 1024);
+        assert_eq!(ws.max_connections, 64);
         assert_eq!(ws.keepalive_secs, 30);
     }
 

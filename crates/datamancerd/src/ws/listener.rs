@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use datamancer::Datamancer;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 use tokio::task::JoinSet;
 
 use crate::config::WsConfig;
@@ -54,23 +54,43 @@ pub async fn serve(
     let mut conns: JoinSet<()> = JoinSet::new();
     let (conn_shutdown_tx, _) = broadcast::channel::<()>(1);
 
+    // Hard cap on concurrent connections. Each accept takes one owned permit,
+    // moved into its task and released on drop when the connection ends — so an
+    // abusive/runaway client cannot exhaust memory, FDs, or session state by
+    // opening connections without bound. Accepts past the cap close immediately.
+    let conn_limit = Arc::new(Semaphore::new(cfg.max_connections));
+
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             () = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
                 Ok((tcp, peer)) => {
+                    let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
+                        tracing::warn!(
+                            %peer,
+                            max = cfg.max_connections,
+                            "ws connection cap reached; rejecting new connection",
+                        );
+                        drop(tcp);
+                        continue;
+                    };
                     let dm = dm.clone();
                     let auth_token = auth_token.clone();
                     let conn_shutdown = conn_shutdown_tx.subscribe();
-                    conns.spawn(handle_connection(
-                        tcp,
-                        peer,
-                        dm,
-                        auth_token,
-                        channel_depth,
-                        conn_shutdown,
-                    ));
+                    conns.spawn(async move {
+                        // Held for the connection's lifetime; releases on drop.
+                        let _permit = permit;
+                        handle_connection(
+                            tcp,
+                            peer,
+                            dm,
+                            auth_token,
+                            channel_depth,
+                            conn_shutdown,
+                        )
+                        .await;
+                    });
                 }
                 Err(e) => tracing::warn!(error = %e, "ws accept failed"),
             },

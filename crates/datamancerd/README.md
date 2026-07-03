@@ -280,6 +280,7 @@ bind = "127.0.0.1"                 # loopback default; can be bound off-loopback
 port = 9001
 auth_token = "change-me"           # optional shared bearer token; omit to disable auth
 channel_depth = 1024               # bounded per-connection outbound channel
+max_connections = 64               # hard cap on concurrent clients; accepts past this close immediately
 keepalive_secs = 30                # reserved; see caveat below
 ```
 
