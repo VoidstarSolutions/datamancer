@@ -1014,6 +1014,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "datamancer-transport-ws"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "datamancer-core",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+]
+
+[[package]]
 name = "datamancerd"
 version = "0.1.0"
 dependencies = [
