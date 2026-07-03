@@ -307,7 +307,11 @@ const fn default_web_port() -> u16 {
 
 /// The remote WebSocket client surface. Mutating and network-reachable — its own
 /// posture, separate from the loopback read-only web UI. Off unless `enabled`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand rather than derived so the bearer token is
+/// never printed: a derived `{:?}` on `Config`/`WsConfig` (panic messages, debug
+/// logs, error contexts) would otherwise leak the secret in plaintext.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WsConfig {
     #[serde(default)]
@@ -329,6 +333,21 @@ pub struct WsConfig {
     pub max_connections: usize,
     #[serde(default = "default_ws_keepalive")]
     pub keepalive_secs: u64,
+}
+
+impl std::fmt::Debug for WsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsConfig")
+            .field("enabled", &self.enabled)
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            // Presence, never the value.
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .field("channel_depth", &self.channel_depth)
+            .field("max_connections", &self.max_connections)
+            .field("keepalive_secs", &self.keepalive_secs)
+            .finish()
+    }
 }
 
 fn default_ws_bind() -> String {
@@ -788,6 +807,20 @@ account_type = "paper"
         assert_eq!(ws.channel_depth, 1024);
         assert_eq!(ws.max_connections, 64);
         assert_eq!(ws.keepalive_secs, 30);
+    }
+
+    #[test]
+    fn ws_config_debug_redacts_auth_token() {
+        let cfg = Config::parse(
+            "[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\nauth_token = \"super-secret-token\"\n",
+        )
+        .expect("parse");
+        // Debug on both the inner struct and the whole Config must not leak it.
+        let ws_dbg = format!("{:?}", cfg.ws.as_ref().expect("ws present"));
+        assert!(!ws_dbg.contains("super-secret-token"), "{ws_dbg}");
+        assert!(ws_dbg.contains("<redacted>"), "{ws_dbg}");
+        let cfg_dbg = format!("{cfg:?}");
+        assert!(!cfg_dbg.contains("super-secret-token"), "{cfg_dbg}");
     }
 
     #[test]
