@@ -12,6 +12,8 @@ mod client;
 mod error;
 
 pub mod codes;
+#[cfg(feature = "iceoryx2")]
+pub mod iox2;
 pub mod protocol;
 pub mod spec;
 #[cfg(feature = "ws")]
