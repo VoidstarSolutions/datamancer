@@ -15,7 +15,7 @@ Cargo workspace (resolver 3, edition 2024) with six crates:
 
 Default features: `provider-alpaca`, `storage-surreal`. `transport-iceoryx2`, `transport-ws`, `client-ws`, and `client-iceoryx2` are **off by default**. All optional; pulling in a new provider/transport should be additive and gated behind a feature.
 
-Workspace-wide lints: `clippy::pedantic = deny` (with `priority = -1` so individual lints can be relaxed per call site). Member crates opt in via `[lints] workspace = true`. **`#![forbid(unsafe_code)]` in all five crates** — including the iceoryx2 transport (its EXT-1 gate confirms `ZeroCopySend` is a safe derive; see that crate's CLAUDE.md).
+Workspace-wide lints: `clippy::pedantic = deny` (with `priority = -1` so individual lints can be relaxed per call site). Member crates opt in via `[lints] workspace = true`. **`#![forbid(unsafe_code)]` in all six crates** — including the iceoryx2 transport (its EXT-1 gate confirms `ZeroCopySend` is a safe derive; see that crate's CLAUDE.md).
 
 ## Common commands
 
