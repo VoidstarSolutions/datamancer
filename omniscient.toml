@@ -1,6 +1,0 @@
-languages = ["rust", "python", "typescript"]
-strip_comments = true
-
-[embedder]
-base_url = "http://192.168.50.200:8080"
-model = "qwen3-embedding-8b"
