@@ -29,27 +29,35 @@ impl Quantity {
     }
 
     /// Construct from whole base units. `from_units(100)` is 100 shares /
-    /// 100 coins.
+    /// 100 coins. Values above `u64::MAX / SCALE` (~1.8e10 whole units)
+    /// saturate to `u64::MAX` internal units rather than wrapping — provider
+    /// volumes feed this constructor, so a corrupt upstream value must not
+    /// wrap into a plausible-looking small one.
     #[must_use]
     pub const fn from_units(units: u64) -> Self {
-        Self(units * Self::SCALE)
+        Self(units.saturating_mul(Self::SCALE))
     }
 
     /// Construct from an `f64`, rounding to the nearest internal unit.
     ///
     /// Lossy by definition; provider wire formats are themselves `f64`. NaN,
-    /// ±∞, and negative inputs collapse to [`Quantity::ZERO`]; values at or
-    /// above the representable maximum saturate to `u64::MAX` internal units.
+    /// ±∞, and negative inputs collapse to [`Quantity::ZERO`] (non-finite is
+    /// bad data, not a large size); *finite* values at or above the
+    /// representable maximum saturate to `u64::MAX` internal units.
     #[must_use]
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "lossy by contract — entire purpose of this constructor. \
-                  The f64→u64 cast is saturating: NaN and negatives clamp to 0, \
-                  overflow clamps to u64::MAX — exactly the documented contract."
+                  The f64→u64 cast is saturating: negatives clamp to 0, \
+                  finite overflow clamps to u64::MAX — exactly the documented \
+                  contract (non-finite is handled explicitly above the cast)."
     )]
     pub fn from_f64_round(value: f64) -> Self {
+        if !value.is_finite() {
+            return Self::ZERO;
+        }
         Self((value * Self::SCALE as f64).round() as u64)
     }
 
@@ -121,6 +129,17 @@ mod tests {
     }
 
     #[test]
+    fn from_units_saturates_instead_of_wrapping() {
+        // Above u64::MAX / SCALE whole units: saturate, never wrap. Provider
+        // bar volumes reach this constructor unchecked.
+        assert_eq!(Quantity::from_units(u64::MAX), Quantity(u64::MAX));
+        assert_eq!(
+            Quantity::from_units(u64::MAX / Quantity::SCALE + 1),
+            Quantity(u64::MAX)
+        );
+    }
+
+    #[test]
     fn from_raw_is_verbatim() {
         assert_eq!(Quantity::from_raw(4_000_000).raw(), 4_000_000);
     }
@@ -147,7 +166,7 @@ mod tests {
     #[test]
     fn nan_and_infinities_collapse_to_zero() {
         assert_eq!(Quantity::from_f64_round(f64::NAN), Quantity::ZERO);
-        assert_eq!(Quantity::from_f64_round(f64::INFINITY), Quantity(u64::MAX));
+        assert_eq!(Quantity::from_f64_round(f64::INFINITY), Quantity::ZERO);
         assert_eq!(Quantity::from_f64_round(f64::NEG_INFINITY), Quantity::ZERO);
     }
 
