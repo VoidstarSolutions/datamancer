@@ -40,8 +40,8 @@ pub use datamancer_core::{
     Adjustment, AssetClass, AuthoritativeSessionSnapshot, Bar, BarInterval, CacheCatalogEntry,
     CacheCoverage, CacheKey, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
     ConnectionState, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
-    HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId,
-    ProviderMetrics, ProviderSnapshot, Quote, ReplayRequest, ReplaySource, Result,
+    HistoryRequest, Instrument, InstrumentInfo, LiveHandle, MarketEvent, Price, Provider,
+    ProviderId, ProviderMetrics, ProviderSnapshot, Quote, ReplayRequest, ReplaySource, Result,
     ResumeBufferSnapshot, Seq, SubscriptionRef, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 pub use session::{
