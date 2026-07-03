@@ -9,6 +9,7 @@ default = ["provider-alpaca", "storage-surreal"]
 provider-alpaca = ["dep:oxidized_alpaca", "dep:chrono"]
 storage-surreal = ["dep:surrealdb", "dep:chrono", "dep:serde"]
 transport-iceoryx2 = ["dep:datamancer-transport-iceoryx2"]
+transport-ws = ["dep:datamancer-transport-ws"]
 
 [dependencies]
 async-trait = "0.1"
@@ -29,6 +30,9 @@ serde = { workspace = true, optional = true }
 
 # transport-iceoryx2
 datamancer-transport-iceoryx2 = { path = "../datamancer-transport-iceoryx2", optional = true }
+
+# transport-ws
+datamancer-transport-ws = { path = "../datamancer-transport-ws", optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

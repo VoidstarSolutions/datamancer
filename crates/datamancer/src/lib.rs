@@ -58,3 +58,14 @@ pub use session::{
 pub mod transport {
     pub use datamancer_transport_iceoryx2::*;
 }
+
+/// WebSocket client transport, gated behind the `transport-ws` feature.
+/// Re-exports the
+/// [`datamancer-transport-ws`](datamancer_transport_ws) crate so
+/// embedders enable the transport through this single feature flag. The sink is
+/// an additional [`EventSink`](datamancer_core::EventSink) selected like any
+/// other; `SymbolId`/interning stay sink-local (never core).
+#[cfg(feature = "transport-ws")]
+pub mod transport_ws {
+    pub use datamancer_transport_ws::*;
+}

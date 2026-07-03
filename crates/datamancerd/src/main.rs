@@ -26,6 +26,8 @@ mod server;
 mod shutdown;
 #[cfg(feature = "web-ui")]
 mod web;
+#[cfg(feature = "ws")]
+mod ws;
 
 use clap::Parser;
 

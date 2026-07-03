@@ -55,6 +55,9 @@ pub struct Config {
     #[cfg_attr(not(feature = "web-ui"), allow(dead_code))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_ui: Option<WebUiConfig>,
+    /// Optional remote WebSocket client surface (off unless configured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws: Option<WsConfig>,
     /// Boot-time authoritative sessions held as lifecycle anchors.
     #[serde(default)]
     pub startup_session: Vec<StartupSession>,
@@ -300,6 +303,71 @@ fn default_web_bind() -> String {
 
 const fn default_web_port() -> u16 {
     8080
+}
+
+/// The remote WebSocket client surface. Mutating and network-reachable — its own
+/// posture, separate from the loopback read-only web UI. Off unless `enabled`.
+///
+/// `Debug` is implemented by hand rather than derived so the bearer token is
+/// never printed: a derived `{:?}` on `Config`/`WsConfig` (panic messages, debug
+/// logs, error contexts) would otherwise leak the secret in plaintext.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ws_bind")]
+    pub bind: String,
+    #[serde(default = "default_ws_port")]
+    pub port: u16,
+    /// Optional shared bearer token checked at the WS handshake. When unset the
+    /// daemon logs a prominent warning (louder off-loopback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    #[serde(default = "default_ws_channel_depth")]
+    pub channel_depth: usize,
+    /// Hard cap on concurrent client connections. New accepts past this are
+    /// closed immediately, bounding memory/FD/session growth from an abusive or
+    /// runaway client (mirrors the iceoryx2 transport's `max_clients`).
+    #[serde(default = "default_ws_max_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_ws_keepalive")]
+    pub keepalive_secs: u64,
+}
+
+impl std::fmt::Debug for WsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsConfig")
+            .field("enabled", &self.enabled)
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            // Presence, never the value.
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .field("channel_depth", &self.channel_depth)
+            .field("max_connections", &self.max_connections)
+            .field("keepalive_secs", &self.keepalive_secs)
+            .finish()
+    }
+}
+
+fn default_ws_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+const fn default_ws_port() -> u16 {
+    9001
+}
+
+const fn default_ws_channel_depth() -> usize {
+    1024
+}
+
+const fn default_ws_max_connections() -> usize {
+    64
+}
+
+const fn default_ws_keepalive() -> u64 {
+    30
 }
 
 /// A boot-time authoritative session held as a lifecycle anchor.
@@ -723,6 +791,50 @@ account_type = "paper"
         assert_eq!(config.server.service_prefix, "datamancerd");
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.diagnostics.publish_interval_ms, 1000);
+    }
+
+    #[test]
+    fn ws_config_parses_with_defaults() {
+        let cfg = Config::parse(
+            "[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\nport = 9001\n",
+        )
+        .expect("parse");
+        let ws = cfg.ws.expect("ws present");
+        assert!(ws.enabled);
+        assert_eq!(ws.bind, "127.0.0.1");
+        assert_eq!(ws.port, 9001);
+        assert_eq!(ws.auth_token, None);
+        assert_eq!(ws.channel_depth, 1024);
+        assert_eq!(ws.max_connections, 64);
+        assert_eq!(ws.keepalive_secs, 30);
+    }
+
+    #[test]
+    fn ws_config_debug_redacts_auth_token() {
+        let cfg = Config::parse(
+            "[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\nauth_token = \"super-secret-token\"\n",
+        )
+        .expect("parse");
+        // Debug on both the inner struct and the whole Config must not leak it.
+        let ws_dbg = format!("{:?}", cfg.ws.as_ref().expect("ws present"));
+        assert!(!ws_dbg.contains("super-secret-token"), "{ws_dbg}");
+        assert!(ws_dbg.contains("<redacted>"), "{ws_dbg}");
+        let cfg_dbg = format!("{cfg:?}");
+        assert!(!cfg_dbg.contains("super-secret-token"), "{cfg_dbg}");
+    }
+
+    #[test]
+    fn ws_config_absent_is_none() {
+        let cfg = Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n").expect("parse");
+        assert!(cfg.ws.is_none());
+    }
+
+    #[test]
+    fn ws_config_rejects_unknown_field() {
+        let err = Config::parse(
+            "[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\nport = 9001\nbogus = 1\n",
+        );
+        assert!(err.is_err(), "unknown [ws] field must be rejected");
     }
 
     #[test]
