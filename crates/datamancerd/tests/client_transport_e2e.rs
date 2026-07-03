@@ -83,10 +83,11 @@ impl Drop for DaemonHandle {
 /// generation with `daemon_e2e.rs`'s admin-socket wait) and block until both
 /// surfaces are reachable.
 ///
-/// `service_prefix` is pinned to `"datamancer"` (NOT the daemon's own
-/// `"datamancerd"` default) because `datamancer_client::iox2::parse_client_id`
-/// matches the literal `"datamancer/data/"` prefix on the `open-client`
-/// reply's service name; any other prefix (including the default) breaks it.
+/// `service_prefix` uses this file's own distinct value (as the other e2e
+/// files each do); `datamancer_client::iox2::parse_client_id` extracts the
+/// client id from the trailing `/data/{id}` segments of the `open-client`
+/// reply's service name regardless of the configured prefix, so no
+/// particular prefix value is required here.
 async fn spawn_daemon(dir: &std::path::Path, ws_port: u16) -> DaemonHandle {
     let socket = dir.join("admin.sock");
     let config_path = dir.join("datamancerd.toml");
@@ -98,7 +99,7 @@ venue = "us"
 
 [server]
 admin_socket = "{socket}"
-service_prefix = "datamancer"
+service_prefix = "datamancerd-ct-e2e"
 
 [diagnostics]
 publish_interval_ms = 200

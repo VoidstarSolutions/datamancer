@@ -55,15 +55,21 @@ pub enum Iceoryx2ClientError {
     Transport(#[from] datamancer_transport_iceoryx2::TransportError),
 }
 
-/// Extract the numeric client id from the `open-client` reply's service name
-/// (`datamancer/data/{id}`).
+/// Extract the numeric client id from the `open-client` reply's service name.
+/// The id sits in the trailing `.../data/{id}` segments regardless of the
+/// daemon's configured service prefix (`service_prefix` in the daemon's
+/// config is not fixed to `"datamancer"`, so this must not hardcode it).
 fn parse_client_id(service: &str) -> Result<u64, Iceoryx2ClientError> {
-    service
-        .strip_prefix("datamancer/data/")
-        .and_then(|id| id.parse().ok())
-        .ok_or_else(|| {
-            Iceoryx2ClientError::Protocol(format!("unparseable data-service name: {service}"))
-        })
+    let mut segments = service.rsplit('/');
+    let id = segments.next();
+    let marker = segments.next();
+    match (marker, id) {
+        (Some("data"), Some(id)) => id.parse().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        Iceoryx2ClientError::Protocol(format!("unparseable data-service name: {service}"))
+    })
 }
 
 /// Map a control [`Reply`] to the two-layer error model.
@@ -290,6 +296,19 @@ mod tests {
         assert!(parse_client_id("datamancer/data/").is_err());
         assert!(parse_client_id("nonsense").is_err());
         assert!(parse_client_id("datamancer/data/not-a-number").is_err());
+    }
+
+    /// The id is extracted from the trailing `/data/{id}` segments
+    /// regardless of the daemon's configured `service_prefix` — it need not
+    /// be literally `"datamancer"`.
+    #[test]
+    fn client_id_parses_regardless_of_daemon_service_prefix() {
+        assert_eq!(parse_client_id("datamancerd/data/40").unwrap(), 40);
+        assert_eq!(parse_client_id("custom-prefix/data/7").unwrap(), 7);
+        assert!(parse_client_id("data/").is_err());
+        assert!(parse_client_id("prefix/data/not-a-number").is_err());
+        assert!(parse_client_id("prefix/notdata/3").is_err());
+        assert!(parse_client_id("3").is_err());
     }
 
     /// Scripted fake UDS daemon: reads one request line, sends one reply line.
