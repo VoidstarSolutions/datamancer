@@ -29,3 +29,16 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: tests (all features)
         run: cargo test --workspace --all-features
+
+  features:
+    name: feature matrix (cargo-hack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: check each feature in isolation
+        run: cargo hack check --each-feature --no-dev-deps --workspace
