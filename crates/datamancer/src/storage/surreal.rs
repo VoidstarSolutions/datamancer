@@ -15,10 +15,10 @@
 //! Tables are declared `SCHEMALESS` so the `SurrealValue`-derived row
 //! structs in this module round-trip directly. There's one table per kind:
 //!
-//! - `trades` — `{ provider, symbol, source_ts, rx_ts, price_raw, size,
+//! - `trades` — `{ provider, symbol, source_ts, rx_ts, price_raw, size_raw,
 //!   adjustment }`
-//! - `quotes` — `{ provider, symbol, source_ts, rx_ts, bid_raw, bid_size,
-//!   ask_raw, ask_size, adjustment }`
+//! - `quotes` — `{ provider, symbol, source_ts, rx_ts, bid_raw, bid_size_raw,
+//!   ask_raw, ask_size_raw, adjustment }`
 //! - `bars_1s`, `bars_1m`, `bars_5m`, `bars_15m`, `bars_1h`, `bars_1d`
 //!   — one table per supported [`BarInterval`]; OHLCV columns plus the
 //!   common `provider`, `symbol`, `source_ts`, `rx_ts`, `adjustment`.
@@ -62,8 +62,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     Adjustment, AssetClass, Bar, BarInterval, CacheCatalogEntry, CacheCoverage, CacheKey, Error,
-    EventKind, GapSpan, HistoricalCache, Instrument, MarketEvent, Price, Quote, ReplayRequest,
-    ReplaySource, Result, Seq, Timestamp, Trade,
+    EventKind, GapSpan, HistoricalCache, Instrument, MarketEvent, Price, Quantity, Quote,
+    ReplayRequest, ReplaySource, Result, Seq, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,17 @@ impl SurrealCacheConfig {
             path: path.as_ref().to_path_buf(),
         }
     }
+}
+
+/// On-disk schema version of the row shapes below. v1 (implicit — no marker
+/// record) stored sizes/volumes as whole base units under plain column names;
+/// v2 stores raw fixed-point [`Quantity`] units under `*_raw` columns.
+const SCHEMA_VERSION: u32 = 2;
+
+/// The singleton `meta:schema` marker row.
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+struct SchemaVersionRow {
+    version: u32,
 }
 
 /// SurrealDB-backed historical cache.
@@ -130,7 +141,55 @@ impl SurrealCache {
             .map_err(map_err)?;
         let cache = Self { db };
         cache.init_schema().await?;
+        cache.check_or_stamp_schema_version().await?;
         Ok(cache)
+    }
+
+    /// Refuse to open a cache whose row shapes this build cannot decode.
+    ///
+    /// The marker is a singleton `meta:schema` record. A cache written before
+    /// schema versioning existed has coverage rows but no marker — its
+    /// whole-unit size/volume columns would make every read of a "covered"
+    /// range fail row decode, silently poisoning the read-through path — so a
+    /// markerless, non-empty cache is rejected loudly here instead. A fresh
+    /// cache is stamped with the current version.
+    async fn check_or_stamp_schema_version(&self) -> Result<()> {
+        let row: Option<SchemaVersionRow> =
+            self.db.select(("meta", "schema")).await.map_err(map_err)?;
+        if let Some(row) = row {
+            if row.version == SCHEMA_VERSION {
+                return Ok(());
+            }
+            return Err(Error::Storage(format!(
+                "cache schema version {} does not match this build's {SCHEMA_VERSION}; \
+                 read it with a matching build, or delete the cache and re-fetch",
+                row.version
+            )));
+        }
+        let mut response = self
+            .db
+            .query("SELECT count() AS n FROM coverage GROUP ALL")
+            .await
+            .map_err(map_err)?;
+        let rows: Vec<CountRow> = response.take(0).map_err(map_err)?;
+        if rows.first().is_some_and(|r| r.n > 0) {
+            return Err(Error::Storage(
+                "cache predates schema versioning (whole-unit size/volume columns); \
+                 this build reads raw fixed-point Quantity columns. Delete the cache \
+                 (it is a re-fetchable read-through cache) or read it with the build \
+                 that wrote it"
+                    .to_string(),
+            ));
+        }
+        let _: Option<SchemaVersionRow> = self
+            .db
+            .upsert(("meta", "schema"))
+            .content(SchemaVersionRow {
+                version: SCHEMA_VERSION,
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(())
     }
 
     async fn init_schema(&self) -> Result<()> {
@@ -139,6 +198,7 @@ impl SurrealCache {
         // shape flexible while letting `SurrealValue`-derived rows
         // round-trip directly. Safe to run repeatedly.
         let stmts = "
+            DEFINE TABLE IF NOT EXISTS meta SCHEMALESS;
             DEFINE TABLE IF NOT EXISTS coverage SCHEMALESS;
             DEFINE TABLE IF NOT EXISTS trades SCHEMALESS;
             DEFINE TABLE IF NOT EXISTS quotes SCHEMALESS;
@@ -241,7 +301,8 @@ struct TradeRow {
     rx_ts: i64,
     /// Price in datamancer-core internal units.
     price_raw: i64,
-    size: u64,
+    /// Size in raw `Quantity` units (1e-9 of a base unit).
+    size_raw: u64,
     /// Adjustment discriminant. Trades are never adjusted, so this is always
     /// `"raw"`; it keeps the mode-scoped `WHERE adjustment = $adj` filter on
     /// the shared store DELETE / count uniform across kinds.
@@ -255,9 +316,11 @@ struct QuoteRow {
     source_ts: i64,
     rx_ts: i64,
     bid_raw: i64,
-    bid_size: u64,
+    /// Bid size in raw `Quantity` units (1e-9 of a base unit).
+    bid_size_raw: u64,
     ask_raw: i64,
-    ask_size: u64,
+    /// Ask size in raw `Quantity` units (1e-9 of a base unit).
+    ask_size_raw: u64,
     /// Adjustment discriminant; always `"raw"` for quotes. See [`TradeRow`].
     adjustment: String,
 }
@@ -272,7 +335,8 @@ struct BarRow {
     high_raw: i64,
     low_raw: i64,
     close_raw: i64,
-    volume: u64,
+    /// Volume in raw `Quantity` units (1e-9 of a base unit).
+    volume_raw: u64,
     /// Corporate-action adjustment mode this bar was fetched under. Segregates
     /// adjusted vs raw bars for the same `(symbol, range)` so a mode-scoped
     /// SELECT never returns orphaned rows from another mode.
@@ -438,7 +502,7 @@ impl HistoricalCache for SurrealCache {
                         source_ts: t.source_ts.0,
                         rx_ts: t.rx_ts.0,
                         price_raw: t.price.raw(),
-                        size: t.size,
+                        size_raw: t.size.raw(),
                         adjustment: adj.to_string(),
                     };
                     let _: Option<TradeRow> = self
@@ -455,9 +519,9 @@ impl HistoricalCache for SurrealCache {
                         source_ts: q.source_ts.0,
                         rx_ts: q.rx_ts.0,
                         bid_raw: q.bid.raw(),
-                        bid_size: q.bid_size,
+                        bid_size_raw: q.bid_size.raw(),
                         ask_raw: q.ask.raw(),
-                        ask_size: q.ask_size,
+                        ask_size_raw: q.ask_size.raw(),
                         adjustment: adj.to_string(),
                     };
                     let _: Option<QuoteRow> = self
@@ -477,7 +541,7 @@ impl HistoricalCache for SurrealCache {
                         high_raw: b.high.raw(),
                         low_raw: b.low.raw(),
                         close_raw: b.close.raw(),
-                        volume: b.volume,
+                        volume_raw: b.volume.raw(),
                         adjustment: adj.to_string(),
                     };
                     let _: Option<BarRow> = self
@@ -759,7 +823,7 @@ impl ReplaySource for SurrealReplaySource {
                             rx_ts: Timestamp(r.rx_ts),
                             seq: Seq(0),
                             price: Price::from_raw(r.price_raw),
-                            size: r.size,
+                            size: Quantity::from_raw(r.size_raw),
                         })
                     })
                     .collect()
@@ -793,9 +857,9 @@ impl ReplaySource for SurrealReplaySource {
                             rx_ts: Timestamp(r.rx_ts),
                             seq: Seq(0),
                             bid: Price::from_raw(r.bid_raw),
-                            bid_size: r.bid_size,
+                            bid_size: Quantity::from_raw(r.bid_size_raw),
                             ask: Price::from_raw(r.ask_raw),
-                            ask_size: r.ask_size,
+                            ask_size: Quantity::from_raw(r.ask_size_raw),
                         })
                     })
                     .collect()
@@ -833,7 +897,7 @@ impl ReplaySource for SurrealReplaySource {
                             high: Price::from_raw(r.high_raw),
                             low: Price::from_raw(r.low_raw),
                             close: Price::from_raw(r.close_raw),
-                            volume: r.volume,
+                            volume: Quantity::from_raw(r.volume_raw),
                         })
                     })
                     .collect()
@@ -856,6 +920,84 @@ pub(crate) fn ts_from_chrono(dt: DateTime<Utc>) -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Open an embedded cache expecting a refusal, retrying while the
+    /// previous handle's `SurrealKV` file lock is still being released (the
+    /// same transient the integration suite's embedded reopen test retries).
+    async fn open_expecting_refusal(path: &std::path::Path) -> Error {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match SurrealCache::open(SurrealCacheConfig::embedded(path)).await {
+                Ok(_) => panic!("open must refuse this cache"),
+                Err(e)
+                    if e.to_string().contains("already locked")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return e,
+            }
+        }
+    }
+
+    /// A cache with coverage rows but no schema marker is the pre-versioning
+    /// shape (whole-unit size columns); `open` must refuse it instead of
+    /// letting every read of a "covered" range fail row decode.
+    #[tokio::test]
+    async fn open_refuses_a_pre_versioning_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache");
+        {
+            let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(
+                path.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            db.use_ns("datamancer").use_db("cache").await.unwrap();
+            db.query("DEFINE TABLE IF NOT EXISTS coverage SCHEMALESS")
+                .await
+                .unwrap();
+            let _: Option<CoverageDoc> = db
+                .upsert(("coverage", "alpaca|AAPL|trades|raw"))
+                .content(CoverageDoc {
+                    segments: vec![(0, 100)],
+                    event_count: 1,
+                    asset_class: None,
+                })
+                .await
+                .unwrap();
+        }
+        let err = open_expecting_refusal(&path).await;
+        assert!(
+            err.to_string().contains("schema versioning"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A marker from a different (future) schema version must refuse loudly.
+    #[tokio::test]
+    async fn open_refuses_a_mismatched_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache");
+        {
+            let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(
+                path.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            db.use_ns("datamancer").use_db("cache").await.unwrap();
+            db.query("DEFINE TABLE IF NOT EXISTS meta SCHEMALESS")
+                .await
+                .unwrap();
+            let _: Option<SchemaVersionRow> = db
+                .upsert(("meta", "schema"))
+                .content(SchemaVersionRow { version: 999 })
+                .await
+                .unwrap();
+        }
+        let err = open_expecting_refusal(&path).await;
+        assert!(err.to_string().contains("999"), "unexpected error: {err}");
+    }
 
     #[test]
     fn coverage_merges_overlapping_segments() {
@@ -936,7 +1078,7 @@ mod tests {
                     rx_ts: Timestamp(10),
                     seq: Seq(0),
                     price: Price::from_f64_round(1.0),
-                    size: 1,
+                    size: Quantity::from_units(1),
                 })],
             )
             .await

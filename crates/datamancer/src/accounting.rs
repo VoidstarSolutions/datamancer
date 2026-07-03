@@ -219,7 +219,7 @@ mod tests {
             rx_ts: Timestamp(2),
             seq: Seq(0),
             price: Price::from_f64_round(1.0),
-            size: 1,
+            size: datamancer_core::Quantity::from_units(1),
         })
     }
 

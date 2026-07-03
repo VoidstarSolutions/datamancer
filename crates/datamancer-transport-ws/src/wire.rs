@@ -2,16 +2,31 @@
 //!
 //! Unlike the iceoryx2 POD, the instrument is carried **inline** on every frame
 //! (JSON is self-describing; no `SymbolId` interning / announcement race).
-//! Prices cross as raw `i64` because core `Price` does not derive `Serialize`.
+//! Prices and quantities cross as raw fixed-point integers (`price` as `i64`,
+//! sizes/`volume` as `u64`) because core `Price`/`Quantity` do not derive
+//! `Serialize` — the plain field names carry raw 1e-9 units, not whole units.
 //! Control kinds are flattened into top-level `type` tags. Connection-scoped
 //! controls are suppressed (`to_wire` returns `None`), matching the iceoryx2
 //! routing rule; a remote client reads connectivity from the `snapshot` reply.
 
 use datamancer_core::{
-    Bar, Control, ControlKind, EventKind, GapSpan, Instrument, MarketEvent, Price, Quote, Seq,
-    Timestamp, Trade,
+    Bar, Control, ControlKind, EventKind, GapSpan, Instrument, MarketEvent, Price, Quantity, Quote,
+    Seq, Timestamp, Trade,
 };
 use serde::{Deserialize, Serialize};
+
+/// WebSocket subprotocol token naming this wire format's version, negotiated
+/// on the handshake (`Sec-WebSocket-Protocol`) so mixed-version peers are
+/// rejected before any frame crosses. The JSON field names alone cannot
+/// protect against a *reinterpretation* of a field (`size: 100` parses fine
+/// whether it means whole units or raw 1e-9 units). History: v1 (implicit —
+/// no subprotocol) carried sizes/volumes as whole base units; v2 carries them
+/// as raw 1e-9 `Quantity` units.
+///
+/// Servers must require and echo this token; clients must offer it and verify
+/// the echo (a pre-versioning server silently ignores the offer, so the
+/// missing echo is the only mismatch signal on the client side).
+pub const WS_SUBPROTOCOL: &str = "datamancer.v2";
 
 /// The tagged JSON event frame. One `type` per data/control kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,7 +105,7 @@ pub fn to_wire(ev: &MarketEvent) -> Option<EventFrame> {
             source_ts: t.source_ts,
             rx_ts: t.rx_ts,
             price: t.price.0,
-            size: t.size,
+            size: t.size.raw(),
         }),
         MarketEvent::Quote(q) => Some(EventFrame::Quote {
             instrument: q.instrument.clone(),
@@ -98,9 +113,9 @@ pub fn to_wire(ev: &MarketEvent) -> Option<EventFrame> {
             source_ts: q.source_ts,
             rx_ts: q.rx_ts,
             bid: q.bid.0,
-            bid_size: q.bid_size,
+            bid_size: q.bid_size.raw(),
             ask: q.ask.0,
-            ask_size: q.ask_size,
+            ask_size: q.ask_size.raw(),
         }),
         MarketEvent::Bar(b) => Some(EventFrame::Bar {
             instrument: b.instrument.clone(),
@@ -112,7 +127,7 @@ pub fn to_wire(ev: &MarketEvent) -> Option<EventFrame> {
             high: b.high.0,
             low: b.low.0,
             close: b.close.0,
-            volume: b.volume,
+            volume: b.volume.raw(),
         }),
         MarketEvent::Control(c) => control_to_wire(c),
         _ => None,
@@ -176,7 +191,7 @@ pub fn from_wire(f: &EventFrame) -> MarketEvent {
             rx_ts: *rx_ts,
             seq: *seq,
             price: Price(*price),
-            size: *size,
+            size: Quantity::from_raw(*size),
         }),
         EventFrame::Quote {
             instrument,
@@ -193,9 +208,9 @@ pub fn from_wire(f: &EventFrame) -> MarketEvent {
             rx_ts: *rx_ts,
             seq: *seq,
             bid: Price(*bid),
-            bid_size: *bid_size,
+            bid_size: Quantity::from_raw(*bid_size),
             ask: Price(*ask),
-            ask_size: *ask_size,
+            ask_size: Quantity::from_raw(*ask_size),
         }),
         EventFrame::Bar {
             instrument,
@@ -218,7 +233,7 @@ pub fn from_wire(f: &EventFrame) -> MarketEvent {
             high: Price(*high),
             low: Price(*low),
             close: Price(*close),
-            volume: *volume,
+            volume: Quantity::from_raw(*volume),
         }),
         frame @ (EventFrame::Gap { .. }
         | EventFrame::SubscriptionChanged { .. }
@@ -292,7 +307,7 @@ mod tests {
     use super::{EventFrame, from_wire, to_wire};
     use datamancer_core::{
         AssetClass, Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, Instrument,
-        MarketEvent, Price, ProviderId, Quote, Seq, Timestamp, Trade,
+        MarketEvent, Price, ProviderId, Quantity, Quote, Seq, Timestamp, Trade,
     };
 
     fn inst(symbol: &str) -> Instrument {
@@ -318,7 +333,9 @@ mod tests {
             rx_ts: Timestamp(222),
             seq: Seq(7),
             price: Price(123_456),
-            size: 99,
+            // 0.004 BTC in raw Quantity units — a fractional size must survive
+            // the JSON wire round trip intact.
+            size: Quantity::from_raw(4_000_000),
         });
         assert_eq!(round_trip(&ev), ev);
     }
@@ -331,9 +348,9 @@ mod tests {
             rx_ts: Timestamp(2),
             seq: Seq(3),
             bid: Price(100),
-            bid_size: 10,
+            bid_size: Quantity::from_raw(10),
             ask: Price(200),
-            ask_size: 20,
+            ask_size: Quantity::from_raw(20),
         });
         assert_eq!(round_trip(&ev), ev);
     }
@@ -358,10 +375,33 @@ mod tests {
                 high: Price(4),
                 low: Price(0),
                 close: Price(3),
-                volume: 1000,
+                volume: Quantity::from_raw(1000),
             });
             assert_eq!(round_trip(&ev), ev, "interval {interval:?}");
         }
+    }
+
+    #[test]
+    fn volumes_beyond_2_pow_53_round_trip_exactly() {
+        // Raw fixed-point u64 values routinely exceed the IEEE-754 double
+        // exact-integer range (a 10M-share daily bar volume is 1e16 raw).
+        // serde_json must carry them exactly — a double-based JSON parser
+        // cannot, which is why the README requires 64-bit integer decoding.
+        let volume = Quantity::from_units(50_000_000); // 5e16 raw > 2^53
+        assert!(volume.raw() > (1u64 << 53));
+        let ev = MarketEvent::Bar(Bar {
+            instrument: inst("AAPL"),
+            interval: BarInterval::OneDay,
+            source_ts: Timestamp(10),
+            rx_ts: Timestamp(20),
+            seq: Seq(5),
+            open: Price(1),
+            high: Price(4),
+            low: Price(0),
+            close: Price(3),
+            volume,
+        });
+        assert_eq!(round_trip(&ev), ev);
     }
 
     #[test]
@@ -423,7 +463,7 @@ mod tests {
             rx_ts: Timestamp(999_999),
             seq: Seq(1),
             price: Price(1),
-            size: 1,
+            size: Quantity::from_raw(1),
         });
         let back = round_trip(&ev);
         let MarketEvent::Trade(t) = back else {

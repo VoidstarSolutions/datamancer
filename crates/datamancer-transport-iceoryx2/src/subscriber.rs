@@ -104,11 +104,11 @@ mod runtime {
         /// Returns [`TransportError`] if either service or subscriber port
         /// cannot be opened.
         pub fn open(node: &Node<ipc_threadsafe::Service>, client_id: u64) -> Result<Self> {
-            let data_name: ServiceName = format!("datamancer/data/{client_id}")
+            let data_name: ServiceName = crate::naming::data_service_name(client_id)
                 .as_str()
                 .try_into()
                 .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))?;
-            let ann_name: ServiceName = format!("datamancer/symbols/{client_id}")
+            let ann_name: ServiceName = crate::naming::announcement_service_name(client_id)
                 .as_str()
                 .try_into()
                 .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))?;
@@ -187,7 +187,7 @@ mod tests {
     use crate::payload::to_pod;
     use crate::symbol_table::SymbolTable;
     use datamancer_core::{
-        AssetClass, Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
+        AssetClass, Instrument, MarketEvent, Price, ProviderId, Quantity, Seq, Timestamp, Trade,
     };
 
     fn trade(symbol: &str, seq: u64) -> MarketEvent {
@@ -202,7 +202,7 @@ mod tests {
             rx_ts: Timestamp(ts + 1),
             seq: Seq(seq),
             price: Price(100),
-            size: 1,
+            size: Quantity::from_raw(1),
         })
     }
 

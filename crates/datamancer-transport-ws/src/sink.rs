@@ -61,7 +61,7 @@ mod tests {
     use super::WsDataSink;
     use datamancer_core::{
         AssetClass, Control, ControlKind, EventSink, Instrument, MarketEvent, Price, ProviderId,
-        PublishOutcome, Seq, Timestamp, Trade,
+        PublishOutcome, Quantity, Seq, Timestamp, Trade,
     };
 
     fn trade() -> MarketEvent {
@@ -75,7 +75,7 @@ mod tests {
             rx_ts: Timestamp(2),
             seq: Seq(1),
             price: Price(42),
-            size: 7,
+            size: Quantity::from_raw(7),
         })
     }
 

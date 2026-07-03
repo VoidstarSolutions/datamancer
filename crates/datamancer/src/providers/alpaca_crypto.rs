@@ -37,7 +37,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     AssetClass, Bar, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest,
-    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quote, Result, Seq,
+    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity, Quote, Result, Seq,
     Timestamp, Trade,
 };
 use oxidized_alpaca::{
@@ -684,7 +684,7 @@ fn translate_trade(t: &CryptoTradeEvent, rx: Timestamp) -> Trade {
         rx_ts: rx,
         seq: Seq(0),
         price: Price::from_f64_round(t.price),
-        size: super::f64_to_u64_saturating(t.size.round()),
+        size: Quantity::from_f64_round(t.size),
     }
 }
 
@@ -695,9 +695,9 @@ fn translate_quote(q: &CryptoQuoteEvent, rx: Timestamp) -> Quote {
         rx_ts: rx,
         seq: Seq(0),
         bid: Price::from_f64_round(q.bid_price),
-        bid_size: super::f64_to_u64_saturating(q.bid_size.round()),
+        bid_size: Quantity::from_f64_round(q.bid_size),
         ask: Price::from_f64_round(q.ask_price),
-        ask_size: super::f64_to_u64_saturating(q.ask_size.round()),
+        ask_size: Quantity::from_f64_round(q.ask_size),
     }
 }
 
@@ -712,7 +712,7 @@ fn translate_bar(b: &CryptoBarEvent, interval: BarInterval, rx: Timestamp) -> Ba
         high: Price::from_f64_round(b.high),
         low: Price::from_f64_round(b.low),
         close: Price::from_f64_round(b.close),
-        volume: super::f64_to_u64_saturating(b.volume.round()),
+        volume: Quantity::from_f64_round(b.volume),
     }
 }
 
@@ -740,7 +740,10 @@ mod tests {
 
     #[test]
     fn translates_crypto_trade() {
-        let json = r#"{"T":"t","S":"BTC/USD","i":12345,"p":50050.0,"s":0.5,"tks":"B","t":"2024-01-02T15:30:00Z"}"#;
+        // 0.004 BTC is the canonical case the fixed-point Quantity change
+        // exists for: under the old `f64_to_u64_saturating(size.round())`
+        // boundary it collapsed to `size: 0`; it must now survive exactly.
+        let json = r#"{"T":"t","S":"BTC/USD","i":12345,"p":50050.0,"s":0.004,"tks":"B","t":"2024-01-02T15:30:00Z"}"#;
         let msg: CryptoStreamMessage = serde_json::from_str(json).unwrap();
         let events = translate_crypto_message(msg);
         assert_eq!(events.len(), 1);
@@ -748,6 +751,8 @@ mod tests {
             MarketEvent::Trade(t) => {
                 assert_eq!(t.instrument.symbol(), "BTC/USD");
                 assert_eq!(t.price, Price::from_f64_round(50050.0));
+                assert_eq!(t.size, Quantity::from_raw(4_000_000));
+                assert_ne!(t.size, Quantity::ZERO);
             }
             other => panic!("expected Trade, got {other:?}"),
         }
@@ -789,7 +794,7 @@ mod tests {
             rx_ts: now,
             seq: Seq(0),
             price: Price::from_f64_round(1.0),
-            size: 1,
+            size: Quantity::from_units(1),
         });
         assert_eq!(
             event_route_key(&trade),
@@ -806,7 +811,7 @@ mod tests {
             high: Price::ZERO,
             low: Price::ZERO,
             close: Price::ZERO,
-            volume: 0,
+            volume: Quantity::ZERO,
         });
         assert_eq!(
             event_route_key(&bar),

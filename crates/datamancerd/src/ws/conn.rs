@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datamancer::traits::{EventSink, PublishOutcome};
-use datamancer::transport_ws::{WsDataSink, run_writer};
+use datamancer::transport_ws::{WS_SUBPROTOCOL, WsDataSink, run_writer};
 use datamancer::{ClientSession, Datamancer, Instrument, ProviderId, Scope};
 use futures::StreamExt as _;
 use tokio::net::TcpStream;
@@ -158,7 +158,10 @@ pub async fn handle_connection(
 }
 
 /// Perform the tungstenite server handshake, rejecting the upgrade with 401 if a
-/// configured bearer token is missing or wrong.
+/// configured bearer token is missing or wrong, and with 400 if the client does
+/// not offer the [`WS_SUBPROTOCOL`] wire-version token — a peer built against a
+/// different event-frame version must fail here, before any frame whose fields
+/// it would misinterpret crosses the socket.
 // The `ErrorResponse` (an `http::Response`) is the callback's imposed return
 // type from `accept_hdr_async`; its size is not ours to shrink.
 #[allow(clippy::result_large_err)]
@@ -166,7 +169,7 @@ async fn accept_with_auth(
     tcp: TcpStream,
     auth_token: Option<Arc<String>>,
 ) -> Result<WebSocketStream<TcpStream>, tokio_tungstenite::tungstenite::Error> {
-    tokio_tungstenite::accept_hdr_async(tcp, move |req: &HsRequest, resp: HsResponse| {
+    tokio_tungstenite::accept_hdr_async(tcp, move |req: &HsRequest, mut resp: HsResponse| {
         if let Some(expected) = auth_token.as_ref() {
             // RFC 7235 auth schemes are case-insensitive, so match "Bearer"
             // ignoring case; the token value itself is compared exactly.
@@ -188,6 +191,32 @@ async fn accept_with_auth(
                 return Err(err);
             }
         }
+        // `Sec-WebSocket-Protocol` is a comma-separated offer list that RFC
+        // 7230 also allows split across repeated header lines, so scan every
+        // field instance (`get_all`), not just the first. Require our
+        // wire-version token among the offers and echo it (RFC 6455 §4.2.2 —
+        // the chosen subprotocol must appear in the response). Checked after
+        // auth so an unauthenticated peer learns nothing beyond 401.
+        let offered = req
+            .headers()
+            .get_all("sec-websocket-protocol")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.split(',').any(|p| p.trim() == WS_SUBPROTOCOL));
+        if !offered {
+            let mut err = ErrorResponse::new(Some(format!(
+                "unsupported event-frame wire version: this server speaks \
+                 subprotocol {WS_SUBPROTOCOL}"
+            )));
+            *err.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::BAD_REQUEST;
+            return Err(err);
+        }
+        resp.headers_mut().insert(
+            "sec-websocket-protocol",
+            WS_SUBPROTOCOL
+                .parse()
+                .expect("static token is a valid header value"),
+        );
         Ok(resp)
     })
     .await

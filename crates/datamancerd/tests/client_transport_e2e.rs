@@ -135,7 +135,17 @@ port = {ws_port}
     let url = format!("ws://127.0.0.1:{ws_port}/");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match tokio_tungstenite::connect_async(&url).await {
+        let mut request = {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+            url.as_str().into_client_request().expect("build request")
+        };
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            datamancer::transport_ws::WS_SUBPROTOCOL
+                .parse()
+                .expect("header"),
+        );
+        match tokio_tungstenite::connect_async(request).await {
             Ok((ws, _resp)) => {
                 drop(ws);
                 break;

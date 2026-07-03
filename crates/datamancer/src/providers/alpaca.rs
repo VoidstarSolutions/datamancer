@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     Adjustment, AssetClass, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest,
-    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Result, Seq, Timestamp,
-    Trade,
+    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity, Result, Seq,
+    Timestamp, Trade,
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
@@ -624,7 +624,7 @@ fn translate_trade(t: &StockTradeEvent, rx: Timestamp) -> Trade {
         rx_ts: rx,
         seq: Seq(0),
         price: Price::from_f64_round(t.price),
-        size: super::f64_to_u64_saturating(t.size),
+        size: Quantity::from_f64_round(t.size),
     }
 }
 
@@ -635,9 +635,9 @@ fn translate_quote(q: &StockQuoteEvent, rx: Timestamp) -> Quote {
         rx_ts: rx,
         seq: Seq(0),
         bid: Price::from_f64_round(q.bid_price),
-        bid_size: super::f64_to_u64_saturating(q.bid_size),
+        bid_size: Quantity::from_f64_round(q.bid_size),
         ask: Price::from_f64_round(q.ask_price),
-        ask_size: super::f64_to_u64_saturating(q.ask_size),
+        ask_size: Quantity::from_f64_round(q.ask_size),
     }
 }
 
@@ -652,7 +652,7 @@ fn translate_bar(b: &StockBar, interval: BarInterval, rx: Timestamp) -> Bar {
         high: Price::from_f64_round(b.high),
         low: Price::from_f64_round(b.low),
         close: Price::from_f64_round(b.close),
-        volume: b.volume.max(0).cast_unsigned(),
+        volume: Quantity::from_units(b.volume.max(0).cast_unsigned()),
     }
 }
 
@@ -710,7 +710,7 @@ async fn fetch_history_via(
                     rx_ts: rx,
                     seq: Seq(0),
                     price: Price::from_f64_round(t.price),
-                    size: u64::from(t.size),
+                    size: Quantity::from_units(u64::from(t.size)),
                 };
                 if sink.send(MarketEvent::Trade(trade)).await.is_err() {
                     return Ok(());
@@ -762,7 +762,7 @@ async fn fetch_history_via(
                     high: Price::from_f64_round(b.high),
                     low: Price::from_f64_round(b.low),
                     close: Price::from_f64_round(b.close),
-                    volume: b.volume,
+                    volume: Quantity::from_units(b.volume),
                 };
                 if sink.send(MarketEvent::Bar(bar)).await.is_err() {
                     return Ok(());
@@ -786,7 +786,7 @@ mod tests {
         match &events[0] {
             MarketEvent::Trade(t) => {
                 assert_eq!(t.instrument.symbol(), "AAPL");
-                assert_eq!(t.size, 100);
+                assert_eq!(t.size, Quantity::from_units(100));
                 assert_eq!(t.price, Price::from_f64_round(150.10));
                 assert_eq!(t.source_ts.0, 1_704_209_400_123_456_789);
             }
@@ -805,8 +805,8 @@ mod tests {
                 assert_eq!(q.instrument.symbol(), "MSFT");
                 assert_eq!(q.bid, Price::from_f64_round(420.05));
                 assert_eq!(q.ask, Price::from_f64_round(420.10));
-                assert_eq!(q.bid_size, 2);
-                assert_eq!(q.ask_size, 3);
+                assert_eq!(q.bid_size, Quantity::from_units(2));
+                assert_eq!(q.ask_size, Quantity::from_units(3));
             }
             other => panic!("expected Quote, got {other:?}"),
         }
@@ -822,7 +822,7 @@ mod tests {
             MarketEvent::Bar(b) => {
                 assert_eq!(b.instrument.symbol(), "AAPL");
                 assert_eq!(b.interval, BarInterval::OneMinute);
-                assert_eq!(b.volume, 12345);
+                assert_eq!(b.volume, Quantity::from_units(12345));
             }
             other => panic!("expected Bar, got {other:?}"),
         }

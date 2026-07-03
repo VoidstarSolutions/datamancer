@@ -299,6 +299,13 @@ the `ws` cargo feature (off by default) and `[ws] enabled = true` in config.
 It is one of two worked client-transport examples alongside the iceoryx2 data
 plane; see `crates/datamancer-transport-ws/README.md` for the wire format.
 
+Clients must offer the event-frame wire version as the WebSocket subprotocol
+(`Sec-WebSocket-Protocol: datamancer.v2`); the handshake is rejected with 400
+otherwise, and the daemon echoes the token on acceptance. This is what keeps a
+client built against a different wire version from silently misreading the
+raw fixed-point size/volume fields (see the transport README for the version
+history and the 64-bit-integer parsing requirement).
+
 ```toml
 [ws]                               # optional; requires the `ws` feature (off by default)
 enabled = false                    # off unless explicitly enabled

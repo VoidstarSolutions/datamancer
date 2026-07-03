@@ -19,6 +19,7 @@
 
 mod diagnostics;
 mod error;
+mod naming;
 mod payload;
 mod sink;
 mod subscriber;
@@ -29,6 +30,7 @@ pub use diagnostics::{
     Iceoryx2DiagnosticsSubscriber, decode_snapshot, encode_snapshot,
 };
 pub use error::{Result, TransportError};
+pub use naming::{WIRE_VERSION, announcement_service_name, data_service_name};
 pub use payload::{ControlTag, DataPayload, FromPodError, PayloadKind, from_pod, to_pod};
 pub use sink::Iceoryx2DataSink;
 pub use subscriber::{DataSubscriber, HoldBuffer};

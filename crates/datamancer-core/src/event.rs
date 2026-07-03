@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Instrument, Price};
+use crate::{Instrument, Price, Quantity};
 
 /// A per-symbol ordering identifier stamped **once at the source** of an
 /// authoritative per-`(instrument, kind)` session, in that session's canonical
@@ -146,7 +146,7 @@ pub struct Trade {
     pub rx_ts: Timestamp,
     pub seq: Seq,
     pub price: Price,
-    pub size: u64,
+    pub size: Quantity,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,9 +156,9 @@ pub struct Quote {
     pub rx_ts: Timestamp,
     pub seq: Seq,
     pub bid: Price,
-    pub bid_size: u64,
+    pub bid_size: Quantity,
     pub ask: Price,
-    pub ask_size: u64,
+    pub ask_size: Quantity,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,7 +172,7 @@ pub struct Bar {
     pub high: Price,
     pub low: Price,
     pub close: Price,
-    pub volume: u64,
+    pub volume: Quantity,
 }
 
 /// In-band session-control entry. Rides the same stream as data events because

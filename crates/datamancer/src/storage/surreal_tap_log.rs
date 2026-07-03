@@ -30,7 +30,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use datamancer_core::{
     AssetClass, Bar, BarInterval, Error, EventKind, Instrument, MarketEvent, Price, ProviderId,
-    Quote, ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
+    Quantity, Quote, ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -89,7 +89,8 @@ struct TapTradeRow {
     source_ts: i64,
     rx_ts: i64,
     price_raw: i64,
-    size: u64,
+    /// Size in raw `Quantity` units (1e-9 of a base unit).
+    size_raw: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -103,9 +104,11 @@ struct TapQuoteRow {
     source_ts: i64,
     rx_ts: i64,
     bid_raw: i64,
-    bid_size: u64,
+    /// Bid size in raw `Quantity` units (1e-9 of a base unit).
+    bid_size_raw: u64,
     ask_raw: i64,
-    ask_size: u64,
+    /// Ask size in raw `Quantity` units (1e-9 of a base unit).
+    ask_size_raw: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -122,7 +125,8 @@ struct TapBarRow {
     high_raw: i64,
     low_raw: i64,
     close_raw: i64,
-    volume: u64,
+    /// Volume in raw `Quantity` units (1e-9 of a base unit).
+    volume_raw: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -133,6 +137,11 @@ struct StreamRow {
     kind_tag: String,
     table: String,
 }
+
+/// On-disk schema version of the shard row shapes. v1 (implicit — absent from
+/// the `meta` row) stored sizes/volumes as whole base units under plain column
+/// names; v2 stores raw fixed-point `Quantity` units under `*_raw` columns.
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, SurrealValue)]
 struct MetaRow {
@@ -146,6 +155,11 @@ struct MetaRow {
     /// (which, unlike serde, does not honor `default` for an absent field).
     #[serde(default)]
     next_ord: Option<u64>,
+    /// [`SCHEMA_VERSION`] of the shard rows in this log. `None` means the log
+    /// was written before schema versioning existed (whole-unit sizes) —
+    /// `open` refuses such a log rather than mis-decode or mix row shapes.
+    #[serde(default)]
+    schema_version: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +321,30 @@ impl SurrealTapLog {
         .map_err(map_err)?;
 
         let meta: Option<MetaRow> = db.select(("meta", "singleton")).await.map_err(map_err)?;
+        // Refuse a log whose shard rows this build cannot decode: replaying it
+        // would fail row deserialization, and appending would mix incompatible
+        // row shapes in the same tables. (An absent meta row is a fresh log —
+        // the writer stamps the version on first persist.)
+        if let Some(row) = &meta {
+            match row.schema_version {
+                Some(v) if v == SCHEMA_VERSION => {}
+                Some(v) => {
+                    return Err(Error::Storage(format!(
+                        "tap log schema version {v} does not match this build's \
+                         {SCHEMA_VERSION}; replay it with a matching build or start a new log"
+                    )));
+                }
+                None => {
+                    return Err(Error::Storage(
+                        "tap log predates schema versioning (whole-unit size/volume \
+                         columns); this build reads and writes raw fixed-point Quantity \
+                         columns. Replay it with the build that recorded it or start a \
+                         new log"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         let meta = meta.unwrap_or_default();
 
         // Load the registry, rebuild the in-memory shard map, and re-DEFINE each
@@ -443,7 +481,7 @@ impl Writer {
                     source_ts: t.source_ts.0,
                     rx_ts: t.rx_ts.0,
                     price_raw: t.price.raw(),
-                    size: t.size,
+                    size_raw: t.size.raw(),
                 };
                 let _: Option<TapTradeRow> = self
                     .db
@@ -459,9 +497,9 @@ impl Writer {
                     source_ts: q.source_ts.0,
                     rx_ts: q.rx_ts.0,
                     bid_raw: q.bid.raw(),
-                    bid_size: q.bid_size,
+                    bid_size_raw: q.bid_size.raw(),
                     ask_raw: q.ask.raw(),
-                    ask_size: q.ask_size,
+                    ask_size_raw: q.ask_size.raw(),
                 };
                 let _: Option<TapQuoteRow> = self
                     .db
@@ -480,7 +518,7 @@ impl Writer {
                     high_raw: b.high.raw(),
                     low_raw: b.low.raw(),
                     close_raw: b.close.raw(),
-                    volume: b.volume,
+                    volume_raw: b.volume.raw(),
                 };
                 let _: Option<TapBarRow> = self
                     .db
@@ -567,6 +605,7 @@ impl Writer {
             next_shard: self.next_shard,
             // Persist the reservation boundary, not the live counter.
             next_ord: Some(self.ord_high),
+            schema_version: Some(SCHEMA_VERSION),
         };
         let _: Option<MetaRow> = self
             .db
@@ -640,7 +679,7 @@ impl ReplaySource for SurrealTapReplaySource {
                                 rx_ts: Timestamp(r.rx_ts),
                                 seq: Seq(r.seq),
                                 price: Price::from_raw(r.price_raw),
-                                size: r.size,
+                                size: Quantity::from_raw(r.size_raw),
                             }),
                         )
                     }));
@@ -669,9 +708,9 @@ impl ReplaySource for SurrealTapReplaySource {
                                 rx_ts: Timestamp(r.rx_ts),
                                 seq: Seq(r.seq),
                                 bid: Price::from_raw(r.bid_raw),
-                                bid_size: r.bid_size,
+                                bid_size: Quantity::from_raw(r.bid_size_raw),
                                 ask: Price::from_raw(r.ask_raw),
-                                ask_size: r.ask_size,
+                                ask_size: Quantity::from_raw(r.ask_size_raw),
                             }),
                         )
                     }));
@@ -704,7 +743,7 @@ impl ReplaySource for SurrealTapReplaySource {
                                 high: Price::from_raw(r.high_raw),
                                 low: Price::from_raw(r.low_raw),
                                 close: Price::from_raw(r.close_raw),
-                                volume: r.volume,
+                                volume: Quantity::from_raw(r.volume_raw),
                             }),
                         )
                     }));
@@ -720,5 +759,98 @@ impl ReplaySource for SurrealTapReplaySource {
         // `seq` is preserved on each event; it just is not the ordering key.)
         all.sort_by_key(|(ord, _)| *ord);
         Ok(stream::iter(all.into_iter().map(|(_, ev)| ev)).boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact `meta` row shape written before `schema_version` existed.
+    #[derive(Serialize, Deserialize, SurrealValue)]
+    struct LegacyMetaRow {
+        next_shard: u64,
+        next_ord: Option<u64>,
+    }
+
+    /// Open an embedded tap log expecting a refusal, retrying while the
+    /// previous handle's `SurrealKV` file lock is still being released (the
+    /// same transient the integration suite's embedded reopen test retries).
+    async fn open_expecting_refusal(path: &std::path::Path) -> Error {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match SurrealTapLog::open(SurrealTapLogConfig::embedded(path)).await {
+                Ok(_) => panic!("open must refuse this log"),
+                Err(e)
+                    if e.to_string().contains("already locked")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return e,
+            }
+        }
+    }
+
+    /// A log whose `meta` row predates schema versioning stored sizes as whole
+    /// units; `open` must refuse it rather than fail replay row decode or
+    /// append v2-shaped rows into the same tables.
+    #[tokio::test]
+    async fn open_refuses_a_pre_versioning_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("taplog");
+        {
+            let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(
+                path.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            db.use_ns("datamancer").use_db("taplog").await.unwrap();
+            db.query("DEFINE TABLE IF NOT EXISTS meta SCHEMALESS")
+                .await
+                .unwrap();
+            let _: Option<LegacyMetaRow> = db
+                .upsert(("meta", "singleton"))
+                .content(LegacyMetaRow {
+                    next_shard: 1,
+                    next_ord: Some(64),
+                })
+                .await
+                .unwrap();
+        }
+        let err = open_expecting_refusal(&path).await;
+        assert!(
+            err.to_string().contains("schema versioning"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A marker from a different (future) schema version must refuse loudly.
+    #[tokio::test]
+    async fn open_refuses_a_mismatched_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("taplog");
+        {
+            let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(
+                path.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            db.use_ns("datamancer").use_db("taplog").await.unwrap();
+            db.query("DEFINE TABLE IF NOT EXISTS meta SCHEMALESS")
+                .await
+                .unwrap();
+            let _: Option<MetaRow> = db
+                .upsert(("meta", "singleton"))
+                .content(MetaRow {
+                    next_shard: 0,
+                    next_ord: None,
+                    schema_version: Some(999),
+                })
+                .await
+                .unwrap();
+        }
+        let err = open_expecting_refusal(&path).await;
+        assert!(err.to_string().contains("999"), "unexpected error: {err}");
     }
 }

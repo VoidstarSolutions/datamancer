@@ -44,7 +44,7 @@ fn trade(ts: i64) -> MarketEvent {
         rx_ts: Timestamp(ts),
         seq: Seq(0),
         price: Price::from_f64_round(100.0),
-        size: 1,
+        size: datamancer::Quantity::from_units(1),
     })
 }
 

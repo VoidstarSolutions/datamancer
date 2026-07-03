@@ -15,7 +15,7 @@
 
 use datamancer_core::{
     Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, Instrument, MarketEvent, Price,
-    Quote, Seq, Timestamp, Trade,
+    Quantity, Quote, Seq, Timestamp, Trade,
 };
 use iceoryx2::prelude::ZeroCopySend;
 
@@ -114,9 +114,13 @@ pub struct DataPayload {
     pub c: i64,
     /// Bar close.
     pub d: i64,
-    /// Trade size / Quote `bid_size` / Bar volume.
+    /// Trade size / Quote `bid_size` / Bar volume, in raw `Quantity` units
+    /// (1e-9 of a base unit). Layout is unchanged from the pre-`Quantity`
+    /// `u64`; only the interpretation is now fixed-point — which is exactly
+    /// why the service names embed [`WIRE_VERSION`](crate::WIRE_VERSION):
+    /// a mixed-version peer must fail to attach, not read 1e9x-wrong sizes.
     pub size0: u64,
-    /// Quote `ask_size`.
+    /// Quote `ask_size`, in raw `Quantity` units (1e-9 of a base unit).
     pub size1: u64,
 }
 
@@ -167,7 +171,7 @@ pub fn to_pod(
                 t.seq.0,
             );
             p.a = t.price.0;
-            p.size0 = t.size;
+            p.size0 = t.size.raw();
             p
         }
         MarketEvent::Quote(q) => {
@@ -181,8 +185,8 @@ pub fn to_pod(
             );
             p.a = q.bid.0;
             p.b = q.ask.0;
-            p.size0 = q.bid_size;
-            p.size1 = q.ask_size;
+            p.size0 = q.bid_size.raw();
+            p.size1 = q.ask_size.raw();
             p
         }
         MarketEvent::Bar(b) => {
@@ -194,7 +198,7 @@ pub fn to_pod(
             p.b = b.high.0;
             p.c = b.low.0;
             p.d = b.close.0;
-            p.size0 = b.volume;
+            p.size0 = b.volume.raw();
             p
         }
         MarketEvent::Control(c) => return control_to_pod(c, table),
@@ -316,7 +320,7 @@ pub fn from_pod(p: &DataPayload, resolver: &SymbolResolver) -> Result<MarketEven
                 rx_ts,
                 seq,
                 price: Price(p.a),
-                size: p.size0,
+                size: Quantity::from_raw(p.size0),
             }))
         }
         x if x == PayloadKind::Quote as u8 => {
@@ -327,9 +331,9 @@ pub fn from_pod(p: &DataPayload, resolver: &SymbolResolver) -> Result<MarketEven
                 rx_ts,
                 seq,
                 bid: Price(p.a),
-                bid_size: p.size0,
+                bid_size: Quantity::from_raw(p.size0),
                 ask: Price(p.b),
-                ask_size: p.size1,
+                ask_size: Quantity::from_raw(p.size1),
             }))
         }
         x if x == PayloadKind::Bar as u8 => {
@@ -345,7 +349,7 @@ pub fn from_pod(p: &DataPayload, resolver: &SymbolResolver) -> Result<MarketEven
                 high: Price(p.b),
                 low: Price(p.c),
                 close: Price(p.d),
-                volume: p.size0,
+                volume: Quantity::from_raw(p.size0),
             }))
         }
         x if x == PayloadKind::Control as u8 => {
@@ -404,7 +408,7 @@ mod tests {
     use crate::symbol_table::{SymbolId, SymbolResolver, SymbolTable};
     use datamancer_core::{
         AssetClass, Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, Instrument,
-        MarketEvent, Price, ProviderId, Quote, Seq, Timestamp, Trade,
+        MarketEvent, Price, ProviderId, Quantity, Quote, Seq, Timestamp, Trade,
     };
 
     fn inst(symbol: &str) -> Instrument {
@@ -435,7 +439,9 @@ mod tests {
             rx_ts: Timestamp(222),
             seq: Seq(7),
             price: Price(123_456),
-            size: 99,
+            // 0.004 BTC in raw Quantity units — a fractional size must survive
+            // the POD round trip intact.
+            size: Quantity::from_raw(4_000_000),
         });
         assert_eq!(round_trip(&ev), ev);
     }
@@ -448,9 +454,9 @@ mod tests {
             rx_ts: Timestamp(2),
             seq: Seq(3),
             bid: Price(100),
-            bid_size: 10,
+            bid_size: Quantity::from_raw(10),
             ask: Price(200),
-            ask_size: 20,
+            ask_size: Quantity::from_raw(20),
         });
         assert_eq!(round_trip(&ev), ev);
     }
@@ -475,7 +481,7 @@ mod tests {
                 high: Price(4),
                 low: Price(0),
                 close: Price(3),
-                volume: 1000,
+                volume: Quantity::from_raw(1000),
             });
             assert_eq!(round_trip(&ev), ev, "interval {interval:?}");
         }
@@ -600,7 +606,7 @@ mod tests {
             rx_ts: Timestamp(999_999),
             seq: Seq(1),
             price: Price(1),
-            size: 1,
+            size: Quantity::from_raw(1),
         });
         let mut table = SymbolTable::new();
         let pod = to_pod(&ev, &mut table).unwrap().unwrap();

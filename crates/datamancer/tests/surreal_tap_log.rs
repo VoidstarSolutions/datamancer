@@ -7,8 +7,8 @@
 
 use datamancer::storage::{SurrealTapLog, SurrealTapLogConfig};
 use datamancer::{
-    AssetClass, Bar, BarInterval, EventKind, Instrument, MarketEvent, Price, ProviderId, Quote,
-    ReplayRequest, Seq, TapLog, Timestamp, Trade,
+    AssetClass, Bar, BarInterval, EventKind, Instrument, MarketEvent, Price, ProviderId, Quantity,
+    Quote, ReplayRequest, Seq, TapLog, Timestamp, Trade,
 };
 use futures::StreamExt;
 
@@ -30,7 +30,9 @@ fn trade(symbol: &str, source_ts: i64, rx_ts: i64, seq: u64, price: f64, size: u
         rx_ts: Timestamp(rx_ts),
         seq: Seq(seq),
         price: Price::from_f64_round(price),
-        size,
+        // `size` is whole shares (fractional sizes are covered explicitly by
+        // `awkward_symbol_round_trips`).
+        size: Quantity::from_units(size),
     })
 }
 
@@ -45,7 +47,7 @@ fn bar(symbol: &str, source_ts: i64, seq: u64, close: f64) -> MarketEvent {
         high: Price::from_f64_round(close),
         low: Price::from_f64_round(close),
         close: Price::from_f64_round(close),
-        volume: 100,
+        volume: Quantity::from_units(100),
     })
 }
 
@@ -96,7 +98,14 @@ async fn append_then_flush_persists_and_replays_in_order() {
         }
     }
     // Arrival order preserved; the source `seq` is persisted verbatim.
-    assert_eq!(got, vec![(100, 1, 0), (250, 2, 1), (399, 3, 2)]);
+    assert_eq!(
+        got,
+        vec![
+            (100, Quantity::from_units(1), 0),
+            (250, Quantity::from_units(2), 1),
+            (399, Quantity::from_units(3), 2),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -154,9 +163,9 @@ fn quote(symbol: &str, source_ts: i64, rx_ts: i64, seq: u64, bid: f64, ask: f64)
         rx_ts: Timestamp(rx_ts),
         seq: Seq(seq),
         bid: Price::from_f64_round(bid),
-        bid_size: 1,
+        bid_size: Quantity::from_units(1),
         ask: Price::from_f64_round(ask),
-        ask_size: 1,
+        ask_size: Quantity::from_units(1),
     })
 }
 
@@ -285,7 +294,9 @@ async fn awkward_symbol_round_trips() {
         rx_ts: Timestamp(1),
         seq: Seq(0),
         price: Price::from_f64_round(60000.0),
-        size: 1,
+        // 0.004 BTC — a fractional size must survive the tap-log round trip
+        // through the renamed `size_raw` column, not truncate to zero.
+        size: Quantity::from_f64_round(0.004),
     });
     log.append(&ev).await.unwrap();
     log.flush().await.unwrap();
@@ -300,7 +311,10 @@ async fn awkward_symbol_round_trips() {
     let mut stream = source.open(request).await.unwrap();
     let ev = stream.next().await.expect("one event");
     match ev {
-        MarketEvent::Trade(t) => assert_eq!(t.instrument, crypto),
+        MarketEvent::Trade(t) => {
+            assert_eq!(t.instrument, crypto);
+            assert_eq!(t.size, Quantity::from_raw(4_000_000));
+        }
         _ => panic!("expected trade"),
     }
 }

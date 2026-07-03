@@ -9,7 +9,7 @@
 use datamancer::storage::{SurrealCache, SurrealCacheConfig};
 use datamancer::{
     Adjustment, AssetClass, Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache,
-    Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
+    Instrument, MarketEvent, Price, ProviderId, Quantity, Seq, Timestamp, Trade,
 };
 use datamancer_core::ReplayRequest;
 use futures::StreamExt;
@@ -29,7 +29,8 @@ fn trade(symbol: &str, ts: i64, price: f64, size: u64) -> MarketEvent {
         rx_ts: Timestamp(ts),
         seq: Seq(0),
         price: Price::from_f64_round(price),
-        size,
+        // `size` is whole shares, matching the tap-log suite's fixtures.
+        size: Quantity::from_units(size),
     })
 }
 
@@ -44,7 +45,7 @@ fn bar(symbol: &str, ts: i64, close: f64) -> MarketEvent {
         high: Price::from_f64_round(close),
         low: Price::from_f64_round(close),
         close: Price::from_f64_round(close),
-        volume: 100,
+        volume: Quantity::from_units(100),
     })
 }
 
