@@ -50,7 +50,7 @@
 //! Explicit [`Session::close`] is always available for forced termination.
 
 use crate::accounting::ProviderAccounting;
-use crate::client::{
+use crate::client_session::{
     AuthoritativeSession, ClientHandle, ClientSession, ClientStats, FanOut, LiveStats,
     SubscriberGuard, SubscriberId, spawn_client,
 };

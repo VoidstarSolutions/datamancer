@@ -241,6 +241,15 @@ impl Client for Iceoryx2Client {
         Ok(reply.instruments.unwrap_or_default())
     }
 
+    /// Graceful close. **Known race:** the daemon emits a terminal
+    /// `SessionClosing` on the data plane before tearing the service down,
+    /// but this client's poll loop can observe the service go away (an
+    /// `Err` from `subscriber.poll()`, which ends the event stream) before it
+    /// drains that final sample. The closer already knows the close was
+    /// intentional — it is the one that called `close` — so this is narrow
+    /// and pre-existing; stream-readers on the iceoryx2 transport should not
+    /// rely on always observing the `SessionClosing` marker (unlike the WS
+    /// transport, which is single-writer and does not have this race).
     async fn close(mut self) -> Result<(), ClientError<Self::Error>> {
         // `close` consumes the client, so this is the caller's last chance to
         // signal the poll task. Set the stop flag unconditionally *before* the

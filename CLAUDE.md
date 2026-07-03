@@ -4,15 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workspace
 
-Cargo workspace (resolver 3, edition 2024) with five crates:
+Cargo workspace (resolver 3, edition 2024) with six crates:
 
 - **`datamancer-core`** — pure types and trait surface (`Provider`, `LiveHandle`, `TapLog`, `HistoricalCache`, `ReplaySource`, `EventSink`) plus the event model (`MarketEvent`, `Trade`, `Bar`, `Quote`, `Control`), `Instrument`, `Price`. No I/O, minimal deps. Provider/storage/transport implementation crates depend only on this — never on the orchestrator.
 - **`datamancer`** — the session orchestrator. Re-exports the core surface and adds `Datamancer`, `DatamancerBuilder`, `Session`. Holds provider integrations (`providers/alpaca*`) and storage backends (`storage/surreal`) behind cargo features.
 - **`datamancer-transport-iceoryx2`** — optional same-host zero-copy iceoryx2 transport (data + diagnostics planes). Depends on `datamancer-core` only; isolates the heavy iceoryx2 dependency tree behind a hard crate boundary. `datamancer` pulls it in via the `transport-iceoryx2` feature and re-exports it as `datamancer::transport`. `SymbolId`/interning are sink-local, never core.
 - **`datamancer-transport-ws`** — optional remote WebSocket client transport (one connection = one client; JSON control + event frames, instrument carried inline, no interning). Depends on `datamancer-core` only. `datamancer` pulls it in via the `transport-ws` feature and re-exports it as `datamancer::transport_ws`; `datamancerd` gates its listener/connection glue behind its own `ws` feature. Both features are **off by default**. Alongside `datamancer-transport-iceoryx2`, the two worked examples for a future unified client-transport trait.
+- **`datamancer-client`** — optional consumer-side crate: the control vocabulary extracted from `datamancerd` (`spec`, `codes`, `protocol::{uds,ws}`) plus, behind features `ws`/`iceoryx2`, two implementations of one generic `Client` trait. Depends on `datamancer-core` and the relevant transport crate only — never the orchestrator. `datamancer` pulls it in via the `client-ws`/`client-iceoryx2` features and re-exports it as `datamancer::client`; both features are **off by default**. `datamancerd` re-imports the same vocabulary rather than duplicating it.
 - **`datamancerd`** — the standalone server: a thin **binary** (`#![forbid(unsafe_code)]`) that wraps `datamancer` (with `transport-iceoryx2`) and serves multiple same-host consumer processes. It adds **no** new ordering/transport/event semantics — only composition, process lifecycle, a UDS + newline-JSON control surface, an optional WS client surface (feature `ws`), and graceful shutdown. Operator contracts (TOML config schema, control protocol, stable JSON error codes) are documented in `crates/datamancerd/README.md`.
 
-Default features: `provider-alpaca`, `storage-surreal`. `transport-iceoryx2` and `transport-ws` are **off by default**. All optional; pulling in a new provider/transport should be additive and gated behind a feature.
+Default features: `provider-alpaca`, `storage-surreal`. `transport-iceoryx2`, `transport-ws`, `client-ws`, and `client-iceoryx2` are **off by default**. All optional; pulling in a new provider/transport should be additive and gated behind a feature.
 
 Workspace-wide lints: `clippy::pedantic = deny` (with `priority = -1` so individual lints can be relaxed per call site). Member crates opt in via `[lints] workspace = true`. **`#![forbid(unsafe_code)]` in all five crates** — including the iceoryx2 transport (its EXT-1 gate confirms `ZeroCopySend` is a safe derive; see that crate's CLAUDE.md).
 

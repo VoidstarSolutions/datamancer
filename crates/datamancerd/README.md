@@ -19,6 +19,13 @@ sessions (and their recording) and read a single multiplexed stream each.
 > byte-identical `(seq, source_ts)` because they share the one authoritative
 > per-`(instrument, kind)` session.
 
+**Writing a consumer?** Don't hand-roll the control protocol below —
+`datamancer-client` (`crates/datamancer-client`) is the vocabulary this
+daemon speaks (`spec`, `codes`, request/reply framings) plus, behind features
+`ws`/`iceoryx2`, ready-made `Client` implementations for both surfaces. See
+that crate's README for the trait contract, connect-and-subscribe examples,
+and the loss contract per transport.
+
 ## Running
 
 ```bash
