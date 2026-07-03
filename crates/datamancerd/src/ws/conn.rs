@@ -109,10 +109,29 @@ pub async fn handle_connection(
         // read loop need not re-parse it to compute `close_after`.
         let (reply, was_close_client) = dispatch(&session, &dm, &text).await;
         let close_after = was_close_client && reply.ok;
-        if let Ok(line) = serde_json::to_string(&reply)
-            && tx.send(line).await.is_err()
-        {
-            break;
+        if let Ok(line) = serde_json::to_string(&reply) {
+            // Enqueue the reply, but stay responsive to teardown while doing so.
+            // A stalled consumer can fill the shared outbound channel; a bare
+            // `tx.send(line).await` would then park here — deaf to both the
+            // pump's overrun `cancel` and the daemon `shutdown` — until TCP
+            // eventually errors. Racing the send against those signals preserves
+            // the prompt-teardown guarantee for a client that keeps sending
+            // control frames while never draining its reads.
+            tokio::select! {
+                res = tx.send(line) => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                _ = shutdown.recv() => {
+                    drained = true;
+                    break;
+                }
+                () = cancel.notified() => {
+                    tracing::warn!(%peer, "ws slow consumer overran while sending reply; tearing down");
+                    break;
+                }
+            }
         }
         if close_after {
             closed_by_client = true;
