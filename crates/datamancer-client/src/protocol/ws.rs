@@ -32,6 +32,13 @@ pub enum WsRequest {
     Snapshot { id: u64 },
     /// Gracefully close this connection's client.
     CloseClient { id: u64 },
+    /// Enumerate available instruments and their supported kinds, optionally
+    /// restricted to one provider.
+    Instruments {
+        id: u64,
+        #[serde(default)]
+        provider: Option<String>,
+    },
 }
 
 impl WsRequest {
@@ -42,7 +49,8 @@ impl WsRequest {
             Self::Subscribe { id, .. }
             | Self::Unsubscribe { id, .. }
             | Self::Snapshot { id }
-            | Self::CloseClient { id } => *id,
+            | Self::CloseClient { id }
+            | Self::Instruments { id, .. } => *id,
         }
     }
 }
@@ -58,22 +66,36 @@ pub struct WsReply {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SystemSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruments: Option<Vec<datamancer_core::InstrumentInfo>>,
 }
 
 impl WsReply {
     #[must_use]
     pub fn ok(id: u64) -> Self {
-        Self { id, ok: true, code: None, message: None, snapshot: None }
+        Self { id, ok: true, code: None, message: None, snapshot: None, instruments: None }
     }
 
     #[must_use]
     pub fn error(id: u64, code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { id, ok: false, code: Some(code.into()), message: Some(message.into()), snapshot: None }
+        Self {
+            id,
+            ok: false,
+            code: Some(code.into()),
+            message: Some(message.into()),
+            snapshot: None,
+            instruments: None,
+        }
     }
 
     #[must_use]
     pub fn snapshot(id: u64, snapshot: SystemSnapshot) -> Self {
-        Self { id, ok: true, code: None, message: None, snapshot: Some(snapshot) }
+        Self { id, ok: true, code: None, message: None, snapshot: Some(snapshot), instruments: None }
+    }
+
+    #[must_use]
+    pub fn instruments(id: u64, catalog: Vec<datamancer_core::InstrumentInfo>) -> Self {
+        Self { id, ok: true, code: None, message: None, snapshot: None, instruments: Some(catalog) }
     }
 }
 
@@ -125,6 +147,18 @@ mod tests {
         assert_eq!(err["id"], 6);
         assert_eq!(err["ok"], serde_json::Value::Bool(false));
         assert_eq!(err["code"], "bad_request");
+    }
+
+    #[test]
+    fn ws_instruments_parses_and_carries_id() {
+        let req: WsRequest =
+            serde_json::from_str(r#"{"id":4,"op":"instruments","provider":"alpaca-crypto"}"#)
+                .unwrap();
+        assert!(
+            matches!(&req, WsRequest::Instruments { id: 4, provider: Some(p) } if p == "alpaca-crypto")
+        );
+        let all: WsRequest = serde_json::from_str(r#"{"id":5,"op":"instruments"}"#).unwrap();
+        assert!(matches!(all, WsRequest::Instruments { id: 5, provider: None }));
     }
 
     #[test]

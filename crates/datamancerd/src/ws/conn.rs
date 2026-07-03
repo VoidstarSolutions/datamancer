@@ -259,6 +259,13 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
             Err(e) => ws_reply_from_library_error(id, &e),
         },
         WsRequest::CloseClient { .. } => WsReply::ok(id),
+        WsRequest::Instruments { provider, .. } => {
+            let filter = provider.map(ProviderId::new);
+            match dm.instrument_catalog(filter.as_ref()).await {
+                Ok(catalog) => WsReply::instruments(id, catalog),
+                Err(e) => ws_reply_from_library_error(id, &e),
+            }
+        }
     };
     (reply, is_close_client)
 }

@@ -42,6 +42,13 @@ pub enum Request {
     ListClients,
     /// Return the current diagnostics snapshot as JSON.
     Snapshot,
+    /// Enumerate available instruments and their supported kinds, optionally
+    /// restricted to one provider (a full equities catalog is ~10k rows —
+    /// prefer the filter).
+    Instruments {
+        #[serde(default)]
+        provider: Option<String>,
+    },
 }
 
 /// A control reply (one per line). `ok` discriminates success from error; the
@@ -58,6 +65,9 @@ pub struct Reply {
     /// The diagnostics snapshot (on `snapshot`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SystemSnapshot>,
+    /// The instrument catalog (on `instruments`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruments: Option<Vec<datamancer_core::InstrumentInfo>>,
     /// Stable error code (on failure).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -75,6 +85,7 @@ impl Reply {
             service: None,
             clients: None,
             snapshot: None,
+            instruments: None,
             code: None,
             message: None,
         }
@@ -107,6 +118,15 @@ impl Reply {
         }
     }
 
+    /// Success carrying the instrument catalog.
+    #[must_use]
+    pub fn instruments(catalog: Vec<datamancer_core::InstrumentInfo>) -> Self {
+        Self {
+            instruments: Some(catalog),
+            ..Self::ok()
+        }
+    }
+
     /// An error reply with a stable code and a message.
     #[must_use]
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -115,6 +135,7 @@ impl Reply {
             service: None,
             clients: None,
             snapshot: None,
+            instruments: None,
             code: Some(code.into()),
             message: Some(message.into()),
         }
@@ -197,5 +218,34 @@ mod tests {
         assert_eq!(err["ok"], serde_json::Value::Bool(false));
         assert_eq!(err["code"], "bad_request");
         assert!(err.get("service").is_none());
+    }
+
+    #[test]
+    fn instruments_request_parses_with_and_without_filter() {
+        let filtered: Request =
+            serde_json::from_str(r#"{"op":"instruments","provider":"alpaca-crypto"}"#).unwrap();
+        assert!(
+            matches!(filtered, Request::Instruments { provider: Some(p) } if p == "alpaca-crypto")
+        );
+        let all: Request = serde_json::from_str(r#"{"op":"instruments"}"#).unwrap();
+        assert!(matches!(all, Request::Instruments { provider: None }));
+    }
+
+    #[test]
+    fn instruments_reply_round_trips() {
+        use datamancer_core::{AssetClass, EventKind, Instrument, InstrumentInfo, ProviderId};
+        let reply = Reply::instruments(vec![InstrumentInfo {
+            instrument: Instrument::new(
+                ProviderId::from_static("alpaca-crypto"),
+                AssetClass::Crypto,
+                "BTC/USD",
+            ),
+            kinds: vec![EventKind::Trade],
+        }]);
+        let line = serde_json::to_string(&reply).unwrap();
+        let back: Reply = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply, back);
+        assert!(back.ok);
+        assert_eq!(back.instruments.unwrap().len(), 1);
     }
 }

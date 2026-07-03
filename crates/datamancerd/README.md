@@ -261,7 +261,18 @@ One JSON object per line; one reply line per request.
 {"op":"close-client","client":"exec-1"}
 {"op":"list-clients"}  -> {"ok":true,"clients":["exec-1"]}
 {"op":"snapshot"}      -> {"ok":true,"snapshot":{ /* SystemSnapshot */ }}
+{"op":"instruments","provider":"alpaca-crypto"}
+  -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
+{"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
 ```
+
+`instruments` enumerates the discoverable catalog and, per entry, the
+`EventKind`s that instrument supports; `provider` is optional and restricts
+the catalog to one provider (a full equities catalog is ~10k rows — prefer
+the filter when you know the provider). Because it awaits a live provider
+REST call, it is dispatched off the single-actor control loop (in the
+per-connection task) so it cannot stall unrelated `open-client`/`subscribe`/
+etc. traffic on other connections.
 
 Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 (`live_session_conflict`, `unsupported_event_kind`, `persistence_required`,
@@ -324,7 +335,13 @@ connection identifies the client):
 {"id":3,"op":"unsubscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
 {"id":4,"op":"close-client"}
   -> {"id":4,"ok":true}
+{"id":5,"op":"instruments","provider":"alpaca-crypto"}
+  -> {"id":5,"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
 ```
+
+Like on the UDS surface, `instruments` (optional `provider` filter) is
+dispatched per-connection rather than through any shared actor, so it never
+blocks other connections while it awaits a live provider REST call.
 
 Errors reuse the **same stable `codes` table** as the UDS control surface
 (`{"id":5,"ok":false,"code":"unsupported_event_kind","message":"…"}`). Event
