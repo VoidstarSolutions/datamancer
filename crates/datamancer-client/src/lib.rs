@@ -14,6 +14,8 @@ mod error;
 pub mod codes;
 pub mod protocol;
 pub mod spec;
+#[cfg(feature = "ws")]
+pub mod ws;
 
 pub use client::Client;
 pub use error::ClientError;
