@@ -330,7 +330,7 @@ mod tests {
             rx_ts: Timestamp(222),
             seq: Seq(7),
             price: Price(123_456),
-            size: 99,
+            size: datamancer_core::Quantity::from_raw(99),
         })
     }
 

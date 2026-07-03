@@ -187,7 +187,7 @@ mod tests {
     use crate::payload::to_pod;
     use crate::symbol_table::SymbolTable;
     use datamancer_core::{
-        AssetClass, Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
+        AssetClass, Instrument, MarketEvent, Price, ProviderId, Quantity, Seq, Timestamp, Trade,
     };
 
     fn trade(symbol: &str, seq: u64) -> MarketEvent {
@@ -202,7 +202,7 @@ mod tests {
             rx_ts: Timestamp(ts + 1),
             seq: Seq(seq),
             price: Price(100),
-            size: 1,
+            size: Quantity::from_raw(1),
         })
     }
 

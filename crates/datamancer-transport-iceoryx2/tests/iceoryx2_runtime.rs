@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use datamancer_core::{
     AssetClass, CacheSnapshot, ConnectionState, Control, ControlKind, EventSink, Instrument,
-    MarketEvent, Price, ProviderId, ProviderSnapshot, Seq, SystemSnapshot, Timestamp, Trade,
+    MarketEvent, Price, ProviderId, ProviderSnapshot, Quantity, Seq, SystemSnapshot, Timestamp,
+    Trade,
 };
 use datamancer_transport_iceoryx2::{
     DataSubscriber, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2DiagnosticsSubscriber,
@@ -48,7 +49,7 @@ fn trade(symbol: &str, seq: u64, price: i64) -> MarketEvent {
         rx_ts: Timestamp(ts + 1),
         seq: Seq(seq),
         price: Price(price),
-        size: 10,
+        size: Quantity::from_raw(10),
     })
 }
 
