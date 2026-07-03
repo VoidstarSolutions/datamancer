@@ -64,6 +64,12 @@ pub async fn serve(
     loop {
         tokio::select! {
             () = &mut shutdown => break,
+            // Continuously reap finished connections. A `JoinSet` retains each
+            // completed task's handle until it is joined, so without this the set
+            // would grow unbounded over the daemon's lifetime as short-lived
+            // clients come and go. Empty-set `join_next()` yields `None`, which
+            // simply disables this branch for that iteration.
+            Some(_) = conns.join_next() => {}
             accepted = listener.accept() => match accepted {
                 Ok((tcp, peer)) => {
                     let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
