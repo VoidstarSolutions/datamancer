@@ -129,6 +129,9 @@ pub struct Server {
     /// the embedded HTTP introspection surface.
     #[cfg(feature = "web-ui")]
     web: Option<crate::config::WebUiConfig>,
+    /// The web layer's handle to the on-disk config file (Phase 6 config API).
+    #[cfg(feature = "web-ui")]
+    config_state: crate::web::ConfigState,
     /// `true` once a shutdown signal has been observed; rejects new requests.
     draining: bool,
 }
@@ -141,7 +144,7 @@ impl Server {
     /// # Errors
     ///
     /// Propagates config/library/transport errors.
-    pub async fn bootstrap(config: Config) -> Result<Self> {
+    pub async fn bootstrap(config: Config, config_path: std::path::PathBuf) -> Result<Self> {
         let admin_socket = config.server.admin_socket.clone();
         let service_prefix = config.server.service_prefix.clone();
         let max_clients = config.iceoryx2.max_clients;
@@ -151,6 +154,10 @@ impl Server {
 
         #[cfg(feature = "web-ui")]
         let web = config.web_ui.clone();
+        #[cfg(feature = "web-ui")]
+        let config_state = crate::web::ConfigState::new(config_path, config.clone());
+        #[cfg(not(feature = "web-ui"))]
+        let _ = config_path;
         tracing::debug!(
             live_state_ms = config.diagnostics.publish_interval_ms,
             cache_catalog_ms = config.diagnostics.cache_catalog_interval_ms,
@@ -206,6 +213,8 @@ impl Server {
             diag_interval,
             #[cfg(feature = "web-ui")]
             web,
+            #[cfg(feature = "web-ui")]
+            config_state,
             draining: false,
         })
     }
@@ -351,7 +360,10 @@ impl Server {
             web.cache_catalog_cadence_ms,
         );
 
-        let state = refreshers.state.clone();
+        let state = crate::web::AppState {
+            snapshots: refreshers.state.clone(),
+            config: self.config_state.clone(),
+        };
         let assets_dir = web.assets_dir.clone();
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let serve = tokio::spawn(async move {
@@ -594,8 +606,7 @@ fn spec_instrument(spec: &SubscriptionSpec) -> Instrument {
 fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(), String> {
     let input: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("invalid request: {e}"))?;
-    let canonical =
-        serde_json::to_value(request).map_err(|e| format!("invalid request: {e}"))?;
+    let canonical = serde_json::to_value(request).map_err(|e| format!("invalid request: {e}"))?;
     if let (Some(input), Some(canonical)) = (input.as_object(), canonical.as_object()) {
         for key in input.keys() {
             if !canonical.contains_key(key) {
@@ -678,7 +689,9 @@ async fn handle_connection(stream: UnixStream, cmd_tx: mpsc::Sender<ServerComman
                             // rejected open (e.g. duplicate-name) never causes the
                             // EOF path to tear down the existing client of that
                             // name.
-                            if reply.ok && let Some(name) = open_client_name {
+                            if reply.ok
+                                && let Some(name) = open_client_name
+                            {
                                 opened_client = Some(name);
                             }
                             reply

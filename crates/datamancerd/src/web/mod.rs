@@ -9,16 +9,20 @@
 //!
 //! - **Loopback bind only** (`127.0.0.1`); auth is deferred (single operator,
 //!   no network exposure).
-//! - **`GET`-only**: no mutation route is registered, so there is no
-//!   axum-level write path to flip (guarded by `web_router_get_only`).
+//! - **One mutating route**: `PUT /api/config` (validated, atomic, loopback +
+//!   same-origin + JSON-content-type guarded) writes the config *file*;
+//!   apply-on-restart, the running daemon is never mutated. Everything else is
+//!   `GET`-only (guarded by `web_router_single_mutating_route`).
 //! - **Single-origin, no CORS**: the UI and JSON API share one loopback origin,
 //!   so no CORS layer is added — never a permissive `Any` origin (guarded by
 //!   `web_no_permissive_cors`).
 //! - Basic response hardening headers (`X-Content-Type-Options`, a `Content-Security-Policy`)
 //!   even same-host.
 
+pub mod config_api;
 pub mod handlers;
 pub mod refresh;
+mod settings;
 pub mod state;
 mod ui;
 
@@ -33,6 +37,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use axum::Router;
+use axum::extract::FromRef;
 use axum::http::HeaderValue;
 use axum::http::header::{CONTENT_SECURITY_POLICY, X_CONTENT_TYPE_OPTIONS};
 use axum::routing::get;
@@ -40,7 +45,27 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
+pub use config_api::ConfigState;
 pub use state::WebState;
+
+/// Combined router state: snapshot reads plus the config-file handle.
+#[derive(Clone)]
+pub struct AppState {
+    pub snapshots: WebState,
+    pub config: ConfigState,
+}
+
+impl FromRef<AppState> for WebState {
+    fn from_ref(state: &AppState) -> Self {
+        state.snapshots.clone()
+    }
+}
+
+impl FromRef<AppState> for ConfigState {
+    fn from_ref(state: &AppState) -> Self {
+        state.config.clone()
+    }
+}
 
 /// `Content-Security-Policy` for the same-host operator UI. Self-origin only;
 /// inline script/style are permitted because the server-rendered page carries a
@@ -53,15 +78,20 @@ const CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-
 /// Registers **only `GET`** routes (the read-only invariant), adds the security
 /// headers and request-trace layers, and — when `assets_dir` resolves to an
 /// existing directory — mounts static assets under `/assets`.
-pub fn router(state: WebState, assets_dir: Option<&Path>) -> Router {
+pub fn router(state: AppState, assets_dir: Option<&Path>) -> Router {
     let mut app = Router::new()
         .route("/", get(ui::index))
+        .route("/config", get(settings::page))
         .route("/api/snapshot", get(handlers::snapshot))
         .route("/api/cache", get(handlers::cache))
         .route("/api/providers", get(handlers::providers))
         .route("/api/sessions", get(handlers::sessions))
         .route("/api/health", get(handlers::health))
-        .route("/api/stream", get(handlers::stream));
+        .route("/api/stream", get(handlers::stream))
+        .route(
+            "/api/config",
+            get(config_api::get_config).put(config_api::put_config),
+        );
 
     #[cfg(feature = "metrics")]
     {
@@ -118,14 +148,21 @@ pub async fn bind(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> 
 ///
 /// Propagates the serve I/O error.
 pub async fn serve(
-    state: WebState,
+    state: AppState,
     listener: tokio::net::TcpListener,
     assets_dir: Option<std::path::PathBuf>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let app = router(state, assets_dir.as_deref());
     if let Ok(addr) = listener.local_addr() {
-        tracing::info!(%addr, "datamancerd web UI listening (loopback, read-only)");
+        // Emit the literal IPv4/IPv6 URL, not a `localhost` form: the bind is
+        // to one address family only, and `localhost` resolves to both on a
+        // dual-stack host, so a browser preferring the other family (Happy
+        // Eyeballs) can silently land on an unrelated service sharing the port.
+        tracing::info!(
+            url = %format_args!("http://{addr}/"),
+            "datamancerd web UI listening (loopback; single mutating route /api/config) — open this exact URL, not localhost"
+        );
     }
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -143,8 +180,18 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tower::ServiceExt as _;
 
-    fn state() -> WebState {
-        WebState::fixed(testdata::snapshot(), testdata::snapshot())
+    fn state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let boot = crate::config::Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n")
+            .expect("parse");
+        boot.save(&path).expect("seed config");
+        // Leak the tempdir so the file outlives the helper (test-only).
+        std::mem::forget(dir);
+        AppState {
+            snapshots: WebState::fixed(testdata::snapshot(), testdata::snapshot()),
+            config: ConfigState::new(path, boot),
+        }
     }
 
     async fn send(method: Method, uri: &str) -> axum::response::Response {
@@ -169,6 +216,26 @@ mod tests {
             .to_vec()
     }
 
+    async fn send_json(
+        method: Method,
+        uri: &str,
+        body: &str,
+        origin: Option<&str>,
+    ) -> axum::response::Response {
+        let app = router(state(), None);
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("host", "127.0.0.1:8080");
+        if let Some(o) = origin {
+            req = req.header("origin", o);
+        }
+        app.oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
     const ROUTES: &[&str] = &[
         "/",
         "/api/snapshot",
@@ -180,17 +247,106 @@ mod tests {
     ];
 
     #[tokio::test]
-    async fn web_router_get_only() {
+    async fn web_router_single_mutating_route() {
         for route in ROUTES {
             for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
                 let resp = send(method.clone(), route).await;
                 assert_eq!(
                     resp.status(),
                     StatusCode::METHOD_NOT_ALLOWED,
-                    "{method} {route} must be rejected (read-only surface)"
+                    "{method} {route} must be rejected"
                 );
             }
         }
+        // /api/config: PUT is allowed (guarded), all other mutations rejected.
+        for method in [Method::POST, Method::DELETE, Method::PATCH] {
+            let resp = send(method.clone(), "/api/config").await;
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+    }
+
+    #[tokio::test]
+    async fn config_get_returns_config_and_flag() {
+        let resp = send(Method::GET, "/api/config").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["restart_required"], Value::Bool(false));
+        assert!(v["config"]["provider"]["alpaca"].is_object());
+        assert!(v["path"].as_str().unwrap().ends_with("config.toml"));
+    }
+
+    #[tokio::test]
+    async fn config_put_writes_and_flags_restart() {
+        let app = router(state(), None);
+        let body = serde_json::json!({
+            "provider": {"alpaca": {"account_type": "live"}},
+            "session": {"resume_buffer_events": 128, "adjustment": "all"}
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/config")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:8080")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["restart_required"], Value::Bool(true));
+        assert_eq!(v["config"]["provider"]["alpaca"]["account_type"], "live");
+    }
+
+    #[tokio::test]
+    async fn config_put_invalid_writes_nothing() {
+        // No provider at all -> validation failure with the stable `config` code.
+        let resp = send_json(Method::PUT, "/api/config", r#"{"provider": {}}"#, None).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["code"], "config");
+    }
+
+    #[tokio::test]
+    async fn config_put_malformed_json_is_bad_request() {
+        let resp = send_json(Method::PUT, "/api/config", "{not json", None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(v["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn config_put_cross_origin_is_rejected() {
+        let body = r#"{"provider": {"alpaca": {"account_type": "paper"}}}"#;
+        let resp = send_json(
+            Method::PUT,
+            "/api/config",
+            body,
+            Some("http://evil.example"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn config_put_wrong_content_type_is_rejected() {
+        let app = router(state(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/config")
+                    .header("content-type", "text/plain")
+                    .header("host", "127.0.0.1:8080")
+                    .body(Body::from("x=1"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]
@@ -343,5 +499,14 @@ mod tests {
             .await
             .expect("serve task must resolve after shutdown");
         assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn settings_page_serves_form_shell() {
+        let resp = send(Method::GET, "/config").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(body.contains("id=\"settings\""), "form container present");
+        assert!(body.contains("/api/config"), "wired to the config API");
     }
 }

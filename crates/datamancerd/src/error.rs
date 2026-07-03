@@ -26,6 +26,10 @@ pub enum DaemonError {
     #[error("invalid config: {0}")]
     ConfigInvalid(String),
 
+    /// A config value could not be serialized to TOML.
+    #[error("failed to serialize config: {0}")]
+    ConfigSerialize(#[from] toml::ser::Error),
+
     /// A library operation failed while building or running the daemon.
     #[error(transparent)]
     Library(#[from] datamancer::Error),

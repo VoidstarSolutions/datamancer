@@ -182,7 +182,16 @@ mod tests {
 
         // `warm` populates the cache swap with the freshly-enumerated catalog.
         let refreshers = Refreshers::warm(&dm).await.unwrap();
-        let app = crate::web::router(refreshers.state.clone(), None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let boot =
+            crate::config::Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n").unwrap();
+        boot.save(&path).unwrap();
+        let state = crate::web::AppState {
+            snapshots: refreshers.state.clone(),
+            config: crate::web::ConfigState::new(path, boot),
+        };
+        let app = crate::web::router(state, None);
 
         let resp = app
             .oneshot(

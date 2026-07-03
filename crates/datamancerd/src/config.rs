@@ -27,16 +27,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::{DaemonError, Result};
 
 /// Top-level daemon configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Provider selection. At least one provider must be configured.
     pub provider: ProviderConfig,
     /// Historical-cache backend (optional unless a session uses the cache).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<StorageConfig>,
     /// Tap-log backend (optional unless a session writes the tap log).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tap_log: Option<StorageConfig>,
     /// Session knobs (resume buffer, adjustment).
     #[serde(default)]
@@ -53,7 +53,7 @@ pub struct Config {
     /// Optional web UI (Phase 6 drives it; config surface lives here). Always
     /// parsed so configs stay portable; only read by the `web-ui` feature.
     #[cfg_attr(not(feature = "web-ui"), allow(dead_code))]
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_ui: Option<WebUiConfig>,
     /// Boot-time authoritative sessions held as lifecycle anchors.
     #[serde(default)]
@@ -62,7 +62,7 @@ pub struct Config {
 
 /// Provider selection block. Each provider is optional, but at least one must
 /// be present (enforced in [`Config::validate`]).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     #[serde(default)]
@@ -72,7 +72,7 @@ pub struct ProviderConfig {
 }
 
 /// Alpaca equities provider section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlpacaSection {
     #[serde(default)]
@@ -80,7 +80,7 @@ pub struct AlpacaSection {
 }
 
 /// Alpaca crypto provider section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlpacaCryptoSection {
     #[serde(default)]
@@ -90,7 +90,7 @@ pub struct AlpacaCryptoSection {
 }
 
 /// Which environment credential pair `oxidized_alpaca` loads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountTypeCfg {
     #[default]
@@ -108,7 +108,7 @@ impl From<AccountTypeCfg> for AccountType {
 }
 
 /// Alpaca crypto venue selector.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CryptoVenueCfg {
     #[default]
@@ -128,17 +128,17 @@ impl From<CryptoVenueCfg> for AlpacaCryptoVenue {
 }
 
 /// A persistence backend (cache or tap log).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub backend: StorageBackend,
     /// Filesystem path for embedded backends; ignored for `surreal-memory`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 }
 
 /// Supported storage backends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageBackend {
     SurrealEmbedded,
@@ -146,7 +146,7 @@ pub enum StorageBackend {
 }
 
 /// Session-level knobs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     #[serde(default = "default_resume_buffer")]
@@ -169,7 +169,7 @@ const fn default_resume_buffer() -> usize {
 }
 
 /// Corporate-action adjustment mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdjustmentCfg {
     Raw,
@@ -193,7 +193,7 @@ impl From<AdjustmentCfg> for Adjustment {
 }
 
 /// Control surface + iceoryx2 naming.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_admin_socket")]
@@ -227,7 +227,7 @@ const fn default_shutdown_timeout() -> u64 {
 }
 
 /// Diagnostics-plane cadence.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticsConfig {
     #[serde(default = "default_live_cadence")]
@@ -256,7 +256,7 @@ const fn default_catalog_cadence() -> u64 {
 /// iceoryx2 transport caps. The per-client data-plane service is fixed-size at
 /// creation; `max_clients` bounds how many per-client services the daemon will
 /// create before rejecting `open-client` with a service-cap error.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Iceoryx2Config {
     #[serde(default = "default_max_clients")]
@@ -277,7 +277,7 @@ const fn default_max_clients() -> usize {
 
 /// Optional web UI (Phase 6).
 #[cfg_attr(not(feature = "web-ui"), allow(dead_code))]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebUiConfig {
     #[serde(default)]
@@ -286,7 +286,7 @@ pub struct WebUiConfig {
     pub bind: String,
     #[serde(default = "default_web_port")]
     pub port: u16,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assets_dir: Option<PathBuf>,
     #[serde(default = "default_live_cadence")]
     pub live_state_cadence_ms: u64,
@@ -303,7 +303,7 @@ const fn default_web_port() -> u16 {
 }
 
 /// A boot-time authoritative session held as a lifecycle anchor.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartupSession {
     pub provider: String,
@@ -312,7 +312,7 @@ pub struct StartupSession {
     pub kind: EventKindCfg,
     #[serde(default)]
     pub scope: ScopeCfg,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_from: Option<String>,
     #[serde(default)]
     pub persistence: PersistenceCfg,
@@ -584,6 +584,32 @@ impl Config {
         Ok(())
     }
 
+    /// Serialize to pretty TOML.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::ConfigSerialize`] if serialization fails.
+    #[allow(dead_code)]
+    pub fn to_toml(&self) -> Result<String> {
+        Ok(toml::to_string_pretty(self)?)
+    }
+
+    /// Validate, serialize, and atomically write this config to `path`.
+    /// Nothing is written when validation or serialization fails.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::ConfigInvalid`] on validation failure,
+    /// [`DaemonError::ConfigSerialize`] on serialization failure, or an I/O
+    /// error from the atomic write.
+    #[allow(dead_code)]
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        let text = self.to_toml()?;
+        crate::paths::atomic_write(path, &text)?;
+        Ok(())
+    }
+
     /// Build the full daemon runtime: construct the configured providers, open
     /// the cache + tap log, assemble the [`Datamancer`], and retain the tap-log
     /// `Arc` so the shutdown path can flush it (the builder takes ownership, so
@@ -639,14 +665,30 @@ pub struct BuiltRuntime {
     pub tap_log: Option<std::sync::Arc<dyn datamancer::TapLog>>,
 }
 
+/// Resolve the on-disk path for a `surreal-embedded` backend: the explicit
+/// `path`, or the platform-native data dir under `subdir` when omitted. The
+/// embedded storage engine (`SurrealKV`) creates the directory if absent, so the
+/// default path behaves exactly like an explicit one — no scaffolding here.
+///
+/// The only remaining failure is a headless host with no derivable home
+/// directory; there the operator must set `path` explicitly.
+fn embedded_path(cfg: &StorageConfig, section: &str, subdir: &str) -> Result<PathBuf> {
+    if let Some(path) = &cfg.path {
+        return Ok(path.clone());
+    }
+    let dir = crate::paths::default_data_dir().ok_or_else(|| {
+        DaemonError::ConfigInvalid(format!(
+            "[{section}] surreal-embedded needs a `path`: no home directory to derive a default"
+        ))
+    })?;
+    Ok(dir.join(subdir))
+}
+
 fn storage_to_cache_config(cfg: &StorageConfig) -> Result<SurrealCacheConfig> {
     match cfg.backend {
         StorageBackend::SurrealMemory => Ok(SurrealCacheConfig::Memory),
         StorageBackend::SurrealEmbedded => {
-            let path = cfg.path.as_ref().ok_or_else(|| {
-                DaemonError::ConfigInvalid("[cache] surreal-embedded requires `path`".to_string())
-            })?;
-            Ok(SurrealCacheConfig::embedded(path))
+            Ok(SurrealCacheConfig::embedded(embedded_path(cfg, "cache", "cache")?))
         }
     }
 }
@@ -654,12 +696,9 @@ fn storage_to_cache_config(cfg: &StorageConfig) -> Result<SurrealCacheConfig> {
 fn storage_to_tap_config(cfg: &StorageConfig) -> Result<SurrealTapLogConfig> {
     match cfg.backend {
         StorageBackend::SurrealMemory => Ok(SurrealTapLogConfig::Memory),
-        StorageBackend::SurrealEmbedded => {
-            let path = cfg.path.as_ref().ok_or_else(|| {
-                DaemonError::ConfigInvalid("[tap_log] surreal-embedded requires `path`".to_string())
-            })?;
-            Ok(SurrealTapLogConfig::embedded(path))
-        }
+        StorageBackend::SurrealEmbedded => Ok(SurrealTapLogConfig::embedded(embedded_path(
+            cfg, "tap_log", "taplog",
+        )?)),
     }
 }
 
@@ -684,6 +723,83 @@ account_type = "paper"
         assert_eq!(config.server.service_prefix, "datamancerd");
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.diagnostics.publish_interval_ms, 1000);
+    }
+
+    #[test]
+    fn embedded_path_uses_explicit_when_present() {
+        let cfg = StorageConfig {
+            backend: StorageBackend::SurrealEmbedded,
+            path: Some(PathBuf::from("/tmp/explicit-cache")),
+        };
+        let path = embedded_path(&cfg, "cache", "cache").expect("explicit path");
+        assert_eq!(path, PathBuf::from("/tmp/explicit-cache"));
+    }
+
+    #[test]
+    fn embedded_path_defaults_to_platform_data_dir() {
+        let cfg = StorageConfig {
+            backend: StorageBackend::SurrealEmbedded,
+            path: None,
+        };
+        // Home dir exists in the test env, so a default is derivable.
+        let cache = embedded_path(&cfg, "cache", "cache").expect("default cache path");
+        let tap = embedded_path(&cfg, "tap_log", "taplog").expect("default tap path");
+        let data_dir = crate::paths::default_data_dir().expect("data dir");
+        assert_eq!(cache, data_dir.join("cache"));
+        assert_eq!(tap, data_dir.join("taplog"));
+        // The two backends never share a directory.
+        assert_ne!(cache, tap);
+    }
+
+    #[test]
+    fn embedded_config_omitting_path_builds_default() {
+        // A `[cache]`/`[tap_log]` with no `path` must resolve, not error —
+        // enabling caching should never make the server impossible to start.
+        let cfg = StorageConfig {
+            backend: StorageBackend::SurrealEmbedded,
+            path: None,
+        };
+        storage_to_cache_config(&cfg).expect("cache config resolves without explicit path");
+        storage_to_tap_config(&cfg).expect("tap config resolves without explicit path");
+    }
+
+    /// Pins the `EventKindCfg` wire form consumed by the `/config` settings
+    /// page's JS `KINDS` constant (`crates/datamancerd/src/web/settings.rs`):
+    /// `snake_case` does **not** insert an underscore before a leading digit.
+    #[test]
+    fn event_kind_wire_values() {
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Trade).unwrap(),
+            "\"trade\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Quote).unwrap(),
+            "\"quote\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar1s).unwrap(),
+            "\"bar1s\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar1m).unwrap(),
+            "\"bar1m\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar5m).unwrap(),
+            "\"bar5m\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar15m).unwrap(),
+            "\"bar15m\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar1h).unwrap(),
+            "\"bar1h\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventKindCfg::Bar1d).unwrap(),
+            "\"bar1d\""
+        );
     }
 
     #[test]
@@ -866,5 +982,109 @@ account_type = "paper"
 bogus = true
 "#;
         assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn save_writes_atomically_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let config = Config::parse(FULL).expect("parse");
+        config.save(&path).expect("save");
+        let loaded = Config::load(&path).expect("load");
+        assert_eq!(config, loaded);
+        // No temp droppings left behind.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.toml")]);
+    }
+
+    #[test]
+    fn save_rejects_invalid_config_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // No provider configured -> validation failure.
+        let config = Config::parse("[provider]\n").expect("parse");
+        let err = config.save(&path).expect_err("must reject");
+        assert!(matches!(err, DaemonError::ConfigInvalid(_)));
+        assert!(!path.exists(), "invalid config must not be written");
+    }
+
+    const FULL: &str = r#"
+[provider.alpaca]
+account_type = "paper"
+
+[provider.alpaca_crypto]
+account_type = "live"
+venue = "us_kraken"
+
+[cache]
+backend = "surreal-embedded"
+path = "/tmp/dmc-cache"
+
+[tap_log]
+backend = "surreal-memory"
+
+[session]
+resume_buffer_events = 1024
+adjustment = "split"
+
+[server]
+admin_socket = "/tmp/dmc/admin.sock"
+service_prefix = "dmc"
+shutdown_timeout_secs = 5
+
+[diagnostics]
+publish_interval_ms = 500
+cache_catalog_interval_ms = 10000
+
+[iceoryx2]
+max_clients = 8
+
+[web_ui]
+enabled = true
+bind = "127.0.0.1"
+port = 8091
+
+[[startup_session]]
+provider = "alpaca-crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+scope = "live_backfill"
+backfill_from = "2026-06-01T00:00:00Z"
+persistence = "cached_with_tap"
+always_on = true
+"#;
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let config = Config::parse(FULL).expect("parse");
+        config.validate().expect("validate");
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        let back = Config::parse(&text).expect("reparse");
+        assert_eq!(config, back);
+    }
+
+    #[test]
+    fn minimal_config_round_trips_without_none_fields() {
+        // `None` options must be skipped, not serialized (TOML has no null).
+        let config = Config::parse(MINIMAL).expect("parse");
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        assert!(
+            !text.contains("[cache]"),
+            "absent [cache] must not serialize: {text}"
+        );
+        assert!(
+            !text.contains("[tap_log]"),
+            "absent [tap_log] must not serialize: {text}"
+        );
+        assert!(
+            !text.contains("[web_ui]"),
+            "absent [web_ui] must not serialize: {text}"
+        );
+        let back = Config::parse(&text).expect("reparse");
+        assert_eq!(config, back);
     }
 }

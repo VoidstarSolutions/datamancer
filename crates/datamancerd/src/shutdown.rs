@@ -131,7 +131,8 @@ mod tests {
             &self.name
         }
         async fn close(&mut self) {
-            self.recorder.record(format!("session-closed:{}", self.name));
+            self.recorder
+                .record(format!("session-closed:{}", self.name));
         }
         async fn flush_sink(&self) {
             self.recorder.record(format!("sink-flushed:{}", self.name));
