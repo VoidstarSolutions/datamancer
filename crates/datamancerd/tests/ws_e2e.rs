@@ -338,16 +338,35 @@ async fn correct_bearer_token_is_accepted() {
 /// therefore (a) pin `channel_depth = 1` AND (b) connect with a tiny client
 /// `SO_RCVBUF` so only a handful of un-read event frames are needed to overrun —
 /// but it still requires SOME real Alpaca trades to arrive within the window.
-/// In a fully quiet market (no trades at all — e.g. the feed emitting only
-/// keepalive Pings) nothing overruns and this test will (correctly) not observe
-/// a teardown and thus FAIL; that is a market-data gap, not a code defect. Run
-/// during active market hours, consistent with how
-/// `subscribe_reply_echoes_id_and_snapshot_returns` depends on Alpaca. The
-/// bounded reads guarantee failure-not-hang either way.
+///
+/// To avoid a false FAIL on a quiet or light feed, this test first runs a
+/// bounded warm-up read phase after subscribing: it reads frames and COUNTS
+/// real event frames (an `EventFrame`-tagged object, i.e. one with a `"type"`
+/// field such as `"trade"`/`"quote"`/`"bar"` — as opposed to the subscribe's
+/// own `WsReply`, which has `"id"`/`"ok"` and no `"type"`). A single lone trade
+/// is NOT enough: forcing the depth-1 channel + tiny rcvbuf to overrun needs a
+/// SUSTAINED burst, so the warm-up must observe at least
+/// `MIN_EVENTS_TO_PROVE_FLOW` events before the overrun assertion is trusted.
+/// If fewer arrive within the warm-up window, the feed is too light to force an
+/// overrun and this test soft-passes (prints an "inconclusive" message and
+/// returns) without asserting teardown — that is a market-data gap, not a code
+/// defect. Only once the feed is confirmed actively producing does the test
+/// stop reading and assert teardown within the bounded window; a regression
+/// that lets the connection stall while events are actively flowing now
+/// genuinely FAILS the test. The bounded reads guarantee failure-not-hang
+/// either way. Net: this test asserts teardown ONLY when market events are
+/// confirmed flowing fast enough to overrun; it soft-passes (inconclusive) on a
+/// quiet or light feed, so it never false-fails, and fails only if events were
+/// actively flowing AND the connection did not tear down.
 #[tokio::test]
 #[ignore = "spawns the binary; needs a live iceoryx2 runtime + live market activity; run with --ignored"]
 async fn slow_consumer_overrun_tears_down_connection() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    // A single lone trade does NOT prove the feed is producing fast enough to
+    // overrun the depth-1 channel + tiny rcvbuf; require a small sustained burst
+    // in warm-up before trusting the teardown assertion (else soft-pass).
+    const MIN_EVENTS_TO_PROVE_FLOW: usize = 10;
 
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -392,6 +411,41 @@ async fn slow_consumer_overrun_tears_down_connection() {
     .expect("send subscribe");
     let sub = read_reply(&mut ws, 1).await;
     assert_eq!(sub["ok"], serde_json::Value::Bool(true), "subscribe reply: {sub}");
+
+    // Bounded warm-up: keep reading (draining, so we don't overrun yet) and COUNT
+    // real event frames (an `EventFrame`-tagged object, i.e. one with a `"type"`
+    // field). The subscribe reply above (and any other control frame) has
+    // `"id"`/`"ok"` and no `"type"`, so it does not count. A single lone trade
+    // does NOT prove the feed is producing fast enough to overrun the depth-1
+    // channel + tiny rcvbuf, so we require a small SUSTAINED burst before trusting
+    // the overrun assertion; a quiet or light feed (fewer events) soft-passes
+    // rather than false-failing.
+    let warmup_deadline = Instant::now() + Duration::from_secs(15);
+    let mut events_seen = 0usize;
+    while events_seen < MIN_EVENTS_TO_PROVE_FLOW && Instant::now() < warmup_deadline {
+        let remaining = warmup_deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
+                    && v.get("type").is_some()
+                {
+                    events_seen += 1;
+                }
+            }
+            Ok(Some(Ok(_))) => {} // other frame kinds (ping/etc.); keep reading
+            // Connection ended during warm-up, or the warm-up window elapsed.
+            Ok(Some(Err(_)) | None) | Err(_) => break,
+        }
+    }
+    if events_seen < MIN_EVENTS_TO_PROVE_FLOW {
+        eprintln!(
+            "inconclusive: only {events_seen} market event(s) in warm-up window \
+             (need {MIN_EVENTS_TO_PROVE_FLOW} to force overrun); skipping overrun assertion"
+        );
+        child.kill().expect("kill");
+        let _ = child.wait();
+        return;
+    }
 
     // Deliberately stop reading for a beat so the pump fills the depth-1 channel
     // and hits `Rejected`, cancelling the read loop into teardown.
