@@ -23,6 +23,16 @@ and a first-run setup flow with secure provider-key storage.
 | Release tooling | `cargo-dist` (installers, artifacts, `axoupdater` auto-update) + `release-plz` (crates.io publishing, changelogs, version bumps, semver gating) |
 | Versioning | Stays 0.x; `cargo-semver-checks` enforces compatibility within 0.x minor lines |
 
+## Amendment (2026-07-03, post-SP1-Task-4)
+
+The SP1 license gate found SurrealDB is BUSL-1.1 (source-available) as a
+direct default dependency, plus two surrealdb-rooted advisories with no
+upstream fix. Decision: replace the storage backend with Turso — see
+`2026-07-03-turso-storage-design.md`. That port runs as **SP6**, sequenced
+after SP1 and before SP5 (the public repo never ships a BUSL tree).
+`deny.toml` carries clearly-marked transitional exceptions until then.
+MPL-2.0 is allowed for dependencies (file-level copyleft, unmodified use).
+
 ## Sub-projects and ordering
 
 Each is its own spec → plan → implementation cycle. Order is load-bearing at
