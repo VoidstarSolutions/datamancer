@@ -14,9 +14,6 @@ use crate::config::{AssetClassCfg, EventKindCfg};
 use crate::control::{SubscriptionSpec, error_code};
 
 /// A WS control request (one JSON text frame).
-// Not yet consumed outside tests; the listener/bridge task (Task 6) wires this
-// into `ClientSession`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum WsRequest {
@@ -40,7 +37,6 @@ pub enum WsRequest {
     CloseClient { id: u64 },
 }
 
-#[allow(dead_code)]
 impl WsRequest {
     /// The correlation id carried by every request.
     #[must_use]
@@ -55,7 +51,6 @@ impl WsRequest {
 }
 
 /// A WS control reply (one JSON text frame), echoing the request `id`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WsReply {
     pub id: u64,
@@ -68,7 +63,6 @@ pub struct WsReply {
     pub snapshot: Option<SystemSnapshot>,
 }
 
-#[allow(dead_code)]
 impl WsReply {
     #[must_use]
     pub fn ok(id: u64) -> Self {

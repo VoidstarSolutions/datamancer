@@ -4,9 +4,9 @@
 //! `datamancer-transport-ws` crate; this module owns the part that touches the
 //! orchestrator (`ClientSession`).
 
+mod conn;
+mod listener;
 mod protocol;
 
-// Not yet consumed outside tests; the listener/bridge task (Task 6) wires
-// these into `ClientSession`.
-#[allow(unused_imports)]
+pub use listener::serve;
 pub use protocol::{WsReply, WsRequest};

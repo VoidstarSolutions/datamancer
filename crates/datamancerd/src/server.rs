@@ -129,6 +129,10 @@ pub struct Server {
     /// the embedded HTTP introspection surface.
     #[cfg(feature = "web-ui")]
     web: Option<crate::config::WebUiConfig>,
+    /// Optional WS client-surface settings; `None` (or `enabled=false`) disables
+    /// the remote WebSocket listener.
+    #[cfg(feature = "ws")]
+    ws: Option<crate::config::WsConfig>,
     /// The web layer's handle to the on-disk config file (Phase 6 config API).
     #[cfg(feature = "web-ui")]
     config_state: crate::web::ConfigState,
@@ -154,6 +158,8 @@ impl Server {
 
         #[cfg(feature = "web-ui")]
         let web = config.web_ui.clone();
+        #[cfg(feature = "ws")]
+        let ws = config.ws.clone();
         #[cfg(feature = "web-ui")]
         let config_state = crate::web::ConfigState::new(config_path, config.clone());
         #[cfg(not(feature = "web-ui"))]
@@ -213,6 +219,8 @@ impl Server {
             diag_interval,
             #[cfg(feature = "web-ui")]
             web,
+            #[cfg(feature = "ws")]
+            ws,
             #[cfg(feature = "web-ui")]
             config_state,
             draining: false,
@@ -236,6 +244,9 @@ impl Server {
 
         #[cfg(feature = "web-ui")]
         let mut web_handles = self.start_web().await?;
+
+        #[cfg(feature = "ws")]
+        let (ws_task, ws_shutdown) = self.start_ws();
 
         tracing::info!(socket = %self.admin_socket.display(), "datamancerd listening");
 
@@ -266,6 +277,20 @@ impl Server {
         #[cfg(feature = "web-ui")]
         if let Some(handles) = web_handles.take() {
             handles.shutdown().await;
+        }
+
+        // Stop accepting new WS clients and let in-flight connections tear down.
+        #[cfg(feature = "ws")]
+        {
+            if let Some(trigger) = ws_shutdown {
+                let _ = trigger.send(());
+            }
+            if tokio::time::timeout(Duration::from_secs(5), ws_task)
+                .await
+                .is_err()
+            {
+                tracing::warn!("ws surface did not drain within timeout");
+            }
         }
 
         let recorder = DrainRecorder::default();
@@ -378,6 +403,30 @@ impl Server {
             shutdown,
             refreshers,
         }))
+    }
+
+    /// Start the WS client surface if enabled. Returns the serve task and its
+    /// shutdown trigger (both `None`-equivalent when disabled: a no-op task and a
+    /// dropped sender).
+    #[cfg(feature = "ws")]
+    fn start_ws(
+        &self,
+    ) -> (
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        Option<oneshot::Sender<()>>,
+    ) {
+        let Some(cfg) = self.ws.as_ref().filter(|w| w.enabled).cloned() else {
+            return (tokio::spawn(async { Ok(()) }), None);
+        };
+        let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+        let dm = self.dm.clone();
+        let task = tokio::spawn(async move {
+            crate::ws::serve(dm, cfg, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        (task, Some(shutdown))
     }
 
     fn bind_socket(&self) -> Result<UnixListener> {

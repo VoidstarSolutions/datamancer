@@ -21,8 +21,8 @@ web-ui = [
 # recorder installs without the UI; the `/metrics` route only registers when
 # `web-ui` is also enabled).
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
-# The remote WebSocket client surface. Extended with socket deps in the listener task.
-ws = []
+# The remote WebSocket client surface (second transport worked example).
+ws = ["dep:tokio-tungstenite", "datamancer/transport-ws"]
 
 [dependencies]
 datamancer = { path = "../datamancer", features = ["transport-iceoryx2"] }
@@ -46,6 +46,9 @@ tower = { version = "0.5", features = ["util"], optional = true }
 arc-swap = { version = "1", optional = true }
 maud = { version = "0.27", features = ["axum"], optional = true }
 tokio-stream = { workspace = true, optional = true }
+
+# WebSocket client surface (feature `ws`). Must match the transport-ws crate.
+tokio-tungstenite = { version = "0.29.0", optional = true }
 
 # Metrics (feature `metrics`).
 metrics = { version = "0.24", optional = true }
