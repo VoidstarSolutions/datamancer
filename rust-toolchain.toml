@@ -1,0 +1,6 @@
+# Pins the toolchain for every contributor and CI runner: rustfmt and clippy
+# output must agree byte-for-byte between local runs and the pipeline.
+# Bump deliberately (a PR that updates this file and fixes any new lints).
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]

@@ -638,8 +638,7 @@ impl SurrealCache {
         // a boundary.
         let mut total: u64 = 0;
         for &(seg_from, seg_to) in &doc.segments {
-            total =
-                total.saturating_add(self.count_events_in(key, seg_from, seg_to).await?);
+            total = total.saturating_add(self.count_events_in(key, seg_from, seg_to).await?);
         }
         doc.event_count = total;
         // Record the asset class so the catalog can reconstruct a faithful

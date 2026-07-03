@@ -124,7 +124,11 @@ fn control_to_wire(c: &Control) -> Option<EventFrame> {
         ControlKind::ProviderConnected { .. }
         | ControlKind::ProviderDisconnected { .. }
         | ControlKind::ProviderError { .. } => None,
-        ControlKind::Gap { provider, instrument, span } => Some(EventFrame::Gap {
+        ControlKind::Gap {
+            provider,
+            instrument,
+            span,
+        } => Some(EventFrame::Gap {
             instrument: instrument.clone(),
             provider: provider.clone(),
             seq: c.seq,
@@ -133,17 +137,20 @@ fn control_to_wire(c: &Control) -> Option<EventFrame> {
             from_source_ts: span.from_source_ts,
             to_source_ts: span.to_source_ts,
         }),
-        ControlKind::SubscriptionChanged { provider, instrument, kind, active } => {
-            Some(EventFrame::SubscriptionChanged {
-                instrument: instrument.clone(),
-                provider: provider.clone(),
-                kind: *kind,
-                active: *active,
-                seq: c.seq,
-                source_ts: c.source_ts,
-                rx_ts: c.rx_ts,
-            })
-        }
+        ControlKind::SubscriptionChanged {
+            provider,
+            instrument,
+            kind,
+            active,
+        } => Some(EventFrame::SubscriptionChanged {
+            instrument: instrument.clone(),
+            provider: provider.clone(),
+            kind: *kind,
+            active: *active,
+            seq: c.seq,
+            source_ts: c.source_ts,
+            rx_ts: c.rx_ts,
+        }),
         ControlKind::SessionClosing => Some(EventFrame::SessionClosing {
             seq: c.seq,
             source_ts: c.source_ts,
@@ -156,30 +163,51 @@ fn control_to_wire(c: &Control) -> Option<EventFrame> {
 #[must_use]
 pub fn from_wire(f: &EventFrame) -> MarketEvent {
     match f {
-        EventFrame::Trade { instrument, seq, source_ts, rx_ts, price, size } => {
-            MarketEvent::Trade(Trade {
-                instrument: instrument.clone(),
-                source_ts: *source_ts,
-                rx_ts: *rx_ts,
-                seq: *seq,
-                price: Price(*price),
-                size: *size,
-            })
-        }
-        EventFrame::Quote { instrument, seq, source_ts, rx_ts, bid, bid_size, ask, ask_size } => {
-            MarketEvent::Quote(Quote {
-                instrument: instrument.clone(),
-                source_ts: *source_ts,
-                rx_ts: *rx_ts,
-                seq: *seq,
-                bid: Price(*bid),
-                bid_size: *bid_size,
-                ask: Price(*ask),
-                ask_size: *ask_size,
-            })
-        }
+        EventFrame::Trade {
+            instrument,
+            seq,
+            source_ts,
+            rx_ts,
+            price,
+            size,
+        } => MarketEvent::Trade(Trade {
+            instrument: instrument.clone(),
+            source_ts: *source_ts,
+            rx_ts: *rx_ts,
+            seq: *seq,
+            price: Price(*price),
+            size: *size,
+        }),
+        EventFrame::Quote {
+            instrument,
+            seq,
+            source_ts,
+            rx_ts,
+            bid,
+            bid_size,
+            ask,
+            ask_size,
+        } => MarketEvent::Quote(Quote {
+            instrument: instrument.clone(),
+            source_ts: *source_ts,
+            rx_ts: *rx_ts,
+            seq: *seq,
+            bid: Price(*bid),
+            bid_size: *bid_size,
+            ask: Price(*ask),
+            ask_size: *ask_size,
+        }),
         EventFrame::Bar {
-            instrument, interval, seq, source_ts, rx_ts, open, high, low, close, volume,
+            instrument,
+            interval,
+            seq,
+            source_ts,
+            rx_ts,
+            open,
+            high,
+            low,
+            close,
+            volume,
         } => MarketEvent::Bar(Bar {
             instrument: instrument.clone(),
             interval: *interval,
@@ -192,37 +220,70 @@ pub fn from_wire(f: &EventFrame) -> MarketEvent {
             close: Price(*close),
             volume: *volume,
         }),
-        EventFrame::Gap { instrument, provider, seq, source_ts, rx_ts, from_source_ts, to_source_ts } => {
-            MarketEvent::Control(Control {
-                source_ts: *source_ts,
-                rx_ts: *rx_ts,
-                seq: *seq,
-                kind: ControlKind::Gap {
-                    provider: provider.clone(),
-                    instrument: instrument.clone(),
-                    span: GapSpan { from_source_ts: *from_source_ts, to_source_ts: *to_source_ts },
+        frame @ (EventFrame::Gap { .. }
+        | EventFrame::SubscriptionChanged { .. }
+        | EventFrame::SessionClosing { .. }) => control_from_wire(frame),
+    }
+}
+
+/// Reconstruct the `Control` variants of [`from_wire`]. Split out purely to
+/// keep `from_wire` under clippy's `too_many_lines`; the two together form
+/// one exhaustive frame-to-event mapping.
+fn control_from_wire(frame: &EventFrame) -> MarketEvent {
+    match frame {
+        EventFrame::Gap {
+            instrument,
+            provider,
+            seq,
+            source_ts,
+            rx_ts,
+            from_source_ts,
+            to_source_ts,
+        } => MarketEvent::Control(Control {
+            source_ts: *source_ts,
+            rx_ts: *rx_ts,
+            seq: *seq,
+            kind: ControlKind::Gap {
+                provider: provider.clone(),
+                instrument: instrument.clone(),
+                span: GapSpan {
+                    from_source_ts: *from_source_ts,
+                    to_source_ts: *to_source_ts,
                 },
-            })
-        }
-        EventFrame::SubscriptionChanged { instrument, provider, kind, active, seq, source_ts, rx_ts } => {
-            MarketEvent::Control(Control {
-                source_ts: *source_ts,
-                rx_ts: *rx_ts,
-                seq: *seq,
-                kind: ControlKind::SubscriptionChanged {
-                    provider: provider.clone(),
-                    instrument: instrument.clone(),
-                    kind: *kind,
-                    active: *active,
-                },
-            })
-        }
-        EventFrame::SessionClosing { seq, source_ts, rx_ts } => MarketEvent::Control(Control {
+            },
+        }),
+        EventFrame::SubscriptionChanged {
+            instrument,
+            provider,
+            kind,
+            active,
+            seq,
+            source_ts,
+            rx_ts,
+        } => MarketEvent::Control(Control {
+            source_ts: *source_ts,
+            rx_ts: *rx_ts,
+            seq: *seq,
+            kind: ControlKind::SubscriptionChanged {
+                provider: provider.clone(),
+                instrument: instrument.clone(),
+                kind: *kind,
+                active: *active,
+            },
+        }),
+        EventFrame::SessionClosing {
+            seq,
+            source_ts,
+            rx_ts,
+        } => MarketEvent::Control(Control {
             source_ts: *source_ts,
             rx_ts: *rx_ts,
             seq: *seq,
             kind: ControlKind::SessionClosing,
         }),
+        EventFrame::Trade { .. } | EventFrame::Quote { .. } | EventFrame::Bar { .. } => {
+            unreachable!("data variants are handled by from_wire before dispatch")
+        }
     }
 }
 
@@ -235,7 +296,11 @@ mod tests {
     };
 
     fn inst(symbol: &str) -> Instrument {
-        Instrument::new(ProviderId::from_static("alpaca"), AssetClass::Crypto, symbol)
+        Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Crypto,
+            symbol,
+        )
     }
 
     fn round_trip(ev: &MarketEvent) -> MarketEvent {
@@ -308,7 +373,10 @@ mod tests {
             kind: ControlKind::Gap {
                 provider: "alpaca".to_string(),
                 instrument: inst("BTC/USD"),
-                span: GapSpan { from_source_ts: Timestamp(100), to_source_ts: Timestamp(200) },
+                span: GapSpan {
+                    from_source_ts: Timestamp(100),
+                    to_source_ts: Timestamp(200),
+                },
             },
         });
         assert_eq!(round_trip(&ev), ev);
@@ -340,7 +408,10 @@ mod tests {
         });
         let frame = to_wire(&ev).expect("encodable");
         let json = serde_json::to_string(&frame).expect("ser");
-        assert!(json.contains("18446744073709551615"), "SYNTHETIC seq verbatim");
+        assert!(
+            json.contains("18446744073709551615"),
+            "SYNTHETIC seq verbatim"
+        );
         assert_eq!(round_trip(&ev), ev);
     }
 
@@ -355,7 +426,9 @@ mod tests {
             size: 1,
         });
         let back = round_trip(&ev);
-        let MarketEvent::Trade(t) = back else { panic!("wrong variant") };
+        let MarketEvent::Trade(t) = back else {
+            panic!("wrong variant")
+        };
         assert_eq!(t.rx_ts, Timestamp(999_999));
         assert_ne!(t.rx_ts, t.source_ts);
     }
@@ -363,9 +436,17 @@ mod tests {
     #[test]
     fn connection_scoped_controls_are_suppressed() {
         for kind in [
-            ControlKind::ProviderConnected { provider: "alpaca".to_string() },
-            ControlKind::ProviderDisconnected { provider: "alpaca".to_string(), reason: "boom".to_string() },
-            ControlKind::ProviderError { provider: "alpaca".to_string(), message: "oops".to_string() },
+            ControlKind::ProviderConnected {
+                provider: "alpaca".to_string(),
+            },
+            ControlKind::ProviderDisconnected {
+                provider: "alpaca".to_string(),
+                reason: "boom".to_string(),
+            },
+            ControlKind::ProviderError {
+                provider: "alpaca".to_string(),
+                message: "oops".to_string(),
+            },
         ] {
             let ev = MarketEvent::Control(Control {
                 source_ts: Timestamp(1),
@@ -373,7 +454,10 @@ mod tests {
                 seq: Seq(3),
                 kind,
             });
-            assert!(to_wire(&ev).is_none(), "connection-scoped control suppressed");
+            assert!(
+                to_wire(&ev).is_none(),
+                "connection-scoped control suppressed"
+            );
         }
     }
 }

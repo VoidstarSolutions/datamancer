@@ -88,9 +88,7 @@ port = {port}
 /// Retry `connect_async` until the ws listener is up or the deadline elapses.
 async fn connect_when_ready(
     port: u16,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let url = format!("ws://127.0.0.1:{port}/");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -154,7 +152,11 @@ async fn subscribe_reply_echoes_id_and_snapshot_returns() {
     .expect("send subscribe");
     let sub = read_reply(&mut ws, 8).await;
     assert_eq!(sub["id"], 8);
-    assert_eq!(sub["ok"], serde_json::Value::Bool(true), "subscribe reply: {sub}");
+    assert_eq!(
+        sub["ok"],
+        serde_json::Value::Bool(true),
+        "subscribe reply: {sub}"
+    );
 
     // Close cleanly; the server tears down its side.
     let _ = ws.close(None).await;
@@ -186,7 +188,11 @@ async fn graceful_shutdown_closes_live_connection() {
     .await
     .expect("send subscribe");
     let sub = read_reply(&mut ws, 1).await;
-    assert_eq!(sub["ok"], serde_json::Value::Bool(true), "subscribe reply: {sub}");
+    assert_eq!(
+        sub["ok"],
+        serde_json::Value::Bool(true),
+        "subscribe reply: {sub}"
+    );
 
     // Graceful termination (NOT SIGKILL): the daemon must tear down live WS
     // connections on its drain path.
@@ -240,7 +246,10 @@ async fn graceful_shutdown_closes_live_connection() {
             }
         }
     };
-    assert!(status.success(), "daemon exited non-zero after SIGTERM: {status:?}");
+    assert!(
+        status.success(),
+        "daemon exited non-zero after SIGTERM: {status:?}"
+    );
 }
 
 #[tokio::test]
@@ -273,7 +282,10 @@ async fn missing_bearer_token_is_rejected() {
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
-    assert!(rejected, "server never rejected the unauthenticated handshake");
+    assert!(
+        rejected,
+        "server never rejected the unauthenticated handshake"
+    );
 
     child.kill().expect("kill");
     let _ = child.wait();
@@ -316,7 +328,11 @@ async fn correct_bearer_token_is_accepted() {
         .await
         .expect("send snapshot");
     let snap = read_reply(&mut ws, 3).await;
-    assert_eq!(snap["ok"], serde_json::Value::Bool(true), "snapshot reply: {snap}");
+    assert_eq!(
+        snap["ok"],
+        serde_json::Value::Bool(true),
+        "snapshot reply: {snap}"
+    );
     assert!(snap["snapshot"].is_object(), "expected snapshot object");
 
     let _ = ws.close(None).await;
@@ -410,7 +426,11 @@ async fn slow_consumer_overrun_tears_down_connection() {
     .await
     .expect("send subscribe");
     let sub = read_reply(&mut ws, 1).await;
-    assert_eq!(sub["ok"], serde_json::Value::Bool(true), "subscribe reply: {sub}");
+    assert_eq!(
+        sub["ok"],
+        serde_json::Value::Bool(true),
+        "subscribe reply: {sub}"
+    );
 
     // Bounded warm-up: keep reading (draining, so we don't overrun yet) and COUNT
     // real event frames (an `EventFrame`-tagged object, i.e. one with a `"type"`
@@ -465,7 +485,7 @@ async fn slow_consumer_overrun_tears_down_connection() {
                 break;
             }
             Ok(Some(Ok(_))) => {} // queued event/reply frame draining out; keep reading
-            Err(_) => break, // per-read timeout; fall through to overall deadline
+            Err(_) => break,      // per-read timeout; fall through to overall deadline
         }
     }
     assert!(

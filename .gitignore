@@ -3,3 +3,5 @@ target/
 .omniscient/
 .claude/
 .datamancerd/
+
+omniscient.toml

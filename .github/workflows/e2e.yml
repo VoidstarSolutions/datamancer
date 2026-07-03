@@ -1,0 +1,54 @@
+name: e2e
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # nightly, off the top-of-hour rush
+  pull_request:
+    types: [labeled, synchronize]
+
+concurrency:
+  # Repo-global queue, not per-ref: the contended resource is the single
+  # Alpaca paper connection, not the ref. This serializes the nightly run
+  # against any labeled-PR runs; no cancel-in-progress so a label run can't
+  # kill the nightly signal (or vice versa).
+  group: e2e-live
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live:
+    # Nightly always; on PRs only when labeled 'run-e2e'.
+    if: >-
+      github.event_name == 'schedule' ||
+      contains(github.event.pull_request.labels.*.name, 'run-e2e')
+    name: live daemon e2e (iceoryx2 + ws)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Live Alpaca paper credentials; the suites soft-gate on quiet feeds but
+      # the daemon cannot start the alpaca_crypto provider without keys. These
+      # are the exact env-var names `oxidized_alpaca`'s `AccountType::Paper`
+      # path reads (see oxidized-alpaca/src/env.rs), not the generic
+      # `APCA_API_*` names used elsewhere in the Alpaca ecosystem.
+      ALPACA_PAPER_API_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+      ALPACA_PAPER_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: fail fast when secrets are absent
+        run: |
+          if [ -z "$ALPACA_PAPER_API_KEY_ID" ]; then
+            echo "::error::ALPACA_KEY_ID secret not configured - live e2e cannot run"
+            exit 1
+          fi
+          if [ -z "$ALPACA_PAPER_API_SECRET_KEY" ]; then
+            echo "::error::ALPACA_SECRET_KEY secret not configured - live e2e cannot run"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: daemon e2e
+        run: cargo test -p datamancerd --all-features --test daemon_e2e -- --ignored
+      - name: client transport e2e
+        run: cargo test -p datamancerd --all-features --test client_transport_e2e -- --ignored

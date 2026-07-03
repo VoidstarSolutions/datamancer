@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One in-flight run per ref: a force-push cancels the stale run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: fmt + clippy + tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # Reads rust-toolchain.toml; the @stable ref is the action version,
+      # not the toolchain choice.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy (pedantic, all targets, all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: tests (all features)
+        run: cargo test --workspace --all-features
+
+  features:
+    name: feature matrix (cargo-hack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: check each feature in isolation
+        run: cargo hack check --each-feature --no-dev-deps --workspace
+
+  gates:
+    name: licenses + advisories + semver
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # semver step (next task) diffs against the PR base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny (licenses, advisories, sources)
+        run: cargo deny check
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: semver checks vs PR base
+        # Only meaningful against a diff target; on main pushes the gate
+        # already ran on the PR that merged.
+        if: github.event_name == 'pull_request'
+        run: .github/scripts/semver-checks.sh "origin/${{ github.base_ref }}"
+
+  windows:
+    # The support boundary, enforced: Windows gets the ws transport and the
+    # ws-featured client ONLY. The daemon (UDS control socket) and the
+    # iceoryx2 transport are POSIX; do not add them here - that is a porting
+    # decision, not a CI edit (see the open-sourcing design spec).
+    name: ws-portable subset (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build + test the portable subset
+        run: cargo test -p datamancer-transport-ws -p datamancer-client --features datamancer-client/ws

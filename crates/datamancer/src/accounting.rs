@@ -144,11 +144,11 @@ impl ProviderAccounting {
     /// One authoritative connection for this provider went down. Call once per
     /// down transition (saturating, so a stray disconnect never underflows).
     pub(crate) fn record_connection_down(&self) {
-        let _ = self.active_connections.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |n| Some(n.saturating_sub(1)),
-        );
+        let _ = self
+            .active_connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 }
 

@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 
 use datamancer::providers::AccountType;
 use datamancer::{
-    Adjustment, Datamancer, Instrument, PersistenceOptions, ProviderId,
-    Scope, Timestamp,
+    Adjustment, Datamancer, Instrument, PersistenceOptions, ProviderId, Scope, Timestamp,
     providers::{
         AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue, AlpacaProvider,
         AlpacaProviderConfig,
@@ -342,7 +341,10 @@ impl std::fmt::Debug for WsConfig {
             .field("bind", &self.bind)
             .field("port", &self.port)
             // Presence, never the value.
-            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("channel_depth", &self.channel_depth)
             .field("max_connections", &self.max_connections)
             .field("keepalive_secs", &self.keepalive_secs)
@@ -687,9 +689,9 @@ fn embedded_path(cfg: &StorageConfig, section: &str, subdir: &str) -> Result<Pat
 fn storage_to_cache_config(cfg: &StorageConfig) -> Result<SurrealCacheConfig> {
     match cfg.backend {
         StorageBackend::SurrealMemory => Ok(SurrealCacheConfig::Memory),
-        StorageBackend::SurrealEmbedded => {
-            Ok(SurrealCacheConfig::embedded(embedded_path(cfg, "cache", "cache")?))
-        }
+        StorageBackend::SurrealEmbedded => Ok(SurrealCacheConfig::embedded(embedded_path(
+            cfg, "cache", "cache",
+        )?)),
     }
 }
 
