@@ -1,0 +1,52 @@
+# Dependency gates: licenses must stay permissive (the workspace itself is
+# MIT OR Apache-2.0), advisories must be triaged, sources must be crates.io.
+
+[graph]
+all-features = true
+
+[licenses]
+# Permissive-only allowlist. Extending it with another PERMISSIVE license
+# (BSD-family, ISC, Zlib, Unicode) is routine; adding any copyleft or
+# source-available license (GPL/AGPL/LGPL/MPL/BUSL/SSPL) is a project
+# decision - stop and raise it, do not just append.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "0BSD",                # enum-iterator, enum-iterator-derive (via iceoryx2-bb-posix)
+    "Unlicense",            # ext-sort (via surrealdb-core)
+    "CDLA-Permissive-2.0",  # webpki-root-certs (via rustls-platform-verifier -> reqwest -> oxidized_alpaca)
+    "BSL-1.0",              # xxhash-rust (via surrealkv -> surrealdb-core); Boost Software License, permissive - do not confuse with BUSL-1.1
+]
+
+# NOTE: BUSL-1.1 (surrealdb, surrealdb-core, surrealdb-types, surrealdb-protocol)
+# and MPL-2.0 (cssparser, dtoa-short via ammonia; option-ext via directories)
+# are deliberately NOT in the allow list above: they are source-available/
+# copyleft and require a project-level decision, not a config edit. See
+# .superpowers/sdd/task-4-report.md for the full dependency chains.
+# `cargo deny check` is expected to fail on these until that decision is made.
+
+[licenses.private]
+# The three unpublished workspace binaries/libs (publish = false) don't carry
+# a license field yet; workspace licensing lands in a separate sub-project.
+# Skip license enforcement for local, unpublished workspace members only -
+# this does not affect any third-party dependency.
+ignore = true
+
+[advisories]
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/VoidstarSolutions/oxidized-alpaca", # datamancer's own Alpaca provider fork, not yet published to crates.io
+]

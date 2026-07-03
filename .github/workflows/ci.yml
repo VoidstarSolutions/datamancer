@@ -42,3 +42,18 @@ jobs:
           tool: cargo-hack
       - name: check each feature in isolation
         run: cargo hack check --each-feature --no-dev-deps --workspace
+
+  gates:
+    name: licenses + advisories + semver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # semver step (next task) diffs against the PR base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny (licenses, advisories, sources)
+        run: cargo deny check
