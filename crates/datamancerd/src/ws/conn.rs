@@ -66,7 +66,12 @@ pub async fn handle_connection(
             return;
         }
     };
-    let pump = spawn_pump(stream, sink);
+    // Per-connection cancel: the pump signals this on slow-consumer overrun so the
+    // read loop breaks into the shared teardown path (tearing the socket down)
+    // rather than leaving the connection silently stalled. `notify_one` stores a
+    // permit, so a `notified()` that races after the signal still completes.
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let pump = spawn_pump(stream, sink, Arc::clone(&cancel));
 
     // Control loop: read frames, dispatch against the session, reply on `tx`.
     // Also select on the daemon-wide shutdown signal so graceful drain triggers
@@ -79,6 +84,13 @@ pub async fn handle_connection(
             // down now": break to the shared teardown path below.
             _ = shutdown.recv() => {
                 drained = true;
+                break;
+            }
+            // The pump hit slow-consumer overrun (bounded outbound channel full):
+            // tear the connection down via the shared teardown path instead of
+            // leaving the client silently stalled.
+            () = cancel.notified() => {
+                tracing::warn!(%peer, "ws slow consumer overran outbound channel; tearing down");
                 break;
             }
             msg = read.next() => match msg {
@@ -133,11 +145,15 @@ async fn accept_with_auth(
 ) -> Result<WebSocketStream<TcpStream>, tokio_tungstenite::tungstenite::Error> {
     tokio_tungstenite::accept_hdr_async(tcp, move |req: &HsRequest, resp: HsResponse| {
         if let Some(expected) = auth_token.as_ref() {
+            // RFC 7235 auth schemes are case-insensitive, so match "Bearer"
+            // ignoring case; the token value itself is compared exactly.
             let presented = req
                 .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "));
+                .and_then(|v| v.split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+                .map(|(_, token)| token);
             if presented != Some(expected.as_str()) {
                 let mut err = ErrorResponse::new(Some("missing or invalid bearer token".into()));
                 *err.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
@@ -209,10 +225,13 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
 }
 
 /// Pump the client's multiplexed stream into the WS sink, in arrival order.
-/// Stops when the stream ends or the sink rejects (slow-consumer overrun).
+/// Stops when the stream ends or the sink rejects (slow-consumer overrun). On
+/// overrun it signals `cancel` so the read loop runs the shared teardown path
+/// (lossy-on-overrun by disconnection, never silent drop).
 fn spawn_pump(
     mut stream: datamancer::EventStream,
     sink: Arc<dyn EventSink>,
+    cancel: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(ev) = stream.next().await {
@@ -220,6 +239,7 @@ fn spawn_pump(
                 PublishOutcome::Delivered => {}
                 PublishOutcome::Rejected(_) => {
                     tracing::warn!("ws sink rejected event (slow consumer); stopping pump");
+                    cancel.notify_one();
                     break;
                 }
             }

@@ -34,10 +34,25 @@ static DAEMON_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// Spawn the daemon from a written config file. Returns the child; the caller is
 /// responsible for waiting on WS readiness.
 fn spawn_daemon(dir: &std::path::Path, port: u16, auth_token: Option<&str>) -> Child {
+    spawn_daemon_full(dir, port, auth_token, None)
+}
+
+/// As `spawn_daemon`, but also lets the caller pin a tiny `[ws] channel_depth`
+/// (used by the overrun test to force slow-consumer backpressure quickly).
+fn spawn_daemon_full(
+    dir: &std::path::Path,
+    port: u16,
+    auth_token: Option<&str>,
+    channel_depth: Option<usize>,
+) -> Child {
     let socket = dir.join("admin.sock");
     let config_path = dir.join("datamancerd.toml");
     let auth_line = match auth_token {
         Some(t) => format!("auth_token = \"{t}\"\n"),
+        None => String::new(),
+    };
+    let depth_line = match channel_depth {
+        Some(d) => format!("channel_depth = {d}\n"),
         None => String::new(),
     };
     let config = format!(
@@ -57,7 +72,7 @@ publish_interval_ms = 200
 enabled = true
 bind = "127.0.0.1"
 port = {port}
-{auth_line}"#,
+{auth_line}{depth_line}"#,
         socket = socket.display(),
     );
     std::fs::write(&config_path, config).expect("write config");
@@ -259,6 +274,150 @@ async fn missing_bearer_token_is_rejected() {
         }
     }
     assert!(rejected, "server never rejected the unauthenticated handshake");
+
+    child.kill().expect("kill");
+    let _ = child.wait();
+}
+
+/// Happy-path auth: with a configured bearer token AND a correct
+/// `Authorization: Bearer secret` header, the upgrade succeeds and a `snapshot`
+/// request returns `ok`. Complements `missing_bearer_token_is_rejected` (reject
+/// path) by covering the accept path end-to-end.
+#[tokio::test]
+#[ignore = "spawns the binary; needs a live iceoryx2 runtime; run with --ignored"]
+async fn correct_bearer_token_is_accepted() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let _guard = DAEMON_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = 19014;
+    let mut child = spawn_daemon(dir.path(), port, Some("secret"));
+
+    // Retry the authenticated handshake until the listener is up (connection
+    // refused during boot is transient); a definite success ends the loop.
+    let url = format!("ws://127.0.0.1:{port}/");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ws = loop {
+        let mut request = url.as_str().into_client_request().expect("build request");
+        request
+            .headers_mut()
+            .insert("authorization", "Bearer secret".parse().expect("header"));
+        match connect_async(request).await {
+            Ok((ws, _resp)) => break ws,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("authenticated handshake never succeeded: {e}"),
+        }
+    };
+
+    // snapshot -> reply echoes id 3 with ok=true and a snapshot object.
+    ws.send(Message::text(r#"{"id":3,"op":"snapshot"}"#))
+        .await
+        .expect("send snapshot");
+    let snap = read_reply(&mut ws, 3).await;
+    assert_eq!(snap["ok"], serde_json::Value::Bool(true), "snapshot reply: {snap}");
+    assert!(snap["snapshot"].is_object(), "expected snapshot object");
+
+    let _ = ws.close(None).await;
+    child.kill().expect("kill");
+    let _ = child.wait();
+}
+
+/// Slow-consumer overrun tears the connection down (I-1). With a tiny
+/// `channel_depth = 1`, subscribing to an active symbol and then NOT reading
+/// fills the bounded outbound channel; the pump's `Rejected` must cancel the
+/// read loop, which runs the shared teardown and closes the socket. The client's
+/// read side must observe a Close / EOF / transport error within a bounded
+/// window — a regression that silently stalls would time out and FAIL.
+///
+/// MARKET-ACTIVITY DEPENDENCY (read before relying on this test): the daemon's
+/// outbound path is `pump -> bounded mpsc(channel_depth) -> writer -> TCP`. To
+/// force `Rejected`, the mpsc must stay full, which only happens once the
+/// client's TCP receive buffer is also full and back-pressures the writer. We
+/// therefore (a) pin `channel_depth = 1` AND (b) connect with a tiny client
+/// `SO_RCVBUF` so only a handful of un-read event frames are needed to overrun —
+/// but it still requires SOME real Alpaca trades to arrive within the window.
+/// In a fully quiet market (no trades at all — e.g. the feed emitting only
+/// keepalive Pings) nothing overruns and this test will (correctly) not observe
+/// a teardown and thus FAIL; that is a market-data gap, not a code defect. Run
+/// during active market hours, consistent with how
+/// `subscribe_reply_echoes_id_and_snapshot_returns` depends on Alpaca. The
+/// bounded reads guarantee failure-not-hang either way.
+#[tokio::test]
+#[ignore = "spawns the binary; needs a live iceoryx2 runtime + live market activity; run with --ignored"]
+async fn slow_consumer_overrun_tears_down_connection() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let _guard = DAEMON_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = 19015;
+    // Pin the outbound channel to depth 1 so minimal un-drained events overrun.
+    let mut child = spawn_daemon_full(dir.path(), port, None, Some(1));
+
+    // Connect with a tiny receive buffer so the client's TCP window fills after
+    // only a few un-read frames, back-pressuring the writer and overflowing the
+    // depth-1 mpsc quickly. Retry until the listener is up.
+    let sock_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ws = loop {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        let _ = socket.set_recv_buffer_size(2048); // best-effort; kernel clamps to its min
+        match socket.connect(sock_addr).await {
+            Ok(tcp) => {
+                let request = format!("ws://127.0.0.1:{port}/")
+                    .into_client_request()
+                    .expect("request");
+                match tokio_tungstenite::client_async(request, tcp).await {
+                    Ok((ws, _resp)) => break ws,
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => panic!("ws handshake never succeeded: {e}"),
+                }
+            }
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("tcp connect never succeeded: {e}"),
+        }
+    };
+
+    // Subscribe to an active paper symbol (same as the subscribe test), then stop
+    // reading so events queue and overrun the depth-1 channel.
+    ws.send(Message::text(
+        r#"{"id":1,"op":"subscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+    ))
+    .await
+    .expect("send subscribe");
+    let sub = read_reply(&mut ws, 1).await;
+    assert_eq!(sub["ok"], serde_json::Value::Bool(true), "subscribe reply: {sub}");
+
+    // Deliberately stop reading for a beat so the pump fills the depth-1 channel
+    // and hits `Rejected`, cancelling the read loop into teardown.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Now the server should be tearing us down: within ~15s the read side must
+    // see a Close frame, EOF (`None`), or a transport error. Each read is bounded
+    // so a regression (silent stall) FAILS here instead of hanging.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut torn_down = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            // Close frame, EOF, or a transport error as the peer goes away all
+            // mean the server tore the connection down rather than stalling.
+            Ok(Some(Ok(Message::Close(_)) | Err(_)) | None) => {
+                torn_down = true;
+                break;
+            }
+            Ok(Some(Ok(_))) => {} // queued event/reply frame draining out; keep reading
+            Err(_) => break, // per-read timeout; fall through to overall deadline
+        }
+    }
+    assert!(
+        torn_down,
+        "client never observed teardown after slow-consumer overrun (connection stalled)"
+    );
 
     child.kill().expect("kill");
     let _ = child.wait();
