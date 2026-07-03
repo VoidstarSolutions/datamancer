@@ -103,16 +103,23 @@ async fn run_reader(
 impl WsClient {
     async fn request(&mut self, req: &WsRequest) -> Result<WsReply, ClientError<WsClientError>> {
         let id = req.id();
+        // Serialize before registering: a codec failure must not leave a
+        // stale entry in `pending`.
+        let json = serde_json::to_string(req).map_err(WsClientError::from)?;
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
             .expect("pending poisoned")
             .insert(id, tx);
-        let json = serde_json::to_string(req).map_err(WsClientError::from)?;
-        self.write
-            .send(Message::Text(json.into()))
-            .await
-            .map_err(WsClientError::from)?;
+        if let Err(e) = self.write.send(Message::Text(json.into())).await {
+            // The request never reached the wire, so no reply will ever
+            // resolve this entry — and the reader task only clears the map
+            // when the *read* half dies. Remove it here or a half-open
+            // socket (write direction dead, read alive) leaks one sender
+            // per failed request.
+            self.pending.lock().expect("pending poisoned").remove(&id);
+            return Err(ClientError::Transport(WsClientError::from(e)));
+        }
         let reply = rx
             .await
             .map_err(|_| ClientError::Transport(WsClientError::ConnectionClosed))?;
@@ -414,5 +421,45 @@ mod tests {
         .await;
         let (client, _events) = WsClient::connect(cfg(url)).await.expect("connect");
         client.close().await.expect("close acked");
+    }
+
+    #[tokio::test]
+    async fn failed_send_does_not_leak_a_pending_entry() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let url = fake_server(|mut ws| async move {
+            let _ = ws.next().await;
+        })
+        .await;
+        // Hand-build a client whose write half is already closed and that has
+        // no reader task: the send fails deterministically, and nothing else
+        // can clean the pending map behind the request's back. This is the
+        // half-open shape (write direction dead, read direction alive) where
+        // a leaked entry would otherwise persist indefinitely.
+        let (ws, _resp) = tokio_tungstenite::connect_async(url.as_str())
+            .await
+            .unwrap();
+        let (mut write, read) = ws.split();
+        write.close().await.unwrap();
+        drop(read);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let mut client = WsClient {
+            write,
+            pending: Arc::clone(&pending),
+            next_id: 1,
+        };
+        let spec: SubscriptionSpec = serde_json::from_str(
+            r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+        )
+        .unwrap();
+        match client.subscribe(&spec).await {
+            Err(ClientError::Transport(_)) => {}
+            other => panic!("expected transport error, got {other:?}"),
+        }
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "failed send must remove its pending entry"
+        );
     }
 }
