@@ -17,6 +17,7 @@ mod error;
 mod event;
 mod instrument;
 mod price;
+mod quantity;
 mod snapshot;
 pub mod traits;
 
@@ -28,6 +29,7 @@ pub use event::{
 };
 pub use instrument::{AssetClass, Instrument, InstrumentInfo, ProviderId};
 pub use price::Price;
+pub use quantity::Quantity;
 pub use snapshot::{
     AuthoritativeSessionSnapshot, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
     ConnectionState, ProviderSnapshot, ResumeBufferSnapshot, SubscriptionRef, SystemSnapshot,

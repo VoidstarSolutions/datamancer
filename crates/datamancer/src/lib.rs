@@ -42,8 +42,8 @@ pub use datamancer_core::{
     CacheCoverage, CacheKey, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
     ConnectionState, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
     HistoryRequest, Instrument, InstrumentInfo, LiveHandle, MarketEvent, Price, Provider,
-    ProviderId, ProviderMetrics, ProviderSnapshot, Quote, ReplayRequest, ReplaySource, Result,
-    ResumeBufferSnapshot, Seq, SubscriptionRef, SystemSnapshot, TapLog, Timestamp, Trade,
+    ProviderId, ProviderMetrics, ProviderSnapshot, Quantity, Quote, ReplayRequest, ReplaySource,
+    Result, ResumeBufferSnapshot, Seq, SubscriptionRef, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 pub use session::{
     Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,
