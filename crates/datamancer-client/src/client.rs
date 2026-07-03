@@ -28,10 +28,13 @@ pub trait Client: Sized + Send {
     /// Per-transport connection parameters (URL/token vs socket-path/name).
     type Config;
     /// Transport-layer failure type. Control rejections are **not** this —
-    /// they are [`ClientError::Control`].
-    type Error: std::error::Error + Send + 'static;
-    /// The multiplexed event stream, yielded in delivery order.
-    type Events: Stream<Item = MarketEvent> + Send + Unpin;
+    /// they are [`ClientError::Control`]. `Sync` so generic consumers can
+    /// convert into `anyhow::Error`/`Box<dyn Error + Send + Sync>`.
+    type Error: std::error::Error + Send + Sync + 'static;
+    /// The multiplexed event stream, yielded in delivery order. `'static` so
+    /// generic consumers can `tokio::spawn` the drain task — the point of
+    /// the split `(handle, events)` pair.
+    type Events: Stream<Item = MarketEvent> + Send + Unpin + 'static;
 
     /// Connect and return the split pair: the control handle and the owned
     /// event stream, separate values so a consumer can drain events while

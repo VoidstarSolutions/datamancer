@@ -20,7 +20,7 @@
 //!   market-data-availability gap, not a code defect;
 //! - the `SessionClosing`-before-stream-end assert is relaxed to
 //!   "best-effort, always checked, never hard-failed" for the iceoryx2
-//!   transport specifically. `iox2.rs`'s own `Client::close` doc records a
+//!   transport specifically. `iceoryx2.rs`'s own `Client::close` doc records a
 //!   known race: the poll loop can observe the shared-memory service go away
 //!   (ending the stream) before it drains the daemon's final `SessionClosing`
 //!   sample, because the transport is same-host shared-memory rather than a
@@ -84,7 +84,7 @@ impl Drop for DaemonHandle {
 /// surfaces are reachable.
 ///
 /// `service_prefix` uses this file's own distinct value (as the other e2e
-/// files each do); `datamancer_client::iox2::parse_client_id` extracts the
+/// files each do); `datamancer_client::iceoryx2::parse_client_id` extracts the
 /// client id from the trailing `/data/{id}` segments of the `open-client`
 /// reply's service name regardless of the configured prefix, so no
 /// particular prefix value is required here.
@@ -160,7 +160,7 @@ port = {ws_port}
 /// the concrete transport chosen only by the type parameter.
 ///
 /// `tolerate_missed_closing`: iceoryx2-only escape hatch for the documented
-/// race in `iox2.rs`'s `Client::close` (the poll loop can observe the shared
+/// race in `iceoryx2.rs`'s `Client::close` (the poll loop can observe the shared
 /// memory service go away before draining the final `SessionClosing` sample);
 /// the WS transport has no such race and always passes `false`.
 async fn exercise<C: Client>(cfg: C::Config, tolerate_missed_closing: bool) {
@@ -288,10 +288,10 @@ async fn iceoryx2_client_passes_the_exercise() {
     let dir = tempfile::tempdir().expect("tempdir");
     let daemon = spawn_daemon(dir.path(), 19022).await;
 
-    exercise::<datamancer_client::iox2::Iceoryx2Client>(
-        datamancer_client::iox2::Iceoryx2Config {
+    exercise::<datamancer_client::iceoryx2::Iceoryx2Client>(
+        datamancer_client::iceoryx2::Iceoryx2Config {
             control_socket: daemon.uds_path(),
-            client_name: "exercise-iox2".to_string(),
+            client_name: "exercise-iceoryx2".to_string(),
             poll_interval: Duration::from_millis(5),
             event_buffer: 256,
         },

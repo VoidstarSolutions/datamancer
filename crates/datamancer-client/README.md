@@ -67,7 +67,7 @@ written before the socket closes).
 
 ```rust,no_run
 use datamancer_client::{Client, spec::{AssetClassCfg, EventKindCfg, SubscriptionSpec}};
-use datamancer_client::iox2::{Iceoryx2Client, Iceoryx2Config};
+use datamancer_client::iceoryx2::{Iceoryx2Client, Iceoryx2Config};
 use futures::StreamExt as _;
 use std::time::Duration;
 
@@ -134,6 +134,20 @@ while let Some(event) = events.next().await {
 Both examples are the same shape by design: code written against `C: Client`
 is transport-agnostic; only `C::Config` (`Iceoryx2Config` vs `WsConfig`) and
 the `connect` call differ.
+
+When starting from discovery instead of a hand-written spec, use
+`SubscriptionSpec::new` to close the loop — it converts the core vocabulary
+`Client::instruments` returns into the wire vocabulary `subscribe` takes:
+
+```rust,ignore
+for info in client.instruments(None).await? {
+    for kind in info.kinds {
+        client
+            .subscribe(&SubscriptionSpec::new(&info.instrument, kind)?)
+            .await?;
+    }
+}
+```
 
 ## Honest scoping
 

@@ -4,7 +4,11 @@
 //! per-implementation `E`.
 
 /// Error from a [`crate::Client`] operation.
+///
+/// `#[non_exhaustive]`: future variants (e.g. a client-side timeout) must
+/// not be a breaking change for downstream `match` arms.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError<E: std::error::Error> {
     /// The daemon rejected the request. `code` is one of the stable
     /// [`crate::codes`] strings; identical across transports.
