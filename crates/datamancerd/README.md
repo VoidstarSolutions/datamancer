@@ -262,16 +262,93 @@ Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 `service_cap_exceeded`, `bad_request`, `shutting_down`, …). These are an
 operator contract and are regression-guarded.
 
+## WebSocket client surface (feature `ws`)
+
+An optional remote client transport: a TCP WebSocket listener where **one
+connection is one client** (no `open-client` request — connecting implicitly
+opens it). It reuses the UDS control vocabulary and `codes` table but is a
+genuinely separate, network-reachable, mutating surface from the loopback
+read-only web UI — treat its security posture independently. Gate it behind
+the `ws` cargo feature (off by default) and `[ws] enabled = true` in config.
+It is one of two worked client-transport examples alongside the iceoryx2 data
+plane; see `crates/datamancer-transport-ws/README.md` for the wire format.
+
+```toml
+[ws]                               # optional; requires the `ws` feature (off by default)
+enabled = false                    # off unless explicitly enabled
+bind = "127.0.0.1"                 # loopback default; can be bound off-loopback
+port = 9001
+auth_token = "change-me"           # optional shared bearer token; omit to disable auth
+channel_depth = 1024               # bounded per-connection outbound channel
+keepalive_secs = 30                # reserved; see caveat below
+```
+
+> **Security:** this surface is mutating (subscribe/unsubscribe/close-client)
+> and, unlike the web UI, may be bound off-loopback. `auth_token`, when set,
+> is checked as a bearer token at the WS handshake
+> (`Authorization: Bearer <token>`); a missing or wrong token gets an HTTP 401
+> before the WS upgrade completes. Running with no `auth_token` logs a
+> warning, louder when `bind` is not loopback (unauthenticated remote
+> access). TLS is **out of scope**: terminate it at a reverse proxy if the
+> deployment needs it. This is a worked example of a remote client surface,
+> not yet a hardened public endpoint.
+
+> **Operational note:** run at most **one** `datamancerd` per host. Two
+> daemons on the same host collide on the host-global diagnostics iceoryx2
+> single-publisher service regardless of whether `ws` is enabled — this is a
+> pre-existing daemon-wide constraint, not specific to the WS surface.
+
+`keepalive_secs` is **reserved**: the daemon does not currently send
+server-initiated pings. `tokio-tungstenite` auto-pongs inbound client pings,
+so a client that pings on its own schedule gets working keepalive today;
+server-initiated keepalive is not yet implemented.
+
+Control frames are JSON, tag field `op`, kebab-case, each carrying a
+correlation `id` that the reply echoes (there is no `client` field — the
+connection identifies the client):
+
+```jsonc
+{"id":1,"op":"subscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
+  -> {"id":1,"ok":true}
+{"id":2,"op":"snapshot"}
+  -> {"id":2,"ok":true,"snapshot":{ /* SystemSnapshot */ }}
+{"id":3,"op":"unsubscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
+{"id":4,"op":"close-client"}
+  -> {"id":4,"ok":true}
+```
+
+Errors reuse the **same stable `codes` table** as the UDS control surface
+(`{"id":5,"ok":false,"code":"unsupported_event_kind","message":"…"}`). Event
+frames (JSON, tag field `type`: `trade`/`quote`/`bar`/`gap`/
+`subscription_changed`/`session_closing`) and control replies share the one
+outbound socket, ordered by a single per-connection writer task — a client
+distinguishes them by the presence of `type` vs. `id`/`ok`. Connection-scoped
+controls (provider connect/disconnect/error) are **not** carried on the event
+stream; read connectivity via the `snapshot` reply instead.
+
+Backpressure is bounded and lossy-on-overrun **by disconnection**: if a remote
+consumer falls behind and the connection's outbound channel
+(`channel_depth`) fills, the connection is torn down rather than silently
+dropping frames on a live connection.
+
+Graceful daemon shutdown tears down live WS connections before the UDS-client
+drain: each connection's `session.close()` emits a terminal
+`session_closing` frame, the pump drains it under a bound, then the socket
+gets a clean WS Close frame — honoring the same tap-log-flush-before-drop
+ordering as every other consumer.
+
 ## Shutdown
 
 SIGTERM/SIGINT triggers a bounded, serialized drain: drain the web server (if
-enabled) → stop accepting control requests → stop the diagnostics ticker → per
-client close the session and drain its pump (so a terminal `SessionClosing`
-reaches the sink instead of being severed) → drop the startup anchors → **flush
-the tap log** (the durable record) → per client flush the sink → drop the
-clients/sinks. The web server is drained first so it stops reporting on a data
-plane about to be torn down; the tap log flushes **before** the best-effort
-per-client sink flushes (the load-bearing tap-log-before-sink-flush contract) so
-a stall in those best-effort steps cannot lose durable writes. The whole drain
-is bounded by `server.shutdown_timeout_secs` so a disk-stalled tap-log flush
-cannot hang shutdown forever (it is logged and the process force-exits).
+enabled) → **stop accepting new WS connections and tear down in-flight ones**
+(feature `ws`) → stop accepting control requests → stop the diagnostics ticker
+→ per client close the session and drain its pump (so a terminal
+`SessionClosing` reaches the sink instead of being severed) → drop the startup
+anchors → **flush the tap log** (the durable record) → per client flush the
+sink → drop the clients/sinks. The web server (and WS surface) are drained
+first so they stop reporting on / mutating a data plane about to be torn down;
+the tap log flushes **before** the best-effort per-client sink flushes (the
+load-bearing tap-log-before-sink-flush contract) so a stall in those
+best-effort steps cannot lose durable writes. The whole drain is bounded by
+`server.shutdown_timeout_secs` so a disk-stalled tap-log flush cannot hang
+shutdown forever (it is logged and the process force-exits).
