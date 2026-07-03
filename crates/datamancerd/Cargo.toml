@@ -21,6 +21,8 @@ web-ui = [
 # recorder installs without the UI; the `/metrics` route only registers when
 # `web-ui` is also enabled).
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+# The remote WebSocket client surface. Extended with socket deps in the listener task.
+ws = []
 
 [dependencies]
 datamancer = { path = "../datamancer", features = ["transport-iceoryx2"] }
