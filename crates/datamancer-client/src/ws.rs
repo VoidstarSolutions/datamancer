@@ -36,6 +36,14 @@ pub struct WsConfig {
     /// Bound on locally buffered, not-yet-consumed events. A consumer that
     /// falls behind past the daemon's own channel is disconnected by the
     /// daemon; this bound is the client-side mirror.
+    ///
+    /// When this buffer is full the reader stops draining the socket, which
+    /// **deliberately** propagates backpressure to the daemon (whose
+    /// slow-consumer disconnect is the documented loss contract) rather than
+    /// silently dropping events client-side. Control replies share the
+    /// socket, so a consumer that stops draining for long can also delay its
+    /// own in-flight control calls until the daemon disconnects it — size
+    /// this bound for the burstiest gap the consumer expects to absorb.
     pub event_buffer: usize,
 }
 

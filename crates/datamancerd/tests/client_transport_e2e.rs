@@ -192,9 +192,15 @@ async fn exercise<C: Client>(cfg: C::Config, tolerate_missed_closing: bool) {
         let remaining = warmup_deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, events.next()).await {
             Ok(Some(MarketEvent::Trade(t))) => {
+                // Against a live feed there is no ground truth for rx_ts, so
+                // this only proves the triple is populated with distinct
+                // values (i.e. rx_ts was not collapsed onto source_ts). The
+                // discriminating carried-verbatim check — full-event equality
+                // through the transport — lives in the deterministic ws unit
+                // test `subscribe_correlates_reply_and_events_flow`.
                 assert_ne!(
                     t.rx_ts, t.source_ts,
-                    "rx_ts must be carried, not synthesized"
+                    "rx_ts must not collapse onto source_ts"
                 );
                 saw_trade = true;
                 break;

@@ -114,8 +114,12 @@ pub enum PersistenceCfg {
 
 /// One target `(instrument, kind)` plus per-request scope/persistence
 /// preferences. Used by both `subscribe` and the `open-client` seed list.
+///
+/// No `deny_unknown_fields`: these structs are `#[serde(flatten)]`-ed into
+/// the request frames, and serde documents that combination as unsupported
+/// (the attribute was silently inert via `flatten`). Unknown-key rejection
+/// is the daemon's job — the UDS surface enforces it explicitly server-side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SubscriptionSpec {
     pub provider: String,
     pub asset_class: AssetClassCfg,
@@ -153,9 +157,9 @@ impl SubscriptionSpec {
 
 /// The `(provider, asset_class, symbol, kind)` tuple an `unsubscribe` names.
 /// Flattened into the request frame, so the wire shape is identical to the
-/// historical inline fields.
+/// historical inline fields. No `deny_unknown_fields` for the same reason as
+/// [`SubscriptionSpec`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UnsubscribeSpec {
     pub provider: String,
     pub asset_class: AssetClassCfg,

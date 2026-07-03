@@ -168,4 +168,4 @@ Compare the two before adding a third transport — a unified,
 runtime-selectable client is a natural future extraction once the shape of
 "second transport" is no longer theoretical.
 
-[`Client`]: https://docs.rs/datamancer-client/latest/datamancer_client/trait.Client.html
+[`Client`]: ./src/client.rs

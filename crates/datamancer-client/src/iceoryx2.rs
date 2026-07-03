@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use datamancer_core::{InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
 use datamancer_transport_iceoryx2::DataSubscriber;
-use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
+// `::` prefix: this module is itself named `iceoryx2`, so the extern crate is
+// named explicitly (bare paths here happen to resolve to the crate today, but
+// only because this module contains no item named `iceoryx2`).
+use ::iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
