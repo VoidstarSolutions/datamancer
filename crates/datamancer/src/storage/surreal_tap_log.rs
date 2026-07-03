@@ -30,7 +30,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use datamancer_core::{
     AssetClass, Bar, BarInterval, Error, EventKind, Instrument, MarketEvent, Price, ProviderId,
-    Quote, ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
+    Quantity, Quote, ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -89,7 +89,8 @@ struct TapTradeRow {
     source_ts: i64,
     rx_ts: i64,
     price_raw: i64,
-    size: u64,
+    /// Size in raw `Quantity` units (1e-9 of a base unit).
+    size_raw: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -103,9 +104,11 @@ struct TapQuoteRow {
     source_ts: i64,
     rx_ts: i64,
     bid_raw: i64,
-    bid_size: u64,
+    /// Bid size in raw `Quantity` units (1e-9 of a base unit).
+    bid_size_raw: u64,
     ask_raw: i64,
-    ask_size: u64,
+    /// Ask size in raw `Quantity` units (1e-9 of a base unit).
+    ask_size_raw: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -122,7 +125,8 @@ struct TapBarRow {
     high_raw: i64,
     low_raw: i64,
     close_raw: i64,
-    volume: u64,
+    /// Volume in raw `Quantity` units (1e-9 of a base unit).
+    volume_raw: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -443,7 +447,7 @@ impl Writer {
                     source_ts: t.source_ts.0,
                     rx_ts: t.rx_ts.0,
                     price_raw: t.price.raw(),
-                    size: t.size,
+                    size_raw: t.size.raw(),
                 };
                 let _: Option<TapTradeRow> = self
                     .db
@@ -459,9 +463,9 @@ impl Writer {
                     source_ts: q.source_ts.0,
                     rx_ts: q.rx_ts.0,
                     bid_raw: q.bid.raw(),
-                    bid_size: q.bid_size,
+                    bid_size_raw: q.bid_size.raw(),
                     ask_raw: q.ask.raw(),
-                    ask_size: q.ask_size,
+                    ask_size_raw: q.ask_size.raw(),
                 };
                 let _: Option<TapQuoteRow> = self
                     .db
@@ -480,7 +484,7 @@ impl Writer {
                     high_raw: b.high.raw(),
                     low_raw: b.low.raw(),
                     close_raw: b.close.raw(),
-                    volume: b.volume,
+                    volume_raw: b.volume.raw(),
                 };
                 let _: Option<TapBarRow> = self
                     .db
@@ -640,7 +644,7 @@ impl ReplaySource for SurrealTapReplaySource {
                                 rx_ts: Timestamp(r.rx_ts),
                                 seq: Seq(r.seq),
                                 price: Price::from_raw(r.price_raw),
-                                size: r.size,
+                                size: Quantity::from_raw(r.size_raw),
                             }),
                         )
                     }));
@@ -669,9 +673,9 @@ impl ReplaySource for SurrealTapReplaySource {
                                 rx_ts: Timestamp(r.rx_ts),
                                 seq: Seq(r.seq),
                                 bid: Price::from_raw(r.bid_raw),
-                                bid_size: r.bid_size,
+                                bid_size: Quantity::from_raw(r.bid_size_raw),
                                 ask: Price::from_raw(r.ask_raw),
-                                ask_size: r.ask_size,
+                                ask_size: Quantity::from_raw(r.ask_size_raw),
                             }),
                         )
                     }));
@@ -704,7 +708,7 @@ impl ReplaySource for SurrealTapReplaySource {
                                 high: Price::from_raw(r.high_raw),
                                 low: Price::from_raw(r.low_raw),
                                 close: Price::from_raw(r.close_raw),
-                                volume: r.volume,
+                                volume: Quantity::from_raw(r.volume_raw),
                             }),
                         )
                     }));

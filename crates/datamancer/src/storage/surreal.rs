@@ -15,10 +15,10 @@
 //! Tables are declared `SCHEMALESS` so the `SurrealValue`-derived row
 //! structs in this module round-trip directly. There's one table per kind:
 //!
-//! - `trades` — `{ provider, symbol, source_ts, rx_ts, price_raw, size,
+//! - `trades` — `{ provider, symbol, source_ts, rx_ts, price_raw, size_raw,
 //!   adjustment }`
-//! - `quotes` — `{ provider, symbol, source_ts, rx_ts, bid_raw, bid_size,
-//!   ask_raw, ask_size, adjustment }`
+//! - `quotes` — `{ provider, symbol, source_ts, rx_ts, bid_raw, bid_size_raw,
+//!   ask_raw, ask_size_raw, adjustment }`
 //! - `bars_1s`, `bars_1m`, `bars_5m`, `bars_15m`, `bars_1h`, `bars_1d`
 //!   — one table per supported [`BarInterval`]; OHLCV columns plus the
 //!   common `provider`, `symbol`, `source_ts`, `rx_ts`, `adjustment`.
@@ -62,8 +62,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     Adjustment, AssetClass, Bar, BarInterval, CacheCatalogEntry, CacheCoverage, CacheKey, Error,
-    EventKind, GapSpan, HistoricalCache, Instrument, MarketEvent, Price, Quote, ReplayRequest,
-    ReplaySource, Result, Seq, Timestamp, Trade,
+    EventKind, GapSpan, HistoricalCache, Instrument, MarketEvent, Price, Quantity, Quote,
+    ReplayRequest, ReplaySource, Result, Seq, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -241,7 +241,8 @@ struct TradeRow {
     rx_ts: i64,
     /// Price in datamancer-core internal units.
     price_raw: i64,
-    size: u64,
+    /// Size in raw `Quantity` units (1e-9 of a base unit).
+    size_raw: u64,
     /// Adjustment discriminant. Trades are never adjusted, so this is always
     /// `"raw"`; it keeps the mode-scoped `WHERE adjustment = $adj` filter on
     /// the shared store DELETE / count uniform across kinds.
@@ -255,9 +256,11 @@ struct QuoteRow {
     source_ts: i64,
     rx_ts: i64,
     bid_raw: i64,
-    bid_size: u64,
+    /// Bid size in raw `Quantity` units (1e-9 of a base unit).
+    bid_size_raw: u64,
     ask_raw: i64,
-    ask_size: u64,
+    /// Ask size in raw `Quantity` units (1e-9 of a base unit).
+    ask_size_raw: u64,
     /// Adjustment discriminant; always `"raw"` for quotes. See [`TradeRow`].
     adjustment: String,
 }
@@ -272,7 +275,8 @@ struct BarRow {
     high_raw: i64,
     low_raw: i64,
     close_raw: i64,
-    volume: u64,
+    /// Volume in raw `Quantity` units (1e-9 of a base unit).
+    volume_raw: u64,
     /// Corporate-action adjustment mode this bar was fetched under. Segregates
     /// adjusted vs raw bars for the same `(symbol, range)` so a mode-scoped
     /// SELECT never returns orphaned rows from another mode.
@@ -438,7 +442,7 @@ impl HistoricalCache for SurrealCache {
                         source_ts: t.source_ts.0,
                         rx_ts: t.rx_ts.0,
                         price_raw: t.price.raw(),
-                        size: t.size,
+                        size_raw: t.size.raw(),
                         adjustment: adj.to_string(),
                     };
                     let _: Option<TradeRow> = self
@@ -455,9 +459,9 @@ impl HistoricalCache for SurrealCache {
                         source_ts: q.source_ts.0,
                         rx_ts: q.rx_ts.0,
                         bid_raw: q.bid.raw(),
-                        bid_size: q.bid_size,
+                        bid_size_raw: q.bid_size.raw(),
                         ask_raw: q.ask.raw(),
-                        ask_size: q.ask_size,
+                        ask_size_raw: q.ask_size.raw(),
                         adjustment: adj.to_string(),
                     };
                     let _: Option<QuoteRow> = self
@@ -477,7 +481,7 @@ impl HistoricalCache for SurrealCache {
                         high_raw: b.high.raw(),
                         low_raw: b.low.raw(),
                         close_raw: b.close.raw(),
-                        volume: b.volume,
+                        volume_raw: b.volume.raw(),
                         adjustment: adj.to_string(),
                     };
                     let _: Option<BarRow> = self
@@ -759,7 +763,7 @@ impl ReplaySource for SurrealReplaySource {
                             rx_ts: Timestamp(r.rx_ts),
                             seq: Seq(0),
                             price: Price::from_raw(r.price_raw),
-                            size: r.size,
+                            size: Quantity::from_raw(r.size_raw),
                         })
                     })
                     .collect()
@@ -793,9 +797,9 @@ impl ReplaySource for SurrealReplaySource {
                             rx_ts: Timestamp(r.rx_ts),
                             seq: Seq(0),
                             bid: Price::from_raw(r.bid_raw),
-                            bid_size: r.bid_size,
+                            bid_size: Quantity::from_raw(r.bid_size_raw),
                             ask: Price::from_raw(r.ask_raw),
-                            ask_size: r.ask_size,
+                            ask_size: Quantity::from_raw(r.ask_size_raw),
                         })
                     })
                     .collect()
@@ -833,7 +837,7 @@ impl ReplaySource for SurrealReplaySource {
                             high: Price::from_raw(r.high_raw),
                             low: Price::from_raw(r.low_raw),
                             close: Price::from_raw(r.close_raw),
-                            volume: r.volume,
+                            volume: Quantity::from_raw(r.volume_raw),
                         })
                     })
                     .collect()
@@ -936,7 +940,7 @@ mod tests {
                     rx_ts: Timestamp(10),
                     seq: Seq(0),
                     price: Price::from_f64_round(1.0),
-                    size: 1,
+                    size: Quantity::from_units(1),
                 })],
             )
             .await
