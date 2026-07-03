@@ -93,12 +93,20 @@ async fn run_reader(
     pending: Pending,
     events: mpsc::Sender<MarketEvent>,
 ) {
+    // Dropping the event stream must not poison the control plane: the
+    // socket is still healthy and replies still need demuxing (the iceoryx2
+    // transport behaves this way too — its poll thread dying doesn't touch
+    // the control connection). So a failed event send disables forwarding
+    // but keeps this loop alive; only the socket dying ends it.
+    let mut events = Some(events);
     while let Some(Ok(msg)) = read.next().await {
         let Message::Text(text) = msg else { continue };
         match serde_json::from_str::<Inbound>(&text) {
             Ok(Inbound::Event(frame)) => {
-                if events.send(from_wire(&frame)).await.is_err() {
-                    break; // consumer dropped the stream
+                if let Some(tx) = &events
+                    && tx.send(from_wire(&frame)).await.is_err()
+                {
+                    events = None; // consumer dropped the stream
                 }
             }
             Ok(Inbound::Reply(reply)) => {
@@ -428,6 +436,47 @@ mod tests {
         };
         let _ = WsClient::connect(cfg).await; // may error on immediate drop; header assert is the test
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_event_stream_does_not_poison_the_control_plane() {
+        // Regression test: the consumer dropping `Events` must not take the
+        // control plane down with it. The server answers the subscribe by
+        // first pushing an event frame — which the reader can no longer
+        // deliver — and *then* the ack. Wire order guarantees the reader hits
+        // the failed event send before the reply; pre-fix it broke out of its
+        // loop there, latched `closed`, and cleared `pending`, so the
+        // subscribe below came back `ConnectionClosed` on a healthy socket.
+        let url = fake_server(|mut ws| async move {
+            let Some(Ok(Message::Text(text))) = ws.next().await else {
+                panic!("expected subscribe frame")
+            };
+            let req: WsRequest = serde_json::from_str(&text).unwrap();
+            let frame = to_wire(&trade()).unwrap();
+            ws.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                .await
+                .unwrap();
+            ws.send(Message::Text(
+                serde_json::to_string(&WsReply::ok(req.id()))
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let _ = ws.next().await;
+        })
+        .await;
+
+        let (mut client, events) = WsClient::connect(cfg(url)).await.expect("connect");
+        drop(events);
+        let spec: SubscriptionSpec = serde_json::from_str(
+            r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+        )
+        .unwrap();
+        client
+            .subscribe(&spec)
+            .await
+            .expect("control plane must survive the consumer dropping the event stream");
     }
 
     #[tokio::test]
