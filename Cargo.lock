@@ -975,6 +975,7 @@ dependencies = [
  "chrono",
  "datamancer-core",
  "datamancer-transport-iceoryx2",
+ "datamancer-transport-ws",
  "fastrand",
  "futures",
  "oxidized_alpaca",
