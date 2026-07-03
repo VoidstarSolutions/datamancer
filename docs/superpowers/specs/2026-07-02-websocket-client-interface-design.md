@@ -103,8 +103,10 @@ self-describing):
  "price":6543210,"size":100}
 ```
 
-Variants: `trade` / `quote` / `bar` / `control`. `control` is sub-tagged
-`gap` / `subscription_changed` / `session_closing`.
+Variants (top-level `type` tags): `trade` / `quote` / `bar` / `gap` /
+`subscription_changed` / `session_closing`. The per-symbol control kinds are
+**flattened** to their own top-level tags — there is no nested `control`
+wrapper on the wire.
 
 **Timestamp triple preserved end-to-end** (`source_ts`, `seq`, `rx_ts`); `rx_ts`
 stays observability-only and is never synthesized on decode. `Seq::SYNTHETIC`
@@ -125,8 +127,10 @@ MarketEvent` mirror `to_pod`/`from_pod`, with round-trip unit tests per variant.
 Per accepted connection, mirroring the UDS + iceoryx2 pairing in `server.rs`,
 over one socket:
 
-1. **Accept + handshake** — dedicated TCP listener → `accept_async` (bearer-token
-   check at handshake; see Security) → split into `(write, read)` halves.
+1. **Accept + handshake** — dedicated TCP listener → `accept_hdr_async` (a
+   header-aware callback runs the bearer-token check against the request
+   headers at handshake, before the upgrade completes; see Security) → split
+   into `(write, read)` halves.
 2. **Spawn the writer task** (from the crate) owning `write`, draining a bounded
    `mpsc<Message>`.
 3. **Build `WsDataSink`** over the channel `Sender`; hand a second `Sender` clone
@@ -159,8 +163,9 @@ from iceoryx2's same-host best-effort:
 - **Documented policy: remote WS delivery is lossy-on-overrun by disconnection**,
   not by silent drop. (A future refinement could emit a `Gap`-style marker before
   dropping; v1 disconnects — simplest correct behavior.)
-- Channel depth is configurable. `Ping`/`Pong` keepalive detects
-  dead-but-not-closed sockets.
+- Channel depth is configurable. (`keepalive_secs` is **reserved** for a future
+  server-initiated `Ping`/`Pong` liveness probe; v1 does not send server pings —
+  dead-but-not-closed detection relies on the client and TCP.)
 
 ## Security posture & config
 
@@ -177,12 +182,14 @@ New `[ws]` config block:
 | `port` | (required when enabled) | listen port |
 | `auth_token` | unset | optional shared bearer token |
 | `channel_depth` | e.g. `1024` | per-connection outbound queue depth |
-| `keepalive_secs` | e.g. `30` | ping interval |
+| `keepalive_secs` | e.g. `30` | reserved; future server-initiated ping interval |
+| `max_connections` | e.g. `64` | hard cap on concurrent client connections |
 
-- **Auth (v1): optional shared bearer token**, checked at the WS handshake
-  (`Authorization: Bearer …` or `Sec-WebSocket-Protocol`); connections without it
-  are rejected. If unset, the daemon logs a **prominent warning**, and louder when
-  bound off-loopback (same spirit as the web UI's non-loopback warning).
+- **Auth (v1): optional shared bearer token**, checked at the WS handshake via
+  the `Authorization: Bearer …` header; a missing or wrong token is rejected
+  with HTTP 401 before the upgrade completes. If unset, the daemon logs a
+  **prominent warning**, and louder when bound off-loopback (same spirit as the
+  web UI's non-loopback warning).
 - **TLS is out of scope for v1** — terminate at a reverse proxy; documented as
   such.
 - Honest scoping: a worked example to exercise the interface shape, not yet a

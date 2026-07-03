@@ -79,8 +79,8 @@ workspace = true
 
 Then add `tokio-tungstenite` with a workspace-compatible version:
 
-Run: `cargo add -p datamancer-transport-ws tokio-tungstenite`
-Expected: adds a `tokio-tungstenite = "<version>"` line; `cargo metadata` resolves.
+Run: `cargo add -p datamancer-transport-ws tokio-tungstenite@0.29.0`
+Expected: adds a `tokio-tungstenite = "0.29.0"` line; `cargo metadata` resolves.
 
 - [ ] **Step 3: Create `error.rs`**
 
@@ -1246,8 +1246,8 @@ ws = ["dep:tokio-tungstenite", "datamancer/transport-ws"]
 
 Then add the dependency (run so the version matches the transport crate):
 
-Run: `cargo add -p datamancerd tokio-tungstenite --optional`
-Expected: adds `tokio-tungstenite = { version = "<version>", optional = true }`.
+Run: `cargo add -p datamancerd tokio-tungstenite@0.29.0 --optional`
+Expected: adds `tokio-tungstenite = { version = "0.29.0", optional = true }`.
 
 Confirm `futures` is available to datamancerd (it is used by `server.rs`); if not present as a direct dep, add it:
 
