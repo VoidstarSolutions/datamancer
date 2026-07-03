@@ -65,3 +65,17 @@ jobs:
         # already ran on the PR that merged.
         if: github.event_name == 'pull_request'
         run: .github/scripts/semver-checks.sh "origin/${{ github.base_ref }}"
+
+  windows:
+    # The support boundary, enforced: Windows gets the ws transport and the
+    # ws-featured client ONLY. The daemon (UDS control socket) and the
+    # iceoryx2 transport are POSIX; do not add them here - that is a porting
+    # decision, not a CI edit (see the open-sourcing design spec).
+    name: ws-portable subset (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build + test the portable subset
+        run: cargo test -p datamancer-transport-ws -p datamancer-client --features datamancer-client/ws
