@@ -91,6 +91,17 @@ impl SurrealCacheConfig {
     }
 }
 
+/// On-disk schema version of the row shapes below. v1 (implicit — no marker
+/// record) stored sizes/volumes as whole base units under plain column names;
+/// v2 stores raw fixed-point [`Quantity`] units under `*_raw` columns.
+const SCHEMA_VERSION: u32 = 2;
+
+/// The singleton `meta:schema` marker row.
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+struct SchemaVersionRow {
+    version: u32,
+}
+
 /// SurrealDB-backed historical cache.
 pub struct SurrealCache {
     db: Surreal<Db>,
@@ -130,7 +141,55 @@ impl SurrealCache {
             .map_err(map_err)?;
         let cache = Self { db };
         cache.init_schema().await?;
+        cache.check_or_stamp_schema_version().await?;
         Ok(cache)
+    }
+
+    /// Refuse to open a cache whose row shapes this build cannot decode.
+    ///
+    /// The marker is a singleton `meta:schema` record. A cache written before
+    /// schema versioning existed has coverage rows but no marker — its
+    /// whole-unit size/volume columns would make every read of a "covered"
+    /// range fail row decode, silently poisoning the read-through path — so a
+    /// markerless, non-empty cache is rejected loudly here instead. A fresh
+    /// cache is stamped with the current version.
+    async fn check_or_stamp_schema_version(&self) -> Result<()> {
+        let row: Option<SchemaVersionRow> =
+            self.db.select(("meta", "schema")).await.map_err(map_err)?;
+        if let Some(row) = row {
+            if row.version == SCHEMA_VERSION {
+                return Ok(());
+            }
+            return Err(Error::Storage(format!(
+                "cache schema version {} does not match this build's {SCHEMA_VERSION}; \
+                 read it with a matching build, or delete the cache and re-fetch",
+                row.version
+            )));
+        }
+        let mut response = self
+            .db
+            .query("SELECT count() AS n FROM coverage GROUP ALL")
+            .await
+            .map_err(map_err)?;
+        let rows: Vec<CountRow> = response.take(0).map_err(map_err)?;
+        if rows.first().is_some_and(|r| r.n > 0) {
+            return Err(Error::Storage(
+                "cache predates schema versioning (whole-unit size/volume columns); \
+                 this build reads raw fixed-point Quantity columns. Delete the cache \
+                 (it is a re-fetchable read-through cache) or read it with the build \
+                 that wrote it"
+                    .to_string(),
+            ));
+        }
+        let _: Option<SchemaVersionRow> = self
+            .db
+            .upsert(("meta", "schema"))
+            .content(SchemaVersionRow {
+                version: SCHEMA_VERSION,
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(())
     }
 
     async fn init_schema(&self) -> Result<()> {
@@ -139,6 +198,7 @@ impl SurrealCache {
         // shape flexible while letting `SurrealValue`-derived rows
         // round-trip directly. Safe to run repeatedly.
         let stmts = "
+            DEFINE TABLE IF NOT EXISTS meta SCHEMALESS;
             DEFINE TABLE IF NOT EXISTS coverage SCHEMALESS;
             DEFINE TABLE IF NOT EXISTS trades SCHEMALESS;
             DEFINE TABLE IF NOT EXISTS quotes SCHEMALESS;
@@ -860,6 +920,84 @@ pub(crate) fn ts_from_chrono(dt: DateTime<Utc>) -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Open an embedded cache expecting a refusal, retrying while the
+    /// previous handle's `SurrealKV` file lock is still being released (the
+    /// same transient the integration suite's embedded reopen test retries).
+    async fn open_expecting_refusal(path: &std::path::Path) -> Error {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match SurrealCache::open(SurrealCacheConfig::embedded(path)).await {
+                Ok(_) => panic!("open must refuse this cache"),
+                Err(e)
+                    if e.to_string().contains("already locked")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return e,
+            }
+        }
+    }
+
+    /// A cache with coverage rows but no schema marker is the pre-versioning
+    /// shape (whole-unit size columns); `open` must refuse it instead of
+    /// letting every read of a "covered" range fail row decode.
+    #[tokio::test]
+    async fn open_refuses_a_pre_versioning_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache");
+        {
+            let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(
+                path.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            db.use_ns("datamancer").use_db("cache").await.unwrap();
+            db.query("DEFINE TABLE IF NOT EXISTS coverage SCHEMALESS")
+                .await
+                .unwrap();
+            let _: Option<CoverageDoc> = db
+                .upsert(("coverage", "alpaca|AAPL|trades|raw"))
+                .content(CoverageDoc {
+                    segments: vec![(0, 100)],
+                    event_count: 1,
+                    asset_class: None,
+                })
+                .await
+                .unwrap();
+        }
+        let err = open_expecting_refusal(&path).await;
+        assert!(
+            err.to_string().contains("schema versioning"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A marker from a different (future) schema version must refuse loudly.
+    #[tokio::test]
+    async fn open_refuses_a_mismatched_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache");
+        {
+            let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(
+                path.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            db.use_ns("datamancer").use_db("cache").await.unwrap();
+            db.query("DEFINE TABLE IF NOT EXISTS meta SCHEMALESS")
+                .await
+                .unwrap();
+            let _: Option<SchemaVersionRow> = db
+                .upsert(("meta", "schema"))
+                .content(SchemaVersionRow { version: 999 })
+                .await
+                .unwrap();
+        }
+        let err = open_expecting_refusal(&path).await;
+        assert!(err.to_string().contains("999"), "unexpected error: {err}");
+    }
 
     #[test]
     fn coverage_merges_overlapping_segments() {

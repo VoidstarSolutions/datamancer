@@ -138,6 +138,11 @@ struct StreamRow {
     table: String,
 }
 
+/// On-disk schema version of the shard row shapes. v1 (implicit — absent from
+/// the `meta` row) stored sizes/volumes as whole base units under plain column
+/// names; v2 stores raw fixed-point `Quantity` units under `*_raw` columns.
+const SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, SurrealValue)]
 struct MetaRow {
     /// Next shard ordinal to allocate.
@@ -150,6 +155,11 @@ struct MetaRow {
     /// (which, unlike serde, does not honor `default` for an absent field).
     #[serde(default)]
     next_ord: Option<u64>,
+    /// [`SCHEMA_VERSION`] of the shard rows in this log. `None` means the log
+    /// was written before schema versioning existed (whole-unit sizes) —
+    /// `open` refuses such a log rather than mis-decode or mix row shapes.
+    #[serde(default)]
+    schema_version: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +321,30 @@ impl SurrealTapLog {
         .map_err(map_err)?;
 
         let meta: Option<MetaRow> = db.select(("meta", "singleton")).await.map_err(map_err)?;
+        // Refuse a log whose shard rows this build cannot decode: replaying it
+        // would fail row deserialization, and appending would mix incompatible
+        // row shapes in the same tables. (An absent meta row is a fresh log —
+        // the writer stamps the version on first persist.)
+        if let Some(row) = &meta {
+            match row.schema_version {
+                Some(v) if v == SCHEMA_VERSION => {}
+                Some(v) => {
+                    return Err(Error::Storage(format!(
+                        "tap log schema version {v} does not match this build's \
+                         {SCHEMA_VERSION}; replay it with a matching build or start a new log"
+                    )));
+                }
+                None => {
+                    return Err(Error::Storage(
+                        "tap log predates schema versioning (whole-unit size/volume \
+                         columns); this build reads and writes raw fixed-point Quantity \
+                         columns. Replay it with the build that recorded it or start a \
+                         new log"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         let meta = meta.unwrap_or_default();
 
         // Load the registry, rebuild the in-memory shard map, and re-DEFINE each
@@ -571,6 +605,7 @@ impl Writer {
             next_shard: self.next_shard,
             // Persist the reservation boundary, not the live counter.
             next_ord: Some(self.ord_high),
+            schema_version: Some(SCHEMA_VERSION),
         };
         let _: Option<MetaRow> = self
             .db
@@ -724,5 +759,98 @@ impl ReplaySource for SurrealTapReplaySource {
         // `seq` is preserved on each event; it just is not the ordering key.)
         all.sort_by_key(|(ord, _)| *ord);
         Ok(stream::iter(all.into_iter().map(|(_, ev)| ev)).boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact `meta` row shape written before `schema_version` existed.
+    #[derive(Serialize, Deserialize, SurrealValue)]
+    struct LegacyMetaRow {
+        next_shard: u64,
+        next_ord: Option<u64>,
+    }
+
+    /// Open an embedded tap log expecting a refusal, retrying while the
+    /// previous handle's `SurrealKV` file lock is still being released (the
+    /// same transient the integration suite's embedded reopen test retries).
+    async fn open_expecting_refusal(path: &std::path::Path) -> Error {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match SurrealTapLog::open(SurrealTapLogConfig::embedded(path)).await {
+                Ok(_) => panic!("open must refuse this log"),
+                Err(e)
+                    if e.to_string().contains("already locked")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return e,
+            }
+        }
+    }
+
+    /// A log whose `meta` row predates schema versioning stored sizes as whole
+    /// units; `open` must refuse it rather than fail replay row decode or
+    /// append v2-shaped rows into the same tables.
+    #[tokio::test]
+    async fn open_refuses_a_pre_versioning_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("taplog");
+        {
+            let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(
+                path.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            db.use_ns("datamancer").use_db("taplog").await.unwrap();
+            db.query("DEFINE TABLE IF NOT EXISTS meta SCHEMALESS")
+                .await
+                .unwrap();
+            let _: Option<LegacyMetaRow> = db
+                .upsert(("meta", "singleton"))
+                .content(LegacyMetaRow {
+                    next_shard: 1,
+                    next_ord: Some(64),
+                })
+                .await
+                .unwrap();
+        }
+        let err = open_expecting_refusal(&path).await;
+        assert!(
+            err.to_string().contains("schema versioning"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A marker from a different (future) schema version must refuse loudly.
+    #[tokio::test]
+    async fn open_refuses_a_mismatched_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("taplog");
+        {
+            let db: Surreal<Db> = Surreal::new::<surrealdb::engine::local::SurrealKv>(
+                path.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+            db.use_ns("datamancer").use_db("taplog").await.unwrap();
+            db.query("DEFINE TABLE IF NOT EXISTS meta SCHEMALESS")
+                .await
+                .unwrap();
+            let _: Option<MetaRow> = db
+                .upsert(("meta", "singleton"))
+                .content(MetaRow {
+                    next_shard: 0,
+                    next_ord: None,
+                    schema_version: Some(999),
+                })
+                .await
+                .unwrap();
+        }
+        let err = open_expecting_refusal(&path).await;
+        assert!(err.to_string().contains("999"), "unexpected error: {err}");
     }
 }
