@@ -50,7 +50,7 @@
 //! Explicit [`Session::close`] is always available for forced termination.
 
 use crate::accounting::ProviderAccounting;
-use crate::client::{
+use crate::client_session::{
     AuthoritativeSession, ClientHandle, ClientSession, ClientStats, FanOut, LiveStats,
     SubscriberGuard, SubscriberId, spawn_client,
 };
@@ -63,8 +63,8 @@ use async_trait::async_trait;
 use datamancer_core::{
     Adjustment, AuthoritativeSessionSnapshot, Bar, CacheKey, CacheSnapshot, ClientSessionSnapshot,
     Control, ControlKind, Error, EventKind, EventSink, GapSpan, HistoricalCache, HistoryRequest,
-    Instrument, LiveHandle, MarketEvent, Provider, ProviderSnapshot, PublishOutcome, Quote,
-    ReplayRequest, Result, Seq, SystemSnapshot, TapLog, Timestamp, Trade,
+    Instrument, InstrumentInfo, LiveHandle, MarketEvent, Provider, ProviderId, ProviderSnapshot,
+    PublishOutcome, Quote, ReplayRequest, Result, Seq, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -534,6 +534,51 @@ impl Datamancer {
     #[must_use]
     pub fn snapshot_live(&self) -> SystemSnapshot {
         self.assemble_snapshot(CacheSnapshot::new(Vec::new(), None))
+    }
+
+    /// Enumerate the instruments each registered provider can serve, with the
+    /// event kinds each instrument supports.
+    ///
+    /// Kinds are derived by probing [`Provider::supports`] over
+    /// [`EventKind::enumerate`] for every instrument returned by
+    /// [`Provider::list_instruments`] — the kind space is finite and closed, so
+    /// no provider-side enumeration surface is needed. Pass `provider` to
+    /// restrict the catalog (a full equities list is ~10k rows).
+    ///
+    /// Freshness is pass-through: every call hits the provider's
+    /// reference-data path live. Requests are startup/operator-time, not
+    /// hot-path.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::UnknownProvider`] — `provider` names no registered provider.
+    /// - Any error surfaced by the provider's `list_instruments` call.
+    pub async fn instrument_catalog(
+        &self,
+        provider: Option<&ProviderId>,
+    ) -> Result<Vec<InstrumentInfo>> {
+        let providers: Vec<&Arc<dyn Provider>> = match provider {
+            Some(id) => {
+                let found = self
+                    .inner
+                    .providers
+                    .iter()
+                    .find(|p| p.id() == id.as_str())
+                    .ok_or_else(|| Error::UnknownProvider(id.as_str().to_string()))?;
+                vec![found]
+            }
+            None => self.inner.providers.iter().collect(),
+        };
+        let mut catalog = Vec::new();
+        for p in providers {
+            for instrument in p.list_instruments().await? {
+                let kinds: Vec<EventKind> = EventKind::enumerate()
+                    .filter(|kind| p.supports(&instrument, *kind))
+                    .collect();
+                catalog.push(InstrumentInfo { instrument, kinds });
+            }
+        }
+        Ok(catalog)
     }
 
     /// Assemble the synchronous snapshot parts (provider accounting + live

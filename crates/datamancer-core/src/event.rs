@@ -66,6 +66,21 @@ pub enum BarInterval {
     OneDay,
 }
 
+impl BarInterval {
+    /// Every interval, in ascending duration order. `BarInterval` is a small
+    /// closed enum, so the kind space is finitely enumerable — this powers
+    /// [`EventKind::enumerate`] and, through it, per-instrument capability
+    /// discovery.
+    pub const ALL: [BarInterval; 6] = [
+        BarInterval::OneSecond,
+        BarInterval::OneMinute,
+        BarInterval::FiveMinute,
+        BarInterval::FifteenMinute,
+        BarInterval::OneHour,
+        BarInterval::OneDay,
+    ];
+}
+
 /// Selector used in subscriptions. Each variant maps 1:1 with a [`MarketEvent`]
 /// data variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -73,6 +88,17 @@ pub enum EventKind {
     Trade,
     Quote,
     Bar(BarInterval),
+}
+
+impl EventKind {
+    /// Every subscribable kind: `Trade`, `Quote`, and one `Bar` per
+    /// [`BarInterval`]. Used to derive an instrument's capability list by
+    /// probing [`crate::Provider::supports`] over the full kind space.
+    pub fn enumerate() -> impl Iterator<Item = EventKind> {
+        [EventKind::Trade, EventKind::Quote]
+            .into_iter()
+            .chain(BarInterval::ALL.into_iter().map(EventKind::Bar))
+    }
 }
 
 /// The unified output stream entry.
@@ -227,5 +253,22 @@ mod serde_tests {
         };
         let json = serde_json::to_string(&g).unwrap();
         assert_eq!(serde_json::from_str::<GapSpan>(&json).unwrap(), g);
+    }
+
+    #[test]
+    fn event_kind_enumerate_covers_the_full_kind_space() {
+        let kinds: Vec<EventKind> = EventKind::enumerate().collect();
+        // Trade + Quote + one Bar per interval.
+        assert_eq!(kinds.len(), 2 + BarInterval::ALL.len());
+        assert!(kinds.contains(&EventKind::Trade));
+        assert!(kinds.contains(&EventKind::Quote));
+        for interval in BarInterval::ALL {
+            assert!(kinds.contains(&EventKind::Bar(interval)));
+        }
+        // No duplicates.
+        let mut dedup = kinds.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), kinds.len());
     }
 }

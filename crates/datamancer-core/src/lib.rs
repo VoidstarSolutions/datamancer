@@ -26,7 +26,7 @@ pub use event::{
     Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, MarketEvent, Quote, Seq, Timestamp,
     Trade,
 };
-pub use instrument::{AssetClass, Instrument, ProviderId};
+pub use instrument::{AssetClass, Instrument, InstrumentInfo, ProviderId};
 pub use price::Price;
 pub use snapshot::{
     AuthoritativeSessionSnapshot, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,

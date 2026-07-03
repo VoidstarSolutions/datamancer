@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
-use crate::control::{Reply, Request, SubscriptionSpec, codes};
+use crate::control::{Reply, Request, SubscriptionSpec, codes, reply_from_library_error};
 use crate::error::{DaemonError, Result};
 use crate::shutdown::{DrainClient, DrainRecorder, drain};
 
@@ -198,7 +198,7 @@ impl Server {
                     s.instrument(),
                     s.kind.into(),
                     scope,
-                    s.persistence.options(),
+                    crate::config::persistence_options(s.persistence),
                 )
                 .await?;
             tracing::info!(symbol = %s.symbol, "anchored always_on startup session");
@@ -236,7 +236,7 @@ impl Server {
         let listener = self.bind_socket()?;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(256);
 
-        let accept = tokio::spawn(accept_loop(listener, cmd_tx.clone()));
+        let accept = tokio::spawn(accept_loop(listener, cmd_tx.clone(), self.dm.clone()));
 
         let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
             .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
@@ -497,16 +497,14 @@ impl Server {
                 subscriptions,
             } => self.open_client(client, subscriptions).await,
             Request::Subscribe { client, spec } => self.subscribe(&client, spec).await,
-            Request::Unsubscribe {
-                client,
-                provider,
-                asset_class,
-                symbol,
-                kind,
-            } => {
-                let instrument =
-                    Instrument::new(ProviderId::new(provider), asset_class.into(), symbol);
-                self.unsubscribe(&client, instrument, kind.into()).await
+            Request::Unsubscribe { client, spec } => {
+                let instrument = Instrument::new(
+                    ProviderId::new(spec.provider),
+                    spec.asset_class.into(),
+                    spec.symbol,
+                );
+                self.unsubscribe(&client, instrument, spec.kind.into())
+                    .await
             }
             Request::CloseClient { client } => {
                 if self.clients.contains_key(&client) {
@@ -519,8 +517,19 @@ impl Server {
             Request::ListClients => Reply::clients(self.clients.keys().cloned().collect()),
             Request::Snapshot => match self.dm.snapshot().await {
                 Ok(snapshot) => Reply::snapshot(snapshot),
-                Err(e) => Reply::from_library_error(&e),
+                Err(e) => reply_from_library_error(&e),
             },
+            // Dispatched off-actor in `handle_connection` (a catalog request
+            // awaits live provider REST and must not stall the actor). This
+            // arm only exists for match exhaustiveness / defense in depth —
+            // it should be unreachable in normal operation.
+            Request::Instruments { provider } => {
+                let filter = provider.map(ProviderId::new);
+                match self.dm.instrument_catalog(filter.as_ref()).await {
+                    Ok(catalog) => Reply::instruments(catalog),
+                    Err(e) => reply_from_library_error(&e),
+                }
+            }
         }
     }
 
@@ -558,17 +567,17 @@ impl Server {
                     Scope::Live {
                         backfill_from: None,
                     },
-                    spec.persistence.options(),
+                    crate::config::persistence_options(spec.persistence),
                 )
                 .await
             {
-                return Reply::from_library_error(&e);
+                return reply_from_library_error(&e);
             }
         }
 
         let stream = match session.take_events().await {
             Ok(stream) => stream,
-            Err(e) => return Reply::from_library_error(&e),
+            Err(e) => return reply_from_library_error(&e),
         };
         let pump = spawn_pump(stream, sink.clone());
 
@@ -601,12 +610,12 @@ impl Server {
                 Scope::Live {
                     backfill_from: None,
                 },
-                spec.persistence.options(),
+                crate::config::persistence_options(spec.persistence),
             )
             .await
         {
             Ok(()) => Reply::ok(),
-            Err(e) => Reply::from_library_error(&e),
+            Err(e) => reply_from_library_error(&e),
         }
     }
 
@@ -624,7 +633,7 @@ impl Server {
         };
         match session.unsubscribe(instrument, kind).await {
             Ok(()) => Reply::ok(),
-            Err(e) => Reply::from_library_error(&e),
+            Err(e) => reply_from_library_error(&e),
         }
     }
 
@@ -687,11 +696,11 @@ fn spawn_pump(mut stream: datamancer::EventStream, sink: Arc<dyn EventSink>) -> 
 }
 
 /// Accept control connections and spawn a reader per connection.
-async fn accept_loop(listener: UnixListener, cmd_tx: mpsc::Sender<ServerCommand>) {
+async fn accept_loop(listener: UnixListener, cmd_tx: mpsc::Sender<ServerCommand>, dm: Datamancer) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(handle_connection(stream, cmd_tx.clone()));
+                tokio::spawn(handle_connection(stream, cmd_tx.clone(), dm.clone()));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "control accept failed");
@@ -703,7 +712,11 @@ async fn accept_loop(listener: UnixListener, cmd_tx: mpsc::Sender<ServerCommand>
 /// One long-lived control connection. Reads newline-delimited JSON requests,
 /// forwards each to the server actor, writes the reply line. On EOF, if this
 /// connection had opened a client, signals an emergency teardown.
-async fn handle_connection(stream: UnixStream, cmd_tx: mpsc::Sender<ServerCommand>) {
+///
+/// `Request::Instruments` is dispatched here, off-actor, rather than forwarded
+/// to the actor: it awaits a live provider REST call and must not stall
+/// unrelated control traffic on the single-actor loop.
+async fn handle_connection(stream: UnixStream, cmd_tx: mpsc::Sender<ServerCommand>, dm: Datamancer) {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut opened_client: Option<String> = None;
@@ -719,6 +732,12 @@ async fn handle_connection(stream: UnixStream, cmd_tx: mpsc::Sender<ServerComman
             Ok(request) => {
                 if let Err(detail) = reject_unknown_keys(&line, &request) {
                     Reply::error(codes::BAD_REQUEST, detail)
+                } else if let Request::Instruments { provider } = &request {
+                    let filter = provider.clone().map(ProviderId::new);
+                    match dm.instrument_catalog(filter.as_ref()).await {
+                        Ok(catalog) => Reply::instruments(catalog),
+                        Err(e) => reply_from_library_error(&e),
+                    }
                 } else {
                     let open_client_name = match &request {
                         Request::OpenClient { client, .. } => Some(client.clone()),

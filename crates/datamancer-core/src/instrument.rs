@@ -10,6 +10,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::EventKind;
+
 /// Stable identifier for a market-data provider.
 ///
 /// Matches the value returned by [`crate::Provider::id`]. The `Cow`
@@ -137,5 +139,43 @@ impl fmt::Display for Instrument {
             "{} ({}/{})",
             self.symbol, self.provider, self.asset_class
         )
+    }
+}
+
+/// One catalog row: an instrument a provider can serve, with the event kinds
+/// it supports. Produced by capability discovery
+/// (`Provider::list_instruments` + `supports` probed over
+/// [`EventKind::enumerate`]); carried on the daemon's `instruments` control
+/// op.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentInfo {
+    pub instrument: Instrument,
+    /// Kinds this provider serves for this instrument, in
+    /// [`EventKind::enumerate`] order.
+    pub kinds: Vec<EventKind>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AssetClass, Instrument, InstrumentInfo, ProviderId};
+    use crate::{BarInterval, EventKind};
+
+    #[test]
+    fn instrument_info_serde_round_trips() {
+        let info = InstrumentInfo {
+            instrument: Instrument::new(
+                ProviderId::from_static("alpaca-crypto"),
+                AssetClass::Crypto,
+                "BTC/USD",
+            ),
+            kinds: vec![
+                EventKind::Trade,
+                EventKind::Quote,
+                EventKind::Bar(BarInterval::OneDay),
+            ],
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: InstrumentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, back);
     }
 }

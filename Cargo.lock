@@ -973,6 +973,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "datamancer-client",
  "datamancer-core",
  "datamancer-transport-iceoryx2",
  "datamancer-transport-ws",
@@ -987,6 +988,24 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "datamancer-client"
+version = "0.1.0"
+dependencies = [
+ "datamancer-core",
+ "datamancer-transport-iceoryx2",
+ "datamancer-transport-ws",
+ "futures",
+ "iceoryx2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.29.0",
 ]
 
 [[package]]
@@ -1036,6 +1055,8 @@ dependencies = [
  "axum",
  "clap",
  "datamancer",
+ "datamancer-client",
+ "datamancer-core",
  "directories",
  "futures",
  "http-body-util",

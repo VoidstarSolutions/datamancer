@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use datamancer::providers::AccountType;
 use datamancer::{
-    Adjustment, AssetClass, Datamancer, EventKind, Instrument, PersistenceOptions, ProviderId,
+    Adjustment, Datamancer, Instrument, PersistenceOptions, ProviderId,
     Scope, Timestamp,
     providers::{
         AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue, AlpacaProvider,
@@ -390,87 +390,19 @@ pub struct StartupSession {
     pub always_on: bool,
 }
 
-/// Asset class selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AssetClassCfg {
-    Equity,
-    Crypto,
-}
+pub use datamancer_client::spec::{AssetClassCfg, EventKindCfg, PersistenceCfg, ScopeCfg};
 
-impl From<AssetClassCfg> for AssetClass {
-    fn from(value: AssetClassCfg) -> Self {
-        match value {
-            AssetClassCfg::Equity => AssetClass::Equity,
-            AssetClassCfg::Crypto => AssetClass::Crypto,
-        }
-    }
-}
-
-/// Event-kind selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EventKindCfg {
-    Trade,
-    Quote,
-    Bar1s,
-    Bar1m,
-    Bar5m,
-    Bar15m,
-    Bar1h,
-    Bar1d,
-}
-
-impl From<EventKindCfg> for EventKind {
-    fn from(value: EventKindCfg) -> Self {
-        use datamancer::BarInterval;
-        match value {
-            EventKindCfg::Trade => EventKind::Trade,
-            EventKindCfg::Quote => EventKind::Quote,
-            EventKindCfg::Bar1s => EventKind::Bar(BarInterval::OneSecond),
-            EventKindCfg::Bar1m => EventKind::Bar(BarInterval::OneMinute),
-            EventKindCfg::Bar5m => EventKind::Bar(BarInterval::FiveMinute),
-            EventKindCfg::Bar15m => EventKind::Bar(BarInterval::FifteenMinute),
-            EventKindCfg::Bar1h => EventKind::Bar(BarInterval::OneHour),
-            EventKindCfg::Bar1d => EventKind::Bar(BarInterval::OneDay),
-        }
-    }
-}
-
-/// Startup-session scope selector.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScopeCfg {
-    #[default]
-    Live,
-    LiveBackfill,
-}
-
-/// Persistence-preset selector for a startup session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PersistenceCfg {
-    #[default]
-    None,
-    Cached,
-    CachedWithTap,
-    ReadOnly,
-    Refresh,
-    TapOnly,
-}
-
-impl PersistenceCfg {
-    /// Map the preset name to the library [`PersistenceOptions`].
-    #[must_use]
-    pub fn options(self) -> PersistenceOptions {
-        match self {
-            PersistenceCfg::None => PersistenceOptions::none(),
-            PersistenceCfg::Cached => PersistenceOptions::cached(),
-            PersistenceCfg::CachedWithTap => PersistenceOptions::cached().with_tap_log(true),
-            PersistenceCfg::ReadOnly => PersistenceOptions::read_only(),
-            PersistenceCfg::Refresh => PersistenceOptions::refresh(),
-            PersistenceCfg::TapOnly => PersistenceOptions::none().with_tap_log(true),
-        }
+/// Map a persistence preset to the library [`PersistenceOptions`]. Lives here
+/// (not on the moved enum) because the target type is the orchestrator's.
+#[must_use]
+pub fn persistence_options(cfg: PersistenceCfg) -> PersistenceOptions {
+    match cfg {
+        PersistenceCfg::None => PersistenceOptions::none(),
+        PersistenceCfg::Cached => PersistenceOptions::cached(),
+        PersistenceCfg::CachedWithTap => PersistenceOptions::cached().with_tap_log(true),
+        PersistenceCfg::ReadOnly => PersistenceOptions::read_only(),
+        PersistenceCfg::Refresh => PersistenceOptions::refresh(),
+        PersistenceCfg::TapOnly => PersistenceOptions::none().with_tap_log(true),
     }
 }
 
@@ -633,7 +565,7 @@ impl Config {
             ));
         }
         for s in &self.startup_session {
-            let options = s.persistence.options();
+            let options = persistence_options(s.persistence);
             if options.uses_cache() && self.cache.is_none() {
                 return Err(DaemonError::ConfigInvalid(format!(
                     "startup_session {} uses a cache persistence preset but no [cache] is configured",
@@ -773,7 +705,7 @@ fn storage_to_tap_config(cfg: &StorageConfig) -> Result<SurrealTapLogConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datamancer::BarInterval;
+    use datamancer::{BarInterval, EventKind};
 
     const MINIMAL: &str = r#"
 [provider.alpaca]
@@ -988,25 +920,28 @@ scope = "live_backfill"
 
     #[test]
     fn persistence_preset_maps() {
-        assert_eq!(PersistenceCfg::None.options(), PersistenceOptions::none());
         assert_eq!(
-            PersistenceCfg::Cached.options(),
+            persistence_options(PersistenceCfg::None),
+            PersistenceOptions::none()
+        );
+        assert_eq!(
+            persistence_options(PersistenceCfg::Cached),
             PersistenceOptions::cached()
         );
         assert_eq!(
-            PersistenceCfg::CachedWithTap.options(),
+            persistence_options(PersistenceCfg::CachedWithTap),
             PersistenceOptions::cached().with_tap_log(true)
         );
         assert_eq!(
-            PersistenceCfg::ReadOnly.options(),
+            persistence_options(PersistenceCfg::ReadOnly),
             PersistenceOptions::read_only()
         );
         assert_eq!(
-            PersistenceCfg::Refresh.options(),
+            persistence_options(PersistenceCfg::Refresh),
             PersistenceOptions::refresh()
         );
         assert_eq!(
-            PersistenceCfg::TapOnly.options(),
+            persistence_options(PersistenceCfg::TapOnly),
             PersistenceOptions::none().with_tap_log(true)
         );
     }

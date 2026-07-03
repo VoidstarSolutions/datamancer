@@ -28,20 +28,21 @@
 #![forbid(unsafe_code)]
 
 mod accounting;
-mod client;
+#[path = "client.rs"]
+mod client_session;
 mod fetch_locks;
 pub mod providers;
 mod session;
 pub mod storage;
 
-pub use client::ClientSession;
+pub use client_session::ClientSession;
 pub use datamancer_core::traits;
 pub use datamancer_core::{
     Adjustment, AssetClass, AuthoritativeSessionSnapshot, Bar, BarInterval, CacheCatalogEntry,
     CacheCoverage, CacheKey, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
     ConnectionState, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
-    HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId,
-    ProviderMetrics, ProviderSnapshot, Quote, ReplayRequest, ReplaySource, Result,
+    HistoryRequest, Instrument, InstrumentInfo, LiveHandle, MarketEvent, Price, Provider,
+    ProviderId, ProviderMetrics, ProviderSnapshot, Quote, ReplayRequest, ReplaySource, Result,
     ResumeBufferSnapshot, Seq, SubscriptionRef, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 pub use session::{
@@ -69,3 +70,12 @@ pub mod transport {
 pub mod transport_ws {
     pub use datamancer_transport_ws::*;
 }
+
+/// Consumer-side client crate, gated behind the `client-ws` / `client-iceoryx2`
+/// features. Re-exports [`datamancer-client`](datamancer_client) — the
+/// generic [`Client`](datamancer_client::Client) trait plus the shared control
+/// vocabulary (`spec`, `codes`, `protocol`) — so embedders pull in a consumer
+/// client through the same feature-flag pattern as the transport re-exports
+/// above, without depending on `datamancer-client` directly.
+#[cfg(any(feature = "client-ws", feature = "client-iceoryx2"))]
+pub use datamancer_client as client;

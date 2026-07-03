@@ -21,6 +21,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 
 use crate::control::codes;
+use crate::ws::protocol::ws_reply_from_library_error;
 use crate::ws::{WsReply, WsRequest};
 
 /// Accept the WS handshake (enforcing the bearer token if configured), then run
@@ -61,7 +62,7 @@ pub async fn handle_connection(
             // pump/terminal frame to drain, and the session drops cleanly.
             tracing::warn!(%peer, error = %e, "take_events failed");
             let _ = tx.try_send(
-                serde_json::to_string(&WsReply::from_library_error(0, &e)).unwrap_or_default(),
+                serde_json::to_string(&ws_reply_from_library_error(0, &e)).unwrap_or_default(),
             );
             return;
         }
@@ -234,32 +235,37 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
                     Scope::Live {
                         backfill_from: None,
                     },
-                    spec.persistence.options(),
+                    crate::config::persistence_options(spec.persistence),
                 )
                 .await
             {
                 Ok(()) => WsReply::ok(id),
-                Err(e) => WsReply::from_library_error(id, &e),
+                Err(e) => ws_reply_from_library_error(id, &e),
             }
         }
-        WsRequest::Unsubscribe {
-            provider,
-            asset_class,
-            symbol,
-            kind,
-            ..
-        } => {
-            let instrument = Instrument::new(ProviderId::new(provider), asset_class.into(), symbol);
-            match session.unsubscribe(instrument, kind.into()).await {
+        WsRequest::Unsubscribe { spec, .. } => {
+            let instrument = Instrument::new(
+                ProviderId::new(spec.provider),
+                spec.asset_class.into(),
+                spec.symbol,
+            );
+            match session.unsubscribe(instrument, spec.kind.into()).await {
                 Ok(()) => WsReply::ok(id),
-                Err(e) => WsReply::from_library_error(id, &e),
+                Err(e) => ws_reply_from_library_error(id, &e),
             }
         }
         WsRequest::Snapshot { .. } => match dm.snapshot().await {
             Ok(snapshot) => WsReply::snapshot(id, snapshot),
-            Err(e) => WsReply::from_library_error(id, &e),
+            Err(e) => ws_reply_from_library_error(id, &e),
         },
         WsRequest::CloseClient { .. } => WsReply::ok(id),
+        WsRequest::Instruments { provider, .. } => {
+            let filter = provider.map(ProviderId::new);
+            match dm.instrument_catalog(filter.as_ref()).await {
+                Ok(catalog) => WsReply::instruments(id, catalog),
+                Err(e) => ws_reply_from_library_error(id, &e),
+            }
+        }
     };
     (reply, is_close_client)
 }
