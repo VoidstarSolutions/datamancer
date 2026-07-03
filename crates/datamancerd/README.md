@@ -194,6 +194,14 @@ hand-edits show up, not just UI-driven ones), plus bookkeeping:
  "path": "/home/op/.config/datamancerd/config.toml"}
 ```
 
+**Secrets are redacted.** `[ws].auth_token` is never sent to a client: the
+`GET`/`PUT` response replaces it with the placeholder `"<redacted>"` (like a
+masked password field). On `PUT`, a body that submits the placeholder verbatim
+**keeps the stored token unchanged** — the real value is restored from disk
+before the write, so a UI round-trip (GET → edit → PUT) never clobbers the
+secret and never flags a spurious restart. Submitting a different value rotates
+the token; the literal placeholder is never persisted as a token.
+
 `PUT /api/config` takes a full `Config` JSON body, validates it (the same
 `Config::validate` the daemon runs at boot), and — on success — atomically
 rewrites the file and returns the same envelope shape with the recomputed

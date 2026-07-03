@@ -14,6 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::Config;
 use crate::error::{DaemonError, Result};
 
+/// Placeholder emitted in place of a real secret (currently `[ws].auth_token`)
+/// on the read/response path, and recognized on write as "keep the stored value
+/// unchanged". A UI shows this like a masked password field: submitting it back
+/// verbatim means "don't touch the secret".
+pub(crate) const REDACTED_SECRET: &str = "<redacted>";
+
 /// Cheap-`Clone` (Arc-backed) config-file handle for web handlers.
 #[derive(Clone)]
 pub struct ConfigState {
@@ -94,7 +100,22 @@ impl ConfigState {
     /// Propagates [`Config::save`] errors.
     pub async fn write(&self, config: &Config) -> Result<()> {
         let _guard = self.inner.io_lock.lock().await;
-        let config = config.clone();
+        let mut config = config.clone();
+        // Preserve-on-write: a caller that echoed back the redacted GET view
+        // sends the placeholder in place of the real token. Restore it from the
+        // current on-disk config (read under the same lock as the write, so it
+        // is consistent with what we are about to overwrite). If no stored token
+        // is recoverable, the token is cleared rather than persisting the
+        // literal placeholder as a secret.
+        if let Some(ws) = config.ws.as_mut()
+            && ws.auth_token.as_deref() == Some(REDACTED_SECRET)
+        {
+            ws.auth_token = tokio::fs::read_to_string(&self.inner.path)
+                .await
+                .ok()
+                .and_then(|text| Config::parse(&text).ok())
+                .and_then(|current| current.ws.and_then(|w| w.auth_token));
+        }
         let path = self.inner.path.clone();
         // `save` is small-file blocking I/O; keep it off the shared runtime.
         let config_result =
@@ -144,13 +165,26 @@ fn error_response(status: StatusCode, code: &'static str, message: String) -> Re
     (status, Json(ConfigError { code, message })).into_response()
 }
 
-fn view(state: &ConfigState, config: Config) -> Response {
+fn view(state: &ConfigState, mut config: Config) -> Response {
+    redact_secrets(&mut config);
     let body = ConfigView {
         restart_required: state.restart_required(),
         path: state.path().display().to_string(),
         config,
     };
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Replace secret-bearing fields with [`REDACTED_SECRET`] before the config is
+/// serialized to a web client. The real values never leave the process on the
+/// API surface; a caller that echoes the placeholder back on `PUT` has it
+/// restored from disk in [`ConfigState::write`] (preserve-on-write).
+fn redact_secrets(config: &mut Config) {
+    if let Some(ws) = config.ws.as_mut()
+        && ws.auth_token.is_some()
+    {
+        ws.auth_token = Some(REDACTED_SECRET.to_string());
+    }
 }
 
 /// `GET /api/config` — the on-disk config (shows external hand-edits) plus the
@@ -291,5 +325,89 @@ mod tests {
         state.write(&invalid).await.expect_err("must reject");
         assert_eq!(state.read_disk().await.expect("read"), boot);
         assert!(!state.restart_required());
+    }
+
+    const WITH_TOKEN: &str = "[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\nauth_token = \"super-secret-token\"\n";
+
+    fn token_of(config: &Config) -> Option<&str> {
+        config.ws.as_ref().and_then(|w| w.auth_token.as_deref())
+    }
+
+    #[test]
+    fn redact_secrets_masks_present_token_only() {
+        let mut with = Config::parse(WITH_TOKEN).expect("parse");
+        redact_secrets(&mut with);
+        assert_eq!(token_of(&with), Some(REDACTED_SECRET));
+
+        // An absent token stays absent (no spurious placeholder).
+        let mut without = Config::parse(MINIMAL).expect("parse");
+        redact_secrets(&mut without);
+        assert_eq!(token_of(&without), None);
+    }
+
+    #[tokio::test]
+    async fn get_config_response_never_contains_the_token() {
+        use axum::body::to_bytes;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let boot = Config::parse(WITH_TOKEN).expect("parse");
+        boot.save(&path).expect("seed");
+        let state = ConfigState::new(path, boot);
+
+        let resp = get_config(State(state)).await;
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+        assert!(!text.contains("super-secret-token"), "leaked token: {text}");
+        assert!(text.contains(REDACTED_SECRET), "no placeholder: {text}");
+    }
+
+    #[tokio::test]
+    async fn write_preserves_redacted_token_from_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let boot = Config::parse(WITH_TOKEN).expect("parse");
+        boot.save(&path).expect("seed");
+        let state = ConfigState::new(path, boot.clone());
+
+        // The UI echoes back the redacted view unchanged: token == placeholder.
+        let mut echoed = boot.clone();
+        echoed.ws.as_mut().unwrap().auth_token = Some(REDACTED_SECRET.to_string());
+        state.write(&echoed).await.expect("write");
+
+        // The real token is restored on disk, and the round-trip is a no-op.
+        let disk = state.read_disk().await.expect("read");
+        assert_eq!(token_of(&disk), Some("super-secret-token"));
+        assert!(!state.restart_required(), "placeholder round-trip must not flag restart");
+    }
+
+    #[tokio::test]
+    async fn write_sets_a_genuinely_new_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let boot = Config::parse(WITH_TOKEN).expect("parse");
+        boot.save(&path).expect("seed");
+        let state = ConfigState::new(path, boot.clone());
+
+        let mut changed = boot.clone();
+        changed.ws.as_mut().unwrap().auth_token = Some("rotated-token".to_string());
+        state.write(&changed).await.expect("write");
+        assert_eq!(token_of(&state.read_disk().await.expect("read")), Some("rotated-token"));
+    }
+
+    #[tokio::test]
+    async fn write_never_persists_the_literal_placeholder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // Seed with NO stored token.
+        let boot = Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\n")
+            .expect("parse");
+        boot.save(&path).expect("seed");
+        let state = ConfigState::new(path, boot.clone());
+
+        let mut echoed = boot.clone();
+        echoed.ws.as_mut().unwrap().auth_token = Some(REDACTED_SECRET.to_string());
+        state.write(&echoed).await.expect("write");
+        // No token to restore -> cleared, never the literal placeholder.
+        assert_eq!(token_of(&state.read_disk().await.expect("read")), None);
     }
 }
