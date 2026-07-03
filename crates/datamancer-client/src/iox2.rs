@@ -53,9 +53,6 @@ pub enum Iceoryx2ClientError {
     /// The iceoryx2 transport crate failed.
     #[error("iceoryx2 transport: {0}")]
     Transport(#[from] datamancer_transport_iceoryx2::TransportError),
-    /// iceoryx2 node creation failed.
-    #[error("iceoryx2 node: {0}")]
-    Node(String),
 }
 
 /// Extract the numeric client id from the `open-client` reply's service name
@@ -245,6 +242,11 @@ impl Client for Iceoryx2Client {
     }
 
     async fn close(mut self) -> Result<(), ClientError<Self::Error>> {
+        // `close` consumes the client, so this is the caller's last chance to
+        // signal the poll task. Set the stop flag unconditionally *before* the
+        // round-trip: a transport failure below must not leave the
+        // spawn_blocking loop (and its Node/DataSubscriber) running forever.
+        self.stop.store(true, Ordering::Relaxed);
         let reply = self
             .control
             .request(&Request::CloseClient {
@@ -252,7 +254,6 @@ impl Client for Iceoryx2Client {
             })
             .await
             .map_err(ClientError::Transport)?;
-        self.stop.store(true, Ordering::Relaxed);
         check(reply).map(|_| ())
     }
 }
@@ -333,5 +334,34 @@ mod tests {
             }
             other => panic!("expected Control error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn close_sets_the_stop_flag_even_when_the_transport_fails() {
+        use super::Iceoryx2Client;
+        use crate::client::Client as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A fake daemon that accepts and immediately hangs up: the
+        // close-client round-trip fails at the transport layer (connection
+        // closed before any reply line arrives).
+        let path = fake_uds(vec![]);
+        let control = ControlConn::connect(&path).await.unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let client = Iceoryx2Client {
+            control,
+            client_name: "doomed".to_string(),
+            stop: Arc::clone(&stop),
+        };
+        match client.close().await {
+            Err(ClientError::Transport(_)) => {}
+            other => panic!("expected transport error, got {other:?}"),
+        }
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "close() must signal the poll task even when the request fails — \
+             it consumes the client, so this is the last chance"
+        );
     }
 }
