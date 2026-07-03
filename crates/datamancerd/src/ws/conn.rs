@@ -31,6 +31,7 @@ pub async fn handle_connection(
     dm: Datamancer,
     auth_token: Option<Arc<String>>,
     channel_depth: usize,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let ws = match accept_with_auth(tcp, auth_token).await {
         Ok(ws) => ws,
@@ -54,6 +55,10 @@ pub async fn handle_connection(
     let stream = match session.take_events().await {
         Ok(stream) => stream,
         Err(e) => {
+            // `id:0` is the out-of-band sentinel: this failure precedes any
+            // client request, so there is no request id to echo. We skip
+            // `session.close()` because the stream was never taken — there is no
+            // pump/terminal frame to drain, and the session drops cleanly.
             tracing::warn!(%peer, error = %e, "take_events failed");
             let _ = tx.try_send(
                 serde_json::to_string(&WsReply::from_library_error(0, &e)).unwrap_or_default(),
@@ -64,8 +69,23 @@ pub async fn handle_connection(
     let pump = spawn_pump(stream, sink);
 
     // Control loop: read frames, dispatch against the session, reply on `tx`.
+    // Also select on the daemon-wide shutdown signal so graceful drain triggers
+    // this connection's teardown instead of leaving it blocked on the read.
     let mut closed_by_client = false;
-    while let Some(msg) = read.next().await {
+    let mut drained = false;
+    loop {
+        let msg = tokio::select! {
+            // Any resolution of `recv` — Ok(()), Lagged, or Closed — means "shut
+            // down now": break to the shared teardown path below.
+            _ = shutdown.recv() => {
+                drained = true;
+                break;
+            }
+            msg = read.next() => match msg {
+                Some(msg) => msg,
+                None => break,
+            },
+        };
         let text = match msg {
             Ok(Message::Text(t)) => t.to_string(),
             Ok(Message::Close(_)) | Err(_) => break,
@@ -73,11 +93,10 @@ pub async fn handle_connection(
                 continue;
             }
         };
-        let reply = dispatch(&session, &dm, &text).await;
-        let close_after = matches!(
-            serde_json::from_str::<WsRequest>(&text),
-            Ok(WsRequest::CloseClient { .. })
-        ) && reply.ok;
+        // `dispatch` also reports whether the frame was a `close-client`, so the
+        // read loop need not re-parse it to compute `close_after`.
+        let (reply, was_close_client) = dispatch(&session, &dm, &text).await;
+        let close_after = was_close_client && reply.ok;
         if let Ok(line) = serde_json::to_string(&reply)
             && tx.send(line).await.is_err()
         {
@@ -89,8 +108,10 @@ pub async fn handle_connection(
         }
     }
 
-    // Teardown: close the session (emits terminal `session_closing` on the
-    // stream), let the pump drain under a bound, then drop the writer.
+    // Teardown (shared by every exit: client Close/EOF/error, close-client, and
+    // daemon shutdown): close the session (emits terminal `session_closing` on
+    // the stream), let the pump drain under a bound, then drop the writer so
+    // `run_writer` emits the clean WS Close frame once the channel empties.
     let _ = session.close().await;
     if tokio::time::timeout(Duration::from_secs(2), pump).await.is_err() {
         tracing::warn!(%peer, "ws pump did not drain in time");
@@ -98,7 +119,7 @@ pub async fn handle_connection(
     // Dropping `tx` lets `run_writer` finish once the channel empties.
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
-    tracing::info!(%peer, closed_by_client, "ws client disconnected");
+    tracing::info!(%peer, closed_by_client, drained, "ws client disconnected");
 }
 
 /// Perform the tungstenite server handshake, rejecting the upgrade with 401 if a
@@ -128,14 +149,22 @@ async fn accept_with_auth(
     .await
 }
 
-/// Dispatch one parsed control frame against the connection's session.
-async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> WsReply {
+/// Dispatch one parsed control frame against the connection's session. Returns
+/// the reply plus whether the frame was a `close-client` (so the caller need not
+/// re-parse the line to decide on a graceful close).
+async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsReply, bool) {
     let req = match serde_json::from_str::<WsRequest>(line) {
         Ok(req) => req,
-        Err(e) => return WsReply::error(0, codes::BAD_REQUEST, format!("invalid request: {e}")),
+        Err(e) => {
+            return (
+                WsReply::error(0, codes::BAD_REQUEST, format!("invalid request: {e}")),
+                false,
+            );
+        }
     };
     let id = req.id();
-    match req {
+    let is_close_client = matches!(req, WsRequest::CloseClient { .. });
+    let reply = match req {
         WsRequest::Subscribe { spec, .. } => {
             let instrument = Instrument::new(
                 ProviderId::new(spec.provider.clone()),
@@ -175,7 +204,8 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> WsRep
             Err(e) => WsReply::from_library_error(id, &e),
         },
         WsRequest::CloseClient { .. } => WsReply::ok(id),
-    }
+    };
+    (reply, is_close_client)
 }
 
 /// Pump the client's multiplexed stream into the WS sink, in arrival order.

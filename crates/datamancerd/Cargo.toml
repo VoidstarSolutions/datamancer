@@ -61,6 +61,8 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 arc-swap = "1"
 http-body-util = "0.1"
+# `ws_e2e` graceful-shutdown test sends SIGTERM to the spawned daemon.
+libc = "0.2"
 
 [lints]
 workspace = true

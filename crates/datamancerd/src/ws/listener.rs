@@ -5,15 +5,20 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use datamancer::Datamancer;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 
 use crate::config::WsConfig;
 use crate::ws::conn::handle_connection;
 
 /// Serve the WS client surface until `shutdown` resolves. New accepts stop once
-/// shutdown fires; in-flight connections are dropped by their own teardown.
+/// shutdown fires; in-flight connections are then signalled to tear down (each
+/// runs its `session.close()` → tap-log flush → clean WS Close), and their tasks
+/// are drained under a bound shorter than the supervisor's own drain timeout.
 ///
 /// # Errors
 ///
@@ -42,6 +47,13 @@ pub async fn serve(
 
     let auth_token = cfg.auth_token.map(Arc::new);
     let channel_depth = cfg.channel_depth;
+
+    // Live connection tasks, plus a broadcast signal each one selects on so a
+    // daemon-wide shutdown triggers their teardown (rather than leaving them
+    // blocked on the socket read). Capacity 1: a single fan-out `()`.
+    let mut conns: JoinSet<()> = JoinSet::new();
+    let (conn_shutdown_tx, _) = broadcast::channel::<()>(1);
+
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -50,11 +62,28 @@ pub async fn serve(
                 Ok((tcp, peer)) => {
                     let dm = dm.clone();
                     let auth_token = auth_token.clone();
-                    tokio::spawn(handle_connection(tcp, peer, dm, auth_token, channel_depth));
+                    let conn_shutdown = conn_shutdown_tx.subscribe();
+                    conns.spawn(handle_connection(
+                        tcp,
+                        peer,
+                        dm,
+                        auth_token,
+                        channel_depth,
+                        conn_shutdown,
+                    ));
                 }
                 Err(e) => tracing::warn!(error = %e, "ws accept failed"),
             },
         }
     }
+
+    // New accepts have stopped (the accept loop broke). Signal every live
+    // connection to tear down, then drain their tasks under a bound shorter than
+    // the supervisor's 5s `ws_task` await so this returns before that fires.
+    let _ = conn_shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        while conns.join_next().await.is_some() {}
+    })
+    .await;
     Ok(())
 }

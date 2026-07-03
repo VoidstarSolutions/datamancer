@@ -27,6 +27,10 @@ use tokio_tungstenite::tungstenite::Message;
 /// (they otherwise run on parallel threads within this one test binary).
 static DAEMON_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+// Fixed ports (19011/19012/19013) can collide with anything else already bound
+// on the host — acceptable for these `#[ignore]`d, manually-run tests, which are
+// also serialized by `DAEMON_LOCK` so they never collide with each other.
+
 /// Spawn the daemon from a written config file. Returns the child; the caller is
 /// responsible for waiting on WS readiness.
 fn spawn_daemon(dir: &std::path::Path, port: u16, auth_token: Option<&str>) -> Child {
@@ -142,6 +146,86 @@ async fn subscribe_reply_echoes_id_and_snapshot_returns() {
 
     child.kill().expect("kill");
     let _ = child.wait();
+}
+
+/// SIGTERM the daemon while a live WS client is connected and assert the client
+/// observes a graceful close (a `Close` frame or a clean end-of-stream) — not a
+/// hang. This exercises the daemon-shutdown → per-connection teardown path
+/// (`ws_shutdown` → listener drains `JoinSet` → each `handle_connection` breaks
+/// its read loop → `session.close()` → writer emits the WS Close). All reads are
+/// bounded so a regression FAILS instead of hanging.
+#[tokio::test]
+#[ignore = "spawns the binary; needs a live iceoryx2 runtime; run with --ignored"]
+async fn graceful_shutdown_closes_live_connection() {
+    let _guard = DAEMON_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = 19013;
+    let mut child = spawn_daemon(dir.path(), port, None);
+
+    let mut ws = connect_when_ready(port).await;
+
+    // Subscribe so the connection holds a live client session before shutdown.
+    ws.send(Message::text(
+        r#"{"id":1,"op":"subscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+    ))
+    .await
+    .expect("send subscribe");
+    let sub = read_reply(&mut ws, 1).await;
+    assert_eq!(sub["ok"], serde_json::Value::Bool(true), "subscribe reply: {sub}");
+
+    // Graceful termination (NOT SIGKILL): the daemon must tear down live WS
+    // connections on its drain path.
+    let pid = child.id().cast_signed();
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGTERM) },
+        0,
+        "SIGTERM failed"
+    );
+
+    // The client must observe a graceful close within the shutdown window:
+    // either a `Close` frame or a clean end-of-stream (`None`). A regression that
+    // leaves the connection blocked would time out here and FAIL the test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_close = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            Ok(Some(Ok(Message::Close(_))) | None) => {
+                saw_close = true;
+                break;
+            }
+            // Interleaved event/reply frames or a benign error on the closing
+            // stream: keep reading until Close/EOF or the deadline.
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_))) => {
+                // A transport error as the peer goes away still means the server
+                // side closed rather than hanging.
+                saw_close = true;
+                break;
+            }
+            Err(_) => break, // per-read timeout; fall through to overall deadline
+        }
+    }
+    assert!(
+        saw_close,
+        "client never observed a graceful close after SIGTERM (connection hung)"
+    );
+
+    // The child must exit within the shutdown window (bounded try_wait poll so a
+    // wedged daemon fails rather than hanging the test).
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break status,
+            None if Instant::now() < exit_deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            None => {
+                child.kill().expect("kill wedged daemon");
+                panic!("daemon did not exit within the shutdown window after SIGTERM");
+            }
+        }
+    };
+    assert!(status.success(), "daemon exited non-zero after SIGTERM: {status:?}");
 }
 
 #[tokio::test]
