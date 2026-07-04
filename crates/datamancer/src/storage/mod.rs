@@ -20,3 +20,9 @@ pub(crate) mod turso_common;
 
 #[cfg(feature = "storage-turso")]
 pub(crate) mod coverage;
+
+#[cfg(feature = "storage-turso")]
+pub mod turso;
+
+#[cfg(feature = "storage-turso")]
+pub use turso::{TursoCache, TursoCacheConfig};

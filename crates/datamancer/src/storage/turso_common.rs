@@ -11,11 +11,8 @@
 //! writer task's own), and [`execute_retry`] bounds any residual conflict so
 //! a wedge becomes a loud [`Error::Storage`], never a hang.
 //!
-//! This module's public surface has no callers yet outside its own unit
-//! tests — the cache and tap-log ports that consume it land in later tasks
-//! of the turso migration — so `dead_code` is allowed crate-wide for it
-//! until then.
-#![allow(dead_code)]
+//! Consumed by [`super::turso::TursoCache`] (this module's first caller); the
+//! tap-log port lands in a later task of the turso migration.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -173,11 +170,15 @@ mod tests {
         {
             let db = open_database(&loc).await.unwrap();
             let conn = connect(&db).await.unwrap();
-            check_or_stamp_user_version(&conn, 1, "test store").await.unwrap();
+            check_or_stamp_user_version(&conn, 1, "test store")
+                .await
+                .unwrap();
         }
         let db = open_database(&loc).await.unwrap();
         let conn = connect(&db).await.unwrap();
-        check_or_stamp_user_version(&conn, 1, "test store").await.unwrap();
+        check_or_stamp_user_version(&conn, 1, "test store")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -187,7 +188,9 @@ mod tests {
         {
             let db = open_database(&loc).await.unwrap();
             let conn = connect(&db).await.unwrap();
-            check_or_stamp_user_version(&conn, 999, "test store").await.unwrap();
+            check_or_stamp_user_version(&conn, 999, "test store")
+                .await
+                .unwrap();
         }
         let db = open_database(&loc).await.unwrap();
         let conn = connect(&db).await.unwrap();

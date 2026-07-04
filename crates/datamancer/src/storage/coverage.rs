@@ -1,7 +1,5 @@
 //! Pure coverage-segment bookkeeping shared by storage backends: sorted, non-overlapping half-open [from, to) segments with merge/intersect/gap queries. No I/O.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 /// Sorted, non-overlapping segments and event count.
@@ -58,6 +56,7 @@ impl CoverageDoc {
         best
     }
 
+    #[allow(dead_code)] // consumed by the real gaps() override landing in Task 4.
     pub(crate) fn gaps_within(&self, from: i64, to: i64) -> Vec<(i64, i64)> {
         if from >= to {
             return Vec::new();
