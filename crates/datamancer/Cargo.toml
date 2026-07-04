@@ -74,5 +74,9 @@ required-features = ["storage-surreal"]
 name = "turso_tap_log"
 required-features = ["storage-turso"]
 
+[[test]]
+name = "turso_crash"
+required-features = ["storage-turso"]
+
 [lints]
 workspace = true
