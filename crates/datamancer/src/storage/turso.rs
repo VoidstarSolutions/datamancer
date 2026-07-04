@@ -37,8 +37,9 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use datamancer_core::{
-    Adjustment, BarInterval, CacheCoverage, CacheKey, Error, EventKind, HistoricalCache,
-    MarketEvent, ReplayRequest, ReplaySource, Result, Timestamp,
+    Adjustment, AssetClass, BarInterval, CacheCatalogEntry, CacheCoverage, CacheKey, Error,
+    EventKind, GapSpan, HistoricalCache, MarketEvent, ProviderId, ReplayRequest, ReplaySource,
+    Result, Timestamp,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use tokio::sync::Mutex;
@@ -152,7 +153,6 @@ impl TursoCache {
 
     /// Inverse of [`table_for`](Self::table_for); `None` for an unrecognized
     /// token so a malformed coverage id is skipped rather than panicking.
-    #[allow(dead_code)] // consumed by the catalog scan landing in Task 4.
     pub(crate) fn kind_for(table: &str) -> Option<EventKind> {
         Some(match table {
             "trades" => EventKind::Trade,
@@ -169,7 +169,6 @@ impl TursoCache {
 
     /// Logical bytes per stored row (fixed numeric fields only) — same
     /// best-effort estimate the surreal backend reported.
-    #[allow(dead_code)] // consumed by the catalog `est_bytes` estimate in Task 4.
     const fn bytes_per_row(kind: EventKind) -> u64 {
         match kind {
             EventKind::Trade => 4 * 8,
@@ -318,6 +317,85 @@ impl HistoricalCache for TursoCache {
         }
     }
 
+    async fn gaps(&self, key: &CacheKey) -> Result<Vec<GapSpan>> {
+        let conn = connect(&self.db).await?;
+        let doc = Self::load_coverage(&conn, &Self::coverage_id(key))
+            .await?
+            .unwrap_or_default();
+        Ok(doc
+            .gaps_within(key.from.0, key.to.0)
+            .into_iter()
+            .map(|(a, b)| GapSpan {
+                from_source_ts: Timestamp(a),
+                to_source_ts: Timestamp(b),
+            })
+            .collect())
+    }
+
+    async fn catalog(&self) -> Result<Vec<CacheCatalogEntry>> {
+        let conn = connect(&self.db).await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, segments, event_count, asset_class FROM coverage",
+                (),
+            )
+            .await
+            .map_err(map_err)?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_err)? {
+            let coverage_id: String = row.get(0).map_err(map_err)?;
+            let segments_json: String = row.get(1).map_err(map_err)?;
+            let event_count: i64 = row.get(2).map_err(map_err)?;
+            let asset_class: Option<String> = row.get(3).map_err(map_err)?;
+
+            let parts: Vec<&str> = coverage_id.split('|').collect();
+            let [provider, symbol, table, adjustment] = parts.as_slice() else {
+                tracing::warn!(coverage_id = %coverage_id,
+                    "skipping malformed coverage id (expected 4 |-separated parts)");
+                continue;
+            };
+            let Some(kind) = Self::kind_for(table) else {
+                tracing::warn!(coverage_id = %coverage_id, table = %table,
+                    "skipping coverage id with unknown table token");
+                continue;
+            };
+            let Some(adjustment) = Adjustment::from_token(adjustment) else {
+                tracing::warn!(coverage_id = %coverage_id, adjustment = %adjustment,
+                    "skipping coverage id with unknown adjustment token");
+                continue;
+            };
+            let segments: Vec<(i64, i64)> = match serde_json::from_str(&segments_json) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(coverage_id = %coverage_id, error = %e,
+                        "skipping coverage row with undecodable segments");
+                    continue;
+                }
+            };
+            let event_count = event_count.cast_unsigned();
+            let est_bytes = Some(event_count.saturating_mul(Self::bytes_per_row(kind)));
+            entries.push(
+                CacheCatalogEntry::new(
+                    ProviderId::new((*provider).to_string()),
+                    (*symbol).to_string(),
+                    kind,
+                    adjustment,
+                    segments
+                        .into_iter()
+                        .map(|(a, b)| GapSpan {
+                            from_source_ts: Timestamp(a),
+                            to_source_ts: Timestamp(b),
+                        })
+                        .collect(),
+                    event_count,
+                )
+                .with_asset_class(asset_class.as_deref().and_then(asset_class_from_str))
+                .with_est_bytes(est_bytes),
+            );
+        }
+        Ok(entries)
+    }
+
     fn as_replay_source(&self, key: CacheKey) -> Box<dyn ReplaySource> {
         // Implemented in Task 5; this placeholder keeps the trait total.
         Box::new(TursoCacheReplaySource {
@@ -461,6 +539,17 @@ async fn store_in_tx(
     )
     .await?;
     Ok(())
+}
+
+/// Inverse of [`AssetClass`]'s `Display`. Unknown tokens yield `None` rather
+/// than a fabricated identity.
+fn asset_class_from_str(s: &str) -> Option<AssetClass> {
+    match s {
+        "equity" => Some(AssetClass::Equity),
+        "etf" => Some(AssetClass::Etf),
+        "crypto" => Some(AssetClass::Crypto),
+        _ => None,
+    }
 }
 
 /// Cache replay source — fleshed out in Task 5.

@@ -124,80 +124,74 @@ async fn lookup_returns_none_for_empty_cache() {
 //     }
 // }
 
-// TODO(task-4): needs the real segment-based `gaps` override (mid-range
-// holes); the trait's default `gaps` (lookup-derived leading/trailing
-// fringes only) can't distinguish the middle gap this test asserts on.
-// #[tokio::test]
-// async fn gaps_reports_uncovered_subranges() {
-//     let cache = TursoCache::open(TursoCacheConfig::Memory)
-//         .await
-//         .unwrap();
-//     // First, ingest events for [100, 200) and [300, 400).
-//     let k1 = key(EventKind::Bar(BarInterval::OneMinute), 100, 200);
-//     cache
-//         .store(&k1, &[bar("AAPL", 100, 1.0), bar("AAPL", 199, 1.5)])
-//         .await
-//         .unwrap();
-//     let k2 = key(EventKind::Bar(BarInterval::OneMinute), 300, 400);
-//     cache
-//         .store(&k2, &[bar("AAPL", 300, 2.0), bar("AAPL", 399, 2.5)])
-//         .await
-//         .unwrap();
-//
-//     // Ask about [50, 500): gaps should be [50,100), [200,300), [400,500).
-//     let probe = key(EventKind::Bar(BarInterval::OneMinute), 50, 500);
-//     let gaps = cache.gaps(&probe).await.unwrap();
-//     let want = vec![
-//         GapSpan {
-//             from_source_ts: Timestamp(50),
-//             to_source_ts: Timestamp(100),
-//         },
-//         GapSpan {
-//             from_source_ts: Timestamp(200),
-//             to_source_ts: Timestamp(300),
-//         },
-//         GapSpan {
-//             from_source_ts: Timestamp(400),
-//             to_source_ts: Timestamp(500),
-//         },
-//     ];
-//     assert_eq!(gaps, want);
-//
-//     // After a backfill of [200,300), the middle gap closes.
-//     let k3 = key(EventKind::Bar(BarInterval::OneMinute), 200, 300);
-//     cache.store(&k3, &[bar("AAPL", 250, 1.75)]).await.unwrap();
-//     let gaps = cache.gaps(&probe).await.unwrap();
-//     assert_eq!(
-//         gaps,
-//         vec![
-//             GapSpan {
-//                 from_source_ts: Timestamp(50),
-//                 to_source_ts: Timestamp(100),
-//             },
-//             GapSpan {
-//                 from_source_ts: Timestamp(400),
-//                 to_source_ts: Timestamp(500),
-//             },
-//         ],
-//     );
-// }
+#[tokio::test]
+async fn gaps_reports_uncovered_subranges() {
+    let cache = TursoCache::open(TursoCacheConfig::Memory)
+        .await
+        .unwrap();
+    // First, ingest events for [100, 200) and [300, 400).
+    let k1 = key(EventKind::Bar(BarInterval::OneMinute), 100, 200);
+    cache
+        .store(&k1, &[bar("AAPL", 100, 1.0), bar("AAPL", 199, 1.5)])
+        .await
+        .unwrap();
+    let k2 = key(EventKind::Bar(BarInterval::OneMinute), 300, 400);
+    cache
+        .store(&k2, &[bar("AAPL", 300, 2.0), bar("AAPL", 399, 2.5)])
+        .await
+        .unwrap();
 
-// TODO(task-4): passes today against the default `gaps` impl too (single
-// covered segment), but is owned by the Task 4 gaps test surface — gated for
-// consistency with `gaps_reports_uncovered_subranges` above.
-// #[tokio::test]
-// async fn fully_covered_range_reports_no_gaps() {
-//     let cache = TursoCache::open(TursoCacheConfig::Memory)
-//         .await
-//         .unwrap();
-//     let k = key(EventKind::Trade, 0, 1000);
-//     cache
-//         .store(&k, &[trade("AAPL", 0, 1.0, 1), trade("AAPL", 999, 1.0, 1)])
-//         .await
-//         .unwrap();
-//     let gaps = cache.gaps(&k).await.unwrap();
-//     assert!(gaps.is_empty(), "expected no gaps, got {gaps:?}");
-// }
+    // Ask about [50, 500): gaps should be [50,100), [200,300), [400,500).
+    let probe = key(EventKind::Bar(BarInterval::OneMinute), 50, 500);
+    let gaps = cache.gaps(&probe).await.unwrap();
+    let want = vec![
+        GapSpan {
+            from_source_ts: Timestamp(50),
+            to_source_ts: Timestamp(100),
+        },
+        GapSpan {
+            from_source_ts: Timestamp(200),
+            to_source_ts: Timestamp(300),
+        },
+        GapSpan {
+            from_source_ts: Timestamp(400),
+            to_source_ts: Timestamp(500),
+        },
+    ];
+    assert_eq!(gaps, want);
+
+    // After a backfill of [200,300), the middle gap closes.
+    let k3 = key(EventKind::Bar(BarInterval::OneMinute), 200, 300);
+    cache.store(&k3, &[bar("AAPL", 250, 1.75)]).await.unwrap();
+    let gaps = cache.gaps(&probe).await.unwrap();
+    assert_eq!(
+        gaps,
+        vec![
+            GapSpan {
+                from_source_ts: Timestamp(50),
+                to_source_ts: Timestamp(100),
+            },
+            GapSpan {
+                from_source_ts: Timestamp(400),
+                to_source_ts: Timestamp(500),
+            },
+        ],
+    );
+}
+
+#[tokio::test]
+async fn fully_covered_range_reports_no_gaps() {
+    let cache = TursoCache::open(TursoCacheConfig::Memory)
+        .await
+        .unwrap();
+    let k = key(EventKind::Trade, 0, 1000);
+    cache
+        .store(&k, &[trade("AAPL", 0, 1.0, 1), trade("AAPL", 999, 1.0, 1)])
+        .await
+        .unwrap();
+    let gaps = cache.gaps(&k).await.unwrap();
+    assert!(gaps.is_empty(), "expected no gaps, got {gaps:?}");
+}
 
 #[tokio::test]
 async fn embedded_round_trip_persists_to_disk() {
@@ -365,85 +359,81 @@ fn reexports_are_consistent() {
 }
 
 // --- catalog enumeration ----------------------------------------------------
-//
-// TODO(task-4): `catalog()` is added in Task 4 (the trait's default returns
-// an empty `Vec`, which would make `catalog_empty_when_nothing_stored` pass
-// vacuously and `catalog_roundtrips_stored_ranges` fail); gated until then.
-//
-// #[tokio::test]
-// async fn catalog_empty_when_nothing_stored() {
-//     let cache = TursoCache::open(TursoCacheConfig::Memory)
-//         .await
-//         .unwrap();
-//     assert!(cache.catalog().await.unwrap().is_empty());
-// }
-//
-// #[tokio::test]
-// async fn catalog_roundtrips_stored_ranges() {
-//     use datamancer::CacheCatalogEntry;
-//
-//     let cache = TursoCache::open(TursoCacheConfig::Memory)
-//         .await
-//         .unwrap();
-//
-//     // A trade range (stored under Raw regardless of the key's mode) ...
-//     let trade_key = key_adj(EventKind::Trade, 100, 400, Adjustment::All);
-//     cache
-//         .store(
-//             &trade_key,
-//             &[trade("AAPL", 100, 1.0, 1), trade("AAPL", 300, 2.0, 1)],
-//         )
-//         .await
-//         .unwrap();
-//
-//     // ... and one bar range under each of two adjustment modes.
-//     let bar_all = key_adj(
-//         EventKind::Bar(BarInterval::OneMinute),
-//         0,
-//         200,
-//         Adjustment::All,
-//     );
-//     let bar_raw = key_adj(
-//         EventKind::Bar(BarInterval::OneMinute),
-//         0,
-//         200,
-//         Adjustment::Raw,
-//     );
-//     cache
-//         .store(&bar_all, &[bar("AAPL", 0, 1.0), bar("AAPL", 60, 2.0)])
-//         .await
-//         .unwrap();
-//     cache.store(&bar_raw, &[bar("AAPL", 0, 1.0)]).await.unwrap();
-//
-//     let catalog = cache.catalog().await.unwrap();
-//     assert_eq!(catalog.len(), 3, "trade + two bar-adjustment keys");
-//
-//     let find = |kind: EventKind, adj: Adjustment| -> CacheCatalogEntry {
-//         catalog
-//             .iter()
-//             .find(|e| e.kind == kind && e.adjustment == adj)
-//             .cloned()
-//             .unwrap_or_else(|| panic!("missing catalog entry for {kind:?} / {adj:?}"))
-//     };
-//
-//     // Trades always store under Raw, even though the key requested All.
-//     let t = find(EventKind::Trade, Adjustment::Raw);
-//     assert_eq!(t.symbol, "AAPL");
-//     assert_eq!(t.provider.as_str(), "alpaca");
-//     assert_eq!(t.asset_class, Some(AssetClass::Equity));
-//     assert_eq!(t.event_count, 2);
-//     assert_eq!(
-//         t.segments,
-//         vec![GapSpan {
-//             from_source_ts: Timestamp(100),
-//             to_source_ts: Timestamp(400),
-//         }]
-//     );
-//     assert!(t.est_bytes.is_some_and(|b| b > 0));
-//
-//     let b_all = find(EventKind::Bar(BarInterval::OneMinute), Adjustment::All);
-//     assert_eq!(b_all.event_count, 2);
-//     assert_eq!(b_all.asset_class, Some(AssetClass::Equity));
-//     let b_raw = find(EventKind::Bar(BarInterval::OneMinute), Adjustment::Raw);
-//     assert_eq!(b_raw.event_count, 1);
-// }
+
+#[tokio::test]
+async fn catalog_empty_when_nothing_stored() {
+    let cache = TursoCache::open(TursoCacheConfig::Memory)
+        .await
+        .unwrap();
+    assert!(cache.catalog().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn catalog_roundtrips_stored_ranges() {
+    use datamancer::CacheCatalogEntry;
+
+    let cache = TursoCache::open(TursoCacheConfig::Memory)
+        .await
+        .unwrap();
+
+    // A trade range (stored under Raw regardless of the key's mode) ...
+    let trade_key = key_adj(EventKind::Trade, 100, 400, Adjustment::All);
+    cache
+        .store(
+            &trade_key,
+            &[trade("AAPL", 100, 1.0, 1), trade("AAPL", 300, 2.0, 1)],
+        )
+        .await
+        .unwrap();
+
+    // ... and one bar range under each of two adjustment modes.
+    let bar_all = key_adj(
+        EventKind::Bar(BarInterval::OneMinute),
+        0,
+        200,
+        Adjustment::All,
+    );
+    let bar_raw = key_adj(
+        EventKind::Bar(BarInterval::OneMinute),
+        0,
+        200,
+        Adjustment::Raw,
+    );
+    cache
+        .store(&bar_all, &[bar("AAPL", 0, 1.0), bar("AAPL", 60, 2.0)])
+        .await
+        .unwrap();
+    cache.store(&bar_raw, &[bar("AAPL", 0, 1.0)]).await.unwrap();
+
+    let catalog = cache.catalog().await.unwrap();
+    assert_eq!(catalog.len(), 3, "trade + two bar-adjustment keys");
+
+    let find = |kind: EventKind, adj: Adjustment| -> CacheCatalogEntry {
+        catalog
+            .iter()
+            .find(|e| e.kind == kind && e.adjustment == adj)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing catalog entry for {kind:?} / {adj:?}"))
+    };
+
+    // Trades always store under Raw, even though the key requested All.
+    let t = find(EventKind::Trade, Adjustment::Raw);
+    assert_eq!(t.symbol, "AAPL");
+    assert_eq!(t.provider.as_str(), "alpaca");
+    assert_eq!(t.asset_class, Some(AssetClass::Equity));
+    assert_eq!(t.event_count, 2);
+    assert_eq!(
+        t.segments,
+        vec![GapSpan {
+            from_source_ts: Timestamp(100),
+            to_source_ts: Timestamp(400),
+        }]
+    );
+    assert!(t.est_bytes.is_some_and(|b| b > 0));
+
+    let b_all = find(EventKind::Bar(BarInterval::OneMinute), Adjustment::All);
+    assert_eq!(b_all.event_count, 2);
+    assert_eq!(b_all.asset_class, Some(AssetClass::Equity));
+    let b_raw = find(EventKind::Bar(BarInterval::OneMinute), Adjustment::Raw);
+    assert_eq!(b_raw.event_count, 1);
+}
