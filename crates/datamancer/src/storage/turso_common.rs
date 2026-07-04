@@ -11,8 +11,8 @@
 //! writer task's own), and [`execute_retry`] bounds any residual conflict so
 //! a wedge becomes a loud [`Error::Storage`], never a hang.
 //!
-//! Consumed by [`super::turso::TursoCache`] (this module's first caller); the
-//! tap-log port lands in a later task of the turso migration.
+//! Consumed by both [`super::turso::TursoCache`] and
+//! [`super::turso_tap_log::TursoTapLog`], the two Turso-backed stores.
 
 use std::path::PathBuf;
 use std::time::Duration;

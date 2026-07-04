@@ -328,8 +328,25 @@ async fn embedded_round_trip_persists_and_continues_seq() {
         log.flush().await.unwrap();
     }
 
-    // Reopen the same on-disk store.
-    let log = TursoTapLog::open(cfg.clone()).await.unwrap();
+    // The previous handle's writer task/file lock teardown is async — an
+    // immediate reopen races it and can transiently fail. A fixed sleep here
+    // is flaky on slow CI; poll `open` until the lock clears, capped at ~5 s
+    // total. On any error we just retry — by the deadline we either succeed
+    // or surface the most recent error so the failure mode is diagnosable.
+    let log = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match TursoTapLog::open(cfg.clone()).await {
+                Ok(l) => break l,
+                Err(e) if std::time::Instant::now() >= deadline => {
+                    panic!("embedded reopen never succeeded within 5s: {e}");
+                }
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    };
     // A post-reopen append persists its own source seq; the shard registry and
     // earlier rows survive the reopen.
     log.append(&trade("AAPL", 3, 3, 3, 12.0, 1)).await.unwrap(); // seq 3

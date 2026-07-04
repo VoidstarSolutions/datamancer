@@ -50,8 +50,11 @@ use super::turso_common::{
 };
 
 /// `PRAGMA user_version` for this cache's schema. Fresh lineage (no carry-over
-/// from the prior backend's numbering).
-const CACHE_SCHEMA_VERSION: i64 = 1;
+/// from the prior backend's numbering). Deliberately disjoint from the tap
+/// log's range (cache uses the `1x` band, tap log the `2x` band) so a file
+/// opened as the wrong store type is refused by the version guard instead of
+/// silently colliding.
+const CACHE_SCHEMA_VERSION: i64 = 10;
 
 /// Where the cache is stored.
 #[derive(Clone, Debug)]
@@ -305,10 +308,18 @@ impl HistoricalCache for TursoCache {
         execute_retry(&write, "BEGIN", ()).await?;
         let res = store_in_tx(&write, key, events).await;
         match res {
-            Ok(()) => {
-                execute_retry(&write, "COMMIT", ()).await?;
-                Ok(())
-            }
+            Ok(()) => match execute_retry(&write, "COMMIT", ()).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    // A failed COMMIT can still leave the transaction open on
+                    // the shared write connection; every later BEGIN would
+                    // then fail until the process restarts. Best-effort
+                    // rollback so the connection is usable again — the
+                    // original COMMIT error is still the story.
+                    let _ = write.execute("ROLLBACK", ()).await;
+                    Err(e)
+                }
+            },
             Err(e) => {
                 // Best-effort rollback; the original error is the story.
                 let _ = write.execute("ROLLBACK", ()).await;
@@ -397,7 +408,8 @@ impl HistoricalCache for TursoCache {
     }
 
     fn as_replay_source(&self, key: CacheKey) -> Box<dyn ReplaySource> {
-        // Implemented in Task 5; this placeholder keeps the trait total.
+        // Cheap handle: clones the shared `Database` and the requested key so
+        // `open` can run its own scan later, independent of this cache value.
         Box::new(TursoCacheReplaySource {
             db: self.db.clone(),
             key,

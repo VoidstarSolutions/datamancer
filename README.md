@@ -57,7 +57,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
-Default features are `provider-alpaca` + `storage-surreal`; `transport-iceoryx2` is **off
+Default features are `provider-alpaca` + `storage-turso`; `transport-iceoryx2` is **off
 by default**. Ignored tests need live resources:
 
 ```bash
@@ -73,7 +73,7 @@ use datamancer::{Datamancer, PersistenceOptions};
 
 let dm = Datamancer::builder()
     .provider_arc(provider)
-    .historical_cache(Box::new(SurrealCache::open(cfg).await?))
+    .historical_cache(Box::new(TursoCache::open(TursoCacheConfig::embedded("./cache.db")).await?))
     .build()?;
 
 let mut session = dm
@@ -111,12 +111,12 @@ venue = "us"
 # Repo-local paths so the sample runs without root; use system paths
 # (/var/lib/datamancerd, /run/datamancerd) in a real deployment.
 [cache]
-backend = "surreal-embedded"
-path = "./.datamancerd/cache"
+backend = "embedded"
+path = "./.datamancerd/cache.db"
 
 [tap_log]
-backend = "surreal-embedded"
-path = "./.datamancerd/taplog"
+backend = "embedded"
+path = "./.datamancerd/taplog.db"
 
 [server]
 admin_socket = "./.datamancerd/admin.sock"
@@ -165,7 +165,7 @@ the full op set and the stable error codes.
 | Crate | Feature | Default | Purpose |
 | --- | --- | :-: | --- |
 | `datamancer` | `provider-alpaca` | ✅ | Alpaca provider integration |
-| `datamancer` | `storage-surreal` | ✅ | SurrealDB cache + tap-log backend |
+| `datamancer` | `storage-turso` | ✅ | Turso (embedded SQLite-compatible) cache + tap-log backend |
 | `datamancer` | `transport-iceoryx2` | — | Same-host zero-copy transport |
 | `datamancerd` | `web-ui` | ✅ | Embedded read-only introspection UI + JSON API |
 | `datamancerd` | `metrics` | — | Prometheus `/metrics` endpoint |

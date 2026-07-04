@@ -56,7 +56,6 @@ impl CoverageDoc {
         best
     }
 
-    #[allow(dead_code)] // consumed by the real gaps() override landing in Task 4.
     pub(crate) fn gaps_within(&self, from: i64, to: i64) -> Vec<(i64, i64)> {
         if from >= to {
             return Vec::new();

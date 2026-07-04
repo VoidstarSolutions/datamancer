@@ -568,6 +568,20 @@ impl Config {
                     .to_string(),
             ));
         }
+        if let (Some(cache_cfg), Some(tap_cfg)) = (&self.cache, &self.tap_log)
+            && cache_cfg.backend == StorageBackend::Embedded
+            && tap_cfg.backend == StorageBackend::Embedded
+        {
+            let cache_path = embedded_path(cache_cfg, "cache", "cache.db")?;
+            let tap_path = embedded_path(tap_cfg, "tap_log", "taplog.db")?;
+            if cache_path == tap_path {
+                return Err(DaemonError::ConfigInvalid(format!(
+                    "[cache] and [tap_log] both resolve to the same embedded database file \
+                     ({}); the cache and tap log must use distinct paths",
+                    cache_path.display()
+                )));
+            }
+        }
         for s in &self.startup_session {
             let options = persistence_options(s.persistence);
             if options.uses_cache() && self.cache.is_none() {
@@ -858,6 +872,32 @@ account_type = "paper"
         let config = Config::parse("[provider]\n").expect("parse");
         let err = config.validate().expect_err("must reject");
         assert!(matches!(err, DaemonError::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn config_rejects_cache_and_tap_log_sharing_one_embedded_path() {
+        let text = r#"
+[provider.alpaca_crypto]
+account_type = "paper"
+venue = "us"
+
+[cache]
+backend = "embedded"
+path = "./same.db"
+
+[tap_log]
+backend = "embedded"
+path = "./same.db"
+"#;
+        let config = Config::parse(text).expect("parse");
+        let err = config.validate().expect_err("must reject");
+        match err {
+            DaemonError::ConfigInvalid(m) => {
+                assert!(m.contains("same"), "{m}");
+                assert!(m.contains("distinct"), "{m}");
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
     }
 
     #[test]

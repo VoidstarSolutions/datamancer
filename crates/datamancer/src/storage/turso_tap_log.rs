@@ -5,7 +5,8 @@
 //! strictly monotonic append ordinal unique across shards and process
 //! lifetimes (`ord INTEGER PRIMARY KEY` on every shard table).
 //!
-//! # Schema (one file per log; `PRAGMA user_version` = 1)
+//! # Schema (one file per log; `PRAGMA user_version` = 20 — the `2x` band,
+//! disjoint from the cache's `1x` band, so opening the wrong file type refuses)
 //!
 //! - `meta` — one row: `next_shard`, `next_ord`, upserted inside **every**
 //!   commit, so a crash resumes the counters exactly (tighter than the
@@ -40,7 +41,11 @@ use super::turso_common::{
     DbLocation, check_or_stamp_user_version, connect, execute_retry, map_err, open_database,
 };
 
-const TAP_SCHEMA_VERSION: i64 = 1;
+/// `PRAGMA user_version` for the tap log's schema. Deliberately disjoint from
+/// the cache's range (tap log uses the `2x` band, cache the `1x` band) so a
+/// file opened as the wrong store type is refused by the version guard
+/// instead of silently colliding.
+const TAP_SCHEMA_VERSION: i64 = 20;
 
 /// Where the tap log is stored. Mirrors `TursoCacheConfig`.
 #[derive(Clone, Debug)]
@@ -480,6 +485,11 @@ impl Writer {
         let ordinal = self.next_shard;
         self.next_shard += 1;
         let name = format!("tap_{ordinal:06}");
+        // A crash between the CREATE TABLE below and the registry INSERT
+        // self-heals on reopen: `next_shard` was only persisted by an earlier
+        // commit, so the ordinal is reused, `CREATE TABLE IF NOT EXISTS`
+        // absorbs the empty orphan shard left behind, and `INSERT OR REPLACE`
+        // re-registers it — no orphaned table, no gap in the ordinal space.
         let cols = match kind {
             EventKind::Trade => "price_raw INTEGER NOT NULL, size_raw INTEGER NOT NULL",
             EventKind::Quote => {
