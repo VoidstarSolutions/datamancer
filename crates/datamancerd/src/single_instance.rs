@@ -122,7 +122,10 @@ mod tests {
         let path = dir.path().join("datamancerd.lock");
         let held = InstanceLock::acquire_at(&path).expect("first acquire");
         match InstanceLock::acquire_at(&path) {
-            Err(DaemonError::AlreadyRunning { pid, path: reported }) => {
+            Err(DaemonError::AlreadyRunning {
+                pid,
+                path: reported,
+            }) => {
                 assert_eq!(pid, Some(std::process::id()), "reports the holder PID");
                 assert_eq!(reported, path, "reports the lock path");
             }
