@@ -30,8 +30,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use datamancer_core::{
-    AssetClass, Error, EventKind, Instrument, MarketEvent, ProviderId, ReplayRequest, ReplaySource,
-    Result, TapLog,
+    AssetClass, Bar, Error, EventKind, Instrument, MarketEvent, Price, ProviderId, Quantity, Quote,
+    ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
@@ -525,17 +525,166 @@ impl Writer {
 // ReplaySource
 // ---------------------------------------------------------------------------
 
-/// TODO(task-7): placeholder returning an empty stream. Task 7 implements the
-/// per-shard query + `ord`-ordered merge (mirroring `TursoCacheReplaySource`
-/// and the retired `SurrealTapReplaySource`).
+/// Replays the tap log: enumerate `streams`, filter by requested
+/// instruments/kinds, run a per-shard `source_ts`-windowed scan ordered by
+/// `ord`, then merge all shards with one global sort on `ord` (unique across
+/// shards and process lifetimes, so this sort *is* the k-way merge and
+/// reproduces original arrival order).
 struct TursoTapReplaySource {
     db: ::turso::Database,
 }
 
 #[async_trait]
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear query/decode/merge pipeline kept inline; extraction would obscure the per-kind handling"
+)]
 impl ReplaySource for TursoTapReplaySource {
-    async fn open(&self, _request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
-        let _ = &self.db;
-        Ok(stream::empty().boxed())
+    async fn open(&self, request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
+        let from = request.from.0;
+        let to = request.to.0;
+        if from >= to {
+            return Ok(stream::empty().boxed());
+        }
+        let conn = connect(&self.db).await?;
+
+        // Registry scan, filtered in memory (few streams).
+        let mut regs: Vec<(Instrument, EventKind, String)> = Vec::new();
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT provider, asset_class, symbol, kind_tag, shard_table FROM streams",
+                    (),
+                )
+                .await
+                .map_err(map_err)?;
+            while let Some(row) = rows.next().await.map_err(map_err)? {
+                let provider: String = row.get(0).map_err(map_err)?;
+                let asset_class: String = row.get(1).map_err(map_err)?;
+                let symbol: String = row.get(2).map_err(map_err)?;
+                let kind_tag_s: String = row.get(3).map_err(map_err)?;
+                let shard_table: String = row.get(4).map_err(map_err)?;
+                let (Some(asset), Some(kind)) =
+                    (asset_class_from_tag(&asset_class), kind_from_tag(&kind_tag_s))
+                else {
+                    continue;
+                };
+                let instrument = Instrument::new(ProviderId::new(provider), asset, &symbol);
+                if !request.instruments.is_empty() && !request.instruments.contains(&instrument) {
+                    continue;
+                }
+                if !request.kinds.is_empty() && !request.kinds.contains(&kind) {
+                    continue;
+                }
+                regs.push((instrument, kind, shard_table));
+            }
+        }
+
+        // Per-shard windowed scans; each is an ord-sorted run, merged below
+        // by one global sort (ord is unique across shards and lifetimes).
+        let mut all: Vec<(u64, MarketEvent)> = Vec::new();
+        for (instrument, kind, shard) in regs {
+            match kind {
+                EventKind::Trade => {
+                    let mut rows = conn
+                        .query(
+                            &format!(
+                                "SELECT ord, seq, source_ts, rx_ts, price_raw, size_raw \
+                                 FROM {shard} WHERE source_ts >= ?1 AND source_ts < ?2 \
+                                 ORDER BY ord ASC"
+                            ),
+                            (from, to),
+                        )
+                        .await
+                        .map_err(map_err)?;
+                    while let Some(row) = rows.next().await.map_err(map_err)? {
+                        let ord: i64 = row.get(0).map_err(map_err)?;
+                        let seq: i64 = row.get(1).map_err(map_err)?;
+                        let size_raw: i64 = row.get(5).map_err(map_err)?;
+                        all.push((
+                            ord.cast_unsigned(),
+                            MarketEvent::Trade(Trade {
+                                instrument: instrument.clone(),
+                                source_ts: Timestamp(row.get(2).map_err(map_err)?),
+                                rx_ts: Timestamp(row.get(3).map_err(map_err)?),
+                                seq: Seq(seq.cast_unsigned()),
+                                price: Price::from_raw(row.get(4).map_err(map_err)?),
+                                size: Quantity::from_raw(size_raw.cast_unsigned()),
+                            }),
+                        ));
+                    }
+                }
+                EventKind::Quote => {
+                    let mut rows = conn
+                        .query(
+                            &format!(
+                                "SELECT ord, seq, source_ts, rx_ts, bid_raw, bid_size_raw, \
+                                 ask_raw, ask_size_raw FROM {shard} \
+                                 WHERE source_ts >= ?1 AND source_ts < ?2 ORDER BY ord ASC"
+                            ),
+                            (from, to),
+                        )
+                        .await
+                        .map_err(map_err)?;
+                    while let Some(row) = rows.next().await.map_err(map_err)? {
+                        let ord: i64 = row.get(0).map_err(map_err)?;
+                        let seq: i64 = row.get(1).map_err(map_err)?;
+                        let bid_size: i64 = row.get(5).map_err(map_err)?;
+                        let ask_size: i64 = row.get(7).map_err(map_err)?;
+                        all.push((
+                            ord.cast_unsigned(),
+                            MarketEvent::Quote(Quote {
+                                instrument: instrument.clone(),
+                                source_ts: Timestamp(row.get(2).map_err(map_err)?),
+                                rx_ts: Timestamp(row.get(3).map_err(map_err)?),
+                                seq: Seq(seq.cast_unsigned()),
+                                bid: Price::from_raw(row.get(4).map_err(map_err)?),
+                                bid_size: Quantity::from_raw(bid_size.cast_unsigned()),
+                                ask: Price::from_raw(row.get(6).map_err(map_err)?),
+                                ask_size: Quantity::from_raw(ask_size.cast_unsigned()),
+                            }),
+                        ));
+                    }
+                }
+                EventKind::Bar(interval) => {
+                    let mut rows = conn
+                        .query(
+                            &format!(
+                                "SELECT ord, seq, source_ts, rx_ts, open_raw, high_raw, \
+                                 low_raw, close_raw, volume_raw FROM {shard} \
+                                 WHERE source_ts >= ?1 AND source_ts < ?2 ORDER BY ord ASC"
+                            ),
+                            (from, to),
+                        )
+                        .await
+                        .map_err(map_err)?;
+                    while let Some(row) = rows.next().await.map_err(map_err)? {
+                        let ord: i64 = row.get(0).map_err(map_err)?;
+                        let seq: i64 = row.get(1).map_err(map_err)?;
+                        let volume_raw: i64 = row.get(8).map_err(map_err)?;
+                        all.push((
+                            ord.cast_unsigned(),
+                            MarketEvent::Bar(Bar {
+                                instrument: instrument.clone(),
+                                interval,
+                                source_ts: Timestamp(row.get(2).map_err(map_err)?),
+                                rx_ts: Timestamp(row.get(3).map_err(map_err)?),
+                                seq: Seq(seq.cast_unsigned()),
+                                open: Price::from_raw(row.get(4).map_err(map_err)?),
+                                high: Price::from_raw(row.get(5).map_err(map_err)?),
+                                low: Price::from_raw(row.get(6).map_err(map_err)?),
+                                close: Price::from_raw(row.get(7).map_err(map_err)?),
+                                volume: Quantity::from_raw(volume_raw.cast_unsigned()),
+                            }),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // One sort by the globally unique append ordinal IS the k-way merge:
+        // it reproduces original arrival order across shards and symbols.
+        all.sort_by_key(|(ord, _)| *ord);
+        Ok(stream::iter(all.into_iter().map(|(_, ev)| ev)).boxed())
     }
 }

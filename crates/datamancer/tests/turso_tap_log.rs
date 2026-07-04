@@ -1,10 +1,7 @@
 //! Integration tests for the Turso-backed [`TapLog`].
 //!
-//! Task 6 wires up `open`/`append`/`flush` only; the replay source stays a
-//! placeholder (empty stream) until Task 7. The full parity suite ported
-//! from `surreal_tap_log.rs` is below, commented out and marked
-//! `TODO(task-7)` — every one of those tests exercises replay, so none of
-//! them can run yet. Only the open/append/flush smoke test is enabled here.
+//! Full parity suite ported from `surreal_tap_log.rs`, exercising the
+//! `TursoTapReplaySource` implemented in Task 7.
 
 #![cfg(feature = "storage-turso")]
 
@@ -30,7 +27,7 @@ fn trade(symbol: &str, source_ts: i64, rx_ts: i64, seq: u64, price: f64, size: u
         seq: Seq(seq),
         price: Price::from_f64_round(price),
         // `size` is whole shares (fractional sizes are covered explicitly by
-        // `awkward_symbol_round_trips`, TODO(task-7) below).
+        // `awkward_symbol_round_trips` below).
         size: Quantity::from_units(size),
     })
 }
@@ -44,13 +41,6 @@ async fn append_then_flush_reports_ok() {
     log.flush().await.unwrap();
 }
 
-// ---------------------------------------------------------------------------
-// TODO(task-7): the tests below are ported 1:1 from `surreal_tap_log.rs` but
-// every one of them exercises `as_replay_source`/replay, which is still a
-// placeholder (empty stream) in Task 6. Re-enable this block verbatim (minus
-// this comment) once Task 7 implements `TursoTapReplaySource::open`.
-// ---------------------------------------------------------------------------
-/*
 use datamancer::{Bar, BarInterval, EventKind, Quote, ReplayRequest};
 use futures::StreamExt;
 
@@ -431,4 +421,3 @@ async fn replay_empty_kinds_matches_all_kinds() {
     }
     assert_eq!(seen, vec![("trade", 1), ("bar", 2)]);
 }
-*/
