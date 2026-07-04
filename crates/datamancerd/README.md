@@ -46,8 +46,8 @@ is given**. At startup, before loading config or opening any storage, the daemon
 takes an exclusive advisory lock (`flock`) on a fixed, config-independent
 lockfile:
 
-- macOS: `~/Library/Application Support/datamancerd/datamancerd.lock`
-- Linux: `~/.local/share/datamancerd/datamancerd.lock` (`$XDG_DATA_HOME` respected)
+- macOS: `~/Library/Application Support/datamancer/datamancerd.lock`
+- Linux: `~/.local/share/datamancer/datamancerd.lock` (`$XDG_DATA_HOME` respected)
 
 A second launch while one is running fails fast and exits non-zero with, e.g.:
 
@@ -105,8 +105,11 @@ adjustment = "all"                # raw | split | dividend | spin_off | all
 # admin_socket defaults to the datamancer-owned well-known path
 # ($XDG_RUNTIME_DIR/datamancer/control.sock on Linux,
 # ~/Library/Application Support/datamancer/control.sock on macOS); set
-# explicitly only to override.
-admin_socket = "/run/datamancer/control.sock"
+# explicitly only to override. On a host with no home/runtime dir, the
+# daemon falls back to /run/datamancer/control.sock, but a client's
+# `default_control_socket()` cannot discover that path — configure it
+# explicitly on both sides.
+# admin_socket = "/run/datamancer/control.sock"
 service_prefix = "datamancerd"
 shutdown_timeout_secs = 30
 
@@ -144,8 +147,8 @@ requires `[tap_log]`; `scope = live_backfill` requires a parseable
 
 For `embedded`, `path` is optional and defaults to the platform-native
 data directory (`<data dir>` above): macOS
-`~/Library/Application Support/datamancerd`, Linux
-`~/.local/share/datamancerd` (`$XDG_DATA_HOME` respected), with `cache.db` and
+`~/Library/Application Support/datamancer`, Linux
+`~/.local/share/datamancer` (`$XDG_DATA_HOME` respected), with `cache.db` and
 `taplog.db` database files created on first use. Set `path` explicitly for a
 system location like `/var/lib/datamancerd`, or on a headless host with no home
 directory (where no default can be derived).
