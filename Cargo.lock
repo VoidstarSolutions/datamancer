@@ -739,6 +739,7 @@ dependencies = [
  "datamancer-core",
  "datamancer-transport-iceoryx2",
  "datamancer-transport-ws",
+ "directories",
  "futures",
  "iceoryx2",
  "serde",

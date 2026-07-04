@@ -27,6 +27,7 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+directories = "6"
 
 # ws
 datamancer-transport-ws = { path = "../datamancer-transport-ws", optional = true }
