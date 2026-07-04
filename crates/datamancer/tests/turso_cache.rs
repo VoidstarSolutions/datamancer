@@ -3,16 +3,9 @@
 //! Uses the in-memory engine so the suite stays self-contained and fast.
 //! A separate `embedded_round_trip` test exercises the on-disk file-backed
 //! engine against a tempdir to confirm the persistent path actually works.
-//! (This subset, ported in Task 3, covers only `open`/`lookup`/`store`; the
-//! rest of the parity suite is TODO-gated for Tasks 4-5.)
+//! Ported 1:1 from the retired `SurrealDB` backend's parity suite.
 
 #![cfg(feature = "storage-turso")]
-// Several helpers (`bar`, `key_adj`, the `ReplayRequest`/`GapSpan` imports)
-// and this file's TODO(task-4)/TODO(task-5) test bodies are temporarily
-// commented out rather than deleted, since Tasks 4-5 re-enable them
-// verbatim. Silence unused-item warnings on the currently-dead subset until
-// then rather than thrash the import list twice.
-#![allow(dead_code, unused_imports)]
 
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
@@ -78,51 +71,49 @@ async fn lookup_returns_none_for_empty_cache() {
     assert!(cache.lookup(&k).await.unwrap().is_none());
 }
 
-// TODO(task-5): needs `as_replay_source`/`ReplayRequest` (Task 5 fleshes out
-// the replay source; today it's a placeholder returning an empty stream).
-// #[tokio::test]
-// async fn store_then_replay_round_trip_preserves_order_and_values() {
-//     let cache = TursoCache::open(TursoCacheConfig::Memory)
-//         .await
-//         .unwrap();
-//     let k = key(EventKind::Trade, 100, 400);
-//     let events = vec![
-//         trade("AAPL", 100, 150.10, 1),
-//         trade("AAPL", 250, 150.25, 2),
-//         trade("AAPL", 399, 150.40, 3),
-//     ];
-//     cache.store(&k, &events).await.unwrap();
-//
-//     let coverage = cache.lookup(&k).await.unwrap().expect("coverage");
-//     assert_eq!(coverage.from.0, 100);
-//     assert!(coverage.to.0 >= 400);
-//     assert_eq!(coverage.event_count, 3);
-//
-//     let source = cache.as_replay_source(k.clone());
-//     let request = ReplayRequest {
-//         instruments: vec![inst("AAPL")],
-//         kinds: vec![EventKind::Trade],
-//         from: Timestamp(100),
-//         to: Timestamp(400),
-//     };
-//     let mut stream = source.open(request).await.unwrap();
-//     let mut got = Vec::new();
-//     while let Some(ev) = stream.next().await {
-//         got.push(ev);
-//     }
-//     assert_eq!(got.len(), 3);
-//     for (a, b) in events.iter().zip(got.iter()) {
-//         match (a, b) {
-//             (MarketEvent::Trade(a), MarketEvent::Trade(b)) => {
-//                 assert_eq!(a.source_ts, b.source_ts);
-//                 assert_eq!(a.price, b.price);
-//                 assert_eq!(a.size, b.size);
-//                 assert_eq!(a.instrument, b.instrument);
-//             }
-//             _ => panic!("non-trade in replay"),
-//         }
-//     }
-// }
+#[tokio::test]
+async fn store_then_replay_round_trip_preserves_order_and_values() {
+    let cache = TursoCache::open(TursoCacheConfig::Memory)
+        .await
+        .unwrap();
+    let k = key(EventKind::Trade, 100, 400);
+    let events = vec![
+        trade("AAPL", 100, 150.10, 1),
+        trade("AAPL", 250, 150.25, 2),
+        trade("AAPL", 399, 150.40, 3),
+    ];
+    cache.store(&k, &events).await.unwrap();
+
+    let coverage = cache.lookup(&k).await.unwrap().expect("coverage");
+    assert_eq!(coverage.from.0, 100);
+    assert!(coverage.to.0 >= 400);
+    assert_eq!(coverage.event_count, 3);
+
+    let source = cache.as_replay_source(k.clone());
+    let request = ReplayRequest {
+        instruments: vec![inst("AAPL")],
+        kinds: vec![EventKind::Trade],
+        from: Timestamp(100),
+        to: Timestamp(400),
+    };
+    let mut stream = source.open(request).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(ev) = stream.next().await {
+        got.push(ev);
+    }
+    assert_eq!(got.len(), 3);
+    for (a, b) in events.iter().zip(got.iter()) {
+        match (a, b) {
+            (MarketEvent::Trade(a), MarketEvent::Trade(b)) => {
+                assert_eq!(a.source_ts, b.source_ts);
+                assert_eq!(a.price, b.price);
+                assert_eq!(a.size, b.size);
+                assert_eq!(a.instrument, b.instrument);
+            }
+            _ => panic!("non-trade in replay"),
+        }
+    }
+}
 
 #[tokio::test]
 async fn gaps_reports_uncovered_subranges() {
@@ -208,12 +199,12 @@ async fn embedded_round_trip_persists_to_disk() {
         .await
         .unwrap();
     drop(cache);
-    // SurrealKV's lock is released on drop, but the spawned engine task
-    // holding it needs a tick to finish unwinding. A fixed sleep here is
-    // flaky on slow CI; poll `open` until the lock clears, capped at
-    // ~5 s total. On any error we just retry — by the deadline we either
-    // succeed or surface the most recent error so the failure mode is
-    // diagnosable.
+    // The previous handle's file lock is released on drop, but it retries
+    // reopen while that release is still in flight — the underlying file
+    // lock can take a tick to clear. A fixed sleep here is flaky on slow CI;
+    // poll `open` until the lock clears, capped at ~5 s total. On any error
+    // we just retry — by the deadline we either succeed or surface the most
+    // recent error so the failure mode is diagnosable.
     let cache = {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -272,82 +263,80 @@ async fn store_of_empty_range_marks_it_covered() {
     );
 }
 
-// TODO(task-5): needs `as_replay_source`/`ReplayRequest`.
-// #[tokio::test]
-// async fn store_replaces_existing_rows_in_the_claimed_range() {
-//     let cache = TursoCache::open(TursoCacheConfig::Memory)
-//         .await
-//         .unwrap();
-//     let k = key(EventKind::Bar(BarInterval::OneMinute), 0, 1000);
-//     // Initial store deposits a (soon-to-be stale) bar at 500.
-//     cache.store(&k, &[bar("AAPL", 500, 99.0)]).await.unwrap();
-//     // Re-store the same range (a refresh) with different, fewer events.
-//     cache.store(&k, &[bar("AAPL", 100, 1.0)]).await.unwrap();
-//
-//     // Replay must return only the fresh bar; the stale 500 row is gone.
-//     let source = cache.as_replay_source(k.clone());
-//     let request = ReplayRequest {
-//         instruments: vec![inst("AAPL")],
-//         kinds: vec![EventKind::Bar(BarInterval::OneMinute)],
-//         from: Timestamp(0),
-//         to: Timestamp(1000),
-//     };
-//     let mut stream = source.open(request).await.unwrap();
-//     let mut got = Vec::new();
-//     while let Some(ev) = stream.next().await {
-//         if let MarketEvent::Bar(b) = ev {
-//             got.push(b.source_ts.0);
-//         }
-//     }
-//     assert_eq!(got, vec![100], "refresh must not leave the stale 500 row");
-// }
+#[tokio::test]
+async fn store_replaces_existing_rows_in_the_claimed_range() {
+    let cache = TursoCache::open(TursoCacheConfig::Memory)
+        .await
+        .unwrap();
+    let k = key(EventKind::Bar(BarInterval::OneMinute), 0, 1000);
+    // Initial store deposits a (soon-to-be stale) bar at 500.
+    cache.store(&k, &[bar("AAPL", 500, 99.0)]).await.unwrap();
+    // Re-store the same range (a refresh) with different, fewer events.
+    cache.store(&k, &[bar("AAPL", 100, 1.0)]).await.unwrap();
 
-// TODO(task-5): needs `as_replay_source`/`ReplayRequest` (via `read_closes`).
-// #[tokio::test]
-// async fn bars_segregate_by_adjustment_mode() {
-//     let cache = TursoCache::open(TursoCacheConfig::Memory)
-//         .await
-//         .unwrap();
-//     let kind = EventKind::Bar(BarInterval::OneMinute);
-//     // Same (symbol, range) under two modes, with deliberately different close
-//     // prices so a mode mix-up is observable.
-//     let raw = key_adj(kind, 0, 1000, Adjustment::Raw);
-//     let all = key_adj(kind, 0, 1000, Adjustment::All);
-//
-//     cache.store(&raw, &[bar("AAPL", 100, 10.0)]).await.unwrap();
-//     // Storing the All-mode bar must NOT delete the raw-mode row in the same
-//     // (symbol, range): the store DELETE is mode-scoped.
-//     cache.store(&all, &[bar("AAPL", 100, 20.0)]).await.unwrap();
-//
-//     // Coverage counts are per-mode, not pooled.
-//     assert_eq!(cache.lookup(&raw).await.unwrap().unwrap().event_count, 1);
-//     assert_eq!(cache.lookup(&all).await.unwrap().unwrap().event_count, 1);
-//
-//     // A read under each mode returns only that mode's bar — no orphaned
-//     // cross-mode rows leak through the symbol/time-filtered SELECT.
-//     assert_eq!(read_closes(&cache, &all).await, vec![20.0]);
-//     assert_eq!(read_closes(&cache, &raw).await, vec![10.0]);
-// }
-//
-// async fn read_closes(cache: &TursoCache, k: &CacheKey) -> Vec<f64> {
-//     use datamancer::ReplayRequest;
-//     use futures::StreamExt;
-//     let source = cache.as_replay_source(k.clone());
-//     let request = ReplayRequest {
-//         instruments: vec![k.instrument.clone()],
-//         kinds: vec![k.kind],
-//         from: k.from,
-//         to: k.to,
-//     };
-//     let mut stream = source.open(request).await.unwrap();
-//     let mut closes = Vec::new();
-//     while let Some(ev) = stream.next().await {
-//         if let MarketEvent::Bar(b) = ev {
-//             closes.push(b.close.to_f64());
-//         }
-//     }
-//     closes
-// }
+    // Replay must return only the fresh bar; the stale 500 row is gone.
+    let source = cache.as_replay_source(k.clone());
+    let request = ReplayRequest {
+        instruments: vec![inst("AAPL")],
+        kinds: vec![EventKind::Bar(BarInterval::OneMinute)],
+        from: Timestamp(0),
+        to: Timestamp(1000),
+    };
+    let mut stream = source.open(request).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let MarketEvent::Bar(b) = ev {
+            got.push(b.source_ts.0);
+        }
+    }
+    assert_eq!(got, vec![100], "refresh must not leave the stale 500 row");
+}
+
+#[tokio::test]
+async fn bars_segregate_by_adjustment_mode() {
+    let cache = TursoCache::open(TursoCacheConfig::Memory)
+        .await
+        .unwrap();
+    let kind = EventKind::Bar(BarInterval::OneMinute);
+    // Same (symbol, range) under two modes, with deliberately different close
+    // prices so a mode mix-up is observable.
+    let raw = key_adj(kind, 0, 1000, Adjustment::Raw);
+    let all = key_adj(kind, 0, 1000, Adjustment::All);
+
+    cache.store(&raw, &[bar("AAPL", 100, 10.0)]).await.unwrap();
+    // Storing the All-mode bar must NOT delete the raw-mode row in the same
+    // (symbol, range): the store DELETE is mode-scoped.
+    cache.store(&all, &[bar("AAPL", 100, 20.0)]).await.unwrap();
+
+    // Coverage counts are per-mode, not pooled.
+    assert_eq!(cache.lookup(&raw).await.unwrap().unwrap().event_count, 1);
+    assert_eq!(cache.lookup(&all).await.unwrap().unwrap().event_count, 1);
+
+    // A read under each mode returns only that mode's bar — no orphaned
+    // cross-mode rows leak through the symbol/time-filtered SELECT.
+    assert_eq!(read_closes(&cache, &all).await, vec![20.0]);
+    assert_eq!(read_closes(&cache, &raw).await, vec![10.0]);
+}
+
+async fn read_closes(cache: &TursoCache, k: &CacheKey) -> Vec<f64> {
+    use datamancer::ReplayRequest;
+    use futures::StreamExt;
+    let source = cache.as_replay_source(k.clone());
+    let request = ReplayRequest {
+        instruments: vec![k.instrument.clone()],
+        kinds: vec![k.kind],
+        from: k.from,
+        to: k.to,
+    };
+    let mut stream = source.open(request).await.unwrap();
+    let mut closes = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let MarketEvent::Bar(b) = ev {
+            closes.push(b.close.to_f64());
+        }
+    }
+    closes
+}
 
 // Sanity: the public re-exports we lean on stay in place after the API
 // reshape — Instrument constructs from a &str and EventKind is reachable.

@@ -37,9 +37,9 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use datamancer_core::{
-    Adjustment, AssetClass, BarInterval, CacheCatalogEntry, CacheCoverage, CacheKey, Error,
-    EventKind, GapSpan, HistoricalCache, MarketEvent, ProviderId, ReplayRequest, ReplaySource,
-    Result, Timestamp,
+    Adjustment, AssetClass, Bar, BarInterval, CacheCatalogEntry, CacheCoverage, CacheKey, Error,
+    EventKind, GapSpan, HistoricalCache, MarketEvent, Price, ProviderId, Quantity, Quote,
+    ReplayRequest, ReplaySource, Result, Seq, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use tokio::sync::Mutex;
@@ -552,11 +552,8 @@ fn asset_class_from_str(s: &str) -> Option<AssetClass> {
     }
 }
 
-/// Cache replay source — fleshed out in Task 5.
-///
-/// `db`/`key` are unused by this task's empty-stream placeholder; Task 5's
-/// real implementation reads both.
-#[allow(dead_code)]
+/// Cache replay source: replays `key`'s rows (narrowed by the incoming
+/// [`ReplayRequest`]) in `source_ts` ascending order.
 struct TursoCacheReplaySource {
     db: ::turso::Database,
     key: CacheKey,
@@ -564,7 +561,126 @@ struct TursoCacheReplaySource {
 
 #[async_trait]
 impl ReplaySource for TursoCacheReplaySource {
-    async fn open(&self, _request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
-        Ok(stream::empty().boxed())
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match arm per event kind, each a linear query/decode/push loop; \
+                  splitting per-kind would scatter the shared row-decode shape across \
+                  several small functions for no clarity gain"
+    )]
+    async fn open(&self, request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
+        // `ReplayRequest` may narrow the cache key; intersect from/to,
+        // instruments, and kinds exactly as the surreal source did.
+        let kind = self.key.kind;
+        let from = request.from.0.max(self.key.from.0);
+        let to = request.to.0.min(self.key.to.0);
+        let instrument_matches = request.instruments.is_empty()
+            || request.instruments.contains(&self.key.instrument);
+        if !instrument_matches
+            || (!request.kinds.is_empty() && !request.kinds.contains(&kind))
+            || from >= to
+        {
+            return Ok(stream::empty().boxed());
+        }
+        let conn = connect(&self.db).await?;
+        let table = TursoCache::table_for(kind);
+        let params = (
+            self.key.instrument.provider().as_str().to_string(),
+            self.key.instrument.symbol().to_string(),
+            TursoCache::effective_adjustment(&self.key)
+                .as_str()
+                .to_string(),
+            from,
+            to,
+        );
+        let instrument = self.key.instrument.clone();
+        let events: Vec<MarketEvent> = match kind {
+            EventKind::Trade => {
+                let mut rows = conn
+                    .query(
+                        "SELECT source_ts, rx_ts, price_raw, size_raw FROM trades \
+                         WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
+                         AND source_ts >= ?4 AND source_ts < ?5 \
+                         ORDER BY source_ts ASC",
+                        params,
+                    )
+                    .await
+                    .map_err(map_err)?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await.map_err(map_err)? {
+                    let size_raw: i64 = row.get(3).map_err(map_err)?;
+                    out.push(MarketEvent::Trade(Trade {
+                        instrument: instrument.clone(),
+                        source_ts: Timestamp(row.get(0).map_err(map_err)?),
+                        rx_ts: Timestamp(row.get(1).map_err(map_err)?),
+                        seq: Seq(0),
+                        price: Price::from_raw(row.get(2).map_err(map_err)?),
+                        size: Quantity::from_raw(size_raw.cast_unsigned()),
+                    }));
+                }
+                out
+            }
+            EventKind::Quote => {
+                let mut rows = conn
+                    .query(
+                        "SELECT source_ts, rx_ts, bid_raw, bid_size_raw, ask_raw, ask_size_raw \
+                         FROM quotes \
+                         WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
+                         AND source_ts >= ?4 AND source_ts < ?5 \
+                         ORDER BY source_ts ASC",
+                        params,
+                    )
+                    .await
+                    .map_err(map_err)?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await.map_err(map_err)? {
+                    let bid_size: i64 = row.get(3).map_err(map_err)?;
+                    let ask_size: i64 = row.get(5).map_err(map_err)?;
+                    out.push(MarketEvent::Quote(Quote {
+                        instrument: instrument.clone(),
+                        source_ts: Timestamp(row.get(0).map_err(map_err)?),
+                        rx_ts: Timestamp(row.get(1).map_err(map_err)?),
+                        seq: Seq(0),
+                        bid: Price::from_raw(row.get(2).map_err(map_err)?),
+                        bid_size: Quantity::from_raw(bid_size.cast_unsigned()),
+                        ask: Price::from_raw(row.get(4).map_err(map_err)?),
+                        ask_size: Quantity::from_raw(ask_size.cast_unsigned()),
+                    }));
+                }
+                out
+            }
+            EventKind::Bar(interval) => {
+                let mut rows = conn
+                    .query(
+                        &format!(
+                            "SELECT source_ts, rx_ts, open_raw, high_raw, low_raw, close_raw, \
+                             volume_raw FROM {table} \
+                             WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
+                             AND source_ts >= ?4 AND source_ts < ?5 \
+                             ORDER BY source_ts ASC"
+                        ),
+                        params,
+                    )
+                    .await
+                    .map_err(map_err)?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await.map_err(map_err)? {
+                    let volume_raw: i64 = row.get(6).map_err(map_err)?;
+                    out.push(MarketEvent::Bar(Bar {
+                        instrument: instrument.clone(),
+                        interval,
+                        source_ts: Timestamp(row.get(0).map_err(map_err)?),
+                        rx_ts: Timestamp(row.get(1).map_err(map_err)?),
+                        seq: Seq(0),
+                        open: Price::from_raw(row.get(2).map_err(map_err)?),
+                        high: Price::from_raw(row.get(3).map_err(map_err)?),
+                        low: Price::from_raw(row.get(4).map_err(map_err)?),
+                        close: Price::from_raw(row.get(5).map_err(map_err)?),
+                        volume: Quantity::from_raw(volume_raw.cast_unsigned()),
+                    }));
+                }
+                out
+            }
+        };
+        Ok(stream::iter(events).boxed())
     }
 }
