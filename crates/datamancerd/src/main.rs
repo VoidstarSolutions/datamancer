@@ -68,6 +68,11 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
+    // Acquire the global single-instance lock before touching any shared
+    // resource (config scaffold, tap-log/cache DBs, iceoryx2 node). Held for
+    // the whole process; released by the kernel on exit. A second launch —
+    // whatever config it is given — fails here.
+    let _instance = single_instance::InstanceLock::acquire()?;
     let config_path = paths::resolve_config_path(args.config)?;
     tracing::info!(path = %config_path.display(), "loading config");
     let config = Config::load(&config_path)?;

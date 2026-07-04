@@ -17,24 +17,17 @@ use crate::error::{DaemonError, Result};
 use crate::paths::default_data_dir;
 
 /// Basename of the lockfile within the data directory.
-// Unused until Task 2 wires `InstanceLock::acquire` into `main.rs`; the plain
-// (non-test) bin build has no caller yet, so `-D warnings` flags this whole
-// module as dead code. Remove this allow once Task 2 lands.
-#[allow(dead_code)]
 const LOCK_FILE_NAME: &str = "datamancerd.lock";
 
 /// Holds the process-wide single-instance lock. Keeping the `File` open keeps
 /// the exclusive `flock` held; dropping it (or process exit) releases it.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct InstanceLock {
     // Never read: its sole job is to keep the fd — and thus the flock — alive
     // for the lifetime of this value.
     _file: File,
 }
 
-// Same dead_code note as above: wired into `main.rs` in Task 2.
-#[allow(dead_code)]
 impl InstanceLock {
     /// Acquire the global lock at the fixed, config-independent path
     /// (`<data dir>/datamancerd.lock`).
@@ -97,8 +90,6 @@ impl InstanceLock {
 /// Best-effort read of the PID text a lock holder wrote. `None` if the file is
 /// empty or unparseable — there is a brief window between another process
 /// acquiring the lock and writing its PID.
-// Same dead_code note as above: wired into `main.rs` in Task 2.
-#[allow(dead_code)]
 fn read_pid(file: &mut File) -> Option<u32> {
     file.seek(std::io::SeekFrom::Start(0)).ok()?;
     let mut buf = String::new();
