@@ -4,8 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Required for GitHub's merge queue: queued entries fire a `merge_group`
+  # event on a temporary `gh-readonly-queue/...` ref. Without this trigger the
+  # required checks never run on the queue entry and it stalls until timeout.
+  merge_group:
 
-# One in-flight run per ref: a force-push cancels the stale run.
+# One in-flight run per ref: a force-push cancels the stale run. `github.ref`
+# is unique per merge-queue entry (the gh-readonly-queue ref), so queue runs
+# never cancel each other or the PR run.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
