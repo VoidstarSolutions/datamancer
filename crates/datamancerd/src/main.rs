@@ -24,6 +24,7 @@ mod error;
 mod paths;
 mod server;
 mod shutdown;
+mod single_instance;
 #[cfg(feature = "web-ui")]
 mod web;
 #[cfg(feature = "ws")]
