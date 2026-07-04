@@ -1,7 +1,7 @@
 //! Phase 3 introspection: provider accounting, the cache catalog in the
 //! snapshot, and per-symbol live state through `Datamancer::snapshot()`.
 
-#![cfg(feature = "storage-surreal")]
+#![cfg(feature = "storage-turso")]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use datamancer::storage::{SurrealCache, SurrealCacheConfig};
+use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, EventKind, GapSpan, Instrument,
     LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ProviderSnapshot,
@@ -238,11 +238,7 @@ async fn provider_accounting_counts_coalesced_fetches() {
         started: started.clone(),
         release: release_rx,
     };
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     let dm = Arc::new(
         Datamancer::builder()
             .provider_arc(Arc::new(provider))

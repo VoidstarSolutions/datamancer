@@ -2,7 +2,7 @@
 //!
 //! A synthetic provider serves a fixed set of daily bars and counts how many
 //! times it is asked to fetch. We open the same historical session twice
-//! against an embedded `SurrealKV` cache:
+//! against an embedded Turso cache:
 //!
 //! 1. Cold run — the cache is empty, so the provider is hit once and the data
 //!    is stored.
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use datamancer::storage::{SurrealCache, SurrealCacheConfig};
+use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, ControlKind, Datamancer, EventKind, HistoryRequest, Instrument,
     LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq,
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
 
     let fetch_count = Arc::new(AtomicUsize::new(0));
     let provider = SyntheticProvider::new("ACME", 30, fetch_count.clone());
-    let cache = SurrealCache::open(SurrealCacheConfig::embedded(dir.path())).await?;
+    let cache = TursoCache::open(TursoCacheConfig::embedded(dir.path().join("cache.db"))).await?;
 
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))

@@ -1,6 +1,6 @@
 //! Turso-backed [`HistoricalCache`] (and [`ReplaySource`]).
 //!
-//! Semantics ported 1:1 from the retired `SurrealDB` backend: one table per
+//! Semantics ported 1:1 from the retired prior backend: one table per
 //! kind (`trades`, `quotes`, `bars_1s` … `bars_1d`), a `coverage` table of
 //! merged half-open segments per `(provider, symbol, kind, adjustment)`,
 //! store-claims-exactly-the-key-range (so a fetched-but-empty range is not
@@ -11,9 +11,9 @@
 //!
 //! Event tables share the composite PRIMARY KEY
 //! `(provider, symbol, adjustment, source_ts)` — it is both the upsert
-//! identity (re-ingest overwrites) and the range-scan index the surreal
+//! identity (re-ingest overwrites) and the range-scan index the prior
 //! module doc wished for. `coverage` rows are keyed by the same
-//! `"{provider}|{symbol}|{table}|{adjustment}"` string id the surreal
+//! `"{provider}|{symbol}|{table}|{adjustment}"` string id the prior
 //! backend used, so catalog parsing is unchanged. Segments are a JSON
 //! `[[from,to],…]` column. Schema version rides `PRAGMA user_version`.
 //!
@@ -50,7 +50,7 @@ use super::turso_common::{
 };
 
 /// `PRAGMA user_version` for this cache's schema. Fresh lineage (no carry-over
-/// from the surreal backend's numbering).
+/// from the prior backend's numbering).
 const CACHE_SCHEMA_VERSION: i64 = 1;
 
 /// Where the cache is stored.
@@ -168,7 +168,7 @@ impl TursoCache {
     }
 
     /// Logical bytes per stored row (fixed numeric fields only) — same
-    /// best-effort estimate the surreal backend reported.
+    /// best-effort estimate the prior backend reported.
     const fn bytes_per_row(kind: EventKind) -> u64 {
         match kind {
             EventKind::Trade => 4 * 8,
@@ -569,12 +569,12 @@ impl ReplaySource for TursoCacheReplaySource {
     )]
     async fn open(&self, request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>> {
         // `ReplayRequest` may narrow the cache key; intersect from/to,
-        // instruments, and kinds exactly as the surreal source did.
+        // instruments, and kinds exactly as the prior source did.
         let kind = self.key.kind;
         let from = request.from.0.max(self.key.from.0);
         let to = request.to.0.min(self.key.to.0);
-        let instrument_matches = request.instruments.is_empty()
-            || request.instruments.contains(&self.key.instrument);
+        let instrument_matches =
+            request.instruments.is_empty() || request.instruments.contains(&self.key.instrument);
         if !instrument_matches
             || (!request.kinds.is_empty() && !request.kinds.contains(&kind))
             || from >= to

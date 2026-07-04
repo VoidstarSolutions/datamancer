@@ -83,18 +83,18 @@ account_type = "paper"
 # venue = "us"
 
 # Historical read-through cache; required by cache-using persistence presets.
-# `path` is optional for surreal-embedded: it defaults to the platform data dir
-# (macOS ~/Library/Application Support/datamancerd/cache, Linux
-# ~/.local/share/datamancerd/cache) and is created on first use.
+# `path` is optional for embedded: it defaults to the platform data dir
+# (macOS ~/Library/Application Support/datamancerd/cache.db, Linux
+# ~/.local/share/datamancerd/cache.db) and is created on first use.
 # [cache]
-# backend = "surreal-embedded"
-# path = "/path/to/cache"
+# backend = "embedded"
+# path = "/path/to/cache.db"
 
 # Live tap-log write-through; required by tap-writing persistence presets.
-# `path` is optional for surreal-embedded (defaults to <data dir>/taplog).
+# `path` is optional for embedded (defaults to <data dir>/taplog.db).
 # [tap_log]
-# backend = "surreal-embedded"
-# path = "/path/to/taplog"
+# backend = "embedded"
+# path = "/path/to/taplog.db"
 
 [server]
 # UDS control socket (same-host operator surface; filesystem permissions are

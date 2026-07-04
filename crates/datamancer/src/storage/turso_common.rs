@@ -102,7 +102,7 @@ pub(crate) async fn execute_retry(
 }
 
 /// Schema-version guard via `PRAGMA user_version` (the idiomatic `SQLite`
-/// mechanism; supersedes the surreal backends' meta-table markers). A fresh
+/// mechanism; supersedes the prior backends' meta-table markers). A fresh
 /// file reads 0 and is stamped; anything else must match exactly. There is no
 /// pre-versioning turso lineage — version numbering starts at 1 per store.
 pub(crate) async fn check_or_stamp_user_version(

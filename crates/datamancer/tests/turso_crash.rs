@@ -22,7 +22,11 @@ use futures::StreamExt as _;
 const EVENTS_PER_BATCH: u64 = 10;
 
 fn inst() -> Instrument {
-    Instrument::new(ProviderId::from_static("alpaca"), AssetClass::Equity, "AAPL")
+    Instrument::new(
+        ProviderId::from_static("alpaca"),
+        AssetClass::Equity,
+        "AAPL",
+    )
 }
 
 fn trade(n: u64) -> MarketEvent {
@@ -54,7 +58,9 @@ fn crash_child_writer() {
         let mut stdout = std::io::stdout();
         for batch in 0..u64::MAX {
             for i in 0..EVENTS_PER_BATCH {
-                log.append(&trade(batch * EVENTS_PER_BATCH + i)).await.unwrap();
+                log.append(&trade(batch * EVENTS_PER_BATCH + i))
+                    .await
+                    .unwrap();
             }
             log.flush().await.unwrap();
             // Claim durability ONLY after flush returned Ok.
@@ -92,7 +98,9 @@ async fn completed_flush_survives_sigkill() {
     child.kill().unwrap(); // SIGKILL: no drop-glue, no final commit
     let _ = child.wait();
 
-    let last = *confirmed.last().expect("child confirmed at least one flush");
+    let last = *confirmed
+        .last()
+        .expect("child confirmed at least one flush");
     let expected = (last + 1) * EVENTS_PER_BATCH;
 
     let log = TursoTapLog::open(TursoTapLogConfig::embedded(&db_path))

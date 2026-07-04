@@ -9,7 +9,7 @@
 //!
 //! - `meta` — one row: `next_shard`, `next_ord`, upserted inside **every**
 //!   commit, so a crash resumes the counters exactly (tighter than the
-//!   surreal backend's batch reservation; still satisfies "gaps allowed,
+//!   prior backend's batch reservation; still satisfies "gaps allowed,
 //!   reuse never").
 //! - `streams` — registry `(id, provider, asset_class, symbol, kind_tag,
 //!   shard_table)`; drives write-path shard resolution and replay
@@ -61,7 +61,7 @@ impl TursoTapLogConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Encode/decode helpers — ported verbatim from `surreal_tap_log.rs` (deleted
+// Encode/decode helpers — ported verbatim from the retired tap-log module (deleted
 // with it in Task 9).
 // ---------------------------------------------------------------------------
 
@@ -204,7 +204,7 @@ impl TursoTapLog {
         check_or_stamp_user_version(&conn, TAP_SCHEMA_VERSION, "tap log").await?;
 
         // Load counters + registry (shard tables persist across reopen; no
-        // re-DDL needed, unlike SurrealDB's re-DEFINE quirk). Both queries
+        // re-DDL needed, unlike the prior backend's re-DEFINE quirk). Both queries
         // fully drain their `Rows` cursor to `None` in an inner scope before
         // the connection is handed to the writer task — an un-drained cursor
         // silently swallows the next same-connection write under turso 0.6.1
@@ -242,9 +242,10 @@ impl TursoTapLog {
                 let symbol: String = row.get(2).map_err(map_err)?;
                 let kind_tag_s: String = row.get(3).map_err(map_err)?;
                 let shard_table: String = row.get(4).map_err(map_err)?;
-                let (Some(asset), Some(kind)) =
-                    (asset_class_from_tag(&asset_class), kind_from_tag(&kind_tag_s))
-                else {
+                let (Some(asset), Some(kind)) = (
+                    asset_class_from_tag(&asset_class),
+                    kind_from_tag(&kind_tag_s),
+                ) else {
                     continue;
                 };
                 let instrument = Instrument::new(ProviderId::new(provider), asset, &symbol);
@@ -467,7 +468,7 @@ impl Writer {
         }
         // Refuse an asset class with no stable on-disk encoding — a row that
         // cannot round-trip would orphan the shard on reopen. (Port of the
-        // surreal backend's guard; see asset_class_tag.)
+        // prior backend's guard; see asset_class_tag.)
         if asset_class_tag(instrument.asset_class()) == "unknown" {
             return Err(Error::Storage(format!(
                 "tap log: asset class of {instrument} has no stable on-disk encoding; \
@@ -564,9 +565,10 @@ impl ReplaySource for TursoTapReplaySource {
                 let symbol: String = row.get(2).map_err(map_err)?;
                 let kind_tag_s: String = row.get(3).map_err(map_err)?;
                 let shard_table: String = row.get(4).map_err(map_err)?;
-                let (Some(asset), Some(kind)) =
-                    (asset_class_from_tag(&asset_class), kind_from_tag(&kind_tag_s))
-                else {
+                let (Some(asset), Some(kind)) = (
+                    asset_class_from_tag(&asset_class),
+                    kind_from_tag(&kind_tag_s),
+                ) else {
                     continue;
                 };
                 let instrument = Instrument::new(ProviderId::new(provider), asset, &symbol);

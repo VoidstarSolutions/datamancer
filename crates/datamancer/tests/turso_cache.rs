@@ -3,7 +3,7 @@
 //! Uses the in-memory engine so the suite stays self-contained and fast.
 //! A separate `embedded_round_trip` test exercises the on-disk file-backed
 //! engine against a tempdir to confirm the persistent path actually works.
-//! Ported 1:1 from the retired `SurrealDB` backend's parity suite.
+//! Ported 1:1 from the retired prior backend's parity suite.
 
 #![cfg(feature = "storage-turso")]
 
@@ -73,9 +73,7 @@ async fn lookup_returns_none_for_empty_cache() {
 
 #[tokio::test]
 async fn store_then_replay_round_trip_preserves_order_and_values() {
-    let cache = TursoCache::open(TursoCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     let k = key(EventKind::Trade, 100, 400);
     let events = vec![
         trade("AAPL", 100, 150.10, 1),
@@ -117,9 +115,7 @@ async fn store_then_replay_round_trip_preserves_order_and_values() {
 
 #[tokio::test]
 async fn gaps_reports_uncovered_subranges() {
-    let cache = TursoCache::open(TursoCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     // First, ingest events for [100, 200) and [300, 400).
     let k1 = key(EventKind::Bar(BarInterval::OneMinute), 100, 200);
     cache
@@ -172,9 +168,7 @@ async fn gaps_reports_uncovered_subranges() {
 
 #[tokio::test]
 async fn fully_covered_range_reports_no_gaps() {
-    let cache = TursoCache::open(TursoCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     let k = key(EventKind::Trade, 0, 1000);
     cache
         .store(&k, &[trade("AAPL", 0, 1.0, 1), trade("AAPL", 999, 1.0, 1)])
@@ -265,9 +259,7 @@ async fn store_of_empty_range_marks_it_covered() {
 
 #[tokio::test]
 async fn store_replaces_existing_rows_in_the_claimed_range() {
-    let cache = TursoCache::open(TursoCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     let k = key(EventKind::Bar(BarInterval::OneMinute), 0, 1000);
     // Initial store deposits a (soon-to-be stale) bar at 500.
     cache.store(&k, &[bar("AAPL", 500, 99.0)]).await.unwrap();
@@ -294,9 +286,7 @@ async fn store_replaces_existing_rows_in_the_claimed_range() {
 
 #[tokio::test]
 async fn bars_segregate_by_adjustment_mode() {
-    let cache = TursoCache::open(TursoCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     let kind = EventKind::Bar(BarInterval::OneMinute);
     // Same (symbol, range) under two modes, with deliberately different close
     // prices so a mode mix-up is observable.
@@ -351,9 +341,7 @@ fn reexports_are_consistent() {
 
 #[tokio::test]
 async fn catalog_empty_when_nothing_stored() {
-    let cache = TursoCache::open(TursoCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     assert!(cache.catalog().await.unwrap().is_empty());
 }
 
@@ -361,9 +349,7 @@ async fn catalog_empty_when_nothing_stored() {
 async fn catalog_roundtrips_stored_ranges() {
     use datamancer::CacheCatalogEntry;
 
-    let cache = TursoCache::open(TursoCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
 
     // A trade range (stored under Raw regardless of the key's mode) ...
     let trade_key = key_adj(EventKind::Trade, 100, 400, Adjustment::All);

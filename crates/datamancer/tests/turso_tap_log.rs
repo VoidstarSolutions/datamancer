@@ -1,12 +1,14 @@
 //! Integration tests for the Turso-backed [`TapLog`].
 //!
-//! Full parity suite ported from `surreal_tap_log.rs`, exercising the
+//! Full parity suite ported from the retired tap-log parity suite, exercising the
 //! `TursoTapReplaySource` implemented in Task 7.
 
 #![cfg(feature = "storage-turso")]
 
 use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
-use datamancer::{AssetClass, Instrument, MarketEvent, Price, ProviderId, Quantity, Seq, TapLog, Timestamp, Trade};
+use datamancer::{
+    AssetClass, Instrument, MarketEvent, Price, ProviderId, Quantity, Seq, TapLog, Timestamp, Trade,
+};
 
 fn inst(symbol: &str) -> Instrument {
     Instrument::new(
@@ -80,9 +82,7 @@ async fn replay_count(source: &dyn datamancer_core::ReplaySource, req: ReplayReq
 
 #[tokio::test]
 async fn append_then_flush_persists_and_replays_in_order() {
-    let log = TursoTapLog::open(TursoTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     log.append(&trade("AAPL", 100, 100, 0, 150.10, 1))
         .await
         .unwrap();
@@ -118,9 +118,7 @@ async fn append_then_flush_persists_and_replays_in_order() {
 
 #[tokio::test]
 async fn writer_creates_one_shard_per_instrument_kind() {
-    let log = TursoTapLog::open(TursoTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     // Two instruments, one kind each, plus a bar for AAPL → 3 distinct shards.
     log.append(&trade("AAPL", 1, 1, 0, 10.0, 1)).await.unwrap();
     log.append(&trade("MSFT", 2, 2, 1, 20.0, 1)).await.unwrap();
@@ -153,9 +151,7 @@ async fn writer_creates_one_shard_per_instrument_kind() {
 
 #[tokio::test]
 async fn open_empty_log_replays_nothing() {
-    let log = TursoTapLog::open(TursoTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     let source = log.as_replay_source();
     let mut stream = source
         .open(full_request("AAPL", EventKind::Trade))
@@ -179,9 +175,7 @@ fn quote(symbol: &str, source_ts: i64, rx_ts: i64, seq: u64, bid: f64, ask: f64)
 
 #[tokio::test]
 async fn replay_preserves_arrival_order_not_source_ts_order() {
-    let log = TursoTapLog::open(TursoTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     // Arrival order: quote@300, trade@200, quote@250 — deliberately NOT sorted
     // by source_ts. Replay must reproduce arrival (seq) order.
     log.append(&quote("AAPL", 300, 1000, 0, 9.0, 11.0))
@@ -217,9 +211,7 @@ async fn replay_preserves_arrival_order_not_source_ts_order() {
 
 #[tokio::test]
 async fn replay_merges_shards_by_seq_across_instruments() {
-    let log = TursoTapLog::open(TursoTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     // Interleave two instruments; each lands in its own shard. Replay must
     // merge them back into global seq order.
     log.append(&trade("AAPL", 10, 10, 1, 1.0, 1)).await.unwrap();
@@ -255,9 +247,7 @@ async fn replay_merges_shards_by_seq_across_instruments() {
 
 #[tokio::test]
 async fn replay_windows_by_source_ts() {
-    let log = TursoTapLog::open(TursoTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     log.append(&trade("AAPL", 100, 100, 0, 1.0, 1))
         .await
         .unwrap();
@@ -288,9 +278,7 @@ async fn replay_windows_by_source_ts() {
 
 #[tokio::test]
 async fn awkward_symbol_round_trips() {
-    let log = TursoTapLog::open(TursoTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     let crypto = Instrument::new(
         ProviderId::from_static("alpaca"),
         AssetClass::Crypto,
@@ -367,9 +355,7 @@ async fn embedded_round_trip_persists_and_continues_seq() {
 
 #[tokio::test]
 async fn replay_empty_when_window_is_degenerate() {
-    let log = TursoTapLog::open(TursoTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     log.append(&trade("AAPL", 100, 100, 0, 1.0, 1))
         .await
         .unwrap();
@@ -394,9 +380,7 @@ async fn replay_empty_when_window_is_degenerate() {
 
 #[tokio::test]
 async fn replay_empty_kinds_matches_all_kinds() {
-    let log = TursoTapLog::open(TursoTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     log.append(&trade("AAPL", 100, 100, 1, 1.0, 1))
         .await
         .unwrap(); // seq 1

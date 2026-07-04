@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use datamancer::storage::{SurrealCache, SurrealCacheConfig};
+use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     AssetClass, Datamancer, EventKind, Instrument, LiveHandle, MarketEvent, PersistenceOptions,
     Price, Provider, ProviderId, Result, Scope, Seq, Timestamp, Trade,
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
         live_stop: Arc::new(AtomicBool::new(false)),
         next_live_ts: Arc::new(AtomicI64::new(1_000_000)),
     };
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory).await?;
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await?;
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .historical_cache(Box::new(cache))

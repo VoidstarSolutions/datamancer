@@ -94,7 +94,7 @@ function storageFields(key, cfg) {
   const on = cfg != null;
   return `<fieldset><legend>${key}</legend>`
     + L('enabled', CHK(`${key}-on`, on))
-    + L('backend', SEL(`${key}-backend`, ['surreal-embedded','surreal-memory'], on ? cfg.backend : 'surreal-embedded'))
+    + L('backend', SEL(`${key}-backend`, ['embedded','memory'], on ? cfg.backend : 'embedded'))
     + L('path', TXT(`${key}-path`, on ? cfg.path : ''))
     + `</fieldset>`;
 }
