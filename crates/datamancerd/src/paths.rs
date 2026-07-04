@@ -34,26 +34,26 @@ pub fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// The platform-native default config file:
-/// `<config_dir>/config.toml` for the `datamancerd` project
-/// (macOS: `~/Library/Application Support/datamancerd/config.toml`;
-/// Linux: `$XDG_CONFIG_HOME/datamancerd/config.toml`).
+/// `<config_dir>/config.toml` for the `datamancer` project
+/// (macOS: `~/Library/Application Support/datamancer/config.toml`;
+/// Linux: `$XDG_CONFIG_HOME/datamancer/config.toml`).
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "datamancerd")
+    directories::ProjectDirs::from("", "", "datamancer")
         .map(|dirs| dirs.config_dir().join("config.toml"))
 }
 
 /// The platform-native default **data** directory for embedded storage
-/// (the cache and tap log): `<data_dir>/datamancerd`
-/// (macOS: `~/Library/Application Support/datamancerd`;
-/// Linux: `~/.local/share/datamancerd`, `$XDG_DATA_HOME` respected).
+/// (the cache and tap log): `<data_dir>/datamancer`
+/// (macOS: `~/Library/Application Support/datamancer`;
+/// Linux: `~/.local/share/datamancer`, `$XDG_DATA_HOME` respected).
 ///
 /// This is the data-dir analog of [`default_config_path`]'s config dir — a
 /// growing embedded database belongs in the data dir, not the config dir (they
 /// coincide on macOS but not on Linux).
 #[must_use]
 pub fn default_data_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "datamancerd").map(|dirs| dirs.data_dir().to_path_buf())
+    directories::ProjectDirs::from("", "", "datamancer").map(|dirs| dirs.data_dir().to_path_buf())
 }
 
 /// The commented first-run scaffold. `config_dir` anchors the user-writable
@@ -84,8 +84,8 @@ account_type = "paper"
 
 # Historical read-through cache; required by cache-using persistence presets.
 # `path` is optional for embedded: it defaults to the platform data dir
-# (macOS ~/Library/Application Support/datamancerd/cache.db, Linux
-# ~/.local/share/datamancerd/cache.db) and is created on first use.
+# (macOS ~/Library/Application Support/datamancer/cache.db, Linux
+# ~/.local/share/datamancer/cache.db) and is created on first use.
 # [cache]
 # backend = "embedded"
 # path = "/path/to/cache.db"
@@ -286,11 +286,11 @@ mod tests {
         let s = path.to_string_lossy();
         #[cfg(target_os = "macos")]
         assert!(
-            s.ends_with("Library/Application Support/datamancerd/config.toml"),
+            s.ends_with("Library/Application Support/datamancer/config.toml"),
             "documented macOS path drifted: {s}"
         );
         #[cfg(target_os = "linux")]
-        assert!(s.ends_with("datamancerd/config.toml"), "{s}");
+        assert!(s.ends_with("datamancer/config.toml"), "{s}");
     }
 
     #[test]
