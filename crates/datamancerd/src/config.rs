@@ -572,9 +572,9 @@ impl Config {
             && cache_cfg.backend == StorageBackend::Embedded
             && tap_cfg.backend == StorageBackend::Embedded
         {
-            let cache_path = embedded_path(cache_cfg, "cache", "cache.db")?;
-            let tap_path = embedded_path(tap_cfg, "tap_log", "taplog.db")?;
-            if cache_path == tap_path {
+            let cache_path = cache_db_path(cache_cfg)?;
+            let tap_path = tap_db_path(tap_cfg)?;
+            if lexically_normalize(&cache_path) == lexically_normalize(&tap_path) {
                 return Err(DaemonError::ConfigInvalid(format!(
                     "[cache] and [tap_log] both resolve to the same embedded database file \
                      ({}); the cache and tap log must use distinct paths",
@@ -703,23 +703,49 @@ fn embedded_path(cfg: &StorageConfig, section: &str, file_name: &str) -> Result<
     Ok(dir.join(file_name))
 }
 
+/// The one place the cache's config section name and default file name live —
+/// shared by `validate`'s collision check and the backend conversion.
+fn cache_db_path(cfg: &StorageConfig) -> Result<PathBuf> {
+    embedded_path(cfg, "cache", "cache.db")
+}
+
+/// Tap-log counterpart of [`cache_db_path`].
+fn tap_db_path(cfg: &StorageConfig) -> Result<PathBuf> {
+    embedded_path(cfg, "tap_log", "taplog.db")
+}
+
+/// Lexical `.`/`..` normalization so differently spelled paths to the same
+/// file (`./x.db` vs `x.db`, `a/../a/x.db` vs `a/x.db`) don't slip past the
+/// collision check. Purely lexical — `..` through a symlink resolves wrong,
+/// and `canonicalize` is not an option before the files exist — so this is
+/// best-effort; the schema-version bands are the backstop, refusing a file
+/// opened as the wrong store type before any DDL runs.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn storage_to_cache_config(cfg: &StorageConfig) -> Result<TursoCacheConfig> {
     match cfg.backend {
         StorageBackend::Memory => Ok(TursoCacheConfig::Memory),
-        StorageBackend::Embedded => Ok(TursoCacheConfig::embedded(embedded_path(
-            cfg, "cache", "cache.db",
-        )?)),
+        StorageBackend::Embedded => Ok(TursoCacheConfig::embedded(cache_db_path(cfg)?)),
     }
 }
 
 fn storage_to_tap_config(cfg: &StorageConfig) -> Result<TursoTapLogConfig> {
     match cfg.backend {
         StorageBackend::Memory => Ok(TursoTapLogConfig::Memory),
-        StorageBackend::Embedded => Ok(TursoTapLogConfig::embedded(embedded_path(
-            cfg,
-            "tap_log",
-            "taplog.db",
-        )?)),
+        StorageBackend::Embedded => Ok(TursoTapLogConfig::embedded(tap_db_path(cfg)?)),
     }
 }
 

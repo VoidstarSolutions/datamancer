@@ -31,14 +31,15 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use datamancer_core::{
-    AssetClass, Bar, Error, EventKind, Instrument, MarketEvent, Price, ProviderId, Quantity, Quote,
+    Bar, Error, EventKind, Instrument, MarketEvent, Price, ProviderId, Quantity, Quote,
     ReplayRequest, ReplaySource, Result, Seq, TapLog, Timestamp, Trade,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use super::turso_common::{
-    DbLocation, check_or_stamp_user_version, connect, execute_retry, map_err, open_database,
+    DbLocation, asset_class_from_tag, asset_class_tag, connect, event_columns, execute_retry,
+    map_err, open_database, preflight_user_version, stamp_user_version,
 };
 
 /// `PRAGMA user_version` for the tap log's schema. Deliberately disjoint from
@@ -98,32 +99,6 @@ fn kind_from_tag(tag: &str) -> Option<EventKind> {
     })
 }
 
-/// Stable on-disk tag for an asset class. `AssetClass` is `#[non_exhaustive]`,
-/// so the wildcard is mandatory — but a new variant tagged `"unknown"` would
-/// not round-trip through [`asset_class_from_tag`]. The writer refuses to tap
-/// an `"unknown"` class (see `resolve_shard`) rather than persist an
-/// unreadable shard. **Adding an `AssetClass` variant requires updating this
-/// function and [`asset_class_from_tag`] in lockstep.**
-fn asset_class_tag(asset: AssetClass) -> &'static str {
-    match asset {
-        AssetClass::Equity => "equity",
-        AssetClass::Etf => "etf",
-        AssetClass::Crypto => "crypto",
-        _ => "unknown",
-    }
-}
-
-/// Inverse of [`asset_class_tag`]. Returns `None` for an unrecognized tag;
-/// keep the two in lockstep when adding an `AssetClass` variant.
-fn asset_class_from_tag(tag: &str) -> Option<AssetClass> {
-    Some(match tag {
-        "equity" => AssetClass::Equity,
-        "etf" => AssetClass::Etf,
-        "crypto" => AssetClass::Crypto,
-        _ => return None,
-    })
-}
-
 /// Deterministic, **injective** record id for a `(instrument, kind)` registry
 /// entry. Each component is length-prefixed (`<byte-len>:<bytes>`) before
 /// concatenation, so distinct tuples can never alias onto one id even when
@@ -150,6 +125,36 @@ fn registry_id(instrument: &Instrument, kind: EventKind) -> String {
     id
 }
 
+/// A persisted shard name must be exactly the generated `tap_` + digits form
+/// before it is interpolated into SQL as an identifier — `streams.shard_table`
+/// is data, and a tampered or corrupted row must not become executable SQL.
+fn is_valid_shard_name(name: &str) -> bool {
+    name.strip_prefix("tap_")
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Per-shard INSERT statement, formatted **once per shard** (cached in the
+/// writer's shard map) rather than per event — the write path runs on every
+/// live market event.
+fn insert_sql(shard: &str, kind: EventKind) -> String {
+    match kind {
+        EventKind::Trade => format!(
+            "INSERT INTO {shard} (ord, seq, source_ts, rx_ts, price_raw, size_raw) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        ),
+        EventKind::Quote => format!(
+            "INSERT INTO {shard} (ord, seq, source_ts, rx_ts, bid_raw, \
+             bid_size_raw, ask_raw, ask_size_raw) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ),
+        EventKind::Bar(_) => format!(
+            "INSERT INTO {shard} (ord, seq, source_ts, rx_ts, open_raw, high_raw, \
+             low_raw, close_raw, volume_raw) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+        ),
+    }
+}
+
 fn event_seq(ev: &MarketEvent) -> u64 {
     match ev {
         MarketEvent::Trade(t) => t.seq.0,
@@ -160,6 +165,32 @@ fn event_seq(ev: &MarketEvent) -> u64 {
         // defensive and its return value is never used for ordering.
         _ => 0,
     }
+}
+
+/// `meta.next_shard` is persisted by batch commits, not by the autocommit
+/// CREATE TABLE + registry INSERT pair in `ensure_shard`, so a crash in that
+/// window reopens with a stale counter. Take the floor from the shard tables
+/// that actually exist: reusing a live ordinal would point two registry rows
+/// at one shard table and cross-attribute their events on replay.
+async fn recompute_next_shard(conn: &::turso::Connection, persisted: u64) -> Result<u64> {
+    let mut floor = persisted;
+    let mut rows = conn
+        .query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'tap_%'",
+            (),
+        )
+        .await
+        .map_err(map_err)?;
+    while let Some(row) = rows.next().await.map_err(map_err)? {
+        let name: String = row.get(0).map_err(map_err)?;
+        if let Some(n) = name
+            .strip_prefix("tap_")
+            .and_then(|d| d.parse::<u64>().ok())
+        {
+            floor = floor.max(n.saturating_add(1));
+        }
+    }
+    Ok(floor)
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +222,10 @@ impl TursoTapLog {
         };
         let db = open_database(&location).await?;
         let conn = connect(&db).await?;
+        // Version preflight BEFORE any DDL: a cache file (or a
+        // wrong-generation tap log) is refused without polluting it with
+        // `meta`/`streams`. Stamp only after the schema exists.
+        let fresh = preflight_user_version(&conn, TAP_SCHEMA_VERSION, "tap log").await?;
         execute_retry(
             &conn,
             "CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK (id = 0), \
@@ -206,14 +241,16 @@ impl TursoTapLog {
             (),
         )
         .await?;
-        check_or_stamp_user_version(&conn, TAP_SCHEMA_VERSION, "tap log").await?;
+        if fresh {
+            stamp_user_version(&conn, TAP_SCHEMA_VERSION).await?;
+        }
 
         // Load counters + registry (shard tables persist across reopen; no
         // re-DDL needed, unlike the prior backend's re-DEFINE quirk). Both queries
         // fully drain their `Rows` cursor to `None` in an inner scope before
         // the connection is handed to the writer task — an un-drained cursor
         // silently swallows the next same-connection write under turso 0.6.1
-        // (see `turso_common::check_or_stamp_user_version`).
+        // (see `turso_common::preflight_user_version`).
         let (next_shard, next_ord) = {
             let mut rows = conn
                 .query("SELECT next_shard, next_ord FROM meta WHERE id = 0", ())
@@ -232,7 +269,7 @@ impl TursoTapLog {
             while rows.next().await.map_err(map_err)?.is_some() {}
             counters
         };
-        let mut shards = HashMap::new();
+        let mut shards: HashMap<Instrument, HashMap<EventKind, String>> = HashMap::new();
         {
             let mut rows = conn
                 .query(
@@ -253,11 +290,22 @@ impl TursoTapLog {
                 ) else {
                     continue;
                 };
+                if !is_valid_shard_name(&shard_table) {
+                    tracing::warn!(provider = %provider, symbol = %symbol,
+                        shard_table = %shard_table,
+                        "skipping streams row whose shard_table is not a generated tap_N name");
+                    continue;
+                }
                 let instrument = Instrument::new(ProviderId::new(provider), asset, &symbol);
-                shards.insert((instrument, kind), shard_table);
+                shards
+                    .entry(instrument)
+                    .or_default()
+                    .insert(kind, insert_sql(&shard_table, kind));
             }
             // `while let ... = rows.next()` above already drains to `None`.
         }
+
+        let next_shard = recompute_next_shard(&conn, next_shard).await?;
 
         let (tx, rx) = mpsc::unbounded_channel();
         let writer = Writer {
@@ -309,7 +357,9 @@ struct Writer {
     conn: ::turso::Connection,
     next_shard: u64,
     next_ord: u64,
-    shards: HashMap<(Instrument, EventKind), String>,
+    /// Per-stream prebuilt INSERT SQL (see [`insert_sql`]) — the value is the
+    /// statement, not the shard name, so the hot write path never formats.
+    shards: HashMap<Instrument, HashMap<EventKind, String>>,
     /// A `BEGIN` has been issued and not yet committed.
     tx_open: bool,
     last_error: Option<Error>,
@@ -335,17 +385,21 @@ impl Writer {
     async fn handle(&mut self, cmd: WriteCmd) {
         match cmd {
             WriteCmd::Event(ev) => {
-                if let Err(e) = self.write_event(ev).await {
+                if let Err(e) = self.write_event(&ev).await {
                     tracing::warn!(error = %e, "tap log write failed");
                     self.last_error = Some(e);
                 }
             }
             WriteCmd::Flush(ack) => {
                 let commit_res = self.commit_if_open().await;
-                // Report the most recent error (write or commit) and clear it.
-                let res = match self.last_error.take() {
-                    Some(e) => Err(e),
-                    None => commit_res,
+                // Report the freshest failure and clear the buffered one. A
+                // commit error outranks a buffered write error: both fail the
+                // flush's durability claim, but the commit fault is current
+                // (the write error was already logged when it happened).
+                let res = match (self.last_error.take(), commit_res) {
+                    (_, Err(commit)) => Err(commit),
+                    (Some(write), Ok(())) => Err(write),
+                    (None, Ok(())) => Ok(()),
                 };
                 let _ = ack.send(res);
             }
@@ -383,28 +437,34 @@ impl Writer {
         res
     }
 
-    async fn write_event(&mut self, ev: MarketEvent) -> Result<()> {
-        let (instrument, kind) = match &ev {
-            MarketEvent::Trade(t) => (t.instrument.clone(), EventKind::Trade),
-            MarketEvent::Quote(q) => (q.instrument.clone(), EventKind::Quote),
-            MarketEvent::Bar(b) => (b.instrument.clone(), EventKind::Bar(b.interval)),
+    async fn write_event(&mut self, ev: &MarketEvent) -> Result<()> {
+        let (instrument, kind) = match ev {
+            MarketEvent::Trade(t) => (&t.instrument, EventKind::Trade),
+            MarketEvent::Quote(q) => (&q.instrument, EventKind::Quote),
+            MarketEvent::Bar(b) => (&b.instrument, EventKind::Bar(b.interval)),
             // Non-data events are not tapped (defensive; the session gate
             // also filters these).
             _ => return Ok(()),
         };
-        let shard = self.resolve_shard(&instrument, kind).await?;
-        let seq = event_seq(&ev).cast_signed();
+        self.ensure_shard(instrument, kind).await?;
+        let seq = event_seq(ev).cast_signed();
         let ord = self.next_ord.cast_signed();
         self.next_ord = self.next_ord.saturating_add(1);
         self.begin_if_needed().await?;
+        let sql = self
+            .shards
+            .get(instrument)
+            .and_then(|kinds| kinds.get(&kind))
+            .ok_or_else(|| {
+                Error::Storage(format!(
+                    "tap log: shard for {instrument} vanished after ensure_shard"
+                ))
+            })?;
         match ev {
             MarketEvent::Trade(t) => {
                 execute_retry(
                     &self.conn,
-                    &format!(
-                        "INSERT INTO {shard} (ord, seq, source_ts, rx_ts, price_raw, size_raw) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-                    ),
+                    sql,
                     (
                         ord,
                         seq,
@@ -419,11 +479,7 @@ impl Writer {
             MarketEvent::Quote(q) => {
                 execute_retry(
                     &self.conn,
-                    &format!(
-                        "INSERT INTO {shard} (ord, seq, source_ts, rx_ts, bid_raw, \
-                         bid_size_raw, ask_raw, ask_size_raw) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-                    ),
+                    sql,
                     (
                         ord,
                         seq,
@@ -440,11 +496,7 @@ impl Writer {
             MarketEvent::Bar(b) => {
                 execute_retry(
                     &self.conn,
-                    &format!(
-                        "INSERT INTO {shard} (ord, seq, source_ts, rx_ts, open_raw, high_raw, \
-                         low_raw, close_raw, volume_raw) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
-                    ),
+                    sql,
                     (
                         ord,
                         seq,
@@ -464,12 +516,17 @@ impl Writer {
         Ok(())
     }
 
-    /// Resolve (allocating on first sight) the shard table. DDL cannot ride
-    /// the open batch transaction safely, so a new shard commits the open
-    /// batch first, then runs CREATE TABLE + registry upsert autocommit.
-    async fn resolve_shard(&mut self, instrument: &Instrument, kind: EventKind) -> Result<String> {
-        if let Some(name) = self.shards.get(&(instrument.clone(), kind)) {
-            return Ok(name.clone());
+    /// Ensure the shard table for `(instrument, kind)` exists and its INSERT
+    /// is cached (allocating on first sight). DDL cannot ride the open batch
+    /// transaction safely, so a new shard commits the open batch first, then
+    /// runs CREATE TABLE + registry upsert autocommit.
+    async fn ensure_shard(&mut self, instrument: &Instrument, kind: EventKind) -> Result<()> {
+        if self
+            .shards
+            .get(instrument)
+            .is_some_and(|kinds| kinds.contains_key(&kind))
+        {
+            return Ok(());
         }
         // Refuse an asset class with no stable on-disk encoding — a row that
         // cannot round-trip would orphan the shard on reopen. (Port of the
@@ -485,29 +542,19 @@ impl Writer {
         let ordinal = self.next_shard;
         self.next_shard += 1;
         let name = format!("tap_{ordinal:06}");
-        // A crash between the CREATE TABLE below and the registry INSERT
-        // self-heals on reopen: `next_shard` was only persisted by an earlier
-        // commit, so the ordinal is reused, `CREATE TABLE IF NOT EXISTS`
-        // absorbs the empty orphan shard left behind, and `INSERT OR REPLACE`
-        // re-registers it — no orphaned table, no gap in the ordinal space.
-        let cols = match kind {
-            EventKind::Trade => "price_raw INTEGER NOT NULL, size_raw INTEGER NOT NULL",
-            EventKind::Quote => {
-                "bid_raw INTEGER NOT NULL, bid_size_raw INTEGER NOT NULL, \
-                 ask_raw INTEGER NOT NULL, ask_size_raw INTEGER NOT NULL"
-            }
-            EventKind::Bar(_) => {
-                "open_raw INTEGER NOT NULL, high_raw INTEGER NOT NULL, \
-                 low_raw INTEGER NOT NULL, close_raw INTEGER NOT NULL, \
-                 volume_raw INTEGER NOT NULL"
-            }
-        };
+        // A crash anywhere between here and the next batch commit leaves
+        // `meta.next_shard` stale; reopen recomputes the counter from
+        // `sqlite_master` (see `open`), so the ordinal is never reused — a
+        // half-created shard (table without a registry row, or with one) is
+        // left behind as a harmless dead table rather than being handed to a
+        // different stream.
         execute_retry(
             &self.conn,
             &format!(
                 "CREATE TABLE IF NOT EXISTS {name} (ord INTEGER PRIMARY KEY, \
                  seq INTEGER NOT NULL, source_ts INTEGER NOT NULL, \
-                 rx_ts INTEGER NOT NULL, {cols})"
+                 rx_ts INTEGER NOT NULL, {})",
+                event_columns(kind)
             ),
             (),
         )
@@ -519,16 +566,19 @@ impl Writer {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             (
                 registry_id(instrument, kind),
-                instrument.provider().as_str().to_string(),
-                asset_class_tag(instrument.asset_class()).to_string(),
-                instrument.symbol().to_string(),
-                kind_tag(kind).to_string(),
-                name.clone(),
+                instrument.provider().as_str(),
+                asset_class_tag(instrument.asset_class()),
+                instrument.symbol(),
+                kind_tag(kind),
+                name.as_str(),
             ),
         )
         .await?;
-        self.shards.insert((instrument.clone(), kind), name.clone());
-        Ok(name)
+        self.shards
+            .entry(instrument.clone())
+            .or_default()
+            .insert(kind, insert_sql(&name, kind));
+        Ok(())
     }
 }
 
@@ -581,6 +631,12 @@ impl ReplaySource for TursoTapReplaySource {
                 ) else {
                     continue;
                 };
+                if !is_valid_shard_name(&shard_table) {
+                    tracing::warn!(provider = %provider, symbol = %symbol,
+                        shard_table = %shard_table,
+                        "skipping streams row whose shard_table is not a generated tap_N name");
+                    continue;
+                }
                 let instrument = Instrument::new(ProviderId::new(provider), asset, &symbol);
                 if !request.instruments.is_empty() && !request.instruments.contains(&instrument) {
                     continue;
@@ -698,5 +754,148 @@ impl ReplaySource for TursoTapReplaySource {
         // it reproduces original arrival order across shards and symbols.
         all.sort_by_key(|(ord, _)| *ord);
         Ok(stream::iter(all.into_iter().map(|(_, ev)| ev)).boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datamancer_core::{
+        AssetClass, Instrument, MarketEvent, Price, ProviderId, Quantity, Quote, Seq, TapLog as _,
+        Timestamp, Trade,
+    };
+
+    use super::super::turso::{TursoCache, TursoCacheConfig};
+    use super::super::turso_common::{DbLocation, connect, open_database};
+    use super::{TursoTapLog, TursoTapLogConfig};
+
+    fn inst() -> Instrument {
+        Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        )
+    }
+
+    fn trade(n: i64) -> MarketEvent {
+        MarketEvent::Trade(Trade {
+            instrument: inst(),
+            source_ts: Timestamp(n),
+            rx_ts: Timestamp(n),
+            seq: Seq(n.cast_unsigned()),
+            price: Price::from_units(100),
+            size: Quantity::from_units(1),
+        })
+    }
+
+    fn quote(n: i64) -> MarketEvent {
+        MarketEvent::Quote(Quote {
+            instrument: inst(),
+            source_ts: Timestamp(n),
+            rx_ts: Timestamp(n),
+            seq: Seq(n.cast_unsigned()),
+            bid: Price::from_units(99),
+            bid_size: Quantity::from_units(1),
+            ask: Price::from_units(101),
+            ask_size: Quantity::from_units(1),
+        })
+    }
+
+    /// A cache file must be refused by the version preflight BEFORE any DDL:
+    /// the refusal must not pollute the file with `meta`/`streams`.
+    #[tokio::test]
+    async fn cache_file_is_refused_before_any_tap_ddl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        drop(
+            TursoCache::open(TursoCacheConfig::embedded(&path))
+                .await
+                .unwrap(),
+        );
+
+        let Err(err) = TursoTapLog::open(TursoTapLogConfig::embedded(&path)).await else {
+            panic!("a cache file must refuse to open as a tap log");
+        };
+        assert!(
+            err.to_string().contains("schema version"),
+            "unexpected error: {err}"
+        );
+
+        let db = open_database(&DbLocation::File(path)).await.unwrap();
+        let conn = connect(&db).await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE name IN ('meta', 'streams')",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "tap-log DDL leaked into a cache file"
+        );
+    }
+
+    /// A crash between shard allocation and the next batch commit leaves
+    /// `meta.next_shard` stale; reopen must recompute it from the shard
+    /// tables that exist rather than hand a live ordinal to a new stream.
+    #[tokio::test]
+    async fn stale_next_shard_is_recomputed_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tap.db");
+
+        // Stream A allocates tap_000000 and commits.
+        {
+            let log = TursoTapLog::open(TursoTapLogConfig::embedded(&path))
+                .await
+                .unwrap();
+            log.append(&trade(1)).await.unwrap();
+            log.flush().await.unwrap();
+        }
+
+        // Simulate the crash window: the shard exists and is registered, but
+        // the persisted counter never advanced.
+        {
+            let db = open_database(&DbLocation::File(path.clone()))
+                .await
+                .unwrap();
+            let conn = connect(&db).await.unwrap();
+            conn.execute("UPDATE meta SET next_shard = 0 WHERE id = 0", ())
+                .await
+                .unwrap();
+        }
+
+        // Stream B (same instrument, different kind) must get a fresh shard,
+        // not tap_000000.
+        {
+            let log = TursoTapLog::open(TursoTapLogConfig::embedded(&path))
+                .await
+                .unwrap();
+            log.append(&quote(2)).await.unwrap();
+            log.flush().await.unwrap();
+        }
+
+        let db = open_database(&DbLocation::File(path)).await.unwrap();
+        let conn = connect(&db).await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT kind_tag, shard_table FROM streams ORDER BY kind_tag",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            let kind_tag: String = row.get(0).unwrap();
+            let shard: String = row.get(1).unwrap();
+            seen.push((kind_tag, shard));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("quote".to_string(), "tap_000001".to_string()),
+                ("trade".to_string(), "tap_000000".to_string()),
+            ],
+            "the stale counter must not hand tap_000000 to a second stream"
+        );
     }
 }

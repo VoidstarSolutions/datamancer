@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use datamancer_core::{Error, Result};
+use datamancer_core::{AssetClass, BarInterval, Error, EventKind, Result};
 
 /// Bounded busy-retry budget: writes are serialized by design, so `Busy`
 /// here is unexpected; retry briefly, then fail loudly.
@@ -101,45 +101,41 @@ pub(crate) async fn execute_retry(
     }
 }
 
-/// Schema-version guard via `PRAGMA user_version` (the idiomatic `SQLite`
-/// mechanism; supersedes the prior backends' meta-table markers). A fresh
-/// file reads 0 and is stamped; anything else must match exactly. There is no
-/// pre-versioning turso lineage — version numbering starts at 1 per store.
-pub(crate) async fn check_or_stamp_user_version(
+/// Schema-version preflight via `PRAGMA user_version` (the idiomatic `SQLite`
+/// mechanism; supersedes the prior backends' meta-table markers). Runs
+/// **before any DDL** so a file belonging to another store (or another schema
+/// generation) is refused without polluting it with this store's tables.
+/// Returns `true` when the file is fresh (version 0): the caller must create
+/// its schema and then [`stamp_user_version`]. There is no pre-versioning
+/// turso lineage — version numbering starts fresh per store.
+pub(crate) async fn preflight_user_version(
     conn: &::turso::Connection,
     expected: i64,
     store: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let version: i64 = {
         let mut rows = conn
             .query("PRAGMA user_version", ())
             .await
             .map_err(map_err)?;
-        let row = rows
-            .next()
-            .await
-            .map_err(map_err)?
-            .ok_or_else(|| Error::Storage("PRAGMA user_version returned no row".to_string()))?;
-        let version = row.get(0).map_err(map_err)?;
-        // Fully drain the cursor before issuing a write on this connection:
-        // an un-stepped `Rows` leaves its statement unfinalized, and turso
-        // 0.6.1 silently drops a same-connection write issued while an
-        // earlier read statement is still open (observed via a spike where
+        let first = rows.next().await.map_err(map_err)?;
+        // Defer the decode until the cursor is fully drained: an un-stepped
+        // `Rows` leaves its statement unfinalized, and turso 0.6.1 silently
+        // drops a same-connection write issued while an earlier read
+        // statement is still open (observed via a spike where
         // `PRAGMA user_version = N` read back correctly in-connection but
-        // never reached disk).
-        rows.next().await.map_err(map_err)?;
-        version
+        // never reached disk). Erroring out of this scope before the drain
+        // would leave the connection in exactly that state.
+        let raw = first.map(|row| row.get::<i64>(0));
+        while rows.next().await.map_err(map_err)?.is_some() {}
+        raw.ok_or_else(|| Error::Storage("PRAGMA user_version returned no row".to_string()))?
+            .map_err(map_err)?
     };
     if version == expected {
-        return Ok(());
+        return Ok(false);
     }
     if version == 0 {
-        // PRAGMA assignment cannot be parameterized; `expected` is a trusted
-        // compile-time constant.
-        conn.execute(&format!("PRAGMA user_version = {expected}"), ())
-            .await
-            .map_err(map_err)?;
-        return Ok(());
+        return Ok(true);
     }
     Err(Error::Storage(format!(
         "{store} schema version {version} does not match this build's {expected}; \
@@ -148,9 +144,89 @@ pub(crate) async fn check_or_stamp_user_version(
     )))
 }
 
+/// Stamp a fresh file's `PRAGMA user_version` — call only after schema
+/// creation succeeded, so a half-initialized file is re-checked (and its
+/// `CREATE TABLE IF NOT EXISTS` re-run) on the next open rather than passing
+/// the version gate with missing tables.
+pub(crate) async fn stamp_user_version(conn: &::turso::Connection, expected: i64) -> Result<()> {
+    // PRAGMA assignment cannot be parameterized; `expected` is a trusted
+    // compile-time constant.
+    conn.execute(&format!("PRAGMA user_version = {expected}"), ())
+        .await
+        .map_err(map_err)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared on-disk vocabulary — one definition for both stores.
+//
+// The cache and the tap log are independent files with independent schema
+// versions, but their per-kind row shapes and asset-class tags are the same
+// vocabulary on purpose; defining it once keeps the two from drifting when a
+// kind or class is added.
+// ---------------------------------------------------------------------------
+
+/// Column DDL for a `kind`'s fixed numeric payload (shared by the cache's
+/// per-kind tables and the tap log's shard tables).
+pub(crate) const fn event_columns(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::Trade => "price_raw INTEGER NOT NULL, size_raw INTEGER NOT NULL",
+        EventKind::Quote => {
+            "bid_raw INTEGER NOT NULL, bid_size_raw INTEGER NOT NULL, \
+             ask_raw INTEGER NOT NULL, ask_size_raw INTEGER NOT NULL"
+        }
+        EventKind::Bar(_) => {
+            "open_raw INTEGER NOT NULL, high_raw INTEGER NOT NULL, \
+             low_raw INTEGER NOT NULL, close_raw INTEGER NOT NULL, \
+             volume_raw INTEGER NOT NULL"
+        }
+    }
+}
+
+/// Every persistable event kind, for schema-creation loops.
+pub(crate) const ALL_KINDS: [EventKind; 8] = [
+    EventKind::Trade,
+    EventKind::Quote,
+    EventKind::Bar(BarInterval::OneSecond),
+    EventKind::Bar(BarInterval::OneMinute),
+    EventKind::Bar(BarInterval::FiveMinute),
+    EventKind::Bar(BarInterval::FifteenMinute),
+    EventKind::Bar(BarInterval::OneHour),
+    EventKind::Bar(BarInterval::OneDay),
+];
+
+/// Stable on-disk tag for an asset class. `AssetClass` is `#[non_exhaustive]`,
+/// so the wildcard is mandatory — but a new variant tagged `"unknown"` would
+/// not round-trip through [`asset_class_from_tag`]. Writers refuse to persist
+/// an `"unknown"` class rather than store an unreadable row. **Adding an
+/// `AssetClass` variant requires updating this function and
+/// [`asset_class_from_tag`] in lockstep.**
+pub(crate) fn asset_class_tag(asset: AssetClass) -> &'static str {
+    match asset {
+        AssetClass::Equity => "equity",
+        AssetClass::Etf => "etf",
+        AssetClass::Crypto => "crypto",
+        _ => "unknown",
+    }
+}
+
+/// Inverse of [`asset_class_tag`]. Returns `None` for an unrecognized tag;
+/// keep the two in lockstep when adding an `AssetClass` variant.
+pub(crate) fn asset_class_from_tag(tag: &str) -> Option<AssetClass> {
+    Some(match tag {
+        "equity" => AssetClass::Equity,
+        "etf" => AssetClass::Etf,
+        "crypto" => AssetClass::Crypto,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DbLocation, check_or_stamp_user_version, connect, execute_retry, open_database};
+    use super::{
+        DbLocation, connect, execute_retry, open_database, preflight_user_version,
+        stamp_user_version,
+    };
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -170,15 +246,18 @@ mod tests {
         {
             let db = open_database(&loc).await.unwrap();
             let conn = connect(&db).await.unwrap();
-            check_or_stamp_user_version(&conn, 1, "test store")
+            let fresh = preflight_user_version(&conn, 1, "test store")
                 .await
                 .unwrap();
+            assert!(fresh, "a new file must read as fresh");
+            stamp_user_version(&conn, 1).await.unwrap();
         }
         let db = open_database(&loc).await.unwrap();
         let conn = connect(&db).await.unwrap();
-        check_or_stamp_user_version(&conn, 1, "test store")
+        let fresh = preflight_user_version(&conn, 1, "test store")
             .await
             .unwrap();
+        assert!(!fresh, "a stamped file must not read as fresh");
     }
 
     #[tokio::test]
@@ -188,13 +267,11 @@ mod tests {
         {
             let db = open_database(&loc).await.unwrap();
             let conn = connect(&db).await.unwrap();
-            check_or_stamp_user_version(&conn, 999, "test store")
-                .await
-                .unwrap();
+            stamp_user_version(&conn, 999).await.unwrap();
         }
         let db = open_database(&loc).await.unwrap();
         let conn = connect(&db).await.unwrap();
-        let err = check_or_stamp_user_version(&conn, 1, "test store")
+        let err = preflight_user_version(&conn, 1, "test store")
             .await
             .expect_err("mismatch must refuse");
         assert!(err.to_string().contains("999"), "unexpected error: {err}");

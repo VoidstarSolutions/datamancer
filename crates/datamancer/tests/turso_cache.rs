@@ -346,6 +346,36 @@ async fn catalog_empty_when_nothing_stored() {
 }
 
 #[tokio::test]
+async fn catalog_survives_separator_characters_in_symbols() {
+    // `Instrument` accepts any symbol string; a symbol containing `|` (or
+    // anything else) must round-trip through store → catalog intact now that
+    // coverage keys are real columns rather than a delimiter-joined id.
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
+    let weird = "A|B|bars_1d|raw";
+    let k = CacheKey {
+        instrument: inst(weird),
+        kind: EventKind::Trade,
+        from: Timestamp(100),
+        to: Timestamp(400),
+        adjustment: Adjustment::default(),
+    };
+    cache
+        .store(&k, &[trade(weird, 100, 1.0, 1), trade(weird, 300, 2.0, 1)])
+        .await
+        .unwrap();
+
+    let catalog = cache.catalog().await.unwrap();
+    assert_eq!(
+        catalog.len(),
+        1,
+        "the pipe-symbol entry must not be skipped"
+    );
+    assert_eq!(catalog[0].symbol, weird);
+    assert_eq!(catalog[0].kind, EventKind::Trade);
+    assert_eq!(catalog[0].event_count, 2);
+}
+
+#[tokio::test]
 async fn catalog_roundtrips_stored_ranges() {
     use datamancer::CacheCatalogEntry;
 

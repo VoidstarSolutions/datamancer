@@ -83,15 +83,29 @@ async fn completed_flush_survives_sigkill() {
         .spawn()
         .unwrap();
 
+    // Read confirmations on a helper thread with a deadline: if the child
+    // wedges without exiting, the test fails loudly instead of hanging CI.
     let stdout = child.stdout.take().unwrap();
-    let reader = std::io::BufReader::new(stdout);
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(std::result::Result::ok) {
+            if let Some(id) = line.strip_prefix("flushed ") {
+                let batch: u64 = id.trim().parse().unwrap();
+                if line_tx.send(batch).is_err() {
+                    break;
+                }
+            }
+        }
+    });
     let mut confirmed: Vec<u64> = Vec::new();
-    for line in reader.lines() {
-        let line = line.unwrap();
-        if let Some(id) = line.strip_prefix("flushed ") {
-            confirmed.push(id.trim().parse().unwrap());
-            if confirmed.len() >= 3 {
-                break;
+    while confirmed.len() < 3 {
+        match line_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(batch) => confirmed.push(batch),
+            Err(e) => {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("timed out waiting for the child to confirm 3 flushes: {e}");
             }
         }
     }

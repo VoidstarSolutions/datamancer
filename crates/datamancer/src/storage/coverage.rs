@@ -49,7 +49,14 @@ impl CoverageDoc {
         for &(a, b) in &self.segments {
             let lo = a.max(from);
             let hi = b.min(to);
-            if lo < hi && best.is_none_or(|(prev_lo, prev_hi)| hi - lo > prev_hi - prev_lo) {
+            // Widen before subtracting: with extreme bounds (e.g. a request
+            // from i64::MIN) `hi - lo` overflows i64.
+            let width = i128::from(hi) - i128::from(lo);
+            if lo < hi
+                && best.is_none_or(|(prev_lo, prev_hi)| {
+                    width > i128::from(prev_hi) - i128::from(prev_lo)
+                })
+            {
                 best = Some((lo, hi));
             }
         }
