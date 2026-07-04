@@ -39,6 +39,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 directories = "6"
+# Safe flock(2) for the global single-instance lock. Already in the tree
+# transitively; the `fs` feature exposes `rustix::fs::flock`.
+rustix = { version = "1", features = ["fs"] }
 
 # Web UI / JSON API (feature `web-ui`).
 axum = { version = "0.8", optional = true }

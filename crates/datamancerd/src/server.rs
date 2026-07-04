@@ -439,9 +439,16 @@ impl Server {
         Ok(UnixListener::bind(&self.admin_socket)?)
     }
 
-    /// Remove only a *stale* admin socket. Refuses to delete a non-socket file
-    /// at that path (a misconfiguration must not clobber arbitrary files), and
-    /// refuses to steal a socket a live daemon is still listening on.
+    /// Remove a *stale* admin socket left by an unclean prior exit.
+    ///
+    /// The global single-instance lock (acquired before `run`) rules out another
+    /// live `datamancerd`, so a socket at this path with no listener is
+    /// necessarily stale and safe to remove. Refuses to delete a path that
+    /// exists and is *not* a socket, so a misconfiguration cannot clobber an
+    /// arbitrary file. Also refuses to steal a socket with a *live* listener:
+    /// the lock excludes another daemon but not an unrelated program, so a live
+    /// listener here means `admin_socket` is misconfigured onto a foreign
+    /// service rather than left stale.
     fn clear_stale_socket(&self) -> Result<()> {
         use std::os::unix::fs::FileTypeExt;
         let meta = match std::fs::symlink_metadata(&self.admin_socket) {
@@ -459,12 +466,14 @@ impl Server {
             )
             .into());
         }
-        // It is a socket. If a daemon is still listening, do not steal it.
+        // The lock rules out another datamancerd, but not an unrelated program.
+        // A live listener here is therefore a foreign service, not a stale
+        // socket — do not steal it.
         if std::os::unix::net::UnixStream::connect(&self.admin_socket).is_ok() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
                 format!(
-                    "admin_socket {} is already in use by a running daemon",
+                    "admin_socket {} is already in use by another process",
                     self.admin_socket.display()
                 ),
             )

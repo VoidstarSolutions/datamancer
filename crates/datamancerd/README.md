@@ -39,6 +39,29 @@ environment credential pair `oxidized_alpaca` loads
 (`paper` → `ALPACA_PAPER_API_KEY_ID`/`ALPACA_PAPER_API_SECRET_KEY`,
 `live` → `ALPACA_LIVE_API_KEY_ID`/`ALPACA_LIVE_API_SECRET_KEY`).
 
+### Single instance
+
+Only one `datamancerd` runs per user on a host — **regardless of which config it
+is given**. At startup, before loading config or opening any storage, the daemon
+takes an exclusive advisory lock (`flock`) on a fixed, config-independent
+lockfile:
+
+- macOS: `~/Library/Application Support/datamancerd/datamancerd.lock`
+- Linux: `~/.local/share/datamancerd/datamancerd.lock` (`$XDG_DATA_HOME` respected)
+
+A second launch while one is running fails fast and exits non-zero with, e.g.:
+
+```
+another datamancerd is already running (pid 4321); single-instance lock held at \
+<data dir>/datamancerd.lock
+```
+
+The lock is held for the whole process and released by the kernel on exit —
+clean or not — so a crash leaves at most a harmless leftover lockfile that the
+next start re-locks. The file's contents (the holder's PID) are diagnostic only;
+the lock itself is authoritative. This is a **per-host, per-user** guarantee: it
+does not coordinate across users or hosts.
+
 ### Config file location
 
 `--config <path>` is **optional**. When given, that path is used verbatim: a

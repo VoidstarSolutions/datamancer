@@ -41,6 +41,13 @@ pub enum DaemonError {
     /// An I/O error on the control socket or elsewhere.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    /// Another `datamancerd` already holds the global single-instance lock.
+    #[error(
+        "another datamancerd is already running{}; single-instance lock held at {path}",
+        pid.map_or_else(String::new, |p| format!(" (pid {p})"))
+    )]
+    AlreadyRunning { pid: Option<u32>, path: PathBuf },
 }
 
 /// Daemon result alias.
