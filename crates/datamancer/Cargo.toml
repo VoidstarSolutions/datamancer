@@ -70,5 +70,9 @@ required-features = ["storage-surreal"]
 name = "resume"
 required-features = ["storage-surreal"]
 
+[[test]]
+name = "turso_tap_log"
+required-features = ["storage-turso"]
+
 [lints]
 workspace = true

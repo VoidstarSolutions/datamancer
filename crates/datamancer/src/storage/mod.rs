@@ -26,3 +26,9 @@ pub mod turso;
 
 #[cfg(feature = "storage-turso")]
 pub use turso::{TursoCache, TursoCacheConfig};
+
+#[cfg(feature = "storage-turso")]
+pub mod turso_tap_log;
+
+#[cfg(feature = "storage-turso")]
+pub use turso_tap_log::{TursoTapLog, TursoTapLogConfig};
