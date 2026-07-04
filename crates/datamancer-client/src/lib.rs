@@ -14,6 +14,7 @@ mod error;
 pub mod codes;
 #[cfg(feature = "iceoryx2")]
 pub mod iceoryx2;
+pub mod paths;
 pub mod protocol;
 pub mod spec;
 #[cfg(feature = "ws")]
@@ -21,3 +22,4 @@ pub mod ws;
 
 pub use client::Client;
 pub use error::ClientError;
+pub use paths::default_control_socket;

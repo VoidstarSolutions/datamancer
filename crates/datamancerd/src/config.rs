@@ -219,7 +219,8 @@ impl Default for ServerConfig {
 }
 
 fn default_admin_socket() -> PathBuf {
-    PathBuf::from("/run/datamancerd/admin.sock")
+    datamancer_client::default_control_socket()
+        .unwrap_or_else(|| PathBuf::from("/run/datamancer/control.sock"))
 }
 
 fn default_service_prefix() -> String {
@@ -814,6 +815,15 @@ account_type = "paper"
             "[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\nport = 9001\nbogus = 1\n",
         );
         assert!(err.is_err(), "unknown [ws] field must be rejected");
+    }
+
+    #[test]
+    fn admin_socket_default_is_datamancer_convention() {
+        assert_eq!(
+            super::default_admin_socket(),
+            datamancer_client::default_control_socket()
+                .expect("home/runtime dir exists in test env"),
+        );
     }
 
     #[test]

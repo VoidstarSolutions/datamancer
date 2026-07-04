@@ -34,36 +34,35 @@ pub fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// The platform-native default config file:
-/// `<config_dir>/config.toml` for the `datamancerd` project
-/// (macOS: `~/Library/Application Support/datamancerd/config.toml`;
-/// Linux: `$XDG_CONFIG_HOME/datamancerd/config.toml`).
+/// `<config_dir>/config.toml` for the `datamancer` project
+/// (macOS: `~/Library/Application Support/datamancer/config.toml`;
+/// Linux: `$XDG_CONFIG_HOME/datamancer/config.toml`).
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "datamancerd")
+    directories::ProjectDirs::from("", "", "datamancer")
         .map(|dirs| dirs.config_dir().join("config.toml"))
 }
 
 /// The platform-native default **data** directory for embedded storage
-/// (the cache and tap log): `<data_dir>/datamancerd`
-/// (macOS: `~/Library/Application Support/datamancerd`;
-/// Linux: `~/.local/share/datamancerd`, `$XDG_DATA_HOME` respected).
+/// (the cache and tap log): `<data_dir>/datamancer`
+/// (macOS: `~/Library/Application Support/datamancer`;
+/// Linux: `~/.local/share/datamancer`, `$XDG_DATA_HOME` respected).
 ///
 /// This is the data-dir analog of [`default_config_path`]'s config dir — a
 /// growing embedded database belongs in the data dir, not the config dir (they
 /// coincide on macOS but not on Linux).
 #[must_use]
 pub fn default_data_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "datamancerd").map(|dirs| dirs.data_dir().to_path_buf())
+    directories::ProjectDirs::from("", "", "datamancer").map(|dirs| dirs.data_dir().to_path_buf())
 }
 
-/// The commented first-run scaffold. `config_dir` anchors the user-writable
-/// admin socket (the compiled-in `/run/datamancerd` default needs root and
-/// does not exist on macOS).
+/// The commented first-run scaffold. The control socket default now lives in
+/// the runtime/data dir and needs no root (see [`crate::config`]'s
+/// `default_admin_socket`, which resolves
+/// `datamancer_client::default_control_socket()`).
 #[must_use]
-pub fn default_config_toml(config_dir: &Path) -> String {
-    let socket = config_dir.join("admin.sock");
-    format!(
-        r#"# datamancerd configuration.
+pub fn default_config_toml() -> String {
+    r#"# datamancerd configuration.
 #
 # Generated on first run; edit by hand or through the web UI settings page
 # (http://127.0.0.1:8080/config). UI saves rewrite this file and drop comments.
@@ -84,8 +83,8 @@ account_type = "paper"
 
 # Historical read-through cache; required by cache-using persistence presets.
 # `path` is optional for embedded: it defaults to the platform data dir
-# (macOS ~/Library/Application Support/datamancerd/cache.db, Linux
-# ~/.local/share/datamancerd/cache.db) and is created on first use.
+# (macOS ~/Library/Application Support/datamancer/cache.db, Linux
+# ~/.local/share/datamancer/cache.db) and is created on first use.
 # [cache]
 # backend = "embedded"
 # path = "/path/to/cache.db"
@@ -98,8 +97,11 @@ account_type = "paper"
 
 [server]
 # UDS control socket (same-host operator surface; filesystem permissions are
-# the access control).
-admin_socket = "{socket}"
+# the access control). Defaults to the datamancer-owned well-known path
+# ($XDG_RUNTIME_DIR/datamancer/control.sock on Linux,
+# ~/Library/Application Support/datamancer/control.sock on macOS) that
+# consumers resolve by convention. Uncomment only to override.
+# admin_socket = "/path/to/control.sock"
 
 # Read-mostly operator UI + JSON API + the config settings page. Loopback only.
 # `bind` picks ONE address family. Reach the UI at the literal http://<bind>:<port>
@@ -120,9 +122,8 @@ port = 8080
 # symbol = "BTC/USD"
 # kind = "trade"
 # always_on = true
-"#,
-        socket = socket.display()
-    )
+"#
+    .to_string()
 }
 
 /// Resolve which config file the daemon should load.
@@ -167,7 +168,7 @@ fn resolve_in(explicit: Option<PathBuf>, default: PathBuf) -> DaemonResult<PathB
             })?
             .to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        atomic_write(&default, &default_config_toml(&dir))?;
+        atomic_write(&default, &default_config_toml())?;
         tracing::info!(path = %default.display(), "no config found; wrote default config");
     }
     Ok(default)
@@ -259,15 +260,18 @@ mod tests {
 
     #[test]
     fn scaffold_template_parses_and_validates() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let text = default_config_toml(dir.path());
+        let text = default_config_toml();
         let config = crate::config::Config::parse(&text).expect("scaffold must parse");
         config.validate().expect("scaffold must validate");
-        // Scaffold contract: paper alpaca provider, web UI on, user-writable socket.
+        // Scaffold contract: paper alpaca provider, web UI on, published default socket.
         assert!(config.provider.alpaca.is_some());
         let web = config.web_ui.expect("web_ui section");
         assert!(web.enabled);
-        assert_eq!(config.server.admin_socket, dir.path().join("admin.sock"));
+        assert_eq!(
+            config.server.admin_socket,
+            datamancer_client::default_control_socket()
+                .expect("home/runtime dir exists in test env"),
+        );
     }
 
     #[test]
@@ -286,11 +290,11 @@ mod tests {
         let s = path.to_string_lossy();
         #[cfg(target_os = "macos")]
         assert!(
-            s.ends_with("Library/Application Support/datamancerd/config.toml"),
+            s.ends_with("Library/Application Support/datamancer/config.toml"),
             "documented macOS path drifted: {s}"
         );
         #[cfg(target_os = "linux")]
-        assert!(s.ends_with("datamancerd/config.toml"), "{s}");
+        assert!(s.ends_with("datamancer/config.toml"), "{s}");
     }
 
     #[test]

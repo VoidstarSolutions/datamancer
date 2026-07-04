@@ -436,7 +436,15 @@ impl Server {
             std::fs::create_dir_all(parent)?;
         }
         self.clear_stale_socket()?;
-        Ok(UnixListener::bind(&self.admin_socket)?)
+        UnixListener::bind(&self.admin_socket).map_err(|e| {
+            DaemonError::from(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "binding control socket {}: {e}",
+                    self.admin_socket.display()
+                ),
+            ))
+        })
     }
 
     /// Remove a *stale* admin socket left by an unclean prior exit.
