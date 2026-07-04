@@ -1,14 +1,14 @@
 //! End-to-end Session tests using a fake provider. Exercises historical and
 //! live scopes against the new per-(instrument, kind) Session surface.
 
-#![cfg(feature = "storage-surreal")]
+#![cfg(feature = "storage-turso")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use datamancer::storage::{SurrealTapLog, SurrealTapLogConfig};
+use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, ControlKind, Datamancer, EventKind, Instrument, LiveHandle,
     MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ReplayRequest, Result, Scope,
@@ -718,11 +718,7 @@ fn live_trade(symbol: &str, source_ts: i64) -> MarketEvent {
 #[tokio::test]
 async fn live_session_tees_data_events_to_tap_log() {
     let (provider, ctrl) = FakeProvider::new("fake");
-    let log = std::sync::Arc::new(
-        SurrealTapLog::open(SurrealTapLogConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let log = std::sync::Arc::new(TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap());
     let dm = Datamancer::builder()
         .provider_arc(provider)
         .tap_log_arc(log.clone())
@@ -771,11 +767,7 @@ async fn live_session_tees_data_events_to_tap_log() {
 #[tokio::test]
 async fn tap_log_disabled_captures_nothing() {
     let (provider, ctrl) = FakeProvider::new("fake");
-    let log = std::sync::Arc::new(
-        SurrealTapLog::open(SurrealTapLogConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let log = std::sync::Arc::new(TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap());
     let dm = Datamancer::builder()
         .provider_arc(provider)
         .tap_log_arc(log.clone())

@@ -27,12 +27,12 @@ venue = "us"                      # us | us_kraken | eu_kraken
 # deployment typically uses system paths like /var/lib/datamancerd/{cache,taplog}
 # (create them and chown to the service user first).
 [cache]
-backend = "surreal-embedded"      # surreal-embedded | surreal-memory
-path = "./.datamancerd/cache"     # required for surreal-embedded
+backend = "embedded"              # embedded | memory
+path = "./.datamancerd/cache.db"  # required for embedded; a database file, not a directory
 
 [tap_log]
-backend = "surreal-embedded"
-path = "./.datamancerd/taplog"
+backend = "embedded"
+path = "./.datamancerd/taplog.db"
 
 # ── Session knobs ──────────────────────────────────────────────────────────
 [session]

@@ -1,12 +1,13 @@
-//! Integration tests for the Surreal-backed [`HistoricalCache`].
+//! Integration tests for the Turso-backed [`HistoricalCache`].
 //!
 //! Uses the in-memory engine so the suite stays self-contained and fast.
-//! A separate `embedded_round_trip` test exercises the on-disk `SurrealKV`
+//! A separate `embedded_round_trip` test exercises the on-disk file-backed
 //! engine against a tempdir to confirm the persistent path actually works.
+//! Ported 1:1 from the retired prior backend's parity suite.
 
-#![cfg(feature = "storage-surreal")]
+#![cfg(feature = "storage-turso")]
 
-use datamancer::storage::{SurrealCache, SurrealCacheConfig};
+use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     Adjustment, AssetClass, Bar, BarInterval, CacheKey, EventKind, GapSpan, HistoricalCache,
     Instrument, MarketEvent, Price, ProviderId, Quantity, Seq, Timestamp, Trade,
@@ -65,18 +66,14 @@ fn key_adj(kind: EventKind, from: i64, to: i64, adjustment: Adjustment) -> Cache
 
 #[tokio::test]
 async fn lookup_returns_none_for_empty_cache() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     let k = key(EventKind::Trade, 0, 1_000_000);
     assert!(cache.lookup(&k).await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn store_then_replay_round_trip_preserves_order_and_values() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     let k = key(EventKind::Trade, 100, 400);
     let events = vec![
         trade("AAPL", 100, 150.10, 1),
@@ -118,9 +115,7 @@ async fn store_then_replay_round_trip_preserves_order_and_values() {
 
 #[tokio::test]
 async fn gaps_reports_uncovered_subranges() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     // First, ingest events for [100, 200) and [300, 400).
     let k1 = key(EventKind::Bar(BarInterval::OneMinute), 100, 200);
     cache
@@ -173,9 +168,7 @@ async fn gaps_reports_uncovered_subranges() {
 
 #[tokio::test]
 async fn fully_covered_range_reports_no_gaps() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     let k = key(EventKind::Trade, 0, 1000);
     cache
         .store(&k, &[trade("AAPL", 0, 1.0, 1), trade("AAPL", 999, 1.0, 1)])
@@ -189,8 +182,8 @@ async fn fully_covered_range_reports_no_gaps() {
 async fn embedded_round_trip_persists_to_disk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kv");
-    let cfg = SurrealCacheConfig::embedded(&path);
-    let cache = SurrealCache::open(cfg.clone()).await.unwrap();
+    let cfg = TursoCacheConfig::embedded(&path);
+    let cache = TursoCache::open(cfg.clone()).await.unwrap();
     let k = key(EventKind::Trade, 0, 100);
     cache
         .store(
@@ -200,16 +193,16 @@ async fn embedded_round_trip_persists_to_disk() {
         .await
         .unwrap();
     drop(cache);
-    // SurrealKV's lock is released on drop, but the spawned engine task
-    // holding it needs a tick to finish unwinding. A fixed sleep here is
-    // flaky on slow CI; poll `open` until the lock clears, capped at
-    // ~5 s total. On any error we just retry — by the deadline we either
-    // succeed or surface the most recent error so the failure mode is
-    // diagnosable.
+    // The previous handle's file lock is released on drop, but it retries
+    // reopen while that release is still in flight — the underlying file
+    // lock can take a tick to clear. A fixed sleep here is flaky on slow CI;
+    // poll `open` until the lock clears, capped at ~5 s total. On any error
+    // we just retry — by the deadline we either succeed or surface the most
+    // recent error so the failure mode is diagnosable.
     let cache = {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match SurrealCache::open(cfg.clone()).await {
+            match TursoCache::open(cfg.clone()).await {
                 Ok(c) => break c,
                 Err(e) if std::time::Instant::now() >= deadline => {
                     panic!("embedded reopen never succeeded within 5s: {e}");
@@ -226,9 +219,7 @@ async fn embedded_round_trip_persists_to_disk() {
 
 #[tokio::test]
 async fn store_claims_exactly_the_key_range_not_the_event_span() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     // Key range is [100, 200) but the events sit at 100 and 250 — outside the
     // key's upper bound. Coverage must NOT extend to 250.
     let k = key(EventKind::Trade, 100, 200);
@@ -255,9 +246,7 @@ async fn store_claims_exactly_the_key_range_not_the_event_span() {
 
 #[tokio::test]
 async fn store_of_empty_range_marks_it_covered() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     // A successful fetch that returned no events must still mark the
     // requested range covered, so it is not re-fetched as a gap.
     let k = key(EventKind::Trade, 0, 1000);
@@ -270,9 +259,7 @@ async fn store_of_empty_range_marks_it_covered() {
 
 #[tokio::test]
 async fn store_replaces_existing_rows_in_the_claimed_range() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     let k = key(EventKind::Bar(BarInterval::OneMinute), 0, 1000);
     // Initial store deposits a (soon-to-be stale) bar at 500.
     cache.store(&k, &[bar("AAPL", 500, 99.0)]).await.unwrap();
@@ -299,9 +286,7 @@ async fn store_replaces_existing_rows_in_the_claimed_range() {
 
 #[tokio::test]
 async fn bars_segregate_by_adjustment_mode() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
     let kind = EventKind::Bar(BarInterval::OneMinute);
     // Same (symbol, range) under two modes, with deliberately different close
     // prices so a mode mix-up is observable.
@@ -323,7 +308,7 @@ async fn bars_segregate_by_adjustment_mode() {
     assert_eq!(read_closes(&cache, &raw).await, vec![10.0]);
 }
 
-async fn read_closes(cache: &SurrealCache, k: &CacheKey) -> Vec<f64> {
+async fn read_closes(cache: &TursoCache, k: &CacheKey) -> Vec<f64> {
     use datamancer::ReplayRequest;
     use futures::StreamExt;
     let source = cache.as_replay_source(k.clone());
@@ -356,19 +341,45 @@ fn reexports_are_consistent() {
 
 #[tokio::test]
 async fn catalog_empty_when_nothing_stored() {
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
+    assert!(cache.catalog().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn catalog_survives_separator_characters_in_symbols() {
+    // `Instrument` accepts any symbol string; a symbol containing `|` (or
+    // anything else) must round-trip through store → catalog intact now that
+    // coverage keys are real columns rather than a delimiter-joined id.
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
+    let weird = "A|B|bars_1d|raw";
+    let k = CacheKey {
+        instrument: inst(weird),
+        kind: EventKind::Trade,
+        from: Timestamp(100),
+        to: Timestamp(400),
+        adjustment: Adjustment::default(),
+    };
+    cache
+        .store(&k, &[trade(weird, 100, 1.0, 1), trade(weird, 300, 2.0, 1)])
         .await
         .unwrap();
-    assert!(cache.catalog().await.unwrap().is_empty());
+
+    let catalog = cache.catalog().await.unwrap();
+    assert_eq!(
+        catalog.len(),
+        1,
+        "the pipe-symbol entry must not be skipped"
+    );
+    assert_eq!(catalog[0].symbol, weird);
+    assert_eq!(catalog[0].kind, EventKind::Trade);
+    assert_eq!(catalog[0].event_count, 2);
 }
 
 #[tokio::test]
 async fn catalog_roundtrips_stored_ranges() {
     use datamancer::CacheCatalogEntry;
 
-    let cache = SurrealCache::open(SurrealCacheConfig::Memory)
-        .await
-        .unwrap();
+    let cache = TursoCache::open(TursoCacheConfig::Memory).await.unwrap();
 
     // A trade range (stored under Raw regardless of the key's mode) ...
     let trade_key = key_adj(EventKind::Trade, 100, 400, Adjustment::All);

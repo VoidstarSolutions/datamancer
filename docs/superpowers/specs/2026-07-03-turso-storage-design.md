@@ -2,6 +2,7 @@
 
 **Date:** 2026-07-03
 **Status:** Approved direction (user decision); plan to follow after SP1 (CI) completes.
+**Status:** implemented — cutover landed in Task 9 of the corresponding plan; `storage-turso` is the default, `storage-surreal` is deleted.
 
 ## Goal
 

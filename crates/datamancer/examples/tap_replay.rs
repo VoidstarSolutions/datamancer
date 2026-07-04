@@ -1,7 +1,7 @@
 //! Live tap-log demo (no credentials, no network).
 //!
 //! A synthetic provider pushes a few trades into a live session configured to
-//! tee to an embedded `SurrealKV` tap log. We then reopen the log as a replay
+//! tee to an embedded Turso tap log. We then reopen the log as a replay
 //! source and confirm the captured stream comes back in the exact arrival
 //! order the session emitted it.
 //!
@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datamancer::storage::{SurrealTapLog, SurrealTapLogConfig};
+use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
 use datamancer::{
     AssetClass, Datamancer, EventKind, HistoryRequest, Instrument, LiveHandle, MarketEvent,
     PersistenceOptions, Price, Provider, ProviderId, ReplayRequest, Result, Scope, Seq, TapLog,
@@ -97,7 +97,9 @@ async fn main() -> Result<()> {
     let dir = tempfile::tempdir().expect("temp dir");
     let sink = Arc::new(Mutex::new(None));
     let provider = SyntheticProvider { sink: sink.clone() };
-    let log = Arc::new(SurrealTapLog::open(SurrealTapLogConfig::embedded(dir.path())).await?);
+    let log = Arc::new(
+        TursoTapLog::open(TursoTapLogConfig::embedded(dir.path().join("taplog.db"))).await?,
+    );
 
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))

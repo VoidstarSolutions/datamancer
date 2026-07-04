@@ -67,12 +67,12 @@ account_type = "paper"
 venue = "us"                      # us | us_kraken | eu_kraken
 
 [cache]
-backend = "surreal-embedded"      # surreal-embedded | surreal-memory
-path = "/var/lib/datamancerd/cache"   # optional; default: <data dir>/cache
+backend = "embedded"              # embedded | memory
+path = "/var/lib/datamancerd/cache.db"   # optional; default: <data dir>/cache.db
 
 [tap_log]
-backend = "surreal-embedded"
-path = "/var/lib/datamancerd/taplog"  # optional; default: <data dir>/taplog
+backend = "embedded"
+path = "/var/lib/datamancerd/taplog.db"  # optional; default: <data dir>/taplog.db
 
 [session]
 resume_buffer_events = 65536
@@ -115,11 +115,11 @@ session using a cache preset requires `[cache]`; one writing the tap log
 requires `[tap_log]`; `scope = live_backfill` requires a parseable
 `backfill_from`.
 
-For `surreal-embedded`, `path` is optional and defaults to the platform-native
+For `embedded`, `path` is optional and defaults to the platform-native
 data directory (`<data dir>` above): macOS
 `~/Library/Application Support/datamancerd`, Linux
-`~/.local/share/datamancerd` (`$XDG_DATA_HOME` respected), with `cache` and
-`taplog` subdirectories created on first use. Set `path` explicitly for a
+`~/.local/share/datamancerd` (`$XDG_DATA_HOME` respected), with `cache.db` and
+`taplog.db` database files created on first use. Set `path` explicitly for a
 system location like `/var/lib/datamancerd`, or on a headless host with no home
 directory (where no default can be derived).
 

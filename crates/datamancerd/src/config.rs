@@ -19,7 +19,7 @@ use datamancer::{
         AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue, AlpacaProvider,
         AlpacaProviderConfig,
     },
-    storage::{SurrealCache, SurrealCacheConfig, SurrealTapLog, SurrealTapLogConfig},
+    storage::{TursoCache, TursoCacheConfig, TursoTapLog, TursoTapLogConfig},
 };
 use serde::{Deserialize, Serialize};
 
@@ -134,7 +134,7 @@ impl From<CryptoVenueCfg> for AlpacaCryptoVenue {
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub backend: StorageBackend,
-    /// Filesystem path for embedded backends; ignored for `surreal-memory`.
+    /// Filesystem path for embedded backends; ignored for `memory`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
 }
@@ -143,8 +143,10 @@ pub struct StorageConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageBackend {
-    SurrealEmbedded,
-    SurrealMemory,
+    /// A database file on disk (path from `path`, or the platform data dir).
+    Embedded,
+    /// In-process, ephemeral. Good for tests.
+    Memory,
 }
 
 /// Session-level knobs.
@@ -566,6 +568,20 @@ impl Config {
                     .to_string(),
             ));
         }
+        if let (Some(cache_cfg), Some(tap_cfg)) = (&self.cache, &self.tap_log)
+            && cache_cfg.backend == StorageBackend::Embedded
+            && tap_cfg.backend == StorageBackend::Embedded
+        {
+            let cache_path = cache_db_path(cache_cfg)?;
+            let tap_path = tap_db_path(tap_cfg)?;
+            if lexically_normalize(&cache_path) == lexically_normalize(&tap_path) {
+                return Err(DaemonError::ConfigInvalid(format!(
+                    "[cache] and [tap_log] both resolve to the same embedded database file \
+                     ({}); the cache and tap log must use distinct paths",
+                    cache_path.display()
+                )));
+            }
+        }
         for s in &self.startup_session {
             let options = persistence_options(s.persistence);
             if options.uses_cache() && self.cache.is_none() {
@@ -642,12 +658,12 @@ impl Config {
         }
 
         if let Some(cache_cfg) = &self.cache {
-            let cache = SurrealCache::open(storage_to_cache_config(cache_cfg)?).await?;
+            let cache = TursoCache::open(storage_to_cache_config(cache_cfg)?).await?;
             builder = builder.historical_cache(Box::new(cache));
         }
         let mut tap_log: Option<std::sync::Arc<dyn datamancer::TapLog>> = None;
         if let Some(tap_cfg) = &self.tap_log {
-            let tap = SurrealTapLog::open(storage_to_tap_config(tap_cfg)?).await?;
+            let tap = TursoTapLog::open(storage_to_tap_config(tap_cfg)?).await?;
             let tap: std::sync::Arc<dyn datamancer::TapLog> = std::sync::Arc::new(tap);
             builder = builder.tap_log_arc(tap.clone());
             tap_log = Some(tap);
@@ -667,40 +683,69 @@ pub struct BuiltRuntime {
     pub tap_log: Option<std::sync::Arc<dyn datamancer::TapLog>>,
 }
 
-/// Resolve the on-disk path for a `surreal-embedded` backend: the explicit
-/// `path`, or the platform-native data dir under `subdir` when omitted. The
-/// embedded storage engine (`SurrealKV`) creates the directory if absent, so the
-/// default path behaves exactly like an explicit one — no scaffolding here.
+/// Resolve the on-disk path for an `embedded` backend: the explicit `path`,
+/// or the platform-native data dir joined with `file_name` when omitted. The
+/// path names a database file (the embedded engine creates parent
+/// directories and the file itself if absent), so the default path behaves
+/// exactly like an explicit one — no scaffolding here.
 ///
 /// The only remaining failure is a headless host with no derivable home
 /// directory; there the operator must set `path` explicitly.
-fn embedded_path(cfg: &StorageConfig, section: &str, subdir: &str) -> Result<PathBuf> {
+fn embedded_path(cfg: &StorageConfig, section: &str, file_name: &str) -> Result<PathBuf> {
     if let Some(path) = &cfg.path {
         return Ok(path.clone());
     }
     let dir = crate::paths::default_data_dir().ok_or_else(|| {
         DaemonError::ConfigInvalid(format!(
-            "[{section}] surreal-embedded needs a `path`: no home directory to derive a default"
+            "[{section}] embedded needs a `path`: no home directory to derive a default"
         ))
     })?;
-    Ok(dir.join(subdir))
+    Ok(dir.join(file_name))
 }
 
-fn storage_to_cache_config(cfg: &StorageConfig) -> Result<SurrealCacheConfig> {
+/// The one place the cache's config section name and default file name live —
+/// shared by `validate`'s collision check and the backend conversion.
+fn cache_db_path(cfg: &StorageConfig) -> Result<PathBuf> {
+    embedded_path(cfg, "cache", "cache.db")
+}
+
+/// Tap-log counterpart of [`cache_db_path`].
+fn tap_db_path(cfg: &StorageConfig) -> Result<PathBuf> {
+    embedded_path(cfg, "tap_log", "taplog.db")
+}
+
+/// Lexical `.`/`..` normalization so differently spelled paths to the same
+/// file (`./x.db` vs `x.db`, `a/../a/x.db` vs `a/x.db`) don't slip past the
+/// collision check. Purely lexical — `..` through a symlink resolves wrong,
+/// and `canonicalize` is not an option before the files exist — so this is
+/// best-effort; the schema-version bands are the backstop, refusing a file
+/// opened as the wrong store type before any DDL runs.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn storage_to_cache_config(cfg: &StorageConfig) -> Result<TursoCacheConfig> {
     match cfg.backend {
-        StorageBackend::SurrealMemory => Ok(SurrealCacheConfig::Memory),
-        StorageBackend::SurrealEmbedded => Ok(SurrealCacheConfig::embedded(embedded_path(
-            cfg, "cache", "cache",
-        )?)),
+        StorageBackend::Memory => Ok(TursoCacheConfig::Memory),
+        StorageBackend::Embedded => Ok(TursoCacheConfig::embedded(cache_db_path(cfg)?)),
     }
 }
 
-fn storage_to_tap_config(cfg: &StorageConfig) -> Result<SurrealTapLogConfig> {
+fn storage_to_tap_config(cfg: &StorageConfig) -> Result<TursoTapLogConfig> {
     match cfg.backend {
-        StorageBackend::SurrealMemory => Ok(SurrealTapLogConfig::Memory),
-        StorageBackend::SurrealEmbedded => Ok(SurrealTapLogConfig::embedded(embedded_path(
-            cfg, "tap_log", "taplog",
-        )?)),
+        StorageBackend::Memory => Ok(TursoTapLogConfig::Memory),
+        StorageBackend::Embedded => Ok(TursoTapLogConfig::embedded(tap_db_path(cfg)?)),
     }
 }
 
@@ -774,26 +819,26 @@ account_type = "paper"
     #[test]
     fn embedded_path_uses_explicit_when_present() {
         let cfg = StorageConfig {
-            backend: StorageBackend::SurrealEmbedded,
+            backend: StorageBackend::Embedded,
             path: Some(PathBuf::from("/tmp/explicit-cache")),
         };
-        let path = embedded_path(&cfg, "cache", "cache").expect("explicit path");
+        let path = embedded_path(&cfg, "cache", "cache.db").expect("explicit path");
         assert_eq!(path, PathBuf::from("/tmp/explicit-cache"));
     }
 
     #[test]
     fn embedded_path_defaults_to_platform_data_dir() {
         let cfg = StorageConfig {
-            backend: StorageBackend::SurrealEmbedded,
+            backend: StorageBackend::Embedded,
             path: None,
         };
         // Home dir exists in the test env, so a default is derivable.
-        let cache = embedded_path(&cfg, "cache", "cache").expect("default cache path");
-        let tap = embedded_path(&cfg, "tap_log", "taplog").expect("default tap path");
+        let cache = embedded_path(&cfg, "cache", "cache.db").expect("default cache path");
+        let tap = embedded_path(&cfg, "tap_log", "taplog.db").expect("default tap path");
         let data_dir = crate::paths::default_data_dir().expect("data dir");
-        assert_eq!(cache, data_dir.join("cache"));
-        assert_eq!(tap, data_dir.join("taplog"));
-        // The two backends never share a directory.
+        assert_eq!(cache, data_dir.join("cache.db"));
+        assert_eq!(tap, data_dir.join("taplog.db"));
+        // The two backends never share a file.
         assert_ne!(cache, tap);
     }
 
@@ -802,7 +847,7 @@ account_type = "paper"
         // A `[cache]`/`[tap_log]` with no `path` must resolve, not error —
         // enabling caching should never make the server impossible to start.
         let cfg = StorageConfig {
-            backend: StorageBackend::SurrealEmbedded,
+            backend: StorageBackend::Embedded,
             path: None,
         };
         storage_to_cache_config(&cfg).expect("cache config resolves without explicit path");
@@ -853,6 +898,32 @@ account_type = "paper"
         let config = Config::parse("[provider]\n").expect("parse");
         let err = config.validate().expect_err("must reject");
         assert!(matches!(err, DaemonError::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn config_rejects_cache_and_tap_log_sharing_one_embedded_path() {
+        let text = r#"
+[provider.alpaca_crypto]
+account_type = "paper"
+venue = "us"
+
+[cache]
+backend = "embedded"
+path = "./same.db"
+
+[tap_log]
+backend = "embedded"
+path = "./same.db"
+"#;
+        let config = Config::parse(text).expect("parse");
+        let err = config.validate().expect_err("must reject");
+        match err {
+            DaemonError::ConfigInvalid(m) => {
+                assert!(m.contains("same"), "{m}");
+                assert!(m.contains("distinct"), "{m}");
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
     }
 
     #[test]
@@ -1069,11 +1140,11 @@ account_type = "live"
 venue = "us_kraken"
 
 [cache]
-backend = "surreal-embedded"
+backend = "embedded"
 path = "/tmp/dmc-cache"
 
 [tap_log]
-backend = "surreal-memory"
+backend = "memory"
 
 [session]
 resume_buffer_events = 1024

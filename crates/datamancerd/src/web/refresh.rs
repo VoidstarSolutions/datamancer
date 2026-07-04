@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
-    use datamancer::storage::{SurrealCache, SurrealCacheConfig};
+    use datamancer::storage::{TursoCache, TursoCacheConfig};
     use datamancer::{
         Adjustment, AssetClass, Bar, BarInterval, CacheKey, CacheSnapshot, EventKind,
         HistoricalCache as _, Instrument, Price, ProviderId, Seq, Timestamp,
@@ -168,11 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn web_cache_catalog_reflects_stored_ranges() {
-        let cache = std::sync::Arc::new(
-            SurrealCache::open(SurrealCacheConfig::Memory)
-                .await
-                .unwrap(),
-        );
+        let cache = std::sync::Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
         cache.store(&key(), &[bar(100), bar(900)]).await.unwrap();
 
         let dm = Datamancer::builder()

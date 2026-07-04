@@ -2,13 +2,13 @@
 //! overflow gaps, recording through silence, and the historical→live backfill
 //! seam.
 
-#![cfg(feature = "storage-surreal")]
+#![cfg(feature = "storage-turso")]
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use datamancer::storage::{SurrealCache, SurrealCacheConfig, SurrealTapLog, SurrealTapLogConfig};
+use datamancer::storage::{TursoCache, TursoCacheConfig, TursoTapLog, TursoTapLogConfig};
 use datamancer::{
     Adjustment, AssetClass, CacheKey, ControlKind, Datamancer, EventKind, GapSpan, HistoricalCache,
     Instrument, LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId,
@@ -174,7 +174,7 @@ fn trade(ts: i64) -> MarketEvent {
 }
 
 /// Replay the tap log and return the captured trade `source_ts` in seq order.
-async fn tapped(log: &SurrealTapLog) -> Vec<i64> {
+async fn tapped(log: &TursoTapLog) -> Vec<i64> {
     log.flush().await.unwrap();
     let source = log.as_replay_source();
     let mut replay = source
@@ -197,7 +197,7 @@ async fn tapped(log: &SurrealTapLog) -> Vec<i64> {
 
 /// Poll the tap log until it has captured `n` trades (bounded wait). This
 /// doubles as a barrier proving the controller processed those events.
-async fn wait_for_tapped(log: &SurrealTapLog, n: usize) -> Vec<i64> {
+async fn wait_for_tapped(log: &TursoTapLog, n: usize) -> Vec<i64> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let tss = tapped(log).await;
@@ -218,11 +218,7 @@ async fn wait_for_tapped(log: &SurrealTapLog, n: usize) -> Vec<i64> {
 #[tokio::test]
 async fn overflow_reports_one_gap_and_tap_log_captures_everything() {
     let (provider, handles) = FakeProvider::new("fake");
-    let log = Arc::new(
-        SurrealTapLog::open(SurrealTapLogConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let log = Arc::new(TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap());
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .tap_log_arc(log.clone())
@@ -337,11 +333,7 @@ async fn stitched_session_splices_cache_provider_and_live_in_order() {
     // Cache holds [0, 500) with trades at 100, 300. The provider serves the
     // rest of the backfill (600, 900). Live trades are pushed while the
     // gated fetch is held open, proving the pending-live buffering.
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     cache
         .store(&key(0, 500), &[trade(100), trade(300)])
         .await
@@ -418,11 +410,7 @@ async fn failed_backfill_gaps_to_the_live_edge_and_live_continues() {
     let provider = provider.with_fail_at(900);
     handles.set_history(vec![trade(600), trade(900)]).await;
 
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .historical_cache_arc(cache.clone())
@@ -472,16 +460,8 @@ async fn tap_log_captures_only_the_live_tail_of_a_stitched_session() {
     let provider = provider.gated(gate.clone());
     handles.set_history(vec![trade(600), trade(900)]).await;
 
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
-    let log = Arc::new(
-        SurrealTapLog::open(SurrealTapLogConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    let log = Arc::new(TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap());
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .historical_cache_arc(cache)
@@ -517,7 +497,7 @@ async fn tap_log_captures_only_the_live_tail_of_a_stitched_session() {
 
 /// Replay the tap log and return captured trades as `(source_ts, seq)` pairs in
 /// seq order.
-async fn tapped_with_seq(log: &SurrealTapLog) -> Vec<(i64, u64)> {
+async fn tapped_with_seq(log: &TursoTapLog) -> Vec<(i64, u64)> {
     log.flush().await.unwrap();
     let source = log.as_replay_source();
     let mut replay = source
@@ -544,11 +524,7 @@ async fn tap_log_replay_reproduces_the_source_seq() {
     // so the persisted (and replayed) seq is byte-identical to the delivered
     // stream's seq — the tap log no longer mints its own.
     let (provider, handles) = FakeProvider::new("fake");
-    let log = Arc::new(
-        SurrealTapLog::open(SurrealTapLogConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let log = Arc::new(TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap());
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .tap_log_arc(log.clone())

@@ -1,16 +1,14 @@
-//! Integration tests for the Surreal-backed [`TapLog`].
+//! Integration tests for the Turso-backed [`TapLog`].
 //!
-//! Uses the in-memory engine for the fast suite; one embedded test exercises
-//! the on-disk `SurrealKV` path.
+//! Full parity suite ported from the retired tap-log parity suite, exercising the
+//! `TursoTapReplaySource` implemented in Task 7.
 
-#![cfg(feature = "storage-surreal")]
+#![cfg(feature = "storage-turso")]
 
-use datamancer::storage::{SurrealTapLog, SurrealTapLogConfig};
+use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
 use datamancer::{
-    AssetClass, Bar, BarInterval, EventKind, Instrument, MarketEvent, Price, ProviderId, Quantity,
-    Quote, ReplayRequest, Seq, TapLog, Timestamp, Trade,
+    AssetClass, Instrument, MarketEvent, Price, ProviderId, Quantity, Seq, TapLog, Timestamp, Trade,
 };
-use futures::StreamExt;
 
 fn inst(symbol: &str) -> Instrument {
     Instrument::new(
@@ -31,10 +29,22 @@ fn trade(symbol: &str, source_ts: i64, rx_ts: i64, seq: u64, price: f64, size: u
         seq: Seq(seq),
         price: Price::from_f64_round(price),
         // `size` is whole shares (fractional sizes are covered explicitly by
-        // `awkward_symbol_round_trips`).
+        // `awkward_symbol_round_trips` below).
         size: Quantity::from_units(size),
     })
 }
+
+#[tokio::test]
+async fn append_then_flush_reports_ok() {
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
+    log.append(&trade("AAPL", 100, 100, 0, 150.10, 1))
+        .await
+        .unwrap();
+    log.flush().await.unwrap();
+}
+
+use datamancer::{Bar, BarInterval, EventKind, Quote, ReplayRequest};
+use futures::StreamExt;
 
 fn bar(symbol: &str, source_ts: i64, seq: u64, close: f64) -> MarketEvent {
     MarketEvent::Bar(Bar {
@@ -72,9 +82,7 @@ async fn replay_count(source: &dyn datamancer_core::ReplaySource, req: ReplayReq
 
 #[tokio::test]
 async fn append_then_flush_persists_and_replays_in_order() {
-    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     log.append(&trade("AAPL", 100, 100, 0, 150.10, 1))
         .await
         .unwrap();
@@ -110,9 +118,7 @@ async fn append_then_flush_persists_and_replays_in_order() {
 
 #[tokio::test]
 async fn writer_creates_one_shard_per_instrument_kind() {
-    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     // Two instruments, one kind each, plus a bar for AAPL → 3 distinct shards.
     log.append(&trade("AAPL", 1, 1, 0, 10.0, 1)).await.unwrap();
     log.append(&trade("MSFT", 2, 2, 1, 20.0, 1)).await.unwrap();
@@ -145,9 +151,7 @@ async fn writer_creates_one_shard_per_instrument_kind() {
 
 #[tokio::test]
 async fn open_empty_log_replays_nothing() {
-    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     let source = log.as_replay_source();
     let mut stream = source
         .open(full_request("AAPL", EventKind::Trade))
@@ -171,9 +175,7 @@ fn quote(symbol: &str, source_ts: i64, rx_ts: i64, seq: u64, bid: f64, ask: f64)
 
 #[tokio::test]
 async fn replay_preserves_arrival_order_not_source_ts_order() {
-    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     // Arrival order: quote@300, trade@200, quote@250 — deliberately NOT sorted
     // by source_ts. Replay must reproduce arrival (seq) order.
     log.append(&quote("AAPL", 300, 1000, 0, 9.0, 11.0))
@@ -209,9 +211,7 @@ async fn replay_preserves_arrival_order_not_source_ts_order() {
 
 #[tokio::test]
 async fn replay_merges_shards_by_seq_across_instruments() {
-    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     // Interleave two instruments; each lands in its own shard. Replay must
     // merge them back into global seq order.
     log.append(&trade("AAPL", 10, 10, 1, 1.0, 1)).await.unwrap();
@@ -247,9 +247,7 @@ async fn replay_merges_shards_by_seq_across_instruments() {
 
 #[tokio::test]
 async fn replay_windows_by_source_ts() {
-    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     log.append(&trade("AAPL", 100, 100, 0, 1.0, 1))
         .await
         .unwrap();
@@ -280,9 +278,7 @@ async fn replay_windows_by_source_ts() {
 
 #[tokio::test]
 async fn awkward_symbol_round_trips() {
-    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     let crypto = Instrument::new(
         ProviderId::from_static("alpaca"),
         AssetClass::Crypto,
@@ -323,26 +319,31 @@ async fn awkward_symbol_round_trips() {
 async fn embedded_round_trip_persists_and_continues_seq() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kv");
-    let cfg = SurrealTapLogConfig::embedded(&path);
+    let cfg = TursoTapLogConfig::embedded(&path);
 
     {
-        let log = SurrealTapLog::open(cfg.clone()).await.unwrap();
+        let log = TursoTapLog::open(cfg.clone()).await.unwrap();
         log.append(&trade("AAPL", 1, 1, 1, 10.0, 1)).await.unwrap(); // seq 1
         log.append(&trade("AAPL", 2, 2, 2, 11.0, 1)).await.unwrap(); // seq 2
         log.flush().await.unwrap();
     }
 
-    // Reopen the same on-disk store; poll until the SurrealKV lock clears
-    // (mirrors the cache's embedded test).
+    // The previous handle's writer task/file lock teardown is async — an
+    // immediate reopen races it and can transiently fail. A fixed sleep here
+    // is flaky on slow CI; poll `open` until the lock clears, capped at ~5 s
+    // total. On any error we just retry — by the deadline we either succeed
+    // or surface the most recent error so the failure mode is diagnosable.
     let log = {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match SurrealTapLog::open(cfg.clone()).await {
+            match TursoTapLog::open(cfg.clone()).await {
                 Ok(l) => break l,
                 Err(e) if std::time::Instant::now() >= deadline => {
                     panic!("embedded reopen never succeeded within 5s: {e}");
                 }
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
         }
     };
@@ -371,9 +372,7 @@ async fn embedded_round_trip_persists_and_continues_seq() {
 
 #[tokio::test]
 async fn replay_empty_when_window_is_degenerate() {
-    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     log.append(&trade("AAPL", 100, 100, 0, 1.0, 1))
         .await
         .unwrap();
@@ -398,9 +397,7 @@ async fn replay_empty_when_window_is_degenerate() {
 
 #[tokio::test]
 async fn replay_empty_kinds_matches_all_kinds() {
-    let log = SurrealTapLog::open(SurrealTapLogConfig::Memory)
-        .await
-        .unwrap();
+    let log = TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap();
     log.append(&trade("AAPL", 100, 100, 1, 1.0, 1))
         .await
         .unwrap(); // seq 1

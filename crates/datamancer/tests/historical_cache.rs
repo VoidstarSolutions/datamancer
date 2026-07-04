@@ -1,16 +1,16 @@
 //! Integration tests for the read-through historical cache path.
 //!
-//! Uses an in-memory [`SurrealCache`] and a synthetic provider that records the
+//! Uses an in-memory [`TursoCache`] and a synthetic provider that records the
 //! ranges it was asked to fetch (and can be told to fail mid-fetch), so the
 //! tests assert exactly which gaps hit the provider.
 
-#![cfg(feature = "storage-surreal")]
+#![cfg(feature = "storage-turso")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use datamancer::storage::{SurrealCache, SurrealCacheConfig};
+use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     Adjustment, AssetClass, Bar, BarInterval, CacheKey, ControlKind, Datamancer, EventKind,
     HistoricalCache, Instrument, LiveHandle, MarketEvent, PersistenceOptions, Price, Provider,
@@ -175,11 +175,7 @@ async fn drain(session: &datamancer::Session) -> (Vec<(i64, u64)>, Vec<(i64, i64
 async fn cold_fetch_populates_cache_and_streams_in_order() {
     let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0)];
     let (provider, fetched) = RecordingProvider::new("rec", data);
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .historical_cache_arc(cache.clone())
@@ -214,11 +210,7 @@ async fn cold_fetch_populates_cache_and_streams_in_order() {
 
 #[tokio::test]
 async fn fully_cached_serves_without_touching_provider() {
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     // Pre-populate the whole range.
     cache
         .store(&key(0, 1000), &[bar(100, 1.0), bar(900, 2.0)])
@@ -260,11 +252,7 @@ async fn fully_cached_serves_without_touching_provider() {
 
 #[tokio::test]
 async fn partial_overlap_fetches_only_the_gaps_and_merges_in_order() {
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     // Pre-cache the middle [300, 600).
     cache
         .store(&key(300, 600), &[bar(350, 5.0), bar(550, 6.0)])
@@ -313,11 +301,7 @@ async fn partial_overlap_fetches_only_the_gaps_and_merges_in_order() {
 
 #[tokio::test]
 async fn failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes() {
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
 
     // First provider: has 100,200,300,400 but fails on reaching ts >= 300.
     let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0), bar(400, 4.0)];
@@ -395,11 +379,7 @@ async fn failed_gap_fetch_emits_provider_error_control() {
     // surface its *cause* as a ProviderError so a consumer can tell a failed
     // fetch from a legitimately empty range. (The Gap-only assertions live in
     // `failed_gap_fetch_claims_only_prefix_emits_gap_and_re_request_resumes`.)
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     let data = vec![bar(100, 1.0), bar(200, 2.0), bar(300, 3.0)];
     let (provider, _fetched) = RecordingProvider::new("rec", data);
     let provider = provider.with_fail_at(200);
@@ -442,11 +422,7 @@ async fn failed_gap_fetch_emits_provider_error_control() {
 
 #[tokio::test]
 async fn read_only_fetches_gaps_but_does_not_persist() {
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     let data = vec![bar(100, 1.0), bar(200, 2.0)];
     let (provider, fetched) = RecordingProvider::new("rec", data);
     let dm = Datamancer::builder()
@@ -478,11 +454,7 @@ async fn read_only_fetches_gaps_but_does_not_persist() {
 
 #[tokio::test]
 async fn refresh_refetches_whole_range_despite_coverage() {
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     // Pre-cache the whole range with STALE data.
     cache.store(&key(0, 1000), &[bar(500, 99.0)]).await.unwrap();
 
@@ -585,11 +557,7 @@ async fn concurrent_identical_requests_fetch_once() {
         started: started.clone(),
         release: release_rx,
     };
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .historical_cache_arc(cache.clone())
@@ -641,11 +609,7 @@ async fn concurrent_identical_requests_fetch_once() {
 
 #[tokio::test]
 async fn failed_fetch_releases_slot_for_next_session() {
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
 
     // Session A: provider fails at ts >= 200, so only [.., 200) of the data
     // is delivered/stored; the remainder is reported as a Gap.
@@ -713,11 +677,7 @@ async fn failed_fetch_releases_slot_for_next_session() {
 async fn distinct_ranges_each_fetch() {
     let data = vec![bar(100, 1.0), bar(1100, 2.0)];
     let (provider, fetched) = RecordingProvider::new("rec", data);
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     let dm = Datamancer::builder()
         .provider_arc(Arc::new(provider))
         .historical_cache_arc(cache.clone())
@@ -838,11 +798,7 @@ async fn same_registry_failed_fetch_releases_slot_for_waiter() {
         release: release_rx,
         fail_at: 200,
     };
-    let cache = Arc::new(
-        SurrealCache::open(SurrealCacheConfig::Memory)
-            .await
-            .unwrap(),
-    );
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
     // ONE Datamancer — both sessions share a single `FetchLocks` registry.
     let dm = Arc::new(
         Datamancer::builder()

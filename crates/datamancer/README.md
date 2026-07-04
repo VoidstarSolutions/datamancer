@@ -101,8 +101,8 @@ A `StitchConfig` is essentially a `ReplayConfig` for the backfill window plus a 
 ## Persistence — Historical Cache
 
 Datamancer can back a historical session with a `HistoricalCache` (the bundled
-`SurrealCache` stores to SurrealKV on disk, or in-memory for tests). Caching is
-controlled per-session by `PersistenceOptions`:
+`TursoCache` stores to a Turso/SQLite-compatible database file on disk, or
+in-memory for tests). Caching is controlled per-session by `PersistenceOptions`:
 
 | `read_cache` | `write_cache` | mode      | behavior                                        |
 |--------------|---------------|-----------|-------------------------------------------------|
@@ -114,7 +114,7 @@ controlled per-session by `PersistenceOptions`:
 ```rust
 let dm = Datamancer::builder()
     .provider_arc(provider)
-    .historical_cache(Box::new(SurrealCache::open(cfg).await?))
+    .historical_cache(Box::new(TursoCache::open(cfg).await?))
     .build()?;
 
 let mut session = dm
