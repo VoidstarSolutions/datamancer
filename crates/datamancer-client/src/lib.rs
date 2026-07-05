@@ -11,6 +11,8 @@
 mod client;
 mod error;
 
+#[cfg(feature = "app")]
+pub mod app;
 pub mod codes;
 #[cfg(feature = "iceoryx2")]
 pub mod iceoryx2;
