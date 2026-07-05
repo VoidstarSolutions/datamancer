@@ -3,11 +3,11 @@
 //! [`ControlEndpoint`] (UDS today, named pipe later) and a [`DaemonSpawner`]
 //! (detached unix spawn today, `CreateProcess` later).
 
-// Scaffolding: no consumers yet (Tasks 5-6 add `AppHandle` and the platform
-// `ControlEndpoint`/`DaemonSpawner` impls that call into this module). Every
-// `pub(crate)` item here is otherwise unreachable from the plain `lib`
-// target under `--all-targets` (which doesn't count `#[cfg(test)]` usage).
-// Remove once real callers land.
+// Scaffolding: `platform.rs` (Task 5) supplies the real `ControlEndpoint`/
+// `DaemonSpawner` impls but doesn't wire this state machine into anything
+// yet — that's `AppHandle` (Task 6). Every item here is otherwise
+// unreachable from the plain `lib` target under `--all-targets` (which
+// doesn't count `#[cfg(test)]` usage). Remove once `AppHandle` lands.
 #![allow(dead_code)]
 
 use std::path::Path;

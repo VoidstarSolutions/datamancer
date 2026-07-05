@@ -27,9 +27,29 @@ pub fn default_control_socket() -> Option<PathBuf> {
     Some(base.join("control.sock"))
 }
 
+/// Default destination for a facade-spawned daemon's stdout/stderr:
+/// `<data dir>/datamancerd.log` (macOS `~/Library/Application
+/// Support/datamancer`, Linux `~/.local/share/datamancer`).
+#[must_use]
+pub fn default_daemon_log() -> Option<PathBuf> {
+    let dirs = ProjectDirs::from("", "", "datamancer")?;
+    Some(dirs.data_dir().join("datamancerd.log"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_daemon_log_lives_in_the_data_dir() {
+        let path = default_daemon_log().expect("home dir exists in test env");
+        assert!(
+            path.ends_with("datamancer/datamancerd.log")
+                || path
+                    .to_string_lossy()
+                    .ends_with("datamancer/datamancerd.log")
+        );
+    }
 
     #[test]
     fn default_control_socket_matches_documented_location() {

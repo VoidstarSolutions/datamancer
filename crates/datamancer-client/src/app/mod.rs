@@ -9,6 +9,7 @@
 
 mod error;
 mod lifecycle;
+mod platform;
 
 pub use error::{EnsureError, ReadyDiagnosis};
 
