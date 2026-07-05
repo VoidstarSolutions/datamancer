@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod config_class;
 mod control;
 mod credentials;
 mod error;
