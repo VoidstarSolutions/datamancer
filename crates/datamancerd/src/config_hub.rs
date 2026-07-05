@@ -18,6 +18,15 @@ use crate::config_class::cold_divergence;
 use crate::control::{Reply, codes};
 use crate::error::Result;
 
+/// Placeholder emitted in place of a real secret (currently `[ws].auth_token`)
+/// wherever a full [`Config`] is handed to a client: the control-socket
+/// `get-config` reply (see [`ConfigHub::get_config`]) and the web layer's
+/// `GET`/`PUT /api/config` (see `crate::web::config_api`). Defined here
+/// rather than in the (feature-gated) web module so both call sites can see
+/// it unconditionally. A UI shows this like a masked password field:
+/// submitting it back verbatim means "don't touch the secret".
+pub(crate) const REDACTED_SECRET: &str = "<redacted>";
+
 /// The per-provider settings sources handed to `build_runtime`.
 pub(crate) struct ProviderSettingsSources {
     pub alpaca: SettingsSource<AlpacaSettings>,
@@ -90,10 +99,25 @@ impl ConfigHub {
     }
 
     /// The current config as JSON plus the cold-field divergence flag.
+    ///
+    /// `get-config` is deliberately ungated (same posture as `snapshot`), so
+    /// the one secret-shaped field, `[ws].auth_token`, is replaced with
+    /// [`REDACTED_SECRET`] before serialization — this reply must never let
+    /// the real token leave the process. Round-trip safety: the only
+    /// mutating ops that accept a client-supplied config
+    /// (`configure-provider`/`remove-provider`) touch only `provider.*`
+    /// sections, so a client that echoes this redacted config back through
+    /// those ops can never persist the placeholder in place of the token.
     pub(crate) async fn get_config(&self) -> Reply {
         let state = self.state.lock().await;
         let restart_required = !cold_divergence(&self.boot, &state.current).is_empty();
-        match serde_json::to_value(&state.current) {
+        let mut redacted = state.current.clone();
+        if let Some(ws) = redacted.ws.as_mut()
+            && ws.auth_token.is_some()
+        {
+            ws.auth_token = Some(REDACTED_SECRET.to_string());
+        }
+        match serde_json::to_value(&redacted) {
             Ok(value) => Reply::config(value, restart_required),
             Err(e) => Reply::error(codes::INTERNAL, format!("config serialize: {e}")),
         }
@@ -449,6 +473,23 @@ mod tests {
         assert!(
             !rx.has_changed().unwrap(),
             "a no-op reconfigure must not bump the watch and force a reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_config_redacts_ws_auth_token() {
+        let (hub, _sources, _dir) =
+            hub_with("[provider]\n\n[ws]\nenabled = true\nauth_token = \"super-secret-token\"\n");
+        let reply = hub.get_config().await;
+        assert!(reply.ok, "{reply:?}");
+        let text = serde_json::to_string(&reply.config).expect("serialize reply");
+        assert!(
+            !text.contains("super-secret-token"),
+            "token leaked in get-config reply: {text}"
+        );
+        assert!(
+            text.contains(REDACTED_SECRET),
+            "no placeholder in get-config reply: {text}"
         );
     }
 }

@@ -407,9 +407,19 @@ Nothing credential-shaped lives in the config file.
 
 Four control-socket ops (spec cycle 3) let an operator or the app facade
 read and mutate the daemon's runtime config without hand-editing the file or
-restarting — the daemon is the **sole runtime writer** of its own config
-(a hand edit while the daemon is up only takes effect at the next restart,
-same as `restart_required` below implies).
+restarting — the daemon is the **sole runtime writer** of its own config. A
+hand edit made while the daemon is up is not just deferred to the next
+restart: it is silently **at risk of being overwritten**. The hub persists
+candidates derived from its own in-memory state, not from the file, so the
+next mutating op (`configure-provider`/`remove-provider`/the web UI's `PUT`)
+writes the hub's view of the config back to disk and clobbers the hand edit
+(last-write-wins, by design). Only a restart picks up a hand edit safely.
+
+> **Provider id vs. section key.** The ops' `provider` field takes the
+> provider *id* (`alpaca`, `alpaca-crypto`), while the config JSON/TOML
+> section keys are the corresponding *TOML section names*
+> (`provider.alpaca`, `provider.alpaca_crypto`) — note the hyphen/underscore
+> mismatch for the crypto provider.
 
 ```jsonc
 {"op":"get-config"}
@@ -423,7 +433,10 @@ same as `restart_required` below implies).
 ```
 
 - **Gating.** `get-config` is ungated — any local connection can read it,
-  same posture as `snapshot`/`list-clients`. `configure-provider`,
+  same posture as `snapshot`/`list-clients`. Credentials never live in the
+  config; the one secret-shaped field, `[ws].auth_token`, is redacted
+  (replaced with a fixed placeholder) in every `get-config` reply, so
+  ungating it does not leak the token. `configure-provider`,
   `remove-provider`, and `shutdown` are **mutating** and gated exactly like
   the credential ops: the connection's kernel-reported peer uid must match
   the daemon's own effective uid (`permission_denied` otherwise). None of

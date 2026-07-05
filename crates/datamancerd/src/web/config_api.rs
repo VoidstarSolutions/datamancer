@@ -19,11 +19,12 @@ use crate::config_class::cold_divergence;
 use crate::config_hub::ConfigHub;
 use crate::error::{DaemonError, Result};
 
-/// Placeholder emitted in place of a real secret (currently `[ws].auth_token`)
-/// on the read/response path, and recognized on write as "keep the stored value
-/// unchanged". A UI shows this like a masked password field: submitting it back
-/// verbatim means "don't touch the secret".
-pub(crate) const REDACTED_SECRET: &str = "<redacted>";
+/// Recognized on write as "keep the stored value unchanged".
+///
+/// Defined in `crate::config_hub` (always compiled) rather than here (behind
+/// feature `web-ui`) so the control-socket `get-config` reply and this web
+/// surface redact `[ws].auth_token` with the exact same placeholder.
+pub(crate) use crate::config_hub::REDACTED_SECRET;
 
 /// Cheap-`Clone` (Arc-backed) config-file handle for web handlers.
 #[derive(Clone)]

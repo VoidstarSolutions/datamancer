@@ -851,7 +851,9 @@ async fn dispatch_config_op(
 /// first awaits a live provider REST call, the credential ops do blocking
 /// credential-store I/O (behind `spawn_blocking`) — neither may stall
 /// unrelated control traffic on the single-actor loop. `get-config` is
-/// ungated (the config never contains secrets); the credential ops,
+/// ungated — credentials never live in the config, and the one
+/// secret-shaped field, `[ws].auth_token`, is redacted in its reply (see
+/// `ConfigHub::get_config`); the credential ops,
 /// `configure-provider`/`remove-provider`, and `shutdown` are additionally
 /// gated on the peer's uid matching the daemon's own effective uid, captured
 /// per-connection before the stream is split. `shutdown` is forwarded to the
