@@ -22,7 +22,10 @@ use std::sync::Arc;
 use datamancer::{
     AssetClass, ControlKind, Datamancer, EventKind, Instrument, MarketEvent, PersistenceOptions,
     ProviderId, Scope,
-    providers::{AccountType, AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue},
+    providers::{
+        AccountType, AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoSettings,
+        AlpacaCryptoVenue, SettingsSource,
+    },
 };
 use futures::StreamExt;
 
@@ -38,8 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let provider = Arc::new(AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
-        account_type: AccountType::Paper,
-        venue: AlpacaCryptoVenue::Us,
+        settings: SettingsSource::Static(AlpacaCryptoSettings {
+            account_type: AccountType::Paper,
+            venue: AlpacaCryptoVenue::Us,
+        }),
         ..Default::default()
     }));
     let dm = Datamancer::builder().provider_arc(provider).build()?;

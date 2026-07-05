@@ -48,7 +48,9 @@ pub use datamancer_core::{
     Trade,
 };
 #[cfg(feature = "provider-alpaca")]
-pub use providers::{AlpacaCredentials, CredentialsSource};
+pub use providers::{
+    AlpacaCredentials, AlpacaCryptoSettings, AlpacaSettings, CredentialsSource, SettingsSource,
+};
 pub use session::{
     Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,
 };

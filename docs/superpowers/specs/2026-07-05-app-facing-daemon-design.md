@@ -252,6 +252,27 @@ exists) — a running stream keeps its last-applied credentials until restart.
   last-write-wins per op, never a torn file. The daemon is the sole hot-path
   writer; operator hand-edits are read at boot only.
 
+**Cycle-3 revision (2026-07-05, user decision).** Provider lifecycle model,
+refining decision 2: the provider set is **fixed at build time** (cargo
+features decide what is compiled in) and **runtime configuration only flips
+compiled-in providers between disabled and enabled**. Every compiled-in
+provider is constructed and registered at boot — the `Datamancer` registry
+stays immutable — but starts **disabled (parked)** unless the persisted
+config enables it. `configure-provider` enables a provider (with settings);
+`remove-provider` disables it (credentials remain stored). Mechanism: a
+per-provider runtime-config watch channel
+(`watch::Receiver<Option<Settings>>`, `None` = disabled), generalizing the
+cycle-2 credentials `Watch(None)` parking path — the streaming loops already
+resolve state per reconnect iteration, so enable/disable **and** settings
+changes (`account_type`, `venue`) are all hot through the one mechanism,
+with the same persist-then-apply discipline as the credential hub. A parked
+provider services its command channel and fails subscribes fast, mirroring
+the missing-credentials posture; disablement surfaces in-band as
+`ProviderDisconnected` and via `get-config` (dedicated `HealthView`
+enrichment lands with cycle 4). Library parity per decision 9:
+the runtime-config source lands on each provider's config struct
+(`Env`/`Static`/`Watch`), like `CredentialsSource`.
+
 ## Error handling
 
 Extends the existing two-layer model (`ClientError::Control` with stable

@@ -188,9 +188,10 @@ mod tests {
         boot.save(&path).expect("seed config");
         // Leak the tempdir so the file outlives the helper (test-only).
         std::mem::forget(dir);
+        let (hub, _sources) = crate::config_hub::ConfigHub::bootstrap(boot.clone(), path.clone());
         AppState {
             snapshots: WebState::fixed(testdata::snapshot(), testdata::snapshot()),
-            config: ConfigState::new(path, boot),
+            config: ConfigState::new(path, boot, hub),
         }
     }
 
@@ -303,8 +304,10 @@ mod tests {
 
     #[tokio::test]
     async fn config_put_invalid_writes_nothing() {
-        // No provider at all -> validation failure with the stable `config` code.
-        let resp = send_json(Method::PUT, "/api/config", r#"{"provider": {}}"#, None).await;
+        // Cache and tap log sharing one embedded path -> validation failure
+        // with the stable `config` code.
+        let body = r#"{"cache": {"backend": "embedded", "path": "./same.db"}, "tap_log": {"backend": "embedded", "path": "./same.db"}}"#;
+        let resp = send_json(Method::PUT, "/api/config", body, None).await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(v["code"], "config");

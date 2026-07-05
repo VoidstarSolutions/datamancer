@@ -873,7 +873,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "datamancer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "datamancer-core",
  "datamancer-transport-iceoryx2",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "datamancerd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "async-trait",

@@ -54,6 +54,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
+use super::runtime::SettingsSource;
 use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca crypto provider.
@@ -101,14 +102,24 @@ pub enum AlpacaCryptoVenue {
     EuKraken,
 }
 
-/// Configuration for [`AlpacaCryptoProvider`].
-#[derive(Clone, Debug)]
-pub struct AlpacaCryptoProviderConfig {
+/// Runtime settings for [`AlpacaCryptoProvider`] — the hot-reconfigurable
+/// subset of its configuration, delivered through a [`SettingsSource`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlpacaCryptoSettings {
     /// Paper or live account; selects which credential pair is loaded from
     /// the environment by `oxidized_alpaca`.
     pub account_type: AccountType,
     /// Which crypto venue to connect to.
     pub venue: AlpacaCryptoVenue,
+}
+
+/// Configuration for [`AlpacaCryptoProvider`].
+#[derive(Clone, Debug)]
+pub struct AlpacaCryptoProviderConfig {
+    /// Runtime settings source. `Static` (the default) is always enabled;
+    /// `Watch` is the daemon's enable/disable + hot-settings seam (`None` =
+    /// disabled: the hub task parks and REST calls fail unavailable).
+    pub settings: SettingsSource<AlpacaCryptoSettings>,
     /// Reconnect/retry policy for the live websocket.
     pub reconnect: ReconnectPolicy,
     /// Where this provider's credentials come from. This — not the
@@ -120,18 +131,21 @@ pub struct AlpacaCryptoProviderConfig {
 impl Default for AlpacaCryptoProviderConfig {
     fn default() -> Self {
         Self {
-            account_type: AccountType::Paper,
-            venue: AlpacaCryptoVenue::Us,
+            settings: SettingsSource::Static(AlpacaCryptoSettings {
+                account_type: AccountType::Paper,
+                venue: AlpacaCryptoVenue::Us,
+            }),
             reconnect: ReconnectPolicy::default(),
             credentials: CredentialsSource::Env,
         }
     }
 }
 
-/// The crypto provider's REST surface, rebuilt whenever the credential
-/// source changes (watch bump) — cheap relative to REST call frequency, and
-/// `has_changed` makes the common path a no-op. One `std::sync::Mutex`
-/// (never held across an await) guards the check-and-rebuild.
+/// The crypto provider's REST surface, rebuilt whenever the credential or
+/// settings source changes (watch bump) — cheap relative to REST call
+/// frequency, and `has_changed` makes the common path a no-op. One
+/// `std::sync::Mutex` (never held across an await) guards the
+/// check-and-rebuild.
 struct RestState {
     /// Trading API client, used for the reference-data surface (crypto
     /// asset catalog). `None` when credentials aren't available —
@@ -140,13 +154,17 @@ struct RestState {
     /// `Some` only for [`CredentialsSource::Watch`]; `has_changed` on this
     /// cached receiver is the rebuild trigger.
     cred_rx: Option<watch::Receiver<Option<AlpacaCredentials>>>,
+    /// `Some` only for [`SettingsSource::Watch`]; `has_changed` on this
+    /// cached receiver is the rebuild trigger.
+    settings_rx: Option<watch::Receiver<Option<AlpacaCryptoSettings>>>,
 }
 
 fn build_trading(cfg: &AlpacaCryptoProviderConfig) -> Option<TradingClient> {
+    let settings = cfg.settings.current()?;
     match cfg.credentials.current() {
-        Resolved::Env => TradingClient::new(cfg.account_type).ok(),
+        Resolved::Env => TradingClient::new(settings.account_type).ok(),
         Resolved::Creds(c) => {
-            TradingClient::new_with_credentials(cfg.account_type, c.to_api_key()).ok()
+            TradingClient::new_with_credentials(settings.account_type, c.to_api_key()).ok()
         }
         Resolved::Missing => None,
     }
@@ -174,11 +192,14 @@ impl AlpacaCryptoProvider {
         // Ordering invariant — receiver before build: a rotation after
         // capture triggers rebuild; before capture is included in the build.
         // (Capturing after building would mark an in-between rotation seen
-        // while the cached client is stale.)
+        // while the cached client is stale.) Applies to both the
+        // credentials and the settings receiver.
         let cred_rx = cfg.credentials.watch();
+        let settings_rx = cfg.settings.watch();
         let rest = std::sync::Mutex::new(RestState {
             trading: build_trading(&cfg),
             cred_rx,
+            settings_rx,
         });
         Self {
             cfg,
@@ -187,13 +208,15 @@ impl AlpacaCryptoProvider {
         }
     }
 
-    /// Current trading client, rebuilt first if the credential source
-    /// changed since the last call. Cloning out of the mutex keeps the
-    /// guard from crossing an await (the client is a cheaply cloneable
+    /// Current trading client, rebuilt first if the credential or settings
+    /// source changed since the last call. Cloning out of the mutex keeps
+    /// the guard from crossing an await (the client is a cheaply cloneable
     /// handle).
     fn trading_client(&self) -> Option<TradingClient> {
         let mut state = self.rest.lock().expect("REST client state poisoned");
-        if super::credentials::rest_credentials_changed(&mut state.cred_rx) {
+        let changed = super::runtime::watch_changed(&mut state.cred_rx)
+            | super::runtime::watch_changed(&mut state.settings_rx);
+        if changed {
             state.trading = build_trading(&self.cfg);
         }
         state.trading.clone()
@@ -224,7 +247,10 @@ impl Provider for AlpacaCryptoProvider {
         PROVIDER_ID
     }
 
-    fn supports(&self, _instrument: &Instrument, kind: EventKind) -> bool {
+    fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool {
+        if instrument.asset_class() != AssetClass::Crypto {
+            return false;
+        }
         match kind {
             EventKind::Trade
             | EventKind::Quote
@@ -375,7 +401,21 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
     let mut backoff = cfg.reconnect.initial_backoff_ms;
 
     'outer: loop {
-        let feed = match cfg.venue {
+        let mut settings_rx = cfg.settings.watch();
+        let Some(settings) = cfg.settings.current() else {
+            // Disabled: park until the settings watch delivers a value. Only a
+            // Watch source can resolve to None, so the receiver is always
+            // present here; exit defensively if it isn't (never busy-loop).
+            let Some(rx) = settings_rx.as_mut() else {
+                return;
+            };
+            if !wait_for_provisioning(rx, &mut cmd_rx, "provider disabled").await {
+                return;
+            }
+            continue 'outer;
+        };
+
+        let feed = match settings.venue {
             AlpacaCryptoVenue::Us => CryptoFeed::Us,
             AlpacaCryptoVenue::UsKraken => CryptoFeed::UsKraken,
             AlpacaCryptoVenue::EuKraken => CryptoFeed::EuKraken,
@@ -387,10 +427,14 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
         // *after* this resolution.
         let mut cred_rx = cfg.credentials.watch();
         let connect_result = match cfg.credentials.current() {
-            Resolved::Env => StreamingCryptoClient::new(cfg.account_type, feed).await,
+            Resolved::Env => StreamingCryptoClient::new(settings.account_type, feed).await,
             Resolved::Creds(c) => {
-                StreamingCryptoClient::new_with_credentials(cfg.account_type, feed, c.to_api_key())
-                    .await
+                StreamingCryptoClient::new_with_credentials(
+                    settings.account_type,
+                    feed,
+                    c.to_api_key(),
+                )
+                .await
             }
             Resolved::Missing => {
                 // No credentials yet: wait for provisioning instead of
@@ -399,7 +443,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                 // always present here; exit defensively if it isn't (never
                 // busy-loop).
                 let Some(rx) = cred_rx.as_mut() else { return };
-                if !wait_for_credentials(rx, &mut cmd_rx).await {
+                if !wait_for_provisioning(rx, &mut cmd_rx, "waiting for credentials").await {
                     return;
                 }
                 continue 'outer;
@@ -597,30 +641,59 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                     // otherwise resolve immediately and spin the select).
                     cred_rx = None;
                 }
+                changed = async {
+                    match settings_rx.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        // Unreachable: the arm is guarded on `is_some()`.
+                        None => std::future::pending().await,
+                    }
+                }, if settings_rx.is_some() => {
+                    if changed.is_ok() {
+                        let reason = if cfg.settings.current().is_none() {
+                            "provider disabled"
+                        } else {
+                            "settings changed"
+                        };
+                        tracing::info!(provider = PROVIDER_ID, reason, "settings changed; reconnecting");
+                        broadcast_control(
+                            &routes,
+                            ControlKind::ProviderDisconnected {
+                                provider: PROVIDER_ID.to_string(),
+                                reason: reason.to_string(),
+                            },
+                        )
+                        .await;
+                        let _ = client.shut_down().await;
+                        backoff = cfg.reconnect.initial_backoff_ms;
+                        continue 'outer;
+                    }
+                    settings_rx = None;
+                }
             }
         }
     }
 }
 
-/// Waits for a `Watch` credential source to deliver a value, servicing the
-/// command channel meanwhile (same semantics as [`sleep_with_jitter`]:
-/// subscribe/unsubscribe fail fast, channel closure exits). Returns `false`
-/// if the hub task should exit.
-async fn wait_for_credentials(
-    cred_rx: &mut watch::Receiver<Option<AlpacaCredentials>>,
+/// Waits for a `Watch` source (settings or credentials) to deliver a new
+/// value, servicing the command channel meanwhile (close/drop of all
+/// handles exits, subscribe/unsubscribe fail fast with `reason`). Returns
+/// `false` if the hub task should exit.
+async fn wait_for_provisioning<T>(
+    rx: &mut watch::Receiver<T>,
     cmd_rx: &mut mpsc::Receiver<HubCommand>,
+    reason: &'static str,
 ) -> bool {
     loop {
         tokio::select! {
-            changed = cred_rx.changed() => {
+            changed = rx.changed() => {
                 if changed.is_ok() {
                     // The outer loop re-resolves; if the new value is still
-                    // `None` it lands back here rather than spinning.
+                    // disabled/missing it lands back here rather than spinning.
                     return true;
                 }
-                // Sender dropped with no credentials: they can never
-                // arrive. Keep servicing commands so hub shutdown (all
-                // handles dropped) still works.
+                // Sender dropped with no value: it can never arrive. Keep
+                // servicing commands so hub shutdown (all handles dropped)
+                // still works.
                 loop {
                     match cmd_rx.recv().await {
                         Some(
@@ -629,7 +702,7 @@ async fn wait_for_credentials(
                         ) => {
                             let _ = ack.send(Err(Error::Provider {
                                 provider: PROVIDER_ID.to_string(),
-                                message: "no credentials provisioned".to_string(),
+                                message: reason.to_string(),
                             }));
                         }
                         None => return false,
@@ -644,7 +717,7 @@ async fn wait_for_credentials(
                     ) => {
                         let _ = ack.send(Err(Error::Provider {
                             provider: PROVIDER_ID.to_string(),
-                            message: "waiting for credentials".to_string(),
+                            message: reason.to_string(),
                         }));
                     }
                     None => return false,
@@ -975,6 +1048,38 @@ mod tests {
                 provider_instrument("ETH/USD"),
                 EventKind::Bar(BarInterval::OneMinute)
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_provider_parks_and_fails_subscribes_fast() {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
+            settings: SettingsSource::Watch(rx),
+            ..Default::default()
+        });
+        let (sink, _events) = tokio::sync::mpsc::channel(8);
+        let handle = p.start_live(sink).await.expect("start_live");
+        let err = handle
+            .subscribe(provider_instrument("BTC/USD"), EventKind::Trade)
+            .await
+            .expect_err("disabled provider must fail subscribes fast");
+        let msg = format!("{err}");
+        assert!(msg.contains("provider disabled"), "msg={msg:?}");
+        // `start_live` already returns `Box<dyn LiveHandle>`; `close` takes
+        // `self: Box<Self>`, so call it directly on the box.
+        handle.close().await.expect("close while parked");
+    }
+
+    #[tokio::test]
+    async fn settings_source_default_is_enabled_paper() {
+        let cfg = AlpacaCryptoProviderConfig::default();
+        assert_eq!(
+            cfg.settings.current(),
+            Some(AlpacaCryptoSettings {
+                account_type: AccountType::Paper,
+                venue: AlpacaCryptoVenue::Us,
+            })
         );
     }
 

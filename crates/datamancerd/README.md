@@ -143,9 +143,12 @@ persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only 
 always_on = true                  # hold for the process lifetime regardless of clients
 ```
 
-Validation fails fast: at least one provider must be configured; a startup
-session using a cache preset requires `[cache]`; one writing the tap log
-requires `[tap_log]`; `scope = live_backfill` requires a parseable
+Compiled-in providers start disabled: the daemon boots with zero providers
+configured, and providers are enabled at runtime via the config service's
+`configure-provider` op (or by uncommenting a `[provider.*]` section and
+restarting). Validation fails fast on the remaining cross-section invariants:
+a startup session using a cache preset requires `[cache]`; one writing the
+tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
 `backfill_from`.
 
 For `embedded`, `path` is optional and defaults to the platform-native
@@ -304,12 +307,20 @@ One JSON object per line; one reply line per request.
 {"op":"instruments","provider":"alpaca-crypto"}
   -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
-{"op":"ping"}          -> {"ok":true,"version":"0.3.0","credential_backend":"keychain"}
+{"op":"ping"}          -> {"ok":true,"version":"0.4.0","credential_backend":"keychain"}
 {"op":"set-credentials","provider":"alpaca-crypto","credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
   -> {"ok":true}
 {"op":"get-credentials","provider":"alpaca-crypto"}
   -> {"ok":true,"credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
 {"op":"clear-credentials","provider":"alpaca-crypto"}
+  -> {"ok":true}
+{"op":"get-config"}
+  -> {"ok":true,"config":{ /* full Config, same schema as the TOML file */ },"restart_required":false}
+{"op":"configure-provider","provider":"alpaca","settings":{"account_type":"live"}}
+  -> {"ok":true,"applied":"live"}
+{"op":"remove-provider","provider":"alpaca"}
+  -> {"ok":true,"applied":"live"}
+{"op":"shutdown"}
   -> {"ok":true}
 ```
 
@@ -325,13 +336,21 @@ etc. traffic on other connections.
 the active credential-store backend; the app facade uses it for
 spawn-readiness and version-skew detection.
 
+`get-config`/`configure-provider`/`remove-provider`/`shutdown` are the
+config-service ops (spec cycle 3); see the dedicated section below for
+gating, classification, and semantics.
+
 Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 (`live_session_conflict`, `unsupported_event_kind`, `persistence_required`,
 `unsupported_client_scope`, `duplicate_subscription`, `not_subscribed`,
 `unknown_provider`, `unknown_client`, `duplicate_client`,
 `service_cap_exceeded`, `bad_request`, `shutting_down`,
 `credentials_missing`, `credential_backend_unavailable`, `permission_denied`,
-…). These are an operator contract and are regression-guarded.
+`unknown_config_field`, …). These are an operator contract and are
+regression-guarded. (`restart_required` is not an error code — it is the
+boolean `get-config`/`get`/`PUT /api/config` field and the string value a
+mutating config op's `applied` field carries when a cold-classified change
+needs a restart to take effect.)
 
 ## Credentials
 
@@ -383,6 +402,81 @@ Nothing credential-shaped lives in the config file.
   `credential store: …` error — even if `ALPACA_*` env vars are set. Give
   the service a `HOME` (or a secret-service) to restore the pre-0.3 env-only
   behavior.
+
+## Config service
+
+Four control-socket ops (spec cycle 3) let an operator or the app facade
+read and mutate the daemon's runtime config without hand-editing the file or
+restarting — the daemon is the **sole runtime writer** of its own config. A
+hand edit made while the daemon is up is not just deferred to the next
+restart: it is silently **at risk of being overwritten**. The hub persists
+candidates derived from its own in-memory state, not from the file, so the
+next mutating op (`configure-provider`/`remove-provider`/the web UI's `PUT`)
+writes the hub's view of the config back to disk and clobbers the hand edit
+(last-write-wins, by design). Only a restart picks up a hand edit safely.
+
+> **Provider id vs. section key.** The ops' `provider` field takes the
+> provider *id* (`alpaca`, `alpaca-crypto`), while the config JSON/TOML
+> section keys are the corresponding *TOML section names*
+> (`provider.alpaca`, `provider.alpaca_crypto`) — note the hyphen/underscore
+> mismatch for the crypto provider.
+
+```jsonc
+{"op":"get-config"}
+  -> {"ok":true,"config":{ /* full Config, same schema as the TOML file */ },"restart_required":false}
+{"op":"configure-provider","provider":"alpaca","settings":{"account_type":"live"}}
+  -> {"ok":true,"applied":"live"}
+{"op":"remove-provider","provider":"alpaca"}
+  -> {"ok":true,"applied":"live"}
+{"op":"shutdown"}
+  -> {"ok":true}
+```
+
+- **Gating.** `get-config` is ungated — any local connection can read it,
+  same posture as `snapshot`/`list-clients`. Credentials never live in the
+  config; the one secret-shaped field, `[ws].auth_token`, is redacted
+  (replaced with a fixed placeholder) in every `get-config` reply, so
+  ungating it does not leak the token. `configure-provider`,
+  `remove-provider`, and `shutdown` are **mutating** and gated exactly like
+  the credential ops: the connection's kernel-reported peer uid must match
+  the daemon's own effective uid (`permission_denied` otherwise). None of
+  the four ops exist on the WS client surface — its frame vocabulary has no
+  config-service equivalent.
+- **Hot/cold classification.** Whether a change applies live or needs a
+  restart is determined by a per-dotted-path classification table in
+  `crates/datamancerd/src/config_class.rs` (`CLASSIFICATION`, matched by
+  longest prefix) — that module is the single source of truth for "is field
+  X hot or cold." Currently **all** `provider.*` fields (including a
+  section's presence/absence) are `Hot`; every other top-level section
+  (`cache`, `tap_log`, `session`, `server`, `diagnostics`, `iceoryx2`,
+  `web_ui`, `ws`, `startup_session`) is `Cold`. A build-time exhaustiveness
+  test fails if a new config field is added without a classification entry.
+- **`configure-provider`/`remove-provider` always apply live today.** Because
+  `provider.*` is Hot, both ops persist-then-apply in one step and their
+  `applied` field is currently always `"live"` — `"restart_required"` is
+  reserved for a future Cold-classified mutating op (or the web UI's
+  full-config `PUT`, which is where `restart_required` is actually observed
+  today, via divergence against Cold sections).
+- **Disabled-until-configured posture.** Every compiled-in provider is
+  constructed at boot (parked, not literally absent) but starts **disabled**
+  unless its `[provider.*]` section is present; a scaffolded/empty config
+  enables nothing, so a fresh boot with zero provider sections is a valid,
+  well-defined state (`get-config` returns a fixed-key `provider` table with
+  both provider ids present and `null` values, e.g.
+  `"provider":{"alpaca":null,"alpaca_crypto":null}`).
+  `configure-provider` enables a provider at runtime; uncommenting the
+  section and restarting does the same thing at boot.
+- **`remove-provider` leaves credentials stored.** It only removes the
+  config section (disabling the provider); the credential store is a
+  separate lifecycle (see Credentials above) — re-enabling the same
+  provider later reuses whatever credentials are already on file.
+- **`shutdown` runs the full drain.** It is not a bare process exit: the
+  same ordered drain described under Shutdown below runs (tap-log flush
+  before sink flush before service drop), gated same-uid like the other
+  mutating ops. The `{"ok":true}` reply is sent via a oneshot before the
+  drain starts and is delivered best-effort — the connection task writes it
+  out while the drain runs concurrently, so a slow/interrupted connection
+  may not see it even though the daemon still shuts down cleanly.
 
 ## WebSocket client surface (feature `ws`)
 

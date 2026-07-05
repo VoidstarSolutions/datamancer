@@ -33,7 +33,10 @@ use crate::error::{DaemonError, Result};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Provider selection. At least one provider must be configured.
+    /// Provider selection. Compiled-in providers start disabled; none need be
+    /// configured to boot (cycle 3: providers are enabled at runtime via
+    /// `configure-provider`).
+    #[serde(default)]
     pub provider: ProviderConfig,
     /// Historical-cache backend (optional unless a session uses the cache).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,8 +69,9 @@ pub struct Config {
     pub startup_session: Vec<StartupSession>,
 }
 
-/// Provider selection block. Each provider is optional, but at least one must
-/// be present (enforced in [`Config::validate`]).
+/// Provider selection block. Compiled-in providers start disabled; none need be
+/// configured to boot (cycle 3: providers are enabled at runtime via
+/// `configure-provider`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
@@ -532,6 +536,15 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     Some(era * 146_097 + doe - 719_468)
 }
 
+/// Every provider compiled into this binary, whether or not it is enabled
+/// in the config. The credential hub and config hub seed one watch channel
+/// per entry (cycle-3 revision: fixed compiled-in set, runtime
+/// enable/disable).
+#[must_use]
+pub fn compiled_provider_ids() -> Vec<&'static str> {
+    vec![alpaca::PROVIDER_ID, alpaca_crypto::PROVIDER_ID]
+}
+
 impl Config {
     /// Read and parse a TOML config file, then validate it.
     ///
@@ -567,12 +580,6 @@ impl Config {
     /// [`DaemonError::ConfigInvalid`] when a required section is missing for a
     /// configured startup session, or a startup session is malformed.
     pub fn validate(&self) -> Result<()> {
-        if self.provider.alpaca.is_none() && self.provider.alpaca_crypto.is_none() {
-            return Err(DaemonError::ConfigInvalid(
-                "no provider configured: set [provider.alpaca] and/or [provider.alpaca_crypto]"
-                    .to_string(),
-            ));
-        }
         if let (Some(cache_cfg), Some(tap_cfg)) = (&self.cache, &self.tap_log)
             && cache_cfg.backend == StorageBackend::Embedded
             && tap_cfg.backend == StorageBackend::Embedded
@@ -648,12 +655,13 @@ impl Config {
         providers
     }
 
-    /// Build the full daemon runtime: construct the configured providers
-    /// (each wired to its credential source from `sources`, keyed by provider
-    /// id — a missing entry falls back to the legacy env source), open the
-    /// cache + tap log, assemble the [`Datamancer`], and retain the tap-log
-    /// `Arc` so the shutdown path can flush it (the builder takes ownership,
-    /// so the handle must be cloned out here).
+    /// Build the full daemon runtime: construct every compiled-in provider
+    /// (parked unless enabled, each wired to its credential source from
+    /// `sources`, keyed by provider id — a missing entry falls back to the
+    /// legacy env source), open the cache + tap log, assemble the
+    /// [`Datamancer`], and retain the tap-log `Arc` so the shutdown path can
+    /// flush it (the builder takes ownership, so the handle must be cloned
+    /// out here).
     ///
     /// # Errors
     ///
@@ -661,34 +669,34 @@ impl Config {
     pub async fn build_runtime(
         self,
         sources: &HashMap<String, CredentialsSource>,
+        settings: crate::config_hub::ProviderSettingsSources,
     ) -> Result<BuiltRuntime> {
         let mut builder = Datamancer::builder()
             .resume_buffer_events(self.session.resume_buffer_events)
             .adjustment(self.session.adjustment.into());
 
-        if let Some(alpaca_cfg) = self.provider.alpaca {
-            let provider = AlpacaProvider::new(AlpacaProviderConfig {
-                account_type: alpaca_cfg.account_type.into(),
-                credentials: sources
-                    .get(alpaca::PROVIDER_ID)
-                    .cloned()
-                    .unwrap_or_default(),
-                ..Default::default()
-            });
-            builder = builder.provider(Box::new(provider));
-        }
-        if let Some(crypto) = self.provider.alpaca_crypto {
-            let provider = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
-                account_type: crypto.account_type.into(),
-                venue: crypto.venue.into(),
-                credentials: sources
-                    .get(alpaca_crypto::PROVIDER_ID)
-                    .cloned()
-                    .unwrap_or_default(),
-                ..Default::default()
-            });
-            builder = builder.provider(Box::new(provider));
-        }
+        // Cycle 3: every compiled-in provider is constructed and registered,
+        // parked unless its settings watch carries a value. Presence of a
+        // `[provider.*]` section is enablement, applied through the watch —
+        // not through conditional construction.
+        let provider = AlpacaProvider::new(AlpacaProviderConfig {
+            settings: settings.alpaca,
+            credentials: sources
+                .get(alpaca::PROVIDER_ID)
+                .cloned()
+                .unwrap_or_default(),
+            ..Default::default()
+        });
+        builder = builder.provider(Box::new(provider));
+        let provider = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
+            settings: settings.alpaca_crypto,
+            credentials: sources
+                .get(alpaca_crypto::PROVIDER_ID)
+                .cloned()
+                .unwrap_or_default(),
+            ..Default::default()
+        });
+        builder = builder.provider(Box::new(provider));
 
         if let Some(cache_cfg) = &self.cache {
             let cache = TursoCache::open(storage_to_cache_config(cache_cfg)?).await?;
@@ -936,10 +944,21 @@ account_type = "paper"
     }
 
     #[test]
-    fn config_rejects_no_provider() {
+    fn config_with_no_providers_is_valid() {
+        // Cycle 3: compiled-in providers start disabled; an empty [provider]
+        // block (or none at all) is a valid boot state — the app enables
+        // providers at runtime via configure-provider.
         let config = Config::parse("[provider]\n").expect("parse");
-        let err = config.validate().expect_err("must reject");
-        assert!(matches!(err, DaemonError::ConfigInvalid(_)));
+        config.validate().expect("zero providers must validate");
+        let config = Config::parse("").expect("parse empty");
+        config.validate().expect("empty config must validate");
+    }
+
+    #[test]
+    fn compiled_provider_ids_lists_both_alpaca_providers() {
+        let ids = compiled_provider_ids();
+        assert!(ids.contains(&alpaca::PROVIDER_ID));
+        assert!(ids.contains(&alpaca_crypto::PROVIDER_ID));
     }
 
     #[test]
@@ -1166,8 +1185,17 @@ bogus = true
     fn save_rejects_invalid_config_and_writes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        // No provider configured -> validation failure.
-        let config = Config::parse("[provider]\n").expect("parse");
+        // Cache and tap log sharing one embedded path -> validation failure.
+        let text = r#"
+[cache]
+backend = "embedded"
+path = "./same.db"
+
+[tap_log]
+backend = "embedded"
+path = "./same.db"
+"#;
+        let config = Config::parse(text).expect("parse");
         let err = config.save(&path).expect_err("must reject");
         assert!(matches!(err, DaemonError::ConfigInvalid(_)));
         assert!(!path.exists(), "invalid config must not be written");

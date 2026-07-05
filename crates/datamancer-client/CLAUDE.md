@@ -37,8 +37,10 @@ Consumer-side surface for datamancerd: the shared control vocabulary
   is same-host only, built on `Iceoryx2Client`; it is not a third transport.
 - **The facade adds no protocol semantics.** Every `AppHandle` method maps to
   an existing control-surface op (`ping`, `open-client`/`connect`,
-  `subscribe`, `unsubscribe`, `snapshot`, `close`) — it composes, it does not
-  extend, the vocabulary this crate already owns.
+  `subscribe`, `unsubscribe`, `snapshot`, `close`, `set-credentials`/
+  `get-credentials`/`clear-credentials`, `get-config`/`configure-provider`/
+  `remove-provider`, `shutdown`) — it composes, it does not extend, the
+  vocabulary this crate already owns.
 - **Platform seams are internal traits, not a public abstraction.**
   `ControlEndpoint` and `DaemonSpawner` (`app::lifecycle`) isolate the
   find-or-spawn state machine from the unix-specific `TokioEndpoint` /

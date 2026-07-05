@@ -716,6 +716,13 @@ impl Datamancer {
             .ok_or_else(|| Error::UnknownProvider(id.to_string()))
     }
 
+    /// Pick the provider for `(instrument, kind)`: an explicit
+    /// `instrument_provider` pin if one exists, else the **first** registered
+    /// provider whose `supports()` matches. Load-bearing precondition: no two
+    /// registered providers may claim the same (asset-class, kind) space,
+    /// since an unpinned instrument in that overlap silently routes to
+    /// whichever was registered first — overlapping providers require
+    /// instrument→provider pinning to disambiguate.
     fn route(&self, instrument: &Instrument, kind: EventKind) -> Result<Arc<dyn Provider>> {
         let pinned = self
             .inner

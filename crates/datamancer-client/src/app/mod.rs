@@ -13,6 +13,23 @@ mod platform;
 
 pub use error::{EnsureError, ReadyDiagnosis};
 
+/// The daemon's current configuration (TOML as JSON) and whether any
+/// cold-classified field awaits a restart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DaemonConfig {
+    pub config: serde_json::Value,
+    pub restart_required: bool,
+}
+
+/// How a mutating config op took effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// Applied to the running daemon.
+    Live,
+    /// Persisted; takes effect at the next daemon start.
+    RestartRequired,
+}
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -23,7 +40,7 @@ use datamancer_core::{
 use crate::Client as _;
 use crate::error::ClientError;
 use crate::iceoryx2::{Iceoryx2Client, Iceoryx2ClientError, Iceoryx2Config};
-use crate::protocol::uds::Request;
+use crate::protocol::uds::{Reply, Request};
 use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
 
 /// The multiplexed event stream (same contract as the underlying
@@ -242,6 +259,75 @@ impl AppHandle {
             .map(|_| ())
     }
 
+    /// Fetch the daemon's current config.
+    ///
+    /// # Errors
+    ///
+    /// `ClientError::Control` with stable codes, or a transport failure
+    /// (including a malformed ok reply missing the `config` payload).
+    pub async fn get_config(&mut self) -> Result<DaemonConfig, ClientError<Iceoryx2ClientError>> {
+        let reply = self.client.control_request(&Request::GetConfig).await?;
+        daemon_config_from(&reply)
+    }
+
+    /// Enable (or re-configure) a compiled-in provider. `settings` is the
+    /// provider's config-section shape, e.g.
+    /// `json!({"account_type": "live"})`; pass `json!({})` for defaults.
+    ///
+    /// # Errors
+    ///
+    /// `ClientError::Control` with `unknown_provider`,
+    /// `unknown_config_field`, `bad_request`, or `permission_denied`; or a
+    /// transport failure.
+    pub async fn configure_provider(
+        &mut self,
+        provider: &str,
+        settings: serde_json::Value,
+    ) -> Result<Applied, ClientError<Iceoryx2ClientError>> {
+        let reply = self
+            .client
+            .control_request(&Request::ConfigureProvider {
+                provider: provider.to_string(),
+                settings,
+            })
+            .await?;
+        Ok(applied_from(&reply))
+    }
+
+    /// Disable a compiled-in provider. Stored credentials are untouched;
+    /// re-enabling reuses them.
+    ///
+    /// # Errors
+    ///
+    /// `ClientError::Control` with `unknown_provider` or
+    /// `permission_denied`; or a transport failure.
+    pub async fn remove_provider(
+        &mut self,
+        provider: &str,
+    ) -> Result<Applied, ClientError<Iceoryx2ClientError>> {
+        let reply = self
+            .client
+            .control_request(&Request::RemoveProvider {
+                provider: provider.to_string(),
+            })
+            .await?;
+        Ok(applied_from(&reply))
+    }
+
+    /// Deliberately stop the daemon (graceful drain). Consumes the handle:
+    /// the connection is gone once the daemon exits.
+    ///
+    /// # Errors
+    ///
+    /// `ClientError::Control` with `permission_denied`, or a transport
+    /// failure sending the request.
+    pub async fn shutdown_daemon(mut self) -> Result<(), ClientError<Iceoryx2ClientError>> {
+        self.client
+            .control_request(&Request::Shutdown)
+            .await
+            .map(|_| ())
+    }
+
     /// See [`crate::Client::subscribe`].
     ///
     /// # Errors
@@ -287,14 +373,36 @@ impl AppHandle {
         self.client.snapshot().await
     }
 
-    /// Graceful close of this client (the daemon keeps running — deliberate
-    /// daemon stop is a cycle-3 capability).
+    /// Graceful close of this client (the daemon keeps running — see
+    /// [`Self::shutdown_daemon`] to stop it deliberately).
     ///
     /// # Errors
     ///
     /// See [`crate::Client::close`].
     pub async fn close(self) -> Result<(), ClientError<Iceoryx2ClientError>> {
         self.client.close().await
+    }
+}
+
+/// Map an ok `get-config` reply to [`DaemonConfig`], or a transport error if
+/// the reply is missing its `config` payload.
+fn daemon_config_from(reply: &Reply) -> Result<DaemonConfig, ClientError<Iceoryx2ClientError>> {
+    let config = reply.config.clone().ok_or_else(|| {
+        ClientError::Transport(Iceoryx2ClientError::Protocol(
+            "ok get-config reply missing config payload".to_string(),
+        ))
+    })?;
+    Ok(DaemonConfig {
+        config,
+        restart_required: reply.restart_required.unwrap_or(false),
+    })
+}
+
+/// Map an ok config-mutation reply's `applied` field to [`Applied`].
+fn applied_from(reply: &Reply) -> Applied {
+    match reply.applied.as_deref() {
+        Some(crate::codes::RESTART_REQUIRED) => Applied::RestartRequired,
+        _ => Applied::Live,
     }
 }
 
@@ -353,5 +461,44 @@ mod tests {
         assert_eq!(view.daemon.credential_backend.as_deref(), Some("keychain"));
         let older = fill_health(&snap, "0.3.0", None);
         assert!(older.daemon.credential_backend.is_none());
+    }
+
+    #[test]
+    fn applied_from_maps_restart_required() {
+        let mut reply = Reply::ok();
+        reply.applied = Some("restart_required".to_string());
+        assert_eq!(applied_from(&reply), Applied::RestartRequired);
+    }
+
+    #[test]
+    fn applied_from_maps_live() {
+        let reply = Reply::applied_live();
+        assert_eq!(applied_from(&reply), Applied::Live);
+    }
+
+    #[test]
+    fn applied_from_defaults_to_live_when_absent() {
+        let reply = Reply::config(serde_json::json!({}), false);
+        assert!(reply.applied.is_none());
+        assert_eq!(applied_from(&reply), Applied::Live);
+    }
+
+    #[test]
+    fn daemon_config_from_reads_config_and_restart_flag() {
+        let reply = Reply::config(serde_json::json!({"providers": {}}), true);
+        let config = daemon_config_from(&reply).expect("config payload present");
+        assert_eq!(config.config, serde_json::json!({"providers": {}}));
+        assert!(config.restart_required);
+    }
+
+    #[test]
+    fn daemon_config_from_missing_config_is_transport_error() {
+        let reply = Reply::applied_live();
+        match daemon_config_from(&reply) {
+            Err(ClientError::Transport(Iceoryx2ClientError::Protocol(msg))) => {
+                assert!(msg.contains("config"));
+            }
+            other => panic!("expected Transport(Protocol(_)), got {other:?}"),
+        }
     }
 }

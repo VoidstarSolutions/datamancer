@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
 
 /// A control request (one per line).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum Request {
     /// Register a client and create its per-client data-plane service.
@@ -64,6 +64,25 @@ pub enum Request {
     /// Remove stored credentials. The running provider keeps its last
     /// applied credentials until restart (there is no un-apply).
     ClearCredentials { provider: String },
+    /// Return the daemon's current config (TOML as JSON) plus whether any
+    /// cold-classified field diverges from the boot-applied config.
+    GetConfig,
+    /// Enable (or re-configure) a compiled-in provider. `settings` is the
+    /// provider's config-section shape (e.g. `{"account_type":"live"}`);
+    /// unknown fields are rejected with `unknown_config_field`. UDS-only,
+    /// peer-cred gated; applies live and persists atomically.
+    ConfigureProvider {
+        provider: String,
+        #[serde(default)]
+        settings: serde_json::Value,
+    },
+    /// Disable a compiled-in provider (its section is removed from the
+    /// persisted config; stored credentials are untouched). UDS-only,
+    /// peer-cred gated; applies live.
+    RemoveProvider { provider: String },
+    /// Graceful, deliberate daemon stop (the full drain path). UDS-only,
+    /// peer-cred gated.
+    Shutdown,
 }
 
 /// A control reply (one per line). `ok` discriminates success from error; the
@@ -98,6 +117,16 @@ pub struct Reply {
     /// Human-readable error detail (on failure).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The daemon config and cold-field divergence flag (on `get-config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+    /// Flag indicating a cold-classified field requires daemon restart
+    /// to take effect (on config mutations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_required: Option<bool>,
+    /// Applied scope for a mutating config op (on config mutations).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<String>,
 }
 
 impl Reply {
@@ -115,6 +144,9 @@ impl Reply {
             credential_backend: None,
             code: None,
             message: None,
+            config: None,
+            restart_required: None,
+            applied: None,
         }
     }
 
@@ -188,6 +220,29 @@ impl Reply {
             credential_backend: None,
             code: Some(code.into()),
             message: Some(message.into()),
+            config: None,
+            restart_required: None,
+            applied: None,
+        }
+    }
+
+    /// Success carrying the daemon config and its cold-field divergence flag
+    /// (on `get-config`).
+    #[must_use]
+    pub fn config(config: serde_json::Value, restart_required: bool) -> Self {
+        Self {
+            config: Some(config),
+            restart_required: Some(restart_required),
+            ..Self::ok()
+        }
+    }
+
+    /// Success for a mutating config op that applied to the running daemon.
+    #[must_use]
+    pub fn applied_live() -> Self {
+        Self {
+            applied: Some("live".to_string()),
+            ..Self::ok()
         }
     }
 }
@@ -372,5 +427,57 @@ mod tests {
         assert_eq!(reply, back);
         assert!(back.ok);
         assert_eq!(back.instruments.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn config_ops_round_trip_documented_wire_shapes() {
+        let get: Request = serde_json::from_str(r#"{"op":"get-config"}"#).expect("de");
+        assert!(matches!(get, Request::GetConfig));
+
+        let cfg: Request = serde_json::from_str(
+            r#"{"op":"configure-provider","provider":"alpaca","settings":{"account_type":"live"}}"#,
+        )
+        .expect("de");
+        match &cfg {
+            Request::ConfigureProvider { provider, settings } => {
+                assert_eq!(provider, "alpaca");
+                assert_eq!(settings["account_type"], "live");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_string(&cfg).unwrap(),
+            r#"{"op":"configure-provider","provider":"alpaca","settings":{"account_type":"live"}}"#
+        );
+
+        let rm: Request =
+            serde_json::from_str(r#"{"op":"remove-provider","provider":"alpaca"}"#).unwrap();
+        assert!(matches!(rm, Request::RemoveProvider { .. }));
+
+        let sd: Request = serde_json::from_str(r#"{"op":"shutdown"}"#).unwrap();
+        assert!(matches!(sd, Request::Shutdown));
+    }
+
+    #[test]
+    fn config_replies_carry_payloads_and_omit_when_absent() {
+        let reply =
+            serde_json::to_value(Reply::config(serde_json::json!({"provider": {}}), true)).unwrap();
+        assert_eq!(reply["ok"], serde_json::Value::Bool(true));
+        assert_eq!(reply["restart_required"], serde_json::Value::Bool(true));
+        assert!(reply.get("applied").is_none());
+
+        let applied = serde_json::to_value(Reply::applied_live()).unwrap();
+        assert_eq!(applied["applied"], "live");
+        assert!(applied.get("config").is_none());
+
+        let plain = serde_json::to_value(Reply::ok()).unwrap();
+        assert!(plain.get("config").is_none());
+        assert!(plain.get("restart_required").is_none());
+    }
+
+    #[test]
+    fn new_config_codes_are_stable() {
+        assert_eq!(crate::codes::RESTART_REQUIRED, "restart_required");
+        assert_eq!(crate::codes::UNKNOWN_CONFIG_FIELD, "unknown_config_field");
     }
 }

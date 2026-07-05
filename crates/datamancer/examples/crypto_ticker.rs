@@ -25,7 +25,10 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use datamancer::{
     AssetClass, ControlKind, Datamancer, EventKind, Instrument, MarketEvent, PersistenceOptions,
     Price, ProviderId, Scope, Session, Timestamp,
-    providers::{AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue},
+    providers::{
+        AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoSettings, AlpacaCryptoVenue,
+        SettingsSource,
+    },
 };
 use futures::StreamExt;
 use oxidized_alpaca::AccountType;
@@ -53,8 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Build datamancer with the Alpaca crypto provider.
     let provider = Arc::new(AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
-        account_type: AccountType::Paper,
-        venue: AlpacaCryptoVenue::Us,
+        settings: SettingsSource::Static(AlpacaCryptoSettings {
+            account_type: AccountType::Paper,
+            venue: AlpacaCryptoVenue::Us,
+        }),
         ..Default::default()
     }));
     let dm = Datamancer::builder().provider_arc(provider).build()?;
