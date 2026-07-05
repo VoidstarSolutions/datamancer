@@ -221,9 +221,18 @@ mod tests {
 
     #[test]
     fn skew_gate_produces_typed_error() {
-        match check_version("0.2.0") {
+        // Derive an incompatible daemon version from our own (next major)
+        // instead of hardcoding one, so crate version bumps can't silently
+        // make the "skewed" fixture compatible again.
+        let major: u64 = env!("CARGO_PKG_VERSION")
+            .split('.')
+            .next()
+            .and_then(|m| m.parse().ok())
+            .expect("CARGO_PKG_VERSION starts with a numeric major");
+        let skewed = format!("{}.0.0", major + 1);
+        match check_version(&skewed) {
             Err(EnsureError::VersionSkew { daemon, client }) => {
-                assert_eq!(daemon, "0.2.0");
+                assert_eq!(daemon, skewed);
                 assert_eq!(client, env!("CARGO_PKG_VERSION"));
             }
             other => panic!("expected VersionSkew, got {other:?}"),

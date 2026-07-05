@@ -301,7 +301,7 @@ One JSON object per line; one reply line per request.
 {"op":"instruments","provider":"alpaca-crypto"}
   -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
-{"op":"ping"}          -> {"ok":true,"version":"0.1.0"}
+{"op":"ping"}          -> {"ok":true,"version":"0.2.0"}
 ```
 
 `instruments` enumerates the discoverable catalog and, per entry, the
