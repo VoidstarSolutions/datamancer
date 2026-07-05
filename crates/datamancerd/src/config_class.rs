@@ -103,6 +103,12 @@ mod tests {
 
     // Keep in sync with config.rs's FULL fixture: every section populated,
     // so every serializable field appears in the exhaustiveness walk.
+    // IMPORTANT: Option fields with `skip_serializing_if` MUST be populated
+    // here or the exhaustiveness gate cannot see them. This includes:
+    // - tap_log.path (StorageConfig field)
+    // - web_ui.assets_dir
+    // - startup_session.backfill_from (when scope requires it)
+    // If a new Option field is added, ensure it's set here.
     const FULL: &str = r#"
 [provider.alpaca]
 account_type = "paper"
@@ -116,7 +122,8 @@ backend = "embedded"
 path = "/tmp/dmc-cache"
 
 [tap_log]
-backend = "memory"
+backend = "embedded"
+path = "/tmp/dmc-taplog"
 
 [session]
 resume_buffer_events = 1024
@@ -136,6 +143,7 @@ max_clients = 8
 
 [web_ui]
 enabled = true
+assets_dir = "/tmp/dmc-assets"
 
 [ws]
 enabled = true
@@ -146,7 +154,8 @@ provider = "alpaca-crypto"
 asset_class = "crypto"
 symbol = "BTC/USD"
 kind = "trade"
-scope = "live"
+scope = "live_backfill"
+backfill_from = "2026-06-01T00:00:00Z"
 persistence = "none"
 "#;
 
