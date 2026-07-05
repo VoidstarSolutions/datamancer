@@ -211,10 +211,12 @@ async fn config_service_enables_and_disables_a_provider_live() {
         persistence: datamancer_client::spec::PersistenceCfg::default(),
     };
     let pre_configure = handle.subscribe(&spec).await;
-    assert!(
-        pre_configure.is_err(),
-        "subscribing to a disabled/unconfigured provider must fail: {pre_configure:?}"
-    );
+    match pre_configure {
+        Err(ClientError::Control { .. }) => {}
+        other => panic!(
+            "expected a control error subscribing to a disabled/unconfigured provider, got {other:?}"
+        ),
+    }
 
     // 4. set-credentials works while the provider is disabled — the
     // credential hub seeds a watch for every compiled-in id regardless of
@@ -260,6 +262,9 @@ async fn config_service_enables_and_disables_a_provider_live() {
         .await
         .expect("subscribe after configure-provider");
 
+    // Wait for ConnectionState::Connected rather than actual trade events:
+    // BTC/USD trades are sparse, so waiting on real trades invites flakes.
+    // Connected proves live auth through the freshly-configured provider.
     let connect_deadline = Instant::now() + Duration::from_secs(20);
     let mut connected = false;
     while Instant::now() < connect_deadline {

@@ -448,7 +448,9 @@ same as `restart_required` below implies).
   constructed at boot (parked, not literally absent) but starts **disabled**
   unless its `[provider.*]` section is present; a scaffolded/empty config
   enables nothing, so a fresh boot with zero provider sections is a valid,
-  well-defined state (`get-config` returns an empty `provider` table).
+  well-defined state (`get-config` returns a fixed-key `provider` table with
+  both provider ids present and `null` values, e.g.
+  `"provider":{"alpaca":null,"alpaca_crypto":null}`).
   `configure-provider` enables a provider at runtime; uncommenting the
   section and restarting does the same thing at boot.
 - **`remove-provider` leaves credentials stored.** It only removes the
