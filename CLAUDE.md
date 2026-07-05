@@ -33,6 +33,16 @@ cargo run -p datamancerd -- --config datamancerd.toml   # the standalone server
 
 Integration tests live in `crates/datamancer/tests/`. `alpaca_real.rs` is `#[ignore]`d — it hits real Alpaca and needs credentials; run with `cargo test --test alpaca_real -- --ignored`. The daemon end-to-end tests (`crates/datamancerd/tests/daemon_e2e.rs`) are `#[ignore]`d — they spawn the binary and need a live iceoryx2 runtime; run with `cargo test -p datamancerd --test daemon_e2e -- --ignored`.
 
+**Before opening a PR, run the CI gates locally** — the licenses/semver job has repeatedly failed only in CI:
+
+```bash
+git fetch origin main
+cargo deny check                              # licenses, advisories, sources
+.github/scripts/semver-checks.sh origin/main  # semver vs the PR base (needs cargo-semver-checks)
+```
+
+`cargo-semver-checks` treats any public-API addition to an exhaustive type as breaking (new enum variant, new pub field on a constructible struct) — wire-compatible JSON additions still require a version bump, and `datamancer-client`/`datamancerd` bump **in lockstep** (the ping version gate compares them; regression-guarded in datamancerd). Windows CI builds only the ws-portable subset — path-shape assertions in tests must be cfg'd per-OS (Windows data dirs nest `data\`).
+
 ## Architectural invariants
 
 These are load-bearing design rules — violating them breaks downstream consumers in subtle ways. The crate README (`crates/datamancer/README.md`) is the authoritative design doc; read it before changing public API.
