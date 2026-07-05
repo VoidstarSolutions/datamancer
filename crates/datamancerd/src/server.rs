@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::control::{Reply, Request, SubscriptionSpec, codes, reply_from_library_error};
-use crate::credentials::{CredentialHub, credential_op_permitted};
+use crate::credentials::{CredentialHub, privileged_op_permitted};
 use crate::error::{DaemonError, Result};
 use crate::shutdown::{DrainClient, DrainRecorder, drain};
 
@@ -142,9 +142,9 @@ pub struct Server {
     /// (blocking store I/O runs off-actor in `handle_connection`).
     hub: Arc<CredentialHub>,
     /// The config service: settings watches, persist-then-apply, hot
-    /// provider ops. Not yet dispatched from the control surface — wired in
-    /// the config-service dispatch task.
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
+    /// provider ops. Dispatched off-actor in `handle_connection`, same as the
+    /// credential hub (`get-config` ungated, the mutating ops peer-cred
+    /// gated).
     config_hub: Arc<crate::config_hub::ConfigHub>,
     /// The active credential-store backend name (for `ping`); threaded in at
     /// bootstrap so the actor never touches the hub.
@@ -261,14 +261,15 @@ impl Server {
         let listener = self.bind_socket()?;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(256);
 
-        // The daemon's own effective uid: the credential-op peer-cred gate
-        // admits exactly this uid.
+        // The daemon's own effective uid: the privileged-op peer-cred gate
+        // (credential ops, config mutation, shutdown) admits exactly this uid.
         let own_euid = rustix::process::geteuid().as_raw();
         let accept = tokio::spawn(accept_loop(
             listener,
             cmd_tx.clone(),
             self.dm.clone(),
             self.hub.clone(),
+            self.config_hub.clone(),
             own_euid,
         ));
 
@@ -297,7 +298,11 @@ impl Server {
                 }
                 maybe = cmd_rx.recv() => {
                     match maybe {
-                        Some(cmd) => self.handle(cmd).await,
+                        Some(cmd) => {
+                            if self.handle(cmd).await.is_break() {
+                                break;
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -341,37 +346,12 @@ impl Server {
             std::mem::take(&mut self.anchors),
             self.tap_log.clone(),
         );
-        tokio::pin!(drain_fut);
 
         // Drop the supervisor's own `cmd_tx` clone so `cmd_rx` closes once the
         // accept loop and connection tasks release theirs.
         drop(cmd_tx);
 
-        // Keep servicing `cmd_rx` while the drain runs: the accept loop is
-        // aborted at the start of `drain`, but connection tasks already spawned
-        // may still send a request. Reply `shutting_down` promptly so a producer
-        // never blocks forever on its reply channel (which would otherwise leave
-        // a wedged connection task and could stall a clean exit).
-        let drained = tokio::time::timeout(self.shutdown_timeout, async {
-            let mut producers_open = true;
-            loop {
-                tokio::select! {
-                    () = &mut drain_fut => break,
-                    maybe = cmd_rx.recv(), if producers_open => match maybe {
-                        Some(ServerCommand::Request { reply, .. }) => {
-                            let _ = reply.send(Reply::error(
-                                codes::SHUTTING_DOWN,
-                                "daemon is shutting down",
-                            ));
-                        }
-                        Some(ServerCommand::Disconnect { .. }) => {}
-                        None => producers_open = false,
-                    },
-                }
-            }
-        })
-        .await;
-        if drained.is_err() {
+        if !drain_servicing_late_requests(drain_fut, &mut cmd_rx, self.shutdown_timeout).await {
             tracing::error!("shutdown drain exceeded timeout; forcing exit");
         }
         tracing::debug!(phases = ?recorder.entries(), "drain phases");
@@ -526,9 +506,14 @@ impl Server {
         Ok(())
     }
 
-    async fn handle(&mut self, cmd: ServerCommand) {
+    async fn handle(&mut self, cmd: ServerCommand) -> std::ops::ControlFlow<()> {
         match cmd {
             ServerCommand::Request { request, reply } => {
+                if matches!(request, Request::Shutdown) && !self.draining {
+                    tracing::info!("shutdown requested via control op");
+                    let _ = reply.send(Reply::ok());
+                    return std::ops::ControlFlow::Break(());
+                }
                 let response = self.dispatch(request).await;
                 let _ = reply.send(response);
             }
@@ -536,6 +521,7 @@ impl Server {
                 self.teardown_client(&client).await;
             }
         }
+        std::ops::ControlFlow::Continue(())
     }
 
     async fn dispatch(&mut self, request: Request) -> Reply {
@@ -593,11 +579,18 @@ impl Server {
                 codes::INTERNAL,
                 "credential ops are dispatched off-actor; this arm is unreachable",
             ),
-            // wired in the config-service dispatch task
+            // Dispatched off-actor in `handle_connection` (config-hub state; the
+            // mutating ops and shutdown are peer-cred gated there). These arms only
+            // exist for match exhaustiveness / defense in depth.
             Request::GetConfig
             | Request::ConfigureProvider { .. }
-            | Request::RemoveProvider { .. }
-            | Request::Shutdown => Reply::error(codes::INTERNAL, "not yet implemented"),
+            | Request::RemoveProvider { .. } => Reply::error(
+                codes::INTERNAL,
+                "config ops are dispatched off-actor; this arm is unreachable",
+            ),
+            // `handle` intercepts Shutdown before dispatch; reaching here means the
+            // daemon is already draining.
+            Request::Shutdown => Reply::error(codes::SHUTTING_DOWN, "daemon is shutting down"),
         }
     }
 
@@ -769,6 +762,7 @@ async fn accept_loop(
     cmd_tx: mpsc::Sender<ServerCommand>,
     dm: Datamancer,
     hub: Arc<CredentialHub>,
+    config_hub: Arc<crate::config_hub::ConfigHub>,
     own_euid: u32,
 ) {
     loop {
@@ -779,6 +773,7 @@ async fn accept_loop(
                     cmd_tx.clone(),
                     dm.clone(),
                     hub.clone(),
+                    config_hub.clone(),
                     own_euid,
                 ));
             }
@@ -793,21 +788,76 @@ async fn accept_loop(
 /// forwards each to the server actor, writes the reply line. On EOF, if this
 /// connection had opened a client, signals an emergency teardown.
 ///
-/// `Request::Instruments` and the credential ops are dispatched here,
-/// off-actor, rather than forwarded to the actor: the former awaits a live
-/// provider REST call, the latter do blocking credential-store I/O (behind
-/// `spawn_blocking`) — neither may stall unrelated control traffic on the
-/// single-actor loop. Credential ops are additionally gated on the peer's
-/// uid matching the daemon's own effective uid, captured per-connection
-/// before the stream is split.
+/// `Request::Instruments`, the credential ops, and the config-service ops
+/// are dispatched here, off-actor, rather than forwarded to the actor: the
+/// first awaits a live provider REST call, the credential ops do blocking
+/// credential-store I/O (behind `spawn_blocking`) — neither may stall
+/// unrelated control traffic on the single-actor loop. `get-config` is
+/// ungated (the config never contains secrets); the credential ops,
+/// `configure-provider`/`remove-provider`, and `shutdown` are additionally
+/// gated on the peer's uid matching the daemon's own effective uid, captured
+/// per-connection before the stream is split. `shutdown` is forwarded to the
+/// actor (a run-loop decision, not hub state) once the gate passes.
+/// Route an already-gated credential op to the credential hub.
+async fn dispatch_credential_op(request: Request, hub: &CredentialHub) -> Reply {
+    match request {
+        Request::SetCredentials {
+            provider,
+            credentials,
+        } => hub.set(&provider, credentials).await,
+        Request::GetCredentials { provider } => hub.get(&provider).await,
+        Request::ClearCredentials { provider } => hub.clear(&provider).await,
+        // Narrowed by the caller's `matches!`.
+        _ => Reply::error(codes::INTERNAL, "unreachable credential dispatch"),
+    }
+}
+
+/// Route an already-gated config-mutation or shutdown op. `ConfigureProvider`
+/// and `RemoveProvider` run against the config hub; `Shutdown` is forwarded
+/// to the actor (a run-loop decision, not hub state). Returns `None` when the
+/// actor's command channel is closed, signalling the caller should stop
+/// servicing this connection.
+async fn dispatch_config_op(
+    request: Request,
+    config_hub: &crate::config_hub::ConfigHub,
+    cmd_tx: &mpsc::Sender<ServerCommand>,
+) -> Option<Reply> {
+    Some(match request {
+        Request::ConfigureProvider { provider, settings } => {
+            config_hub.configure_provider(&provider, settings).await
+        }
+        Request::RemoveProvider { provider } => config_hub.remove_provider(&provider).await,
+        Request::Shutdown => {
+            let (tx, rx) = oneshot::channel();
+            if cmd_tx
+                .send(ServerCommand::Request {
+                    request: Request::Shutdown,
+                    reply: tx,
+                })
+                .await
+                .is_err()
+            {
+                return None;
+            }
+            match rx.await {
+                Ok(reply) => reply,
+                Err(_) => return None,
+            }
+        }
+        // Narrowed by the caller's `matches!`.
+        _ => Reply::error(codes::INTERNAL, "unreachable config dispatch"),
+    })
+}
+
 async fn handle_connection(
     stream: UnixStream,
     cmd_tx: mpsc::Sender<ServerCommand>,
     dm: Datamancer,
     hub: Arc<CredentialHub>,
+    config_hub: Arc<crate::config_hub::ConfigHub>,
     own_euid: u32,
 ) {
-    // Kernel-reported peer credentials; unreadable peer = credential ops
+    // Kernel-reported peer credentials; unreadable peer = privileged ops
     // denied (never defaulted).
     let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
     let (read, mut write) = stream.into_split();
@@ -837,21 +887,31 @@ async fn handle_connection(
                         | Request::GetCredentials { .. }
                         | Request::ClearCredentials { .. }
                 ) {
-                    if credential_op_permitted(peer_uid, own_euid) {
-                        match request {
-                            Request::SetCredentials {
-                                provider,
-                                credentials,
-                            } => hub.set(&provider, credentials).await,
-                            Request::GetCredentials { provider } => hub.get(&provider).await,
-                            Request::ClearCredentials { provider } => hub.clear(&provider).await,
-                            // Narrowed by the `matches!` above.
-                            _ => Reply::error(codes::INTERNAL, "unreachable credential dispatch"),
-                        }
+                    if privileged_op_permitted(peer_uid, own_euid) {
+                        dispatch_credential_op(request, &hub).await
                     } else {
                         Reply::error(
                             codes::PERMISSION_DENIED,
                             "credential ops require the daemon owner's uid",
+                        )
+                    }
+                } else if matches!(&request, Request::GetConfig) {
+                    config_hub.get_config().await
+                } else if matches!(
+                    &request,
+                    Request::ConfigureProvider { .. }
+                        | Request::RemoveProvider { .. }
+                        | Request::Shutdown
+                ) {
+                    if privileged_op_permitted(peer_uid, own_euid) {
+                        match dispatch_config_op(request, &config_hub, &cmd_tx).await {
+                            Some(reply) => reply,
+                            None => break,
+                        }
+                    } else {
+                        Reply::error(
+                            codes::PERMISSION_DENIED,
+                            "config mutation and shutdown ops require the daemon owner's uid",
                         )
                     }
                 } else {
@@ -928,6 +988,40 @@ fn spawn_diagnostics(
     })
 }
 
+/// Run `drain_fut` to completion while still servicing `cmd_rx`: the accept
+/// loop is aborted at the start of `drain`, but connection tasks already
+/// spawned may still send a request. Reply `shutting_down` promptly so a
+/// producer never blocks forever on its reply channel (which would otherwise
+/// leave a wedged connection task and could stall a clean exit). Returns
+/// `false` if `shutdown_timeout` was exceeded.
+async fn drain_servicing_late_requests(
+    drain_fut: impl std::future::Future<Output = ()>,
+    cmd_rx: &mut mpsc::Receiver<ServerCommand>,
+    shutdown_timeout: Duration,
+) -> bool {
+    tokio::pin!(drain_fut);
+    let drained = tokio::time::timeout(shutdown_timeout, async {
+        let mut producers_open = true;
+        loop {
+            tokio::select! {
+                () = &mut drain_fut => break,
+                maybe = cmd_rx.recv(), if producers_open => match maybe {
+                    Some(ServerCommand::Request { reply, .. }) => {
+                        let _ = reply.send(Reply::error(
+                            codes::SHUTTING_DOWN,
+                            "daemon is shutting down",
+                        ));
+                    }
+                    Some(ServerCommand::Disconnect { .. }) => {}
+                    None => producers_open = false,
+                },
+            }
+        }
+    })
+    .await;
+    drained.is_ok()
+}
+
 /// A SIGTERM stream (Unix). Wrapped so `run` can `select!` on it.
 fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
     Ok(tokio::signal::unix::signal(
@@ -937,6 +1031,33 @@ fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn privileged_gate_requires_exact_uid_match() {
+        use crate::credentials::privileged_op_permitted;
+        assert!(privileged_op_permitted(Some(501), 501));
+        assert!(!privileged_op_permitted(Some(502), 501));
+        assert!(!privileged_op_permitted(None, 501));
+    }
+
+    #[test]
+    fn reject_unknown_keys_accepts_omitted_settings_on_configure_provider() {
+        let line = r#"{"op":"configure-provider","provider":"alpaca"}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        assert!(
+            reject_unknown_keys(line, &request).is_ok(),
+            "omitted `settings` must round-trip to the canonical `\"settings\":null` form"
+        );
+    }
+
+    #[test]
+    fn reject_unknown_keys_still_rejects_bogus_top_level_key_on_configure_provider() {
+        let line = r#"{"op":"configure-provider","provider":"alpaca","bogus":1}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        assert!(reject_unknown_keys(line, &request).is_err());
+    }
+
     /// `AppHandle::ensure`'s version gate (`datamancer-client`'s
     /// `app::check_version`) requires the daemon's `ping` version
     /// (`env!("CARGO_PKG_VERSION")`, stamped above in `Request::Ping`) to be

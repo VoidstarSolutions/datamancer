@@ -28,25 +28,16 @@ struct HubState {
     /// The authoritative current config (starts as the boot config; every
     /// accepted mutation updates it in the same critical section as the
     /// persist + apply).
-    #[allow(
-        dead_code,
-        reason = "read by get_config/apply_full, consumed by the config-service dispatch task"
-    )]
     current: Config,
 }
 
 pub(crate) struct ConfigHub {
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
     path: PathBuf,
     /// Boot-applied config: `cold_divergence(&boot, &current)` non-empty ⇒
     /// restart required.
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
     boot: Config,
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
     state: tokio::sync::Mutex<HubState>,
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
     alpaca_tx: watch::Sender<Option<AlpacaSettings>>,
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
     alpaca_crypto_tx: watch::Sender<Option<AlpacaCryptoSettings>>,
 }
 
@@ -94,7 +85,6 @@ impl ConfigHub {
     }
 
     /// The current config as JSON plus the cold-field divergence flag.
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
     pub(crate) async fn get_config(&self) -> Reply {
         let state = self.state.lock().await;
         let restart_required = !cold_divergence(&self.boot, &state.current).is_empty();
@@ -105,7 +95,6 @@ impl ConfigHub {
     }
 
     /// Enable or re-configure a provider: validate → persist → apply.
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
     pub(crate) async fn configure_provider(
         &self,
         provider: &str,
@@ -144,7 +133,6 @@ impl ConfigHub {
 
     /// Disable a provider (remove its section; stored credentials are
     /// untouched — re-enabling reuses them).
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
     pub(crate) async fn remove_provider(&self, provider: &str) -> Reply {
         let mut state = self.state.lock().await;
         let mut candidate = state.current.clone();
@@ -183,8 +171,10 @@ impl ConfigHub {
 
     /// Validate + atomically persist `candidate`; commit it to `state`
     /// only on success. Persist-then-apply: callers apply after this
-    /// returns `Ok`.
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
+    /// returns `Ok`. Maps `Config::save`'s failure kind, not its message
+    /// text: a validation failure (`DaemonError::ConfigInvalid`) is the
+    /// caller's fault (`BAD_REQUEST`); a serialize/I-O failure is ours
+    /// (`INTERNAL`).
     async fn persist(
         &self,
         state: &mut tokio::sync::MutexGuard<'_, HubState>,
@@ -197,9 +187,13 @@ impl ConfigHub {
                 state.current = candidate;
                 Ok(())
             }
-            Ok(Err(e)) => Err(Reply::error(
+            Ok(Err(crate::error::DaemonError::ConfigInvalid(msg))) => Err(Reply::error(
                 codes::BAD_REQUEST,
-                format!("config rejected: {e}"),
+                format!("config rejected: {msg}"),
+            )),
+            Ok(Err(e)) => Err(Reply::error(
+                codes::INTERNAL,
+                format!("config persist failed: {e}"),
             )),
             Err(e) => Err(Reply::error(
                 codes::INTERNAL,
@@ -212,7 +206,6 @@ impl ConfigHub {
     /// only when the value actually changed: `watch::Sender::send_replace`
     /// on an unchanged value still wakes receivers, which would force a
     /// needless provider reconnect on a no-op reconfigure.
-    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
     fn apply(&self, current: &Config) {
         let alpaca = current.provider.alpaca.as_ref().map(alpaca_settings);
         if *self.alpaca_tx.borrow() != alpaca {
@@ -232,7 +225,6 @@ impl ConfigHub {
 /// Map a settings-payload deserialization failure to a stable code:
 /// unknown keys are the operator-contract `unknown_config_field`; anything
 /// else (bad enum value, wrong type) is `bad_request`.
-#[allow(dead_code, reason = "consumed by the config-service dispatch task")]
 fn settings_error(e: &serde_json::Error) -> Reply {
     let msg = e.to_string();
     if msg.contains("unknown field") {
@@ -242,7 +234,6 @@ fn settings_error(e: &serde_json::Error) -> Reply {
     }
 }
 
-#[allow(dead_code, reason = "consumed by the config-service dispatch task")]
 fn unknown_provider(provider: &str) -> Reply {
     Reply::error(
         codes::UNKNOWN_PROVIDER,
@@ -352,6 +343,47 @@ mod tests {
             "hot ops never require restart"
         );
         assert!(reply.config.unwrap()["provider"]["alpaca"].is_object());
+    }
+
+    #[tokio::test]
+    async fn configure_provider_persist_failure_leaves_state_and_watch_untouched() {
+        // Point the hub's config path at a location that can never be written:
+        // its "parent" is actually a file, so `atomic_write`'s temp-file
+        // creation fails with an I/O error (not a validation error) every time.
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_file = dir.path().join("not_a_dir");
+        std::fs::write(&blocking_file, b"blocking").unwrap();
+        let bad_path = blocking_file.join("config.toml");
+
+        let config = Config::parse("[provider]\n").expect("parse");
+        let (hub, sources) = ConfigHub::bootstrap(config, bad_path);
+
+        let reply = hub
+            .configure_provider("alpaca", serde_json::json!({"account_type": "live"}))
+            .await;
+        assert!(!reply.ok, "persist failure must surface as an error reply");
+        assert_eq!(
+            reply.code.as_deref(),
+            Some(codes::INTERNAL),
+            "an I/O persist failure (not a validation error) must map to internal, not bad_request"
+        );
+
+        // The settings watch never observed the candidate: persist failed
+        // before `apply` ran.
+        assert_eq!(
+            sources.alpaca.current(),
+            None,
+            "a failed persist must not hot-apply"
+        );
+
+        // `get_config` (backed by the same `state.current`) still lacks the
+        // section: the in-memory state was never committed either.
+        let get_reply = hub.get_config().await;
+        assert!(get_reply.ok);
+        assert!(
+            get_reply.config.unwrap()["provider"]["alpaca"].is_null(),
+            "in-memory state must not diverge from what was actually persisted"
+        );
     }
 
     #[tokio::test]

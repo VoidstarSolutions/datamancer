@@ -14,9 +14,9 @@ use tokio::sync::watch;
 use crate::control::{Reply, codes};
 use crate::error::{DaemonError, Result};
 
-/// Same-uid gate for credential ops. Unreadable peer credentials are denied,
-/// not defaulted.
-pub(crate) fn credential_op_permitted(peer_uid: Option<u32>, own_euid: u32) -> bool {
+/// Same-uid gate for credential and config-mutation ops (and `shutdown`).
+/// Unreadable peer credentials are denied, not defaulted.
+pub(crate) fn privileged_op_permitted(peer_uid: Option<u32>, own_euid: u32) -> bool {
     peer_uid == Some(own_euid)
 }
 
@@ -244,9 +244,9 @@ mod tests {
 
     #[test]
     fn gate_requires_exact_uid_match() {
-        assert!(credential_op_permitted(Some(501), 501));
-        assert!(!credential_op_permitted(Some(502), 501));
-        assert!(!credential_op_permitted(None, 501)); // unreadable peer = denied
+        assert!(privileged_op_permitted(Some(501), 501));
+        assert!(!privileged_op_permitted(Some(502), 501));
+        assert!(!privileged_op_permitted(None, 501)); // unreadable peer = denied
     }
 
     #[tokio::test]

@@ -655,12 +655,13 @@ impl Config {
         providers
     }
 
-    /// Build the full daemon runtime: construct the configured providers
-    /// (each wired to its credential source from `sources`, keyed by provider
-    /// id — a missing entry falls back to the legacy env source), open the
-    /// cache + tap log, assemble the [`Datamancer`], and retain the tap-log
-    /// `Arc` so the shutdown path can flush it (the builder takes ownership,
-    /// so the handle must be cloned out here).
+    /// Build the full daemon runtime: construct every compiled-in provider
+    /// (parked unless enabled, each wired to its credential source from
+    /// `sources`, keyed by provider id — a missing entry falls back to the
+    /// legacy env source), open the cache + tap log, assemble the
+    /// [`Datamancer`], and retain the tap-log `Arc` so the shutdown path can
+    /// flush it (the builder takes ownership, so the handle must be cloned
+    /// out here).
     ///
     /// # Errors
     ///
