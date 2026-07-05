@@ -532,7 +532,7 @@ impl Server {
                 }
             }
             Request::ListClients => Reply::clients(self.clients.keys().cloned().collect()),
-            Request::Ping => Reply::pong(env!("CARGO_PKG_VERSION")),
+            Request::Ping => Reply::pong(env!("CARGO_PKG_VERSION"), "unavailable"),
             Request::Snapshot => match self.dm.snapshot().await {
                 Ok(snapshot) => Reply::snapshot(snapshot),
                 Err(e) => reply_from_library_error(&e),
@@ -547,6 +547,14 @@ impl Server {
                     Ok(catalog) => Reply::instruments(catalog),
                     Err(e) => reply_from_library_error(&e),
                 }
+            }
+            // Credential-broker ops: wired in a later task (store lookup,
+            // hot-apply, peer-cred gating). These arms exist only for match
+            // exhaustiveness in this task.
+            Request::SetCredentials { .. }
+            | Request::GetCredentials { .. }
+            | Request::ClearCredentials { .. } => {
+                Reply::error(codes::INTERNAL, "credential ops not yet implemented")
             }
         }
     }

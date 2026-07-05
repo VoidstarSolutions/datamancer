@@ -52,6 +52,18 @@ pub enum Request {
     /// Liveness/version probe. Answerable before `open-client`; used by the
     /// app facade for spawn-readiness and version-skew detection.
     Ping,
+    /// Store (create or rotate) credentials for a configured provider.
+    /// UDS-only, peer-cred gated; a configured provider hot-applies.
+    SetCredentials {
+        provider: String,
+        credentials: datamancer_core::ProviderCredentials,
+    },
+    /// Read the stored credentials (the trade app reuses the same keys for
+    /// its own trading connections — the daemon is the one copy).
+    GetCredentials { provider: String },
+    /// Remove stored credentials. The running provider keeps its last
+    /// applied credentials until restart (there is no un-apply).
+    ClearCredentials { provider: String },
 }
 
 /// A control reply (one per line). `ok` discriminates success from error; the
@@ -74,6 +86,12 @@ pub struct Reply {
     /// The daemon's crate version (on `ping`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Stored credentials (on `get-credentials`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<datamancer_core::ProviderCredentials>,
+    /// The daemon's active credential-store backend (on `ping`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_backend: Option<String>,
     /// Stable error code (on failure).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -93,6 +111,8 @@ impl Reply {
             snapshot: None,
             instruments: None,
             version: None,
+            credentials: None,
+            credential_backend: None,
             code: None,
             message: None,
         }
@@ -134,11 +154,22 @@ impl Reply {
         }
     }
 
-    /// Success carrying the daemon version (on `ping`).
+    /// Success carrying stored credentials (on `get-credentials`).
     #[must_use]
-    pub fn pong(version: impl Into<String>) -> Self {
+    pub fn credentials(creds: datamancer_core::ProviderCredentials) -> Self {
+        Self {
+            credentials: Some(creds),
+            ..Self::ok()
+        }
+    }
+
+    /// Success carrying the daemon version and active credential backend
+    /// (on `ping`).
+    #[must_use]
+    pub fn pong(version: impl Into<String>, credential_backend: impl Into<String>) -> Self {
         Self {
             version: Some(version.into()),
+            credential_backend: Some(credential_backend.into()),
             ..Self::ok()
         }
     }
@@ -153,6 +184,8 @@ impl Reply {
             snapshot: None,
             instruments: None,
             version: None,
+            credentials: None,
+            credential_backend: None,
             code: Some(code.into()),
             message: Some(message.into()),
         }
@@ -257,10 +290,70 @@ mod tests {
             r#"{"op":"ping"}"#
         );
 
-        let reply = serde_json::to_value(Reply::pong("0.1.0")).expect("ser");
+        let reply = serde_json::to_value(Reply::pong("0.1.0", "keychain")).expect("ser");
         assert_eq!(reply["ok"], serde_json::Value::Bool(true));
         assert_eq!(reply["version"], "0.1.0");
         assert!(reply.get("code").is_none());
+    }
+
+    #[test]
+    fn credential_ops_round_trip_documented_wire_shapes() {
+        use datamancer_core::ProviderCredentials;
+        let set: Request = serde_json::from_str(
+            r#"{"op":"set-credentials","provider":"alpaca","credentials":{"type":"api_key_pair","key_id":"AKID","secret":"s"}}"#,
+        )
+        .expect("de");
+        match &set {
+            Request::SetCredentials {
+                provider,
+                credentials,
+            } => {
+                assert_eq!(provider, "alpaca");
+                assert!(matches!(
+                    credentials,
+                    ProviderCredentials::ApiKeyPair { .. }
+                ));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_string(&set).unwrap(),
+            r#"{"op":"set-credentials","provider":"alpaca","credentials":{"type":"api_key_pair","key_id":"AKID","secret":"s"}}"#
+        );
+        let get: Request =
+            serde_json::from_str(r#"{"op":"get-credentials","provider":"alpaca"}"#).unwrap();
+        assert!(matches!(get, Request::GetCredentials { .. }));
+        let clear: Request =
+            serde_json::from_str(r#"{"op":"clear-credentials","provider":"alpaca"}"#).unwrap();
+        assert!(matches!(clear, Request::ClearCredentials { .. }));
+    }
+
+    #[test]
+    fn credentials_reply_and_backend_carrying_pong() {
+        use datamancer_core::ProviderCredentials;
+        let reply = serde_json::to_value(Reply::credentials(ProviderCredentials::ApiKeyPair {
+            key_id: "AKID".to_string(),
+            secret: "s".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(reply["ok"], serde_json::Value::Bool(true));
+        assert_eq!(reply["credentials"]["type"], "api_key_pair");
+        assert!(reply.get("version").is_none());
+
+        let pong = serde_json::to_value(Reply::pong("0.3.0", "keychain")).unwrap();
+        assert_eq!(pong["version"], "0.3.0");
+        assert_eq!(pong["credential_backend"], "keychain");
+        assert!(pong.get("credentials").is_none());
+    }
+
+    #[test]
+    fn new_credential_codes_are_stable() {
+        assert_eq!(crate::codes::CREDENTIALS_MISSING, "credentials_missing");
+        assert_eq!(
+            crate::codes::CREDENTIAL_BACKEND_UNAVAILABLE,
+            "credential_backend_unavailable"
+        );
+        assert_eq!(crate::codes::PERMISSION_DENIED, "permission_denied");
     }
 
     #[test]
