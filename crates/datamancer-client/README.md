@@ -149,6 +149,68 @@ for info in client.instruments(None).await? {
 }
 ```
 
+## App facade (feature `app`)
+
+Behind feature `app` (implies `iceoryx2`, off by default), `AppHandle` is a
+higher-level entry point for consumer apps that don't want to hand-roll
+discovery: find a running `datamancerd` on the (default or configured)
+control socket, or spawn one, wait for it to become ready, and connect —
+returning the same split `(handle, events)` shape as `Iceoryx2Client::connect`.
+It adds no protocol semantics; every `AppHandle` method maps to an existing
+control-surface op.
+
+```rust,no_run
+use datamancer_client::app::{AppHandle, EnsureConfig};
+use futures::StreamExt as _;
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let cfg = EnsureConfig::new("/opt/myapp/bin/datamancerd", "my-app");
+let (mut handle, mut events) = AppHandle::ensure(cfg).await?;
+
+let view = handle.health().await?;
+println!("daemon {:?}, {} streams", view.daemon.version, view.streams.len());
+
+while let Some(event) = events.next().await {
+    println!("{event:?}");
+}
+# Ok(())
+# }
+```
+
+`ensure` semantics:
+
+- **Connect-or-spawn.** It pings the control socket first; only on failure
+  does it spawn `cfg.daemon_binary` (detached, stdio to
+  `cfg.log_path` or the platform default) and poll `ping` until ready or
+  `cfg.ready_timeout` elapses.
+- **A lost spawn race is success.** If another process wins the
+  single-instance daemon and this app's spawned child exits first, that's
+  fine as long as a subsequent `ping` on the socket answers — `ensure`
+  returns `Ok` either way.
+- **Spawn-don't-supervise.** Once connected, the daemon is not monitored;
+  when the event stream ends (daemon died, connection dropped), the app's
+  recovery is to call `ensure` again, not to restart a handle in place.
+  Deliberately stopping a daemon this app spawned is out of scope for this
+  cycle (`AppHandle::close` closes this client only, not the daemon).
+- **Version-gated.** `ensure` rejects with `EnsureError::VersionSkew` unless
+  the daemon's `ping`-reported version is compatible with this crate's own
+  (`CARGO_PKG_VERSION`): equal major version, and — while major is `0` —
+  equal minor too (pre-1.0 minor bumps are breaking by convention).
+
+`AppHandle::health()` returns a [`HealthView`] (from `datamancer-core`,
+re-exported via the orchestrator too): a versioned, per-`(instrument, kind)`
+reduction of the daemon's snapshot for app rendering. It's per-symbol only —
+there is no cross-instrument aggregate — and its latency/liveness fields are
+wall-clock observability, never engine-decision inputs. `ProviderState`
+includes reserved `Unauthenticated` / `CompanionUnreachable` variants for a
+future IBKR-style provider that attaches to a local companion process;
+nothing produces them yet, but the wire shape is stable now so consumers
+already parse them. `daemon.version` comes from the `ping` handshake
+(`{"op":"ping"}` → `{"ok":true,"version":"…"}`), not the snapshot itself —
+see `datamancerd/README.md` for the control-protocol side of `ping`.
+
+[`HealthView`]: ../datamancer-core/src/health.rs
+
 ## Honest scoping
 
 Both client implementations are worked examples of a consumer-side transport,
