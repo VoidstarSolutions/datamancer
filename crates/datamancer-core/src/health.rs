@@ -36,6 +36,12 @@ pub struct DaemonHealth {
     /// caller (facade after the `ping` handshake, or the embedding library)
     /// assigns it, because the snapshot does not carry it.
     pub version: Option<String>,
+    /// The daemon's active credential-store backend (`"keychain"`,
+    /// `"secret-service"`, `"file"`). `None` out of the pure reduction — the
+    /// caller stamps it (facade, from the `ping` handshake), and `None` also
+    /// means "daemon predates the credential broker". A surprising `"file"`
+    /// on a desktop host is visible here rather than silent.
+    pub credential_backend: Option<String>,
     /// Wall-clock at snapshot assembly (observability).
     pub captured_at: Timestamp,
 }
@@ -156,6 +162,7 @@ impl HealthView {
             schema_version: Self::SCHEMA_VERSION,
             daemon: DaemonHealth {
                 version: None,
+                credential_backend: None,
                 captured_at: snapshot.captured_at,
             },
             providers,
@@ -228,6 +235,7 @@ mod tests {
         let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
         assert_eq!(view.schema_version, HealthView::SCHEMA_VERSION);
         assert_eq!(view.daemon.version, None); // filled by the caller, not the reduction
+        assert_eq!(view.daemon.credential_backend, None); // filled by the caller, not the reduction
         assert_eq!(view.daemon.captured_at, Timestamp(1_000));
         let states: Vec<_> = view.providers.iter().map(|p| p.state).collect();
         assert_eq!(
