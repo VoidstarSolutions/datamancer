@@ -374,6 +374,13 @@ Nothing credential-shaped lives in the config file.
   subscribes fail until `set-credentials` arrives — at which point it
   connects without a restart. The bootstrap log states clearly which
   providers started unprovisioned.
+- **A store must open, or the daemon won't boot.** On a host with no
+  reachable keychain/secret-service **and** no derivable home directory
+  (e.g. a minimal service unit without `HOME`), `open_default` has nowhere
+  to put the file fallback and bootstrap fails fast with a
+  `credential store: …` error — even if `ALPACA_*` env vars are set. Give
+  the service a `HOME` (or a secret-service) to restore the pre-0.3 env-only
+  behavior.
 
 ## WebSocket client surface (feature `ws`)
 
