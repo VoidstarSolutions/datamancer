@@ -186,9 +186,14 @@ impl AlpacaProvider {
     /// or in tests where the env vars are not set.
     #[must_use]
     pub fn new(cfg: AlpacaProviderConfig) -> Self {
+        // Ordering invariant — receiver before build: a rotation after
+        // capture triggers rebuild; before capture is included in the build.
+        // (Capturing after building would mark an in-between rotation seen
+        // while the cached clients are stale.)
+        let cred_rx = cfg.credentials.watch();
         let rest = std::sync::Mutex::new(RestState {
             clients: build_rest(&cfg),
-            cred_rx: cfg.credentials.watch(),
+            cred_rx,
         });
         Self { cfg, rest }
     }
@@ -198,12 +203,12 @@ impl AlpacaProvider {
     /// source.
     #[must_use]
     pub fn with_rest(cfg: AlpacaProviderConfig, rest: MarketDataClient) -> Self {
+        // Ordering invariant — receiver before build: a rotation after
+        // capture triggers rebuild; before capture is included in the build.
+        let cred_rx = cfg.credentials.watch();
         let mut clients = build_rest(&cfg);
         clients.market_data = Some(rest);
-        let rest = std::sync::Mutex::new(RestState {
-            clients,
-            cred_rx: cfg.credentials.watch(),
-        });
+        let rest = std::sync::Mutex::new(RestState { clients, cred_rx });
         Self { cfg, rest }
     }
 

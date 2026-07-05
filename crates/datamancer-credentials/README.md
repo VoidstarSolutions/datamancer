@@ -42,6 +42,17 @@ nature. Async callers wrap calls in `tokio::task::spawn_blocking`.
   implementation of the same trait — not a widened enum or a new code path
   in the store.
 
+### Testing/ops override: `DATAMANCER_CREDENTIALS_FILE`
+
+When the `DATAMANCER_CREDENTIALS_FILE` env var is set (non-empty),
+`CredentialStore::open_default()` uses the `FileBackend` at that path
+unconditionally — the keychain is skipped, and the backend name stays
+`"file"`. This is an escape hatch for tests and operators (e.g. the daemon
+e2e suite points a spawned `datamancerd`'s broker at a tempdir so it never
+touches the developer's real keychain). It is **not** a supported
+configuration surface; provision real deployments through the default
+selection.
+
 ## Default file path
 
 ```rust,ignore

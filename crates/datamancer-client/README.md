@@ -209,9 +209,10 @@ already parse them. `daemon.version` and `daemon.credential_backend` come
 from the `ping` handshake (`{"op":"ping"}` →
 `{"ok":true,"version":"…","credential_backend":"…"}`), not the snapshot
 itself — see `datamancerd/README.md` for the control-protocol side of `ping`.
-`credential_backend` is `None` both when the daemon has no backend
-configured and when it predates the field (older daemons' pongs omit it) —
-`AppHandle` doesn't distinguish the two.
+`credential_backend` is `None` in exactly one case: an older daemon whose
+pong predates the field and omits it. A current daemon always reports a
+backend — it selects one at bootstrap and refuses to boot when none is
+available.
 
 ### Credential methods
 

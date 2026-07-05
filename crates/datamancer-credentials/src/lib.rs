@@ -8,6 +8,11 @@
 //!
 //! The API is deliberately **blocking** (OS keychain APIs are); async
 //! callers wrap calls in `tokio::task::spawn_blocking`.
+//!
+//! Testing/ops override: setting [`CREDENTIALS_FILE_ENV`]
+//! (`DATAMANCER_CREDENTIALS_FILE`) makes [`CredentialStore::open_default`]
+//! use the file backend at that path unconditionally. Not a supported
+//! configuration surface.
 #![forbid(unsafe_code)]
 
 mod file;
@@ -106,16 +111,41 @@ impl CredentialStore {
     }
 }
 
+/// Env var honored by [`CredentialStore::open_default`]: when set (and
+/// non-empty), the store is unconditionally a [`FileBackend`] at that path
+/// (backend name stays `"file"`). A testing/ops escape hatch — e.g. pointing
+/// a spawned daemon's broker at a tempdir instead of the developer's real
+/// keychain — **not** a supported configuration surface.
+pub const CREDENTIALS_FILE_ENV: &str = "DATAMANCER_CREDENTIALS_FILE";
+
 impl CredentialStore {
     /// The platform-default store: OS keychain when it initializes, else the
     /// file backend at [`default_file_path`]. The choice is never silent —
     /// read it back via [`Self::backend_name`].
+    ///
+    /// Override: when [`CREDENTIALS_FILE_ENV`] (`DATAMANCER_CREDENTIALS_FILE`)
+    /// is set and non-empty, the file backend at that path is used
+    /// unconditionally (keychain skipped). Testing/ops escape hatch only.
     ///
     /// # Errors
     ///
     /// [`CredentialError::Backend`] when neither backend is possible (no
     /// keychain and no derivable home directory for the file path).
     pub fn open_default() -> Result<Self, CredentialError> {
+        Self::open_default_with_lookup(|var| std::env::var(var).ok())
+    }
+
+    /// [`Self::open_default`] with the env lookup injected — the selection
+    /// logic is testable without mutating process environment (which is
+    /// `unsafe` and this crate forbids unsafe code).
+    fn open_default_with_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, CredentialError> {
+        if let Some(path) = lookup(CREDENTIALS_FILE_ENV).filter(|p| !p.is_empty()) {
+            return Ok(Self::with_backend(Box::new(FileBackend::new(
+                PathBuf::from(path),
+            ))));
+        }
         if let Ok(backend) = KeychainBackend::new() {
             return Ok(Self::with_backend(Box::new(backend)));
         }
@@ -217,12 +247,67 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600, "credentials file must be owner-only");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_backend_reclaims_a_loose_preexisting_tmp_file() {
+        // OpenOptions::mode applies only at creation: a stale tmp sibling
+        // with loose permissions would otherwise ride the rename into the
+        // real credentials file.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, b"{}").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let backend = FileBackend::new(path.clone());
+        backend
+            .set(
+                "p",
+                &datamancer_core::ProviderCredentials::ApiKeyPair {
+                    key_id: "k".to_string(),
+                    secret: "s".to_string(),
+                },
+            )
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a pre-existing loose tmp must not leak its mode into the credentials file"
+        );
+    }
+
     #[test]
     fn store_reports_backend_name() {
         let dir = tempfile::tempdir().unwrap();
         let store =
             CredentialStore::with_backend(Box::new(FileBackend::new(dir.path().join("c.json"))));
         assert_eq!(store.backend_name(), "file");
+    }
+
+    #[test]
+    fn open_default_env_override_selects_the_file_backend_and_round_trips() {
+        // The DATAMANCER_CREDENTIALS_FILE escape hatch. Injected lookup
+        // instead of `std::env::set_var` (unsafe in edition 2024, and this
+        // crate forbids unsafe code); the spawned-daemon e2e in datamancerd
+        // exercises the real env-var read end-to-end.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("override.json");
+        let lookup = |var: &str| (var == CREDENTIALS_FILE_ENV).then(|| path.display().to_string());
+        let store = CredentialStore::open_default_with_lookup(lookup).expect("override store");
+        assert_eq!(store.backend_name(), "file");
+        let creds = ProviderCredentials::ApiKeyPair {
+            key_id: "k".to_string(),
+            secret: "s".to_string(),
+        };
+        store.set("p", &creds).unwrap();
+        assert_eq!(store.get("p").unwrap(), Some(creds));
+        assert!(path.exists(), "override path must hold the file backend");
+        // An empty value does not divert to a file at "".
+        let empty = CredentialStore::open_default_with_lookup(|_| Some(String::new()));
+        if let Ok(s) = empty {
+            assert!(["keychain", "secret-service", "file"].contains(&s.backend_name()));
+        }
     }
 
     #[test]

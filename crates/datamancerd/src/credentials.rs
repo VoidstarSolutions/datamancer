@@ -25,6 +25,13 @@ pub(crate) fn credential_op_permitted(peer_uid: Option<u32>, own_euid: u32) -> b
 pub(crate) struct CredentialHub {
     store: Arc<CredentialStore>,
     senders: HashMap<String, watch::Sender<Option<AlpacaCredentials>>>,
+    /// Per-provider op serialization (same keys as `senders`). `set` and
+    /// `clear` hold the provider's lock across the store write **and** the
+    /// watch `send_replace`, so concurrent mutations for one provider can't
+    /// interleave persist and apply (store ending on B while the live watch
+    /// ends on A). `get` stays lock-free: it is a single atomic-enough store
+    /// read and never touches the watch.
+    locks: HashMap<String, tokio::sync::Mutex<()>>,
 }
 
 /// The Alpaca shape of a wire credential; `None` for any other shape (both
@@ -72,8 +79,10 @@ impl CredentialHub {
         provider_ids: &[&str],
     ) -> (Self, HashMap<String, CredentialsSource>) {
         let mut senders = HashMap::new();
+        let mut locks = HashMap::new();
         let mut sources = HashMap::new();
         for &id in provider_ids {
+            locks.insert(id.to_string(), tokio::sync::Mutex::new(()));
             let seed = match store.get(id) {
                 Ok(stored) => stored.as_ref().and_then(to_alpaca),
                 Err(e) => {
@@ -89,6 +98,7 @@ impl CredentialHub {
             Self {
                 store: Arc::new(store),
                 senders,
+                locks,
             },
             sources,
         )
@@ -151,6 +161,10 @@ impl CredentialHub {
                 format!("provider {provider:?} takes an api_key_pair credential"),
             );
         };
+        // Serialize persist+apply per provider: without this, concurrent
+        // set/set (or set/clear) could leave the store on one value and the
+        // live watch on another.
+        let _op_guard = self.locks[provider].lock().await;
         let store = Arc::clone(&self.store);
         let id = provider.to_string();
         match tokio::task::spawn_blocking(move || store.set(&id, &creds)).await {
@@ -165,7 +179,9 @@ impl CredentialHub {
     }
 
     /// Read the stored credentials for `provider` (from the store — the
-    /// single source of truth — never the watch).
+    /// single source of truth — never the watch). Deliberately lock-free
+    /// (see `locks`): a single store read is atomic enough, and a get racing
+    /// a set legitimately observes either side of it.
     pub(crate) async fn get(&self, provider: &str) -> Reply {
         if !self.senders.contains_key(provider) {
             return unknown_provider(provider);
@@ -190,6 +206,9 @@ impl CredentialHub {
         if !self.senders.contains_key(provider) {
             return unknown_provider(provider);
         }
+        // Same per-provider serialization as `set`: a clear racing a set must
+        // not interleave with its persist+apply pair.
+        let _op_guard = self.locks[provider].lock().await;
         let store = Arc::clone(&self.store);
         let id = provider.to_string();
         match tokio::task::spawn_blocking(move || store.clear(&id)).await {

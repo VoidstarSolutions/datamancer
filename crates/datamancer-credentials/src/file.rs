@@ -51,6 +51,15 @@ impl FileBackend {
                 opts.mode(0o600);
             }
             let mut f = opts.open(&tmp)?;
+            // `mode(0o600)` above applies only when the tmp file is newly
+            // created; a pre-existing looser-permissioned tmp survives
+            // `truncate(true)` and its mode would ride the rename into the
+            // real credentials file. Re-establish owner-only unconditionally.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
             f.write_all(&serde_json::to_vec_pretty(map)?)?;
             f.sync_all()?;
         }

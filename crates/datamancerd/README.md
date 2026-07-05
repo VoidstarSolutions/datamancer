@@ -343,7 +343,9 @@ Nothing credential-shaped lives in the config file.
   keychain where it initializes, else a permissions-locked (`0600`) file at
   `<data dir>/credentials.json`. The choice is never silent — `ping` reports
   the active backend as `credential_backend` (`"keychain"`,
-  `"secret-service"`, `"file"`).
+  `"secret-service"`, `"file"`). Setting the `DATAMANCER_CREDENTIALS_FILE`
+  env var forces the file backend at that path — a testing/ops escape hatch
+  (see `datamancer-credentials/README.md`), not a supported config surface.
 - **UDS-only, same-uid gated.** The three credential ops exist **only** on
   the Unix-socket control surface — never on the WS surface (its frame
   vocabulary simply has no such ops). On top of the socket's filesystem

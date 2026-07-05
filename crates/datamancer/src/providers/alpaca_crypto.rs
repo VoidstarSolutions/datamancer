@@ -171,9 +171,14 @@ enum HubSlot {
 impl AlpacaCryptoProvider {
     #[must_use]
     pub fn new(cfg: AlpacaCryptoProviderConfig) -> Self {
+        // Ordering invariant — receiver before build: a rotation after
+        // capture triggers rebuild; before capture is included in the build.
+        // (Capturing after building would mark an in-between rotation seen
+        // while the cached client is stale.)
+        let cred_rx = cfg.credentials.watch();
         let rest = std::sync::Mutex::new(RestState {
             trading: build_trading(&cfg),
-            cred_rx: cfg.credentials.watch(),
+            cred_rx,
         });
         Self {
             cfg,

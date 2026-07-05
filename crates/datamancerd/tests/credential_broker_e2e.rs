@@ -76,9 +76,16 @@ async fn broker_provisions_credentials_and_provider_connects() {
     // 1. Spawn datamancerd directly (NOT through the facade's spawner) with
     //    all four ALPACA_* env vars scrubbed — the point of this test is that
     //    credentials arrive ONLY through the broker, never the env fallback.
+    //    DATAMANCER_CREDENTIALS_FILE pins the broker's store to this
+    //    tempdir: the test must never read, write, or clear the developer's
+    //    real keychain entries.
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_datamancerd"))
         .arg("--config")
         .arg(&config)
+        .env(
+            "DATAMANCER_CREDENTIALS_FILE",
+            dir.path().join("credentials.json"),
+        )
         .env_remove("ALPACA_PAPER_API_KEY_ID")
         .env_remove("ALPACA_PAPER_API_SECRET_KEY")
         .env_remove("ALPACA_LIVE_API_KEY_ID")
