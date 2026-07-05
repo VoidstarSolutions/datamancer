@@ -268,7 +268,8 @@ changes (`account_type`, `venue`) are all hot through the one mechanism,
 with the same persist-then-apply discipline as the credential hub. A parked
 provider services its command channel and fails subscribes fast, mirroring
 the missing-credentials posture; disablement surfaces in-band as
-`ProviderDisconnected` and in `HealthView`. Library parity per decision 9:
+`ProviderDisconnected` and via `get-config` (dedicated `HealthView`
+enrichment lands with cycle 4). Library parity per decision 9:
 the runtime-config source lands on each provider's config struct
 (`Env`/`Static`/`Watch`), like `CredentialsSource`.
 
