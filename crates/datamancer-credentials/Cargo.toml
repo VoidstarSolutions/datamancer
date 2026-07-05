@@ -1,0 +1,18 @@
+[package]
+name = "datamancer-credentials"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Credential storage for datamancer providers: OS keychain with a locked-down file fallback"
+
+[dependencies]
+datamancer-core = { path = "../datamancer-core" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+directories = "6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

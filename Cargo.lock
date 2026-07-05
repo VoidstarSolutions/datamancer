@@ -764,6 +764,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "datamancer-credentials"
+version = "0.1.0"
+dependencies = [
+ "datamancer-core",
+ "directories",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "datamancer-transport-iceoryx2"
 version = "0.1.0"
 dependencies = [
