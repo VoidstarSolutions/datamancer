@@ -11,11 +11,13 @@
 #![forbid(unsafe_code)]
 
 mod file;
+mod keychain;
 
 use std::path::PathBuf;
 
 use datamancer_core::ProviderCredentials;
 pub use file::FileBackend;
+pub use keychain::KeychainBackend;
 
 /// A credential-store failure. Messages never carry secret material.
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +103,28 @@ impl CredentialStore {
     /// Propagates the backend failure.
     pub fn clear(&self, provider: &str) -> Result<(), CredentialError> {
         self.backend.clear(provider)
+    }
+}
+
+impl CredentialStore {
+    /// The platform-default store: OS keychain when it initializes, else the
+    /// file backend at [`default_file_path`]. The choice is never silent —
+    /// read it back via [`Self::backend_name`].
+    ///
+    /// # Errors
+    ///
+    /// [`CredentialError::Backend`] when neither backend is possible (no
+    /// keychain and no derivable home directory for the file path).
+    pub fn open_default() -> Result<Self, CredentialError> {
+        if let Ok(backend) = KeychainBackend::new() {
+            return Ok(Self::with_backend(Box::new(backend)));
+        }
+        let path = default_file_path().ok_or_else(|| {
+            CredentialError::Backend(
+                "no keychain and no home directory for the file fallback".to_string(),
+            )
+        })?;
+        Ok(Self::with_backend(Box::new(FileBackend::new(path))))
     }
 }
 
@@ -199,5 +223,14 @@ mod tests {
         let store =
             CredentialStore::with_backend(Box::new(FileBackend::new(dir.path().join("c.json"))));
         assert_eq!(store.backend_name(), "file");
+    }
+
+    #[test]
+    fn open_default_always_selects_some_backend() {
+        // On any host with a home dir this must succeed — keychain if the
+        // platform store is up, else the file fallback. Never silently: the
+        // name says which.
+        let store = CredentialStore::open_default().expect("some backend");
+        assert!(["keychain", "secret-service", "file"].contains(&store.backend_name()));
     }
 }
