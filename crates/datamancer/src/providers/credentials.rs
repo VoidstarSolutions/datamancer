@@ -104,20 +104,7 @@ impl CredentialsSource {
 pub(crate) fn rest_credentials_changed(
     cred_rx: &mut Option<tokio::sync::watch::Receiver<Option<AlpacaCredentials>>>,
 ) -> bool {
-    let Some(rx) = cred_rx.as_mut() else {
-        return false;
-    };
-    match rx.has_changed() {
-        Ok(true) => {
-            let _ = rx.borrow_and_update();
-            true
-        }
-        Ok(false) => false,
-        Err(_) => {
-            *cred_rx = None;
-            true
-        }
-    }
+    super::runtime::watch_changed(cred_rx)
 }
 
 #[cfg(test)]

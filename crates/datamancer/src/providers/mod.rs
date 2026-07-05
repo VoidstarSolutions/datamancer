@@ -9,6 +9,8 @@ pub mod alpaca;
 pub mod alpaca_crypto;
 #[cfg(feature = "provider-alpaca")]
 pub mod credentials;
+#[cfg(feature = "provider-alpaca")]
+pub mod runtime;
 
 #[cfg(feature = "provider-alpaca")]
 pub use alpaca::{AlpacaProvider, AlpacaProviderConfig, AlpacaStreamFeed};
@@ -22,3 +24,5 @@ pub use credentials::{AlpacaCredentials, CredentialsSource};
 /// without depending on `oxidized_alpaca` directly.
 #[cfg(feature = "provider-alpaca")]
 pub use oxidized_alpaca::AccountType;
+#[cfg(feature = "provider-alpaca")]
+pub use runtime::SettingsSource;
