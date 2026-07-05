@@ -84,6 +84,11 @@ impl ConfigHub {
         )
     }
 
+    /// The authoritative current config (clones under the lock).
+    pub(crate) async fn current(&self) -> Config {
+        self.state.lock().await.current.clone()
+    }
+
     /// The current config as JSON plus the cold-field divergence flag.
     pub(crate) async fn get_config(&self) -> Reply {
         let state = self.state.lock().await;
@@ -154,19 +159,30 @@ impl ConfigHub {
     /// Replace the whole config (the web UI's PUT path). Hot provider
     /// changes apply live; returns whether cold fields now diverge from the
     /// boot config.
-    #[allow(dead_code, reason = "consumed by the web-ui config delegation task")]
     pub(crate) async fn apply_full(&self, new: Config) -> Result<bool> {
         let mut state = self.state.lock().await;
-        let path = self.path.clone();
-        let candidate = new.clone();
-        tokio::task::spawn_blocking(move || candidate.save(&path))
-            .await
-            .map_err(|e| {
-                crate::error::DaemonError::ConfigInvalid(format!("config task failed: {e}"))
-            })??;
+        self.save_to_disk(&new).await?;
         state.current = new;
         self.apply(&state.current);
         Ok(!cold_divergence(&self.boot, &state.current).is_empty())
+    }
+
+    /// Atomically persist `candidate` to the config file, off the shared
+    /// runtime (small-file blocking I/O). Does not touch `state` — callers
+    /// commit it themselves once this returns `Ok`. A join failure (the
+    /// blocking task panicked or was cancelled) is an I/O-shaped failure of
+    /// ours, not a validation rejection of the caller's config, so it maps to
+    /// [`DaemonError::Io`] rather than [`DaemonError::ConfigInvalid`].
+    async fn save_to_disk(&self, candidate: &Config) -> Result<()> {
+        let path = self.path.clone();
+        let to_write = candidate.clone();
+        tokio::task::spawn_blocking(move || to_write.save(&path))
+            .await
+            .map_err(|e| {
+                crate::error::DaemonError::Io(std::io::Error::other(format!(
+                    "config task failed: {e}"
+                )))
+            })?
     }
 
     /// Validate + atomically persist `candidate`; commit it to `state`
@@ -180,24 +196,18 @@ impl ConfigHub {
         state: &mut tokio::sync::MutexGuard<'_, HubState>,
         candidate: Config,
     ) -> std::result::Result<(), Reply> {
-        let path = self.path.clone();
-        let to_write = candidate.clone();
-        match tokio::task::spawn_blocking(move || to_write.save(&path)).await {
-            Ok(Ok(())) => {
+        match self.save_to_disk(&candidate).await {
+            Ok(()) => {
                 state.current = candidate;
                 Ok(())
             }
-            Ok(Err(crate::error::DaemonError::ConfigInvalid(msg))) => Err(Reply::error(
+            Err(crate::error::DaemonError::ConfigInvalid(msg)) => Err(Reply::error(
                 codes::BAD_REQUEST,
                 format!("config rejected: {msg}"),
             )),
-            Ok(Err(e)) => Err(Reply::error(
-                codes::INTERNAL,
-                format!("config persist failed: {e}"),
-            )),
             Err(e) => Err(Reply::error(
                 codes::INTERNAL,
-                format!("config task failed: {e}"),
+                format!("config persist failed: {e}"),
             )),
         }
     }
@@ -384,6 +394,42 @@ mod tests {
             get_reply.config.unwrap()["provider"]["alpaca"].is_null(),
             "in-memory state must not diverge from what was actually persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_full_with_cold_and_hot_changes_reports_divergence_applies_and_persists() {
+        let (hub, sources, dir) = hub_with("[provider]\n");
+        assert_eq!(sources.alpaca.current(), None);
+
+        let mut new = hub.current().await;
+        new.provider.alpaca = Some(AlpacaSection {
+            account_type: crate::config::AccountTypeCfg::Live,
+        });
+        new.session.resume_buffer_events = 42;
+
+        let restart_required = hub.apply_full(new.clone()).await.expect("apply_full");
+        assert!(restart_required, "cold field changed vs boot");
+        assert_eq!(
+            sources.alpaca.current().map(|s| s.account_type),
+            Some(datamancer::providers::AccountType::Live),
+            "hot provider change applied live"
+        );
+        let on_disk = Config::load(dir.path().join("config.toml")).expect("reload");
+        assert_eq!(on_disk, new, "file round-trips the new config");
+    }
+
+    #[tokio::test]
+    async fn apply_full_with_only_hot_changes_reports_no_divergence() {
+        let (hub, sources, _dir) = hub_with("[provider]\n");
+
+        let mut new = hub.current().await;
+        new.provider.alpaca = Some(AlpacaSection {
+            account_type: crate::config::AccountTypeCfg::Paper,
+        });
+
+        let restart_required = hub.apply_full(new).await.expect("apply_full");
+        assert!(!restart_required, "no cold field changed vs boot");
+        assert!(sources.alpaca.current().is_some());
     }
 
     #[tokio::test]

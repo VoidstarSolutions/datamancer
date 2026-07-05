@@ -159,7 +159,8 @@ mod tests {
         boot.save(&path).expect("seed config");
         // Leak the tempdir so the file outlives the helper (test-only).
         std::mem::forget(dir);
-        ConfigState::new(path, boot)
+        let (hub, _sources) = crate::config_hub::ConfigHub::bootstrap(boot.clone(), path.clone());
+        ConfigState::new(path, boot, hub)
     }
 
     #[tokio::test]

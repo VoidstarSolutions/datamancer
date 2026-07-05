@@ -1,17 +1,22 @@
 //! The web layer's handle to the daemon's config file.
 //!
 //! Holds the resolved config path and the exact [`Config`] the daemon booted
-//! with. The daemon's runtime is immutable after boot (apply-on-restart), so
-//! this handle only reads and rewrites the *file*; `restart_required` is
-//! parsed-config inequality between the on-disk file and the boot config —
-//! a save that restores the boot config clears the flag even though comments
-//! were lost.
+//! with, plus the [`ConfigHub`](crate::config_hub::ConfigHub) that is the
+//! daemon's sole hot-path config writer. `write` delegates the full
+//! validate→persist→apply sequence to the hub — this layer no longer touches
+//! the file directly. `restart_required` is `true` when either the on-disk
+//! file's cold fields diverge from the boot config, or the on-disk file
+//! diverges from what the hub currently has applied (an external hand-edit
+//! the hub hasn't seen yet) — a hand-edited hot field still needs a restart
+//! to take effect, since hand edits are boot-time only.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
+use crate::config_class::cold_divergence;
+use crate::config_hub::ConfigHub;
 use crate::error::{DaemonError, Result};
 
 /// Placeholder emitted in place of a real secret (currently `[ws].auth_token`)
@@ -29,6 +34,7 @@ pub struct ConfigState {
 struct Inner {
     path: PathBuf,
     boot: Config,
+    hub: Arc<ConfigHub>,
     restart_required: AtomicBool,
     // Serializes read-disk/write so concurrent `PUT /api/config` calls don't
     // race on the shared `<path>.tmp` sibling file or interleave flag updates.
@@ -36,13 +42,15 @@ struct Inner {
 }
 
 impl ConfigState {
-    /// Build from the resolved config path and the boot-time config.
+    /// Build from the resolved config path, the boot-time config, and the
+    /// hub that owns all hot-path writes.
     #[must_use]
-    pub fn new(path: PathBuf, boot: Config) -> Self {
+    pub fn new(path: PathBuf, boot: Config, hub: Arc<ConfigHub>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 path,
                 boot,
+                hub,
                 restart_required: AtomicBool::new(false),
                 io_lock: tokio::sync::Mutex::new(()),
             }),
@@ -83,21 +91,22 @@ impl ConfigState {
                 source,
             })?;
         let config = Config::parse(&text)?;
-        self.store_flag(&config);
+        self.store_disk_flag(&config).await;
         Ok(config)
     }
 
-    /// Validate and atomically write `config` to the file, then recompute the
-    /// restart flag. Nothing is written (and the flag is unchanged) on failure.
+    /// Validate and apply `config` via the hub (the sole hot-path writer):
+    /// validate → persist → apply, then recompute the restart flag from the
+    /// hub's cold-divergence verdict. Nothing is written (and the flag is
+    /// unchanged) on failure.
     ///
     /// Serialized against concurrent `read_disk`/`write` calls: two in-flight
-    /// `PUT /api/config` requests would otherwise share the fixed
-    /// `<path>.tmp` sibling file and could tear each other's write or race
-    /// the restart-required flag.
+    /// `PUT /api/config` requests would otherwise race the preserve-on-write
+    /// secret read against each other or interleave restart-flag updates.
     ///
     /// # Errors
     ///
-    /// Propagates [`Config::save`] errors.
+    /// Propagates [`crate::config_hub::ConfigHub::apply_full`] errors.
     pub async fn write(&self, config: &Config) -> Result<()> {
         let _guard = self.inner.io_lock.lock().await;
         let mut config = config.clone();
@@ -122,25 +131,25 @@ impl ConfigState {
             let current = Config::parse(&text)?;
             ws.auth_token = current.ws.and_then(|w| w.auth_token);
         }
-        let path = self.inner.path.clone();
-        // `save` is small-file blocking I/O; keep it off the shared runtime.
-        let config_result =
-            tokio::task::spawn_blocking(move || config.save(&path).map(|()| config))
-                .await
-                .map_err(|e| {
-                    DaemonError::Io(std::io::Error::other(format!(
-                        "config write task failed: {e}"
-                    )))
-                })?;
-        let saved = config_result?;
-        self.store_flag(&saved);
+        let restart_required = self.inner.hub.apply_full(config).await?;
+        self.inner
+            .restart_required
+            .store(restart_required, Ordering::Relaxed);
         Ok(())
     }
 
-    fn store_flag(&self, on_disk: &Config) {
+    /// Recompute the restart flag for the `read_disk` (display) path: a hand
+    /// edit is flagged whenever its cold fields diverge from the boot config,
+    /// or whenever it diverges at all from what the hub currently has applied
+    /// (an edit the hub hasn't seen — and, being hot-only-at-boot, never will
+    /// apply live — still needs a restart to take effect).
+    async fn store_disk_flag(&self, on_disk: &Config) {
+        let hub_current = self.inner.hub.current().await;
+        let restart_required =
+            !cold_divergence(&self.inner.boot, on_disk).is_empty() || *on_disk != hub_current;
         self.inner
             .restart_required
-            .store(*on_disk != self.inner.boot, Ordering::Relaxed);
+            .store(restart_required, Ordering::Relaxed);
     }
 }
 
@@ -283,11 +292,16 @@ mod tests {
 
     const MINIMAL: &str = "[provider.alpaca]\naccount_type = \"paper\"\n";
 
+    fn config_state(path: PathBuf, boot: Config) -> ConfigState {
+        let (hub, _sources) = crate::config_hub::ConfigHub::bootstrap(boot.clone(), path.clone());
+        ConfigState::new(path, boot, hub)
+    }
+
     fn boot_state(dir: &std::path::Path) -> (ConfigState, Config) {
         let path = dir.join("config.toml");
         let boot = Config::parse(MINIMAL).expect("parse");
         boot.save(&path).expect("seed file");
-        (ConfigState::new(path, boot.clone()), boot)
+        (config_state(path, boot.clone()), boot)
     }
 
     #[tokio::test]
@@ -361,7 +375,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let boot = Config::parse(WITH_TOKEN).expect("parse");
         boot.save(&path).expect("seed");
-        let state = ConfigState::new(path, boot);
+        let state = config_state(path, boot);
 
         let resp = get_config(State(state)).await;
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
@@ -376,7 +390,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let boot = Config::parse(WITH_TOKEN).expect("parse");
         boot.save(&path).expect("seed");
-        let state = ConfigState::new(path, boot.clone());
+        let state = config_state(path, boot.clone());
 
         // The UI echoes back the redacted view unchanged: token == placeholder.
         let mut echoed = boot.clone();
@@ -398,7 +412,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let boot = Config::parse(WITH_TOKEN).expect("parse");
         boot.save(&path).expect("seed");
-        let state = ConfigState::new(path, boot.clone());
+        let state = config_state(path, boot.clone());
 
         let mut changed = boot.clone();
         changed.ws.as_mut().unwrap().auth_token = Some("rotated-token".to_string());
@@ -418,7 +432,7 @@ mod tests {
             Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n\n[ws]\nenabled = true\n")
                 .expect("parse");
         boot.save(&path).expect("seed");
-        let state = ConfigState::new(path, boot.clone());
+        let state = config_state(path, boot.clone());
 
         let mut echoed = boot.clone();
         echoed.ws.as_mut().unwrap().auth_token = Some(REDACTED_SECRET.to_string());
@@ -433,7 +447,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let boot = Config::parse(WITH_TOKEN).expect("parse");
         boot.save(&path).expect("seed");
-        let state = ConfigState::new(path.clone(), boot.clone());
+        let state = config_state(path.clone(), boot.clone());
 
         // The on-disk file is corrupted behind the daemon's back, so the real
         // token can no longer be recovered for a placeholder round-trip.
@@ -451,5 +465,41 @@ mod tests {
         // cleared-auth config replaced it.
         let raw = std::fs::read_to_string(&path).expect("read raw");
         assert_eq!(raw, "this is not valid toml {{{");
+    }
+
+    #[tokio::test]
+    async fn hot_only_web_edit_does_not_require_restart_and_applies_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let boot = Config::parse("[provider]\n").unwrap();
+        boot.save(&path).unwrap();
+        let (hub, sources) = crate::config_hub::ConfigHub::bootstrap(boot.clone(), path.clone());
+        let state = ConfigState::new(path, boot.clone(), hub);
+
+        let mut edited = boot.clone();
+        edited.provider.alpaca = Some(crate::config::AlpacaSection {
+            account_type: crate::config::AccountTypeCfg::Live,
+        });
+        state.write(&edited).await.expect("write");
+        assert!(
+            !state.restart_required(),
+            "hot-only edit must not require restart"
+        );
+        assert!(sources.alpaca.current().is_some(), "hot edit applies live");
+    }
+
+    #[tokio::test]
+    async fn cold_web_edit_requires_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let boot = Config::parse("[provider]\n").unwrap();
+        boot.save(&path).unwrap();
+        let (hub, _sources) = crate::config_hub::ConfigHub::bootstrap(boot.clone(), path.clone());
+        let state = ConfigState::new(path, boot.clone(), hub);
+
+        let mut edited = boot.clone();
+        edited.session.resume_buffer_events = 42;
+        state.write(&edited).await.expect("write");
+        assert!(state.restart_required());
     }
 }

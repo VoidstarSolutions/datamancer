@@ -183,9 +183,10 @@ mod tests {
         let boot =
             crate::config::Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n").unwrap();
         boot.save(&path).unwrap();
+        let (hub, _sources) = crate::config_hub::ConfigHub::bootstrap(boot.clone(), path.clone());
         let state = crate::web::AppState {
             snapshots: refreshers.state.clone(),
-            config: crate::web::ConfigState::new(path, boot),
+            config: crate::web::ConfigState::new(path, boot, hub),
         };
         let app = crate::web::router(state, None);
 

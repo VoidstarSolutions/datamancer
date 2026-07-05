@@ -173,8 +173,6 @@ impl Server {
         let web = config.web_ui.clone();
         #[cfg(feature = "ws")]
         let ws = config.ws.clone();
-        #[cfg(feature = "web-ui")]
-        let config_state = crate::web::ConfigState::new(config_path.clone(), config.clone());
         tracing::debug!(
             live_state_ms = config.diagnostics.publish_interval_ms,
             cache_catalog_ms = config.diagnostics.cache_catalog_interval_ms,
@@ -191,6 +189,9 @@ impl Server {
 
         let (config_hub, provider_settings) =
             crate::config_hub::ConfigHub::bootstrap(config.clone(), config_path.clone());
+        #[cfg(feature = "web-ui")]
+        let config_state =
+            crate::web::ConfigState::new(config_path.clone(), config.clone(), config_hub.clone());
 
         let built = config.build_runtime(&sources, provider_settings).await?;
         let dm = built.datamancer;
@@ -784,20 +785,6 @@ async fn accept_loop(
     }
 }
 
-/// One long-lived control connection. Reads newline-delimited JSON requests,
-/// forwards each to the server actor, writes the reply line. On EOF, if this
-/// connection had opened a client, signals an emergency teardown.
-///
-/// `Request::Instruments`, the credential ops, and the config-service ops
-/// are dispatched here, off-actor, rather than forwarded to the actor: the
-/// first awaits a live provider REST call, the credential ops do blocking
-/// credential-store I/O (behind `spawn_blocking`) — neither may stall
-/// unrelated control traffic on the single-actor loop. `get-config` is
-/// ungated (the config never contains secrets); the credential ops,
-/// `configure-provider`/`remove-provider`, and `shutdown` are additionally
-/// gated on the peer's uid matching the daemon's own effective uid, captured
-/// per-connection before the stream is split. `shutdown` is forwarded to the
-/// actor (a run-loop decision, not hub state) once the gate passes.
 /// Route an already-gated credential op to the credential hub.
 async fn dispatch_credential_op(request: Request, hub: &CredentialHub) -> Reply {
     match request {
@@ -849,6 +836,20 @@ async fn dispatch_config_op(
     })
 }
 
+/// One long-lived control connection. Reads newline-delimited JSON requests,
+/// forwards each to the server actor, writes the reply line. On EOF, if this
+/// connection had opened a client, signals an emergency teardown.
+///
+/// `Request::Instruments`, the credential ops, and the config-service ops
+/// are dispatched here, off-actor, rather than forwarded to the actor: the
+/// first awaits a live provider REST call, the credential ops do blocking
+/// credential-store I/O (behind `spawn_blocking`) — neither may stall
+/// unrelated control traffic on the single-actor loop. `get-config` is
+/// ungated (the config never contains secrets); the credential ops,
+/// `configure-provider`/`remove-provider`, and `shutdown` are additionally
+/// gated on the peer's uid matching the daemon's own effective uid, captured
+/// per-connection before the stream is split. `shutdown` is forwarded to the
+/// actor (a run-loop decision, not hub state) once the gate passes.
 async fn handle_connection(
     stream: UnixStream,
     cmd_tx: mpsc::Sender<ServerCommand>,
