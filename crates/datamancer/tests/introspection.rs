@@ -625,3 +625,19 @@ async fn snapshot_does_not_block_under_load() {
     }
     pump.await.unwrap();
 }
+
+#[tokio::test]
+async fn health_reduces_live_snapshot_with_library_version() {
+    let dm = Datamancer::builder().build().unwrap();
+
+    let health = dm.health();
+
+    assert_eq!(
+        health.schema_version,
+        datamancer_core::HealthView::SCHEMA_VERSION
+    );
+    assert_eq!(
+        health.daemon.version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}

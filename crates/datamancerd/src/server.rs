@@ -532,6 +532,7 @@ impl Server {
                 }
             }
             Request::ListClients => Reply::clients(self.clients.keys().cloned().collect()),
+            Request::Ping => Reply::pong(env!("CARGO_PKG_VERSION")),
             Request::Snapshot => match self.dm.snapshot().await {
                 Ok(snapshot) => Reply::snapshot(snapshot),
                 Err(e) => reply_from_library_error(&e),
@@ -838,4 +839,25 @@ fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
     Ok(tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    /// `AppHandle::ensure`'s version gate (`datamancer-client`'s
+    /// `app::check_version`) requires the daemon's `ping` version
+    /// (`env!("CARGO_PKG_VERSION")`, stamped above in `Request::Ping`) to be
+    /// major.minor-compatible with the client's own `CARGO_PKG_VERSION` —
+    /// but `datamancerd` and `datamancer-client` version independently in
+    /// this workspace. Nothing else enforces they stay in lockstep, so pin
+    /// it here: this test fails the moment one crate is bumped without the
+    /// other, which is the signal to bump both together.
+    #[test]
+    fn daemon_and_client_versions_stay_in_lockstep() {
+        assert_eq!(
+            env!("CARGO_PKG_VERSION"),
+            datamancer_client::VERSION,
+            "datamancerd and datamancer-client must be version-bumped together — \
+             the ping version gate in AppHandle::ensure compares them"
+        );
+    }
 }

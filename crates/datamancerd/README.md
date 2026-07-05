@@ -301,6 +301,7 @@ One JSON object per line; one reply line per request.
 {"op":"instruments","provider":"alpaca-crypto"}
   -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
+{"op":"ping"}          -> {"ok":true,"version":"0.2.0"}
 ```
 
 `instruments` enumerates the discoverable catalog and, per entry, the
@@ -310,6 +311,9 @@ the filter when you know the provider). Because it awaits a live provider
 REST call, it is dispatched off the single-actor control loop (in the
 per-connection task) so it cannot stall unrelated `open-client`/`subscribe`/
 etc. traffic on other connections.
+
+`ping` needs no registered client and reports the daemon's crate version;
+the app facade uses it for spawn-readiness and version-skew detection.
 
 Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 (`live_session_conflict`, `unsupported_event_kind`, `persistence_required`,
