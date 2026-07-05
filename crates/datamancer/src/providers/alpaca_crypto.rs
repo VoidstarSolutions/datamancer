@@ -247,7 +247,10 @@ impl Provider for AlpacaCryptoProvider {
         PROVIDER_ID
     }
 
-    fn supports(&self, _instrument: &Instrument, kind: EventKind) -> bool {
+    fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool {
+        if instrument.asset_class() != AssetClass::Crypto {
+            return false;
+        }
         match kind {
             EventKind::Trade
             | EventKind::Quote

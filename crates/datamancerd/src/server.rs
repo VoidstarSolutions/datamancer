@@ -512,6 +512,12 @@ impl Server {
             ServerCommand::Request { request, reply } => {
                 if matches!(request, Request::Shutdown) && !self.draining {
                     tracing::info!("shutdown requested via control op");
+                    // Best-effort: this reply is delivered via the oneshot
+                    // before we break the actor loop below, but the
+                    // connection task writes it out to the socket while the
+                    // drain (started by the break) runs concurrently —
+                    // same-host best-effort, not guaranteed to reach the
+                    // caller before drain completes.
                     let _ = reply.send(Reply::ok());
                     return std::ops::ControlFlow::Break(());
                 }

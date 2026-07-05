@@ -266,7 +266,13 @@ impl Provider for AlpacaProvider {
         PROVIDER_ID
     }
 
-    fn supports(&self, _instrument: &Instrument, kind: EventKind) -> bool {
+    fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool {
+        if !matches!(
+            instrument.asset_class(),
+            AssetClass::Equity | AssetClass::Etf
+        ) {
+            return false;
+        }
         match kind {
             EventKind::Trade
             | EventKind::Quote

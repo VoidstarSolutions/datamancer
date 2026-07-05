@@ -401,7 +401,7 @@ fn daemon_config_from(reply: &Reply) -> Result<DaemonConfig, ClientError<Iceoryx
 /// Map an ok config-mutation reply's `applied` field to [`Applied`].
 fn applied_from(reply: &Reply) -> Applied {
     match reply.applied.as_deref() {
-        Some("restart_required") => Applied::RestartRequired,
+        Some(crate::codes::RESTART_REQUIRED) => Applied::RestartRequired,
         _ => Applied::Live,
     }
 }
