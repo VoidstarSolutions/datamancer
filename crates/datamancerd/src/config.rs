@@ -683,8 +683,12 @@ impl Config {
         }
         if let Some(crypto) = self.provider.alpaca_crypto {
             let provider = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
-                account_type: crypto.account_type.into(),
-                venue: crypto.venue.into(),
+                settings: datamancer::providers::SettingsSource::Static(
+                    datamancer::providers::AlpacaCryptoSettings {
+                        account_type: crypto.account_type.into(),
+                        venue: crypto.venue.into(),
+                    },
+                ),
                 credentials: sources
                     .get(alpaca_crypto::PROVIDER_ID)
                     .cloned()

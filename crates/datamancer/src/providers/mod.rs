@@ -15,7 +15,9 @@ pub mod runtime;
 #[cfg(feature = "provider-alpaca")]
 pub use alpaca::{AlpacaProvider, AlpacaProviderConfig, AlpacaSettings, AlpacaStreamFeed};
 #[cfg(feature = "provider-alpaca")]
-pub use alpaca_crypto::{AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue};
+pub use alpaca_crypto::{
+    AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoSettings, AlpacaCryptoVenue,
+};
 #[cfg(feature = "provider-alpaca")]
 pub use credentials::{AlpacaCredentials, CredentialsSource};
 /// Re-exported provider account selector (`Paper`/`Live`); the actual

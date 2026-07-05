@@ -94,22 +94,9 @@ impl CredentialsSource {
     }
 }
 
-/// Whether the cached REST-side receiver has an unseen rotation, consuming
-/// the change marker. Shared by both providers' rebuild-on-use guards.
-///
-/// On a closed channel (sender dropped) tokio's `has_changed` returns `Err`
-/// even when a final unseen rotation is pending, so `Err` counts as changed
-/// — the caller rebuilds once with the last value — and the receiver is
-/// dropped so subsequent calls return `false` instead of rebuilding forever.
-pub(crate) fn rest_credentials_changed(
-    cred_rx: &mut Option<tokio::sync::watch::Receiver<Option<AlpacaCredentials>>>,
-) -> bool {
-    super::runtime::watch_changed(cred_rx)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AlpacaCredentials, CredentialsSource, Resolved, rest_credentials_changed};
+    use super::{AlpacaCredentials, CredentialsSource, Resolved};
 
     fn creds(key: &str) -> AlpacaCredentials {
         AlpacaCredentials {
@@ -159,40 +146,6 @@ mod tests {
         let fresh = source.watch().expect("watchable");
         tx.send(Some(creds("A"))).unwrap();
         assert_eq!(fresh.has_changed().ok(), Some(true));
-    }
-
-    #[test]
-    fn rest_change_detection_consumes_the_marker() {
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        let source = CredentialsSource::Watch(rx);
-        let mut cached = source.watch();
-        assert!(!rest_credentials_changed(&mut cached));
-        tx.send(Some(creds("A"))).unwrap();
-        assert!(rest_credentials_changed(&mut cached));
-        // Marker consumed: the same rotation must not rebuild twice.
-        assert!(!rest_credentials_changed(&mut cached));
-    }
-
-    #[test]
-    fn rest_change_detection_syncs_once_on_closed_channel() {
-        // A final rotation delivered just before the sender drops must
-        // still be picked up (tokio reports `Err` from `has_changed` on a
-        // closed channel even when an unseen value is pending) — but
-        // exactly once, not on every subsequent call.
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        let source = CredentialsSource::Watch(rx);
-        let mut cached = source.watch();
-        tx.send(Some(creds("FINAL"))).unwrap();
-        drop(tx);
-        assert!(rest_credentials_changed(&mut cached));
-        assert!(!rest_credentials_changed(&mut cached));
-        assert!(!rest_credentials_changed(&mut cached));
-    }
-
-    #[test]
-    fn rest_change_detection_ignores_non_watch_sources() {
-        let mut cached = CredentialsSource::Env.watch();
-        assert!(!rest_credentials_changed(&mut cached));
     }
 
     #[test]
