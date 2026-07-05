@@ -34,8 +34,11 @@ cargo run -p datamancerd -- --config datamancerd.toml
 cargo test -p datamancerd --test daemon_e2e -- --ignored
 ```
 
-Provider credentials are **not** in the config. The `account_type` selects which
-environment credential pair `oxidized_alpaca` loads
+Provider credentials are **not** in the config. They live in the daemon-owned
+credential store, provisioned over the control socket with `set-credentials`
+(see [Credentials](#credentials)). The `account_type` selects paper vs. live
+endpoints — and, for the deprecated env-var fallback only, which environment
+pair is read at startup
 (`paper` → `ALPACA_PAPER_API_KEY_ID`/`ALPACA_PAPER_API_SECRET_KEY`,
 `live` → `ALPACA_LIVE_API_KEY_ID`/`ALPACA_LIVE_API_SECRET_KEY`).
 
@@ -301,7 +304,13 @@ One JSON object per line; one reply line per request.
 {"op":"instruments","provider":"alpaca-crypto"}
   -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
-{"op":"ping"}          -> {"ok":true,"version":"0.2.0"}
+{"op":"ping"}          -> {"ok":true,"version":"0.2.0","credential_backend":"keychain"}
+{"op":"set-credentials","provider":"alpaca-crypto","credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
+  -> {"ok":true}
+{"op":"get-credentials","provider":"alpaca-crypto"}
+  -> {"ok":true,"credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
+{"op":"clear-credentials","provider":"alpaca-crypto"}
+  -> {"ok":true}
 ```
 
 `instruments` enumerates the discoverable catalog and, per entry, the
@@ -312,15 +321,59 @@ REST call, it is dispatched off the single-actor control loop (in the
 per-connection task) so it cannot stall unrelated `open-client`/`subscribe`/
 etc. traffic on other connections.
 
-`ping` needs no registered client and reports the daemon's crate version;
-the app facade uses it for spawn-readiness and version-skew detection.
+`ping` needs no registered client and reports the daemon's crate version plus
+the active credential-store backend; the app facade uses it for
+spawn-readiness and version-skew detection.
 
 Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 (`live_session_conflict`, `unsupported_event_kind`, `persistence_required`,
 `unsupported_client_scope`, `duplicate_subscription`, `not_subscribed`,
 `unknown_provider`, `unknown_client`, `duplicate_client`,
-`service_cap_exceeded`, `bad_request`, `shutting_down`, …). These are an
-operator contract and are regression-guarded.
+`service_cap_exceeded`, `bad_request`, `shutting_down`,
+`credentials_missing`, `credential_backend_unavailable`, `permission_denied`,
+…). These are an operator contract and are regression-guarded.
+
+## Credentials
+
+The daemon is the **one holder** of provider credentials: a single
+daemon-owned credential store, provisioned and read over the control socket.
+Nothing credential-shaped lives in the config file.
+
+- **Store + backend selection.** The store opens at bootstrap: the OS
+  keychain where it initializes, else a permissions-locked (`0600`) file at
+  `<data dir>/credentials.json`. The choice is never silent — `ping` reports
+  the active backend as `credential_backend` (`"keychain"`,
+  `"secret-service"`, `"file"`).
+- **UDS-only, same-uid gated.** The three credential ops exist **only** on
+  the Unix-socket control surface — never on the WS surface (its frame
+  vocabulary simply has no such ops). On top of the socket's filesystem
+  permissions, each credential op checks the connection's kernel-reported
+  peer uid (`SO_PEERCRED`/`getpeereid`) against the daemon's own effective
+  uid; a mismatch — or an unreadable peer — gets `permission_denied`. Other
+  control ops are unaffected by the gate.
+- **Hot-apply.** `set-credentials` persists to the store, then applies live:
+  the running provider reconnects its stream with the new credentials and
+  rebuilds its REST clients on next use. No restart, no resubscribe — the
+  session and its `seq` stream carry across the rotation (consumers see the
+  usual in-band reconnect controls).
+- **Clear does not un-apply.** `clear-credentials` empties the store only. A
+  running provider keeps its last applied credentials until the daemon
+  restarts — there is deliberately no live revocation half-state.
+- **Why `get-credentials` exists.** Consuming apps (e.g. a trading process)
+  reuse the same keys for their own provider connections; the daemon's store
+  is the single copy they read instead of keeping a second one. It returns
+  the stored value, so it is exactly what `set-credentials` persisted.
+- **Env vars are deprecated.** When the store has no entry for a configured
+  provider at startup, the daemon falls back to the provider's
+  `ALPACA_{PAPER,LIVE}_API_*` pair and logs a deprecation warning (naming the
+  provider, never values). Provision via `set-credentials`; the fallback will
+  be removed once the broker is proven.
+- **No credentials at start.** With an empty store and no env pair, the
+  provider starts **parked**: it emits no connectivity control, REST-backed
+  ops (`instruments`, historical fetch) fail provider-unavailable, and live
+  subscribes fail until `set-credentials` arrives — at which point it
+  connects without a restart. The bootstrap log states clearly which
+  providers started unprovisioned.
 
 ## WebSocket client surface (feature `ws`)
 

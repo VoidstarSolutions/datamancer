@@ -27,6 +27,8 @@ ws = ["dep:tokio-tungstenite", "datamancer/transport-ws"]
 [dependencies]
 datamancer = { path = "../datamancer", features = ["transport-iceoryx2"] }
 datamancer-client = { path = "../datamancer-client", default-features = false }
+datamancer-core = { path = "../datamancer-core" }
+datamancer-credentials = { path = "../datamancer-credentials" }
 async-trait = "0.1"
 iceoryx2 = "0.9.2"
 tokio = { workspace = true, features = ["signal", "io-util"] }
@@ -39,9 +41,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 directories = "6"
-# Safe flock(2) for the global single-instance lock. Already in the tree
-# transitively; the `fs` feature exposes `rustix::fs::flock`.
-rustix = { version = "1", features = ["fs"] }
+# Safe flock(2) for the global single-instance lock (`fs`) and `geteuid` for
+# the credential-op peer-cred gate (`process`). Already in the tree
+# transitively.
+rustix = { version = "1", features = ["fs", "process"] }
 
 # Web UI / JSON API (feature `web-ui`).
 axum = { version = "0.8", optional = true }
@@ -62,7 +65,6 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false, feat
 
 [dev-dependencies]
 datamancer-client = { path = "../datamancer-client", features = ["ws", "iceoryx2", "app"] }
-datamancer-core = { path = "../datamancer-core" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 arc-swap = "1"
