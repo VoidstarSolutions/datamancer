@@ -586,6 +586,11 @@ impl Server {
                 codes::INTERNAL,
                 "credential ops are dispatched off-actor; this arm is unreachable",
             ),
+            // wired in the config-service dispatch task
+            Request::GetConfig
+            | Request::ConfigureProvider { .. }
+            | Request::RemoveProvider { .. }
+            | Request::Shutdown => Reply::error(codes::INTERNAL, "not yet implemented"),
         }
     }
 

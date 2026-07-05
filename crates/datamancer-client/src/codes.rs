@@ -46,3 +46,9 @@ pub const CREDENTIALS_MISSING: &str = "credentials_missing";
 pub const CREDENTIAL_BACKEND_UNAVAILABLE: &str = "credential_backend_unavailable";
 /// The connection's peer credentials failed the same-uid check.
 pub const PERMISSION_DENIED: &str = "permission_denied";
+/// The op was persisted but a cold-classified field needs a daemon restart
+/// to take effect.
+pub const RESTART_REQUIRED: &str = "restart_required";
+/// A configure-provider payload carried a field the provider's config
+/// section does not define.
+pub const UNKNOWN_CONFIG_FIELD: &str = "unknown_config_field";
