@@ -69,8 +69,9 @@ pub struct Config {
     pub startup_session: Vec<StartupSession>,
 }
 
-/// Provider selection block. Each provider is optional, but at least one must
-/// be present (enforced in [`Config::validate`]).
+/// Provider selection block. Compiled-in providers start disabled; none need be
+/// configured to boot (cycle 3: providers are enabled at runtime via
+/// `configure-provider`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {

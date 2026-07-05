@@ -178,9 +178,9 @@ impl Server {
             "diagnostics cadence (cache-catalog split deferred; single cadence in use)"
         );
 
-        // Open the credential store and seed per-provider watch channels
-        // before building the runtime, so each provider is constructed with
-        // its hot-apply credential source.
+        // Open the credential store and seed watch channels for every
+        // compiled-in provider (so set-credentials works before a provider is
+        // enabled). The deprecated env fallback applies only to configured providers.
         let env_fallback = config.configured_providers();
         let all_ids = crate::config::compiled_provider_ids();
         let (hub, sources) = CredentialHub::bootstrap(&all_ids, &env_fallback)?;
