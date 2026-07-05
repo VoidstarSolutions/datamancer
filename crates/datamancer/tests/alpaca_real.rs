@@ -12,7 +12,9 @@
 
 use std::time::Duration;
 
-use datamancer::providers::{AlpacaProvider, AlpacaProviderConfig, AlpacaStreamFeed};
+use datamancer::providers::{
+    AlpacaProvider, AlpacaProviderConfig, AlpacaSettings, AlpacaStreamFeed, SettingsSource,
+};
 use datamancer::{
     AssetClass, Datamancer, EventKind, Instrument, MarketEvent, PersistenceOptions, Provider,
     ProviderId, Scope,
@@ -24,7 +26,9 @@ use oxidized_alpaca::AccountType;
 #[ignore = "requires real Alpaca credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
 async fn live_test_feed_yields_an_event() {
     let provider = AlpacaProvider::new(AlpacaProviderConfig {
-        account_type: AccountType::Paper,
+        settings: SettingsSource::Static(AlpacaSettings {
+            account_type: AccountType::Paper,
+        }),
         stream_feed: AlpacaStreamFeed::Test,
         ..Default::default()
     });
@@ -74,7 +78,9 @@ async fn live_test_feed_yields_an_event() {
 #[ignore = "requires real Alpaca credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
 async fn live_test_feed_delivers_a_trade() {
     let provider = AlpacaProvider::new(AlpacaProviderConfig {
-        account_type: AccountType::Paper,
+        settings: SettingsSource::Static(AlpacaSettings {
+            account_type: AccountType::Paper,
+        }),
         stream_feed: AlpacaStreamFeed::Test,
         ..Default::default()
     });

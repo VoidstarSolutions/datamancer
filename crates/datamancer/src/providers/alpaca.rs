@@ -42,6 +42,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
+use super::runtime::SettingsSource;
 use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca-backed provider.
@@ -102,12 +103,22 @@ pub enum AlpacaStreamFeed {
     Test,
 }
 
+/// Runtime settings for [`AlpacaProvider`] — the hot-reconfigurable subset
+/// of its configuration, delivered through a [`SettingsSource`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlpacaSettings {
+    /// Paper or live account; selects endpoints and, for the legacy `Env`
+    /// credential source, which env credential pair is loaded.
+    pub account_type: AccountType,
+}
+
 /// Configuration for [`AlpacaProvider`].
 #[derive(Clone, Debug)]
 pub struct AlpacaProviderConfig {
-    /// Paper or live account; selects which credential pair is loaded from
-    /// the environment by `oxidized_alpaca`.
-    pub account_type: AccountType,
+    /// Runtime settings source. `Static` (the default) is always enabled;
+    /// `Watch` is the daemon's enable/disable + hot-settings seam (`None` =
+    /// disabled: the streaming task parks and REST calls fail unavailable).
+    pub settings: SettingsSource<AlpacaSettings>,
     /// Which streaming endpoint to connect to.
     pub stream_feed: AlpacaStreamFeed,
     /// Reconnect/retry policy for the live websocket.
@@ -121,7 +132,9 @@ pub struct AlpacaProviderConfig {
 impl Default for AlpacaProviderConfig {
     fn default() -> Self {
         Self {
-            account_type: AccountType::Paper,
+            settings: SettingsSource::Static(AlpacaSettings {
+                account_type: AccountType::Paper,
+            }),
             stream_feed: AlpacaStreamFeed::Iex,
             reconnect: ReconnectPolicy::default(),
             credentials: CredentialsSource::Env,
@@ -144,17 +157,26 @@ struct RestClients {
 }
 
 fn build_rest(cfg: &AlpacaProviderConfig) -> RestClients {
+    let Some(settings) = cfg.settings.current() else {
+        return RestClients {
+            market_data: None,
+            trading: None,
+        };
+    };
     match cfg.credentials.current() {
         Resolved::Env => RestClients {
-            market_data: MarketDataClient::new(cfg.account_type).ok(),
-            trading: TradingClient::new(cfg.account_type).ok(),
+            market_data: MarketDataClient::new(settings.account_type).ok(),
+            trading: TradingClient::new(settings.account_type).ok(),
         },
         Resolved::Creds(c) => {
             let key = c.to_api_key();
             RestClients {
-                market_data: MarketDataClient::new_with_credentials(cfg.account_type, key.clone())
-                    .ok(),
-                trading: TradingClient::new_with_credentials(cfg.account_type, key).ok(),
+                market_data: MarketDataClient::new_with_credentials(
+                    settings.account_type,
+                    key.clone(),
+                )
+                .ok(),
+                trading: TradingClient::new_with_credentials(settings.account_type, key).ok(),
             }
         }
         Resolved::Missing => RestClients {
@@ -172,6 +194,9 @@ struct RestState {
     /// `Some` only for [`CredentialsSource::Watch`]; `has_changed` on this
     /// cached receiver is the rebuild trigger.
     cred_rx: Option<watch::Receiver<Option<AlpacaCredentials>>>,
+    /// `Some` only for [`SettingsSource::Watch`]; `has_changed` on this
+    /// cached receiver is the rebuild trigger.
+    settings_rx: Option<watch::Receiver<Option<AlpacaSettings>>>,
 }
 
 /// Alpaca-backed [`Provider`].
@@ -189,11 +214,14 @@ impl AlpacaProvider {
         // Ordering invariant — receiver before build: a rotation after
         // capture triggers rebuild; before capture is included in the build.
         // (Capturing after building would mark an in-between rotation seen
-        // while the cached clients are stale.)
+        // while the cached clients are stale.) Applies to both the
+        // credentials and the settings receiver.
         let cred_rx = cfg.credentials.watch();
+        let settings_rx = cfg.settings.watch();
         let rest = std::sync::Mutex::new(RestState {
             clients: build_rest(&cfg),
             cred_rx,
+            settings_rx,
         });
         Self { cfg, rest }
     }
@@ -206,18 +234,26 @@ impl AlpacaProvider {
         // Ordering invariant — receiver before build: a rotation after
         // capture triggers rebuild; before capture is included in the build.
         let cred_rx = cfg.credentials.watch();
+        let settings_rx = cfg.settings.watch();
         let mut clients = build_rest(&cfg);
         clients.market_data = Some(rest);
-        let rest = std::sync::Mutex::new(RestState { clients, cred_rx });
+        let rest = std::sync::Mutex::new(RestState {
+            clients,
+            cred_rx,
+            settings_rx,
+        });
         Self { cfg, rest }
     }
 
-    /// Current REST clients, rebuilt first if the credential source changed
-    /// since the last call. Cloning out of the mutex keeps the guard from
-    /// crossing an await (the clients are cheaply cloneable handles).
+    /// Current REST clients, rebuilt first if the credential or settings
+    /// source changed since the last call. Cloning out of the mutex keeps
+    /// the guard from crossing an await (the clients are cheaply cloneable
+    /// handles).
     fn rest_clients(&self) -> RestClients {
         let mut state = self.rest.lock().expect("REST client state poisoned");
-        if super::credentials::rest_credentials_changed(&mut state.cred_rx) {
+        let changed = super::runtime::watch_changed(&mut state.cred_rx)
+            | super::runtime::watch_changed(&mut state.settings_rx);
+        if changed {
             state.clients = build_rest(&self.cfg);
         }
         state.clients.clone()
@@ -367,6 +403,20 @@ async fn run_streaming_task(
     let mut backoff = cfg.reconnect.initial_backoff_ms;
 
     'outer: loop {
+        let mut settings_rx = cfg.settings.watch();
+        let Some(settings) = cfg.settings.current() else {
+            // Disabled: park until the settings watch delivers a value. Only a
+            // Watch source can resolve to None, so the receiver is always
+            // present here; exit defensively if it isn't (never busy-loop).
+            let Some(rx) = settings_rx.as_mut() else {
+                return;
+            };
+            if !wait_for_provisioning(rx, &mut cmd_rx, "provider disabled").await {
+                return;
+            }
+            continue 'outer;
+        };
+
         let feed = match cfg.stream_feed {
             AlpacaStreamFeed::Iex => StreamingFeed::IEX,
             AlpacaStreamFeed::Sip => StreamingFeed::SIP,
@@ -380,10 +430,14 @@ async fn run_streaming_task(
         // *after* this resolution.
         let mut cred_rx = cfg.credentials.watch();
         let connect_result = match cfg.credentials.current() {
-            Resolved::Env => StreamingStockClient::new(cfg.account_type, feed).await,
+            Resolved::Env => StreamingStockClient::new(settings.account_type, feed).await,
             Resolved::Creds(c) => {
-                StreamingStockClient::new_with_credentials(cfg.account_type, feed, c.to_api_key())
-                    .await
+                StreamingStockClient::new_with_credentials(
+                    settings.account_type,
+                    feed,
+                    c.to_api_key(),
+                )
+                .await
             }
             Resolved::Missing => {
                 // No credentials yet: wait for provisioning instead of
@@ -392,7 +446,7 @@ async fn run_streaming_task(
                 // always present here; exit defensively if it isn't (never
                 // busy-loop).
                 let Some(rx) = cred_rx.as_mut() else { return };
-                if !wait_for_credentials(rx, &mut cmd_rx).await {
+                if !wait_for_provisioning(rx, &mut cmd_rx, "waiting for credentials").await {
                     return;
                 }
                 continue 'outer;
@@ -593,29 +647,58 @@ async fn run_streaming_task(
                     // otherwise resolve immediately and spin the select).
                     cred_rx = None;
                 }
+                changed = async {
+                    match settings_rx.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        // Unreachable: the arm is guarded on `is_some()`.
+                        None => std::future::pending().await,
+                    }
+                }, if settings_rx.is_some() => {
+                    if changed.is_ok() {
+                        let reason = if cfg.settings.current().is_none() {
+                            "provider disabled"
+                        } else {
+                            "settings changed"
+                        };
+                        tracing::info!(provider = PROVIDER_ID, reason, "settings changed; reconnecting");
+                        emit_control(
+                            &sink,
+                            ControlKind::ProviderDisconnected {
+                                provider: PROVIDER_ID.to_string(),
+                                reason: reason.to_string(),
+                            },
+                        )
+                        .await;
+                        let _ = client.shut_down().await;
+                        backoff = cfg.reconnect.initial_backoff_ms;
+                        continue 'outer;
+                    }
+                    settings_rx = None;
+                }
             }
         }
     }
 }
 
-/// Waits for a `Watch` credential source to deliver a value, servicing the
-/// command channel meanwhile (same semantics as [`sleep_with_jitter`]: close
-/// exits, subscribe/unsubscribe fail fast). Returns `false` if the task
-/// should exit.
-async fn wait_for_credentials(
-    cred_rx: &mut watch::Receiver<Option<AlpacaCredentials>>,
+/// Waits for a `Watch` source (settings or credentials) to deliver a new
+/// value, servicing the command channel meanwhile (close exits,
+/// subscribe/unsubscribe fail fast with `reason`). Returns `false` if the
+/// task should exit.
+async fn wait_for_provisioning<T>(
+    rx: &mut watch::Receiver<T>,
     cmd_rx: &mut mpsc::Receiver<LiveCommand>,
+    reason: &'static str,
 ) -> bool {
     loop {
         tokio::select! {
-            changed = cred_rx.changed() => {
+            changed = rx.changed() => {
                 if changed.is_ok() {
                     // The outer loop re-resolves; if the new value is still
-                    // `None` it lands back here rather than spinning.
+                    // disabled/missing it lands back here rather than spinning.
                     return true;
                 }
-                // Sender dropped with no credentials: they can never
-                // arrive. Keep servicing commands so close still works.
+                // Sender dropped with no value: it can never arrive. Keep
+                // servicing commands so close still works.
                 loop {
                     match cmd_rx.recv().await {
                         Some(LiveCommand::Close(ack)) => {
@@ -628,7 +711,7 @@ async fn wait_for_credentials(
                         ) => {
                             let _ = ack.send(Err(Error::Provider {
                                 provider: PROVIDER_ID.to_string(),
-                                message: "no credentials provisioned".to_string(),
+                                message: reason.to_string(),
                             }));
                         }
                         None => return false,
@@ -647,7 +730,7 @@ async fn wait_for_credentials(
                     ) => {
                         let _ = ack.send(Err(Error::Provider {
                             provider: PROVIDER_ID.to_string(),
-                            message: "waiting for credentials".to_string(),
+                            message: reason.to_string(),
                         }));
                     }
                     None => return false,
@@ -1087,6 +1170,37 @@ mod tests {
         assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneMinute)));
         assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneDay)));
         assert!(!p.supports(&inst, EventKind::Bar(BarInterval::FiveMinute)));
+    }
+
+    #[tokio::test]
+    async fn disabled_provider_parks_and_fails_subscribes_fast() {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let p = AlpacaProvider::new(AlpacaProviderConfig {
+            settings: SettingsSource::Watch(rx),
+            ..Default::default()
+        });
+        let (sink, _events) = tokio::sync::mpsc::channel(8);
+        let handle = p.start_live(sink).await.expect("start_live");
+        let err = handle
+            .subscribe(provider_instrument("AAPL"), EventKind::Trade)
+            .await
+            .expect_err("disabled provider must fail subscribes fast");
+        let msg = format!("{err}");
+        assert!(msg.contains("provider disabled"), "msg={msg:?}");
+        // `start_live` already returns `Box<dyn LiveHandle>`; `close` takes
+        // `self: Box<Self>`, so call it directly on the box.
+        handle.close().await.expect("close while parked");
+    }
+
+    #[tokio::test]
+    async fn settings_source_default_is_enabled_paper() {
+        let cfg = AlpacaProviderConfig::default();
+        assert_eq!(
+            cfg.settings.current(),
+            Some(AlpacaSettings {
+                account_type: AccountType::Paper
+            })
+        );
     }
 
     #[test]

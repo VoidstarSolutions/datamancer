@@ -668,7 +668,11 @@ impl Config {
 
         if let Some(alpaca_cfg) = self.provider.alpaca {
             let provider = AlpacaProvider::new(AlpacaProviderConfig {
-                account_type: alpaca_cfg.account_type.into(),
+                settings: datamancer::providers::SettingsSource::Static(
+                    datamancer::providers::AlpacaSettings {
+                        account_type: alpaca_cfg.account_type.into(),
+                    },
+                ),
                 credentials: sources
                     .get(alpaca::PROVIDER_ID)
                     .cloned()

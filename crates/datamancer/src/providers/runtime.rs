@@ -32,7 +32,6 @@ impl<T: Clone> SettingsSource<T> {
     /// without `mark_unchanged` every clone handed out after the first
     /// change would report `has_changed` immediately — the reconnect-storm
     /// bug from cycle 2).
-    #[allow(dead_code)]
     pub(crate) fn watch(&self) -> Option<watch::Receiver<Option<T>>> {
         match self {
             Self::Watch(rx) => {
