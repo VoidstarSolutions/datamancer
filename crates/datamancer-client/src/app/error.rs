@@ -23,9 +23,12 @@ pub enum ReadyDiagnosis {
 /// Failure to find-or-spawn-and-connect a daemon.
 #[derive(Debug, thiserror::Error)]
 pub enum EnsureError {
+    /// Also returned when the daemon-log path can't be resolved
+    /// (`EnsureConfig::log_path` unset and `paths::default_daemon_log`
+    /// fails) — both stem from the same no-home-dir condition.
     #[error(
-        "no control-socket path: no platform default derivable (no home/runtime dir); \
-         set EnsureConfig::control_socket explicitly"
+        "no control-socket (or daemon-log) path: no platform default derivable \
+         (no home/runtime dir); set EnsureConfig::control_socket/log_path explicitly"
     )]
     NoSocketPath,
     #[error("failed to spawn datamancerd at {binary}: {source}", binary = binary.display())]

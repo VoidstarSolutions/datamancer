@@ -3,13 +3,6 @@
 //! [`ControlEndpoint`] (UDS today, named pipe later) and a [`DaemonSpawner`]
 //! (detached unix spawn today, `CreateProcess` later).
 
-// Scaffolding: `platform.rs` (Task 5) supplies the real `ControlEndpoint`/
-// `DaemonSpawner` impls but doesn't wire this state machine into anything
-// yet — that's `AppHandle` (Task 6). Every item here is otherwise
-// unreachable from the plain `lib` target under `--all-targets` (which
-// doesn't count `#[cfg(test)]` usage). Remove once `AppHandle` lands.
-#![allow(dead_code)]
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -25,6 +18,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A failed readiness probe (absent socket, refused, stale socket, no/bad
 /// reply). The reason is diagnostic only: every failure means "not ready".
+// The reason string isn't read back out anywhere yet (only `Debug`-formatted
+// in tests) — it exists for a future richer `ReadyDiagnosis`/log line, not
+// dead scaffolding.
+#[allow(dead_code, reason = "diagnostic payload, not yet surfaced")]
 #[derive(Debug, Clone)]
 pub(crate) struct PingFailure(pub String);
 

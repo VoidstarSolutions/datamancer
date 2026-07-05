@@ -3,11 +3,6 @@
 //! port replaces this module (named pipe + `CreateProcess`) without touching
 //! the state machine.
 
-// Scaffolding: nothing outside `#[cfg(test)]` constructs `TokioEndpoint` or
-// `ProcessSpawner` yet — that's `AppHandle` (Task 6), which wires these
-// impls into `lifecycle::ensure_daemon`. Remove once `AppHandle` lands.
-#![allow(dead_code)]
-
 use std::fs::OpenOptions;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
