@@ -15,6 +15,7 @@
 mod adjustment;
 mod error;
 mod event;
+mod health;
 mod instrument;
 mod price;
 mod quantity;
@@ -26,6 +27,9 @@ pub use error::{Error, Result};
 pub use event::{
     Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, MarketEvent, Quote, Seq, Timestamp,
     Trade,
+};
+pub use health::{
+    DaemonHealth, HealthView, LatencySummary, Liveness, ProviderHealth, ProviderState, StreamHealth,
 };
 pub use instrument::{AssetClass, Instrument, InstrumentInfo, ProviderId};
 pub use price::Price;
