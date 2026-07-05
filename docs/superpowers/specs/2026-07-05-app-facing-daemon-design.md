@@ -37,6 +37,7 @@ appendix so we do not design ourselves into a corner.
 | 6 | IBKR scope? | **Constraints only** (appendix). Integration path: TWS API via `rust-ibapi` against a user-run IB Gateway/TWS. |
 | 7 | Platforms? | macOS + Linux now. Platform-specific bits go behind small internal traits so a **Windows port is additive** (named pipes, Credential Manager, CreateProcess), not a redesign. |
 | 8 | Consumer stack? | Tauri app with a Rust core. `datamancer-client`'s Rust crate API is the deliverable; no FFI/bindings work. |
+| 9 | Embedding? | **In-process embedding stays first-class** until the daemon path is effectively done. An internal app ships today embedding the `datamancer` library directly; every change in this effort must be additive from its perspective — no breaking changes to the library's builder/session API or its env-var credential loading. |
 
 ## Delivery: four cycles, consumer-driven order
 
@@ -201,8 +202,13 @@ is gated by a new **peer-credential (same-uid) check** on the UDS connection
   nothing to keep in sync. This is the agreed alternative to sharing keychain
   items across differently-signed binaries (fragile ACLs on macOS, none on
   Linux).
-- The env-var credential path becomes a fallback with a deprecation warning,
-  then is removed.
+- The env-var credential path is demoted **in `datamancerd` only**: the
+  daemon logs a deprecation warning when it falls back to env vars, and the
+  daemon-side fallback is removed once the credential broker is proven. The
+  **library** embedding path (`Datamancer` builder + `account_type` env-var
+  loading) is untouched — the shipping internal embedder keeps working
+  unchanged (decision 9). The broker is daemon-side composition; if the
+  library ever wants keychain credentials, that is a separate opt-in design.
 - The `[ws].auth_token` secret can migrate to the same store later, retiring
   the redaction dance in `GET/PUT /api/config`.
 
