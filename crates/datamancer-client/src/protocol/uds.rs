@@ -49,6 +49,9 @@ pub enum Request {
         #[serde(default)]
         provider: Option<String>,
     },
+    /// Liveness/version probe. Answerable before `open-client`; used by the
+    /// app facade for spawn-readiness and version-skew detection.
+    Ping,
 }
 
 /// A control reply (one per line). `ok` discriminates success from error; the
@@ -68,6 +71,9 @@ pub struct Reply {
     /// The instrument catalog (on `instruments`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruments: Option<Vec<datamancer_core::InstrumentInfo>>,
+    /// The daemon's crate version (on `ping`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Stable error code (on failure).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -86,6 +92,7 @@ impl Reply {
             clients: None,
             snapshot: None,
             instruments: None,
+            version: None,
             code: None,
             message: None,
         }
@@ -127,6 +134,15 @@ impl Reply {
         }
     }
 
+    /// Success carrying the daemon version (on `ping`).
+    #[must_use]
+    pub fn pong(version: impl Into<String>) -> Self {
+        Self {
+            version: Some(version.into()),
+            ..Self::ok()
+        }
+    }
+
     /// An error reply with a stable code and a message.
     #[must_use]
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -136,6 +152,7 @@ impl Reply {
             clients: None,
             snapshot: None,
             instruments: None,
+            version: None,
             code: Some(code.into()),
             message: Some(message.into()),
         }
@@ -229,6 +246,21 @@ mod tests {
         );
         let all: Request = serde_json::from_str(r#"{"op":"instruments"}"#).unwrap();
         assert!(matches!(all, Request::Instruments { provider: None }));
+    }
+
+    #[test]
+    fn ping_round_trips_and_reply_carries_version() {
+        let req: Request = serde_json::from_str(r#"{"op":"ping"}"#).expect("de");
+        assert!(matches!(req, Request::Ping));
+        assert_eq!(
+            serde_json::to_string(&Request::Ping).unwrap(),
+            r#"{"op":"ping"}"#
+        );
+
+        let reply = serde_json::to_value(Reply::pong("0.1.0")).expect("ser");
+        assert_eq!(reply["ok"], serde_json::Value::Bool(true));
+        assert_eq!(reply["version"], "0.1.0");
+        assert!(reply.get("code").is_none());
     }
 
     #[test]

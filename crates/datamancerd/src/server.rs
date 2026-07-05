@@ -532,6 +532,7 @@ impl Server {
                 }
             }
             Request::ListClients => Reply::clients(self.clients.keys().cloned().collect()),
+            Request::Ping => Reply::pong(env!("CARGO_PKG_VERSION")),
             Request::Snapshot => match self.dm.snapshot().await {
                 Ok(snapshot) => Reply::snapshot(snapshot),
                 Err(e) => reply_from_library_error(&e),
