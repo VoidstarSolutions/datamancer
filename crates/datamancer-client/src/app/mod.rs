@@ -16,11 +16,14 @@ pub use error::{EnsureError, ReadyDiagnosis};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use datamancer_core::{HealthView, InstrumentInfo, ProviderId, SystemSnapshot};
+use datamancer_core::{
+    HealthView, InstrumentInfo, ProviderCredentials, ProviderId, SystemSnapshot,
+};
 
 use crate::Client as _;
 use crate::error::ClientError;
 use crate::iceoryx2::{Iceoryx2Client, Iceoryx2ClientError, Iceoryx2Config};
+use crate::protocol::uds::Request;
 use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
 
 /// The multiplexed event stream (same contract as the underlying
@@ -40,10 +43,16 @@ fn check_version(daemon: &str) -> Result<(), EnsureError> {
     }
 }
 
-/// Reduce a snapshot and stamp the daemon version onto it.
-fn fill_health(snapshot: &SystemSnapshot, daemon_version: &str) -> HealthView {
+/// Reduce a snapshot and stamp the daemon version and credential backend
+/// onto it (both from the `ping` handshake, not the snapshot itself).
+fn fill_health(
+    snapshot: &SystemSnapshot,
+    daemon_version: &str,
+    credential_backend: Option<&str>,
+) -> HealthView {
     let mut view = HealthView::from_snapshot(snapshot, HealthView::DEFAULT_STALE_AFTER_NS);
     view.daemon.version = Some(daemon_version.to_string());
+    view.daemon.credential_backend = credential_backend.map(str::to_string);
     view
 }
 
@@ -96,7 +105,7 @@ impl EnsureConfig {
 /// every method maps to control-surface ops.
 pub struct AppHandle {
     client: Iceoryx2Client,
-    daemon_version: String,
+    daemon_hello: lifecycle::DaemonHello,
 }
 
 impl AppHandle {
@@ -118,14 +127,14 @@ impl AppHandle {
             .clone()
             .or_else(crate::paths::default_daemon_log)
             .ok_or(EnsureError::NoSocketPath)?;
-        let daemon_version = lifecycle::ensure_daemon(
+        let daemon_hello = lifecycle::ensure_daemon(
             &platform::TokioEndpoint,
             &platform::ProcessSpawner::new(log_path),
             &cfg,
             &socket,
         )
         .await?;
-        check_version(&daemon_version)?;
+        check_version(&daemon_hello.version)?;
         let (client, events) = Iceoryx2Client::connect(Iceoryx2Config {
             control_socket: socket,
             client_name: cfg.client_name.clone(),
@@ -136,7 +145,7 @@ impl AppHandle {
         Ok((
             Self {
                 client,
-                daemon_version,
+                daemon_hello,
             },
             events,
         ))
@@ -145,18 +154,92 @@ impl AppHandle {
     /// The daemon version reported at connect (`ping`).
     #[must_use]
     pub fn daemon_version(&self) -> &str {
-        &self.daemon_version
+        &self.daemon_hello.version
     }
 
     /// Typed health for app rendering: the daemon snapshot reduced to
-    /// [`HealthView`], with `daemon.version` filled from the handshake.
+    /// [`HealthView`], with `daemon.version` and `daemon.credential_backend`
+    /// filled from the handshake.
     ///
     /// # Errors
     ///
     /// Propagates the underlying `snapshot` control/transport failure.
     pub async fn health(&mut self) -> Result<HealthView, ClientError<Iceoryx2ClientError>> {
         let snapshot = self.client.snapshot().await?;
-        Ok(fill_health(&snapshot, &self.daemon_version))
+        Ok(fill_health(
+            &snapshot,
+            &self.daemon_hello.version,
+            self.daemon_hello.credential_backend.as_deref(),
+        ))
+    }
+
+    /// Store (create or rotate) provider credentials in the daemon's broker.
+    /// Applies live: a configured provider reconnects with the new
+    /// credentials.
+    ///
+    /// # Errors
+    ///
+    /// `ClientError::Control` with the stable codes (`unknown_provider`,
+    /// `bad_request`, `credential_backend_unavailable`, `permission_denied`)
+    /// or a transport failure.
+    pub async fn set_credentials(
+        &mut self,
+        provider: &str,
+        credentials: ProviderCredentials,
+    ) -> Result<(), ClientError<Iceoryx2ClientError>> {
+        self.client
+            .control_request(&Request::SetCredentials {
+                provider: provider.to_string(),
+                credentials,
+            })
+            .await
+            .map(|_| ())
+    }
+
+    /// Read back stored credentials for `provider`.
+    ///
+    /// # Errors
+    ///
+    /// `ClientError::Control` with `unknown_provider`, `credentials_missing`,
+    /// `credential_backend_unavailable`, or `permission_denied`; or a
+    /// transport failure (including a malformed ok reply missing the
+    /// `credentials` payload).
+    pub async fn get_credentials(
+        &mut self,
+        provider: &str,
+    ) -> Result<ProviderCredentials, ClientError<Iceoryx2ClientError>> {
+        let reply = self
+            .client
+            .control_request(&Request::GetCredentials {
+                provider: provider.to_string(),
+            })
+            .await?;
+        reply.credentials.ok_or_else(|| {
+            ClientError::Transport(Iceoryx2ClientError::Protocol(
+                "ok get-credentials reply missing credentials payload".to_string(),
+            ))
+        })
+    }
+
+    /// Remove stored credentials for `provider`. Does **not** unapply a
+    /// running provider's already-live credentials — those persist until the
+    /// provider restarts.
+    ///
+    /// # Errors
+    ///
+    /// `ClientError::Control` with the stable codes (`unknown_provider`,
+    /// `credential_backend_unavailable`, `permission_denied`) or a transport
+    /// failure.
+    pub async fn clear_credentials(
+        &mut self,
+        provider: &str,
+    ) -> Result<(), ClientError<Iceoryx2ClientError>> {
+        self.client
+            .control_request(&Request::ClearCredentials {
+                provider: provider.to_string(),
+            })
+            .await
+            .map(|_| ())
     }
 
     /// See [`crate::Client::subscribe`].
@@ -250,8 +333,25 @@ mod tests {
             vec![],
             vec![],
         );
-        let view = fill_health(&snap, "0.1.0");
+        let view = fill_health(&snap, "0.1.0", None);
         assert_eq!(view.daemon.version.as_deref(), Some("0.1.0"));
         assert_eq!(view.schema_version, HealthView::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn health_fill_sets_backend_alongside_version() {
+        use datamancer_core::{CacheSnapshot, SystemSnapshot, Timestamp};
+        let snap = SystemSnapshot::new(
+            Timestamp(1),
+            vec![],
+            CacheSnapshot::new(vec![], None),
+            vec![],
+            vec![],
+        );
+        let view = fill_health(&snap, "0.3.0", Some("keychain"));
+        assert_eq!(view.daemon.version.as_deref(), Some("0.3.0"));
+        assert_eq!(view.daemon.credential_backend.as_deref(), Some("keychain"));
+        let older = fill_health(&snap, "0.3.0", None);
+        assert!(older.daemon.credential_backend.is_none());
     }
 }
