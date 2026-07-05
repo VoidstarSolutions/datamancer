@@ -2393,8 +2393,8 @@ checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
 
 [[package]]
 name = "oxidized_alpaca"
-version = "0.0.6"
-source = "git+https://github.com/VoidstarSolutions/oxidized-alpaca?branch=main#8bebeceef9f1d3515eb760a97aa902337f3ca824"
+version = "0.0.8"
+source = "git+https://github.com/VoidstarSolutions/oxidized-alpaca?branch=main#3860340f89d4e0a94d20ba58aae68ece28a168af"
 dependencies = [
  "chrono",
  "futures",
@@ -3432,9 +3432,9 @@ dependencies = [
 
 [[package]]
 name = "socketeer"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee1f8d29bc96b56387626d9bbb625af1a2166231e9f10dd126a404293fdaf926"
+checksum = "6749d64adc7a0cb8b6a6508ebdef5c15e56ad113fb798f8b3343adfc3cd4e521"
 dependencies = [
  "bytes",
  "futures",
@@ -4513,7 +4513,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
