@@ -212,10 +212,7 @@ impl AlpacaProvider {
     /// crossing an await (the clients are cheaply cloneable handles).
     fn rest_clients(&self) -> RestClients {
         let mut state = self.rest.lock().expect("REST client state poisoned");
-        if let Some(rx) = state.cred_rx.as_mut()
-            && rx.has_changed().unwrap_or(false)
-        {
-            let _ = rx.borrow_and_update();
+        if super::credentials::rest_credentials_changed(&mut state.cred_rx) {
             state.clients = build_rest(&self.cfg);
         }
         state.clients.clone()
@@ -371,9 +368,11 @@ async fn run_streaming_task(
             AlpacaStreamFeed::DelayedSip => StreamingFeed::DelayedSip,
             AlpacaStreamFeed::Test => StreamingFeed::Test,
         };
-        // Fresh receiver per connect attempt: the clone marks the current
-        // value as seen, so the hot-reconnect arm below only fires on
-        // rotations that land *after* this resolution.
+        // Fresh receiver per connect attempt: `watch()` marks the current
+        // value as seen on the clone (tokio's `Receiver::clone` would
+        // otherwise inherit the stored receiver's stale seen-version), so
+        // the hot-reconnect arm below only fires on rotations that land
+        // *after* this resolution.
         let mut cred_rx = cfg.credentials.watch();
         let connect_result = match cfg.credentials.current() {
             Resolved::Env => StreamingStockClient::new(cfg.account_type, feed).await,
