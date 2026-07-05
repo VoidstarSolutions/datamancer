@@ -141,6 +141,11 @@ pub struct Server {
     /// accept loop; credential ops never go through the actor's `dispatch`
     /// (blocking store I/O runs off-actor in `handle_connection`).
     hub: Arc<CredentialHub>,
+    /// The config service: settings watches, persist-then-apply, hot
+    /// provider ops. Not yet dispatched from the control surface — wired in
+    /// the config-service dispatch task.
+    #[allow(dead_code, reason = "consumed by the config-service dispatch task")]
+    config_hub: Arc<crate::config_hub::ConfigHub>,
     /// The active credential-store backend name (for `ping`); threaded in at
     /// bootstrap so the actor never touches the hub.
     credential_backend: &'static str,
@@ -169,9 +174,7 @@ impl Server {
         #[cfg(feature = "ws")]
         let ws = config.ws.clone();
         #[cfg(feature = "web-ui")]
-        let config_state = crate::web::ConfigState::new(config_path, config.clone());
-        #[cfg(not(feature = "web-ui"))]
-        let _ = config_path;
+        let config_state = crate::web::ConfigState::new(config_path.clone(), config.clone());
         tracing::debug!(
             live_state_ms = config.diagnostics.publish_interval_ms,
             cache_catalog_ms = config.diagnostics.cache_catalog_interval_ms,
@@ -186,7 +189,10 @@ impl Server {
         let (hub, sources) = CredentialHub::bootstrap(&all_ids, &env_fallback)?;
         let credential_backend = hub.backend_name();
 
-        let built = config.build_runtime(&sources).await?;
+        let (config_hub, provider_settings) =
+            crate::config_hub::ConfigHub::bootstrap(config.clone(), config_path.clone());
+
+        let built = config.build_runtime(&sources, provider_settings).await?;
         let dm = built.datamancer;
         let tap_log = built.tap_log;
 
@@ -240,6 +246,7 @@ impl Server {
             #[cfg(feature = "web-ui")]
             config_state,
             hub,
+            config_hub,
             credential_backend,
             draining: false,
         })

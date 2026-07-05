@@ -8,7 +8,6 @@
 use crate::config::Config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "consumed by the config hub (cycle-3 task 7)")]
 pub(crate) enum FieldClass {
     /// Applies live via the config hub's provider watches.
     Hot,
@@ -18,7 +17,6 @@ pub(crate) enum FieldClass {
 
 /// Classification by longest matching dotted-path prefix. Entries end with
 /// `.` to classify a whole section; exact entries classify one leaf.
-#[allow(dead_code, reason = "consumed by the config hub (cycle-3 task 7)")]
 const CLASSIFICATION: &[(&str, FieldClass)] = &[
     // Provider sections: presence (enable/disable) and every setting apply
     // live through the per-provider settings watch.
@@ -37,7 +35,6 @@ const CLASSIFICATION: &[(&str, FieldClass)] = &[
 ];
 
 /// The class for a dotted config path, or `None` for an unknown path.
-#[allow(dead_code, reason = "consumed by the config hub (cycle-3 task 7)")]
 pub(crate) fn classify(path: &str) -> Option<FieldClass> {
     CLASSIFICATION
         .iter()
@@ -68,7 +65,6 @@ fn leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
 /// Cold-classified leaves that differ between `baseline` (the boot-applied
 /// config) and `current`. Non-empty ⇒ a restart is required for `current`
 /// to fully apply.
-#[allow(dead_code, reason = "consumed by the config hub (cycle-3 task 7)")]
 pub(crate) fn cold_divergence(baseline: &Config, current: &Config) -> Vec<String> {
     let a = serde_json::to_value(baseline).expect("Config serializes");
     let b = serde_json::to_value(current).expect("Config serializes");

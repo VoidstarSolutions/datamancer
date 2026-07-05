@@ -20,6 +20,7 @@
 
 mod config;
 mod config_class;
+mod config_hub;
 mod control;
 mod credentials;
 mod error;

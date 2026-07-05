@@ -668,42 +668,34 @@ impl Config {
     pub async fn build_runtime(
         self,
         sources: &HashMap<String, CredentialsSource>,
+        settings: crate::config_hub::ProviderSettingsSources,
     ) -> Result<BuiltRuntime> {
         let mut builder = Datamancer::builder()
             .resume_buffer_events(self.session.resume_buffer_events)
             .adjustment(self.session.adjustment.into());
 
-        if let Some(alpaca_cfg) = self.provider.alpaca {
-            let provider = AlpacaProvider::new(AlpacaProviderConfig {
-                settings: datamancer::providers::SettingsSource::Static(
-                    datamancer::providers::AlpacaSettings {
-                        account_type: alpaca_cfg.account_type.into(),
-                    },
-                ),
-                credentials: sources
-                    .get(alpaca::PROVIDER_ID)
-                    .cloned()
-                    .unwrap_or_default(),
-                ..Default::default()
-            });
-            builder = builder.provider(Box::new(provider));
-        }
-        if let Some(crypto) = self.provider.alpaca_crypto {
-            let provider = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
-                settings: datamancer::providers::SettingsSource::Static(
-                    datamancer::providers::AlpacaCryptoSettings {
-                        account_type: crypto.account_type.into(),
-                        venue: crypto.venue.into(),
-                    },
-                ),
-                credentials: sources
-                    .get(alpaca_crypto::PROVIDER_ID)
-                    .cloned()
-                    .unwrap_or_default(),
-                ..Default::default()
-            });
-            builder = builder.provider(Box::new(provider));
-        }
+        // Cycle 3: every compiled-in provider is constructed and registered,
+        // parked unless its settings watch carries a value. Presence of a
+        // `[provider.*]` section is enablement, applied through the watch —
+        // not through conditional construction.
+        let provider = AlpacaProvider::new(AlpacaProviderConfig {
+            settings: settings.alpaca,
+            credentials: sources
+                .get(alpaca::PROVIDER_ID)
+                .cloned()
+                .unwrap_or_default(),
+            ..Default::default()
+        });
+        builder = builder.provider(Box::new(provider));
+        let provider = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
+            settings: settings.alpaca_crypto,
+            credentials: sources
+                .get(alpaca_crypto::PROVIDER_ID)
+                .cloned()
+                .unwrap_or_default(),
+            ..Default::default()
+        });
+        builder = builder.provider(Box::new(provider));
 
         if let Some(cache_cfg) = &self.cache {
             let cache = TursoCache::open(storage_to_cache_config(cache_cfg)?).await?;
