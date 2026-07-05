@@ -143,9 +143,12 @@ persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only 
 always_on = true                  # hold for the process lifetime regardless of clients
 ```
 
-Validation fails fast: at least one provider must be configured; a startup
-session using a cache preset requires `[cache]`; one writing the tap log
-requires `[tap_log]`; `scope = live_backfill` requires a parseable
+Compiled-in providers start disabled: the daemon boots with zero providers
+configured, and providers are enabled at runtime via the config service's
+`configure-provider` op (or by uncommenting a `[provider.*]` section and
+restarting). Validation fails fast on the remaining cross-section invariants:
+a startup session using a cache preset requires `[cache]`; one writing the
+tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
 `backfill_from`.
 
 For `embedded`, `path` is optional and defaults to the platform-native

@@ -69,12 +69,16 @@ pub fn default_config_toml() -> String {
 # Changes take effect on daemon restart.
 #
 # Credentials are NEVER read from this file: the Alpaca providers resolve
-# API keys from the environment (see crates/datamancerd/README.md).
+# API keys from the environment (see crates/datamancerd/README.md) or the
+# daemon's credential store via `set-credentials`.
 
-# At least one provider is required. `paper` selects the paper-trading
-# credential pair from the environment; `live` the live pair.
-[provider.alpaca]
-account_type = "paper"
+# Compiled-in providers start disabled: the daemon boots with zero providers
+# configured and providers are enabled at runtime via `configure-provider`
+# (the config-service control op) or by uncommenting a section below and
+# restarting. `paper` selects the paper-trading credential pair from the
+# environment; `live` the live pair.
+# [provider.alpaca]
+# account_type = "paper"
 
 # Uncomment for the crypto provider (venues: "us", "us_kraken", "eu_kraken").
 # [provider.alpaca_crypto]
@@ -263,8 +267,10 @@ mod tests {
         let text = default_config_toml();
         let config = crate::config::Config::parse(&text).expect("scaffold must parse");
         config.validate().expect("scaffold must validate");
-        // Scaffold contract: paper alpaca provider, web UI on, published default socket.
-        assert!(config.provider.alpaca.is_some());
+        // Scaffold contract: zero providers configured (cycle 3: providers
+        // start disabled), web UI on, published default socket.
+        assert!(config.provider.alpaca.is_none());
+        assert!(config.provider.alpaca_crypto.is_none());
         let web = config.web_ui.expect("web_ui section");
         assert!(web.enabled);
         assert_eq!(

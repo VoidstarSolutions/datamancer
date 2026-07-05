@@ -327,7 +327,10 @@ mod tests {
     async fn write_invalid_config_changes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (state, boot) = boot_state(dir.path());
-        let invalid = Config::parse("[provider]\n").expect("parse");
+        let invalid = Config::parse(
+            "[cache]\nbackend = \"embedded\"\npath = \"./same.db\"\n\n[tap_log]\nbackend = \"embedded\"\npath = \"./same.db\"\n",
+        )
+        .expect("parse");
         state.write(&invalid).await.expect_err("must reject");
         assert_eq!(state.read_disk().await.expect("read"), boot);
         assert!(!state.restart_required());

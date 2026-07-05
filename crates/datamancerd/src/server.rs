@@ -181,8 +181,9 @@ impl Server {
         // Open the credential store and seed per-provider watch channels
         // before building the runtime, so each provider is constructed with
         // its hot-apply credential source.
-        let providers = config.configured_providers();
-        let (hub, sources) = CredentialHub::bootstrap(&providers)?;
+        let env_fallback = config.configured_providers();
+        let all_ids = crate::config::compiled_provider_ids();
+        let (hub, sources) = CredentialHub::bootstrap(&all_ids, &env_fallback)?;
         let credential_backend = hub.backend_name();
 
         let built = config.build_runtime(&sources).await?;

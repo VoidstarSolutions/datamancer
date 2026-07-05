@@ -104,23 +104,27 @@ impl CredentialHub {
         )
     }
 
-    /// Open the platform-default store and seed one watch per configured
-    /// provider: stored credentials win; else the provider's env-var pair
-    /// (deprecated — warns); else `None` (the provider parks until
-    /// `set-credentials`).
+    /// Open the platform-default store and seed one watch channel per
+    /// **compiled-in** provider (`all_ids`) — so `set-credentials` works
+    /// before a provider is enabled — then apply the deprecated env-var
+    /// fallback only to providers with a config section (`env_fallback`):
+    /// stored credentials win; else the provider's env-var pair (deprecated —
+    /// warns); else `None` (the provider parks until `set-credentials`).
     ///
     /// # Errors
     ///
     /// [`DaemonError::CredentialStore`] when no backend is available.
     pub(crate) fn bootstrap(
-        providers: &[(&str, AccountType)],
+        all_ids: &[&str],
+        env_fallback: &[(&str, AccountType)],
     ) -> Result<(Arc<Self>, HashMap<String, CredentialsSource>)> {
         let store = CredentialStore::open_default().map_err(DaemonError::CredentialStore)?;
         tracing::info!(backend = store.backend_name(), "credential store opened");
-        let ids: Vec<&str> = providers.iter().map(|(id, _)| *id).collect();
-        let (hub, sources) = Self::with_store(store, &ids);
-        for &(id, account_type) in providers {
-            let sender = &hub.senders[id];
+        let (hub, sources) = Self::with_store(store, all_ids);
+        for &(id, account_type) in env_fallback {
+            let Some(sender) = hub.senders.get(id) else {
+                continue;
+            };
             if sender.borrow().is_some() {
                 tracing::info!(provider = id, "credentials loaded from the store");
                 continue;
