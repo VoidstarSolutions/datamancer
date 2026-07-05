@@ -40,3 +40,9 @@ pub const BAD_REQUEST: &str = "bad_request";
 pub const SHUTTING_DOWN: &str = "shutting_down";
 /// An unexpected internal error.
 pub const INTERNAL: &str = "internal";
+/// No credentials are stored for the named provider.
+pub const CREDENTIALS_MISSING: &str = "credentials_missing";
+/// The credential-store backend failed or is unavailable.
+pub const CREDENTIAL_BACKEND_UNAVAILABLE: &str = "credential_backend_unavailable";
+/// The connection's peer credentials failed the same-uid check.
+pub const PERMISSION_DENIED: &str = "permission_denied";

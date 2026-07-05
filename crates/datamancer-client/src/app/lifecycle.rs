@@ -25,9 +25,19 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone)]
 pub(crate) struct PingFailure(pub String);
 
-/// One control-surface probe: ping the socket, return the daemon version.
+/// A `ping` handshake result: the daemon's version and (if reported) its
+/// active credential backend. `credential_backend` is `Option` because an
+/// older daemon's pong predates the field — the probe stays compatible with
+/// it rather than treating the absence as a protocol error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonHello {
+    pub version: String,
+    pub credential_backend: Option<String>,
+}
+
+/// One control-surface probe: ping the socket, return the daemon's hello.
 pub(crate) trait ControlEndpoint {
-    async fn ping(&self, socket: &Path, timeout: Duration) -> Result<String, PingFailure>;
+    async fn ping(&self, socket: &Path, timeout: Duration) -> Result<DaemonHello, PingFailure>;
 }
 
 /// A spawned daemon's exit observation (best effort).
@@ -52,7 +62,7 @@ pub(crate) trait DaemonSpawner {
 }
 
 /// Find a ready daemon on `socket` or spawn one and await readiness.
-/// Returns the daemon's version (from `ping`).
+/// Returns the daemon's hello (from `ping`).
 ///
 /// A spawned process exiting is **not** failure while the deadline holds:
 /// losing the single-instance race to another app's daemon that then answers
@@ -63,9 +73,9 @@ pub(crate) async fn ensure_daemon<E: ControlEndpoint, S: DaemonSpawner>(
     spawner: &S,
     cfg: &EnsureConfig,
     socket: &Path,
-) -> Result<String, EnsureError> {
-    if let Ok(version) = endpoint.ping(socket, PROBE_TIMEOUT).await {
-        return Ok(version);
+) -> Result<DaemonHello, EnsureError> {
+    if let Ok(hello) = endpoint.ping(socket, PROBE_TIMEOUT).await {
+        return Ok(hello);
     }
     let mut proc_ = spawner
         .spawn(&cfg.daemon_binary, cfg.config_path.as_deref())
@@ -76,8 +86,8 @@ pub(crate) async fn ensure_daemon<E: ControlEndpoint, S: DaemonSpawner>(
     let deadline = Instant::now() + cfg.ready_timeout;
     let mut observed_exit: Option<ExitInfo> = None;
     loop {
-        if let Ok(version) = endpoint.ping(socket, PROBE_TIMEOUT).await {
-            return Ok(version);
+        if let Ok(hello) = endpoint.ping(socket, PROBE_TIMEOUT).await {
+            return Ok(hello);
         }
         if observed_exit.is_none() {
             observed_exit = proc_.poll_exit();
@@ -126,11 +136,11 @@ mod tests {
 
     /// Ping outcomes served in order; the last entry repeats forever.
     struct ScriptedEndpoint {
-        script: Vec<Result<String, PingFailure>>,
+        script: Vec<Result<DaemonHello, PingFailure>>,
         calls: AtomicUsize,
     }
     impl ScriptedEndpoint {
-        fn new(script: Vec<Result<String, PingFailure>>) -> Self {
+        fn new(script: Vec<Result<DaemonHello, PingFailure>>) -> Self {
             Self {
                 script,
                 calls: AtomicUsize::new(0),
@@ -138,9 +148,18 @@ mod tests {
         }
     }
     impl ControlEndpoint for ScriptedEndpoint {
-        async fn ping(&self, _: &Path, _: Duration) -> Result<String, PingFailure> {
+        async fn ping(&self, _: &Path, _: Duration) -> Result<DaemonHello, PingFailure> {
             let i = self.calls.fetch_add(1, Ordering::SeqCst);
             self.script[i.min(self.script.len() - 1)].clone()
+        }
+    }
+
+    /// Build a scripted `DaemonHello` with no reported credential backend
+    /// (the common case in these tests, which don't exercise that field).
+    fn hello(version: &str) -> DaemonHello {
+        DaemonHello {
+            version: version.to_string(),
+            credential_backend: None,
         }
     }
 
@@ -198,7 +217,7 @@ mod tests {
         }
     }
 
-    fn fail() -> Result<String, PingFailure> {
+    fn fail() -> Result<DaemonHello, PingFailure> {
         Err(PingFailure("connection refused".to_string()))
     }
     fn cfg() -> EnsureConfig {
@@ -209,18 +228,18 @@ mod tests {
 
     #[tokio::test]
     async fn already_running_daemon_is_used_without_spawning() {
-        let ep = ScriptedEndpoint::new(vec![Ok("0.1.0".to_string())]);
+        let ep = ScriptedEndpoint::new(vec![Ok(hello("0.1.0"))]);
         let sp = ScriptedSpawner::unreachable();
         let v = ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock"))
             .await
             .unwrap();
-        assert_eq!(v, "0.1.0");
+        assert_eq!(v.version, "0.1.0");
         assert_eq!(sp.spawned.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn spawns_then_waits_for_readiness() {
-        let ep = ScriptedEndpoint::new(vec![fail(), fail(), Ok("0.1.0".to_string())]);
+        let ep = ScriptedEndpoint::new(vec![fail(), fail(), Ok(hello("0.1.0"))]);
         let sp = ScriptedSpawner::ok(ScriptedProc {
             alive_polls: usize::MAX,
             exit: None,
@@ -228,7 +247,7 @@ mod tests {
         let v = ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock"))
             .await
             .unwrap();
-        assert_eq!(v, "0.1.0");
+        assert_eq!(v.version, "0.1.0");
         assert_eq!(sp.spawned.load(Ordering::SeqCst), 1);
     }
 
@@ -236,7 +255,7 @@ mod tests {
     async fn lost_spawn_race_still_succeeds_when_winner_answers() {
         // Our spawn exits immediately (single-instance lock held by the
         // winner), but a later ping answers: SUCCESS per the spec.
-        let ep = ScriptedEndpoint::new(vec![fail(), fail(), Ok("0.1.0".to_string())]);
+        let ep = ScriptedEndpoint::new(vec![fail(), fail(), Ok(hello("0.1.0"))]);
         let sp = ScriptedSpawner::ok(ScriptedProc {
             alive_polls: 0,
             exit: Some(ExitInfo {
@@ -247,7 +266,7 @@ mod tests {
         let v = ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock"))
             .await
             .unwrap();
-        assert_eq!(v, "0.1.0");
+        assert_eq!(v.version, "0.1.0");
     }
 
     #[tokio::test]

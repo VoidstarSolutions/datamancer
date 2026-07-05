@@ -38,6 +38,10 @@ pub enum DaemonError {
     #[error("transport: {0}")]
     Transport(String),
 
+    /// The credential store could not be opened at bootstrap.
+    #[error("credential store: {0}")]
+    CredentialStore(#[from] datamancer_credentials::CredentialError),
+
     /// An I/O error on the control socket or elsewhere.
     #[error(transparent)]
     Io(#[from] std::io::Error),

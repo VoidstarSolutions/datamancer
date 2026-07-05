@@ -47,6 +47,8 @@ pub use datamancer_core::{
     ResumeBufferSnapshot, Seq, StreamHealth, SubscriptionRef, SystemSnapshot, TapLog, Timestamp,
     Trade,
 };
+#[cfg(feature = "provider-alpaca")]
+pub use providers::{AlpacaCredentials, CredentialsSource};
 pub use session::{
     Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,
 };

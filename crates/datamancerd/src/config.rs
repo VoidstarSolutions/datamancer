@@ -1,10 +1,11 @@
 //! Daemon configuration (TOML).
 //!
 //! The config is the daemon's primary operator contract. It selects providers
-//! (by `account_type`; credentials resolve from the environment via
-//! `oxidized_alpaca`, never the file), the persistence backends, session knobs,
-//! the control socket, diagnostics cadence, the optional web UI, and an
-//! optional set of boot-time `[[startup_session]]` anchors.
+//! (by `account_type`; credentials come from the daemon-owned credential
+//! store via `set-credentials` — never the config file), the persistence
+//! backends, session knobs, the control socket, diagnostics cadence, the
+//! optional web UI, and an optional set of boot-time `[[startup_session]]`
+//! anchors.
 //!
 //! `Config::load` reads and parses; `Config::validate` enforces cross-section
 //! invariants (a startup session needing the cache requires a `[cache]`
@@ -12,12 +13,15 @@
 
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+
 use datamancer::providers::AccountType;
 use datamancer::{
-    Adjustment, Datamancer, Instrument, PersistenceOptions, ProviderId, Scope, Timestamp,
+    Adjustment, CredentialsSource, Datamancer, Instrument, PersistenceOptions, ProviderId, Scope,
+    Timestamp,
     providers::{
         AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue, AlpacaProvider,
-        AlpacaProviderConfig,
+        AlpacaProviderConfig, alpaca, alpaca_crypto,
     },
     storage::{TursoCache, TursoCacheConfig, TursoTapLog, TursoTapLogConfig},
 };
@@ -629,22 +633,46 @@ impl Config {
         Ok(())
     }
 
-    /// Build the full daemon runtime: construct the configured providers, open
-    /// the cache + tap log, assemble the [`Datamancer`], and retain the tap-log
-    /// `Arc` so the shutdown path can flush it (the builder takes ownership, so
-    /// the handle must be cloned out here).
+    /// The configured providers as `(provider id, account type)` pairs — the
+    /// exact ids the providers register via `Provider::id()`. This is what
+    /// the credential hub seeds its per-provider watch channels from.
+    #[must_use]
+    pub fn configured_providers(&self) -> Vec<(&'static str, AccountType)> {
+        let mut providers = Vec::new();
+        if let Some(a) = &self.provider.alpaca {
+            providers.push((alpaca::PROVIDER_ID, a.account_type.into()));
+        }
+        if let Some(c) = &self.provider.alpaca_crypto {
+            providers.push((alpaca_crypto::PROVIDER_ID, c.account_type.into()));
+        }
+        providers
+    }
+
+    /// Build the full daemon runtime: construct the configured providers
+    /// (each wired to its credential source from `sources`, keyed by provider
+    /// id — a missing entry falls back to the legacy env source), open the
+    /// cache + tap log, assemble the [`Datamancer`], and retain the tap-log
+    /// `Arc` so the shutdown path can flush it (the builder takes ownership,
+    /// so the handle must be cloned out here).
     ///
     /// # Errors
     ///
     /// Propagates storage-open and builder errors as [`DaemonError`].
-    pub async fn build_runtime(self) -> Result<BuiltRuntime> {
+    pub async fn build_runtime(
+        self,
+        sources: &HashMap<String, CredentialsSource>,
+    ) -> Result<BuiltRuntime> {
         let mut builder = Datamancer::builder()
             .resume_buffer_events(self.session.resume_buffer_events)
             .adjustment(self.session.adjustment.into());
 
-        if let Some(alpaca) = self.provider.alpaca {
+        if let Some(alpaca_cfg) = self.provider.alpaca {
             let provider = AlpacaProvider::new(AlpacaProviderConfig {
-                account_type: alpaca.account_type.into(),
+                account_type: alpaca_cfg.account_type.into(),
+                credentials: sources
+                    .get(alpaca::PROVIDER_ID)
+                    .cloned()
+                    .unwrap_or_default(),
                 ..Default::default()
             });
             builder = builder.provider(Box::new(provider));
@@ -653,6 +681,10 @@ impl Config {
             let provider = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
                 account_type: crypto.account_type.into(),
                 venue: crypto.venue.into(),
+                credentials: sources
+                    .get(alpaca_crypto::PROVIDER_ID)
+                    .cloned()
+                    .unwrap_or_default(),
                 ..Default::default()
             });
             builder = builder.provider(Box::new(provider));

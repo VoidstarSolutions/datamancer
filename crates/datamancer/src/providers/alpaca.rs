@@ -38,9 +38,10 @@ use oxidized_alpaca::{
         messages::stock::{StockBar, StockQuoteEvent, StockTradeEvent},
     },
 };
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
 use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca-backed provider.
@@ -111,6 +112,10 @@ pub struct AlpacaProviderConfig {
     pub stream_feed: AlpacaStreamFeed,
     /// Reconnect/retry policy for the live websocket.
     pub reconnect: ReconnectPolicy,
+    /// Where this provider's credentials come from. This — not the
+    /// `DatamancerBuilder` — is the library's credential-source API (spec
+    /// decision 9); the builder consumes providers already constructed.
+    pub credentials: CredentialsSource,
 }
 
 impl Default for AlpacaProviderConfig {
@@ -119,18 +124,60 @@ impl Default for AlpacaProviderConfig {
             account_type: AccountType::Paper,
             stream_feed: AlpacaStreamFeed::Iex,
             reconnect: ReconnectPolicy::default(),
+            credentials: CredentialsSource::Env,
         }
     }
+}
+
+/// REST clients rebuilt whenever the credential source changes (watch
+/// bump) — cheap relative to REST call frequency, and `has_changed` makes
+/// the common path a no-op.
+#[derive(Clone)]
+struct RestClients {
+    /// Market-data REST client. `None` when credentials aren't available —
+    /// `fetch_history` will surface a Provider error in that case.
+    market_data: Option<MarketDataClient>,
+    /// Trading API client, used for the reference-data surface (asset
+    /// catalog). `None` when credentials aren't available —
+    /// `list_instruments` will surface a Provider error in that case.
+    trading: Option<TradingClient>,
+}
+
+fn build_rest(cfg: &AlpacaProviderConfig) -> RestClients {
+    match cfg.credentials.current() {
+        Resolved::Env => RestClients {
+            market_data: MarketDataClient::new(cfg.account_type).ok(),
+            trading: TradingClient::new(cfg.account_type).ok(),
+        },
+        Resolved::Creds(c) => {
+            let key = c.to_api_key();
+            RestClients {
+                market_data: MarketDataClient::new_with_credentials(cfg.account_type, key.clone())
+                    .ok(),
+                trading: TradingClient::new_with_credentials(cfg.account_type, key).ok(),
+            }
+        }
+        Resolved::Missing => RestClients {
+            market_data: None,
+            trading: None,
+        },
+    }
+}
+
+/// [`RestClients`] plus the cached credential-watch receiver used to detect
+/// when they need rebuilding. One `std::sync::Mutex` (never held across an
+/// await) guards both so the check-and-rebuild is atomic.
+struct RestState {
+    clients: RestClients,
+    /// `Some` only for [`CredentialsSource::Watch`]; `has_changed` on this
+    /// cached receiver is the rebuild trigger.
+    cred_rx: Option<watch::Receiver<Option<AlpacaCredentials>>>,
 }
 
 /// Alpaca-backed [`Provider`].
 pub struct AlpacaProvider {
     cfg: AlpacaProviderConfig,
-    rest: Option<MarketDataClient>,
-    /// Trading API client, used for the reference-data surface (asset
-    /// catalog). `None` when credentials weren't available at construction
-    /// — `list_instruments` will surface a Provider error in that case.
-    trading: Option<TradingClient>,
+    rest: std::sync::Mutex<RestState>,
 }
 
 impl AlpacaProvider {
@@ -139,21 +186,41 @@ impl AlpacaProvider {
     /// or in tests where the env vars are not set.
     #[must_use]
     pub fn new(cfg: AlpacaProviderConfig) -> Self {
-        let rest = MarketDataClient::new(cfg.account_type).ok();
-        let trading = TradingClient::new(cfg.account_type).ok();
-        Self { cfg, rest, trading }
+        // Ordering invariant — receiver before build: a rotation after
+        // capture triggers rebuild; before capture is included in the build.
+        // (Capturing after building would mark an in-between rotation seen
+        // while the cached clients are stale.)
+        let cred_rx = cfg.credentials.watch();
+        let rest = std::sync::Mutex::new(RestState {
+            clients: build_rest(&cfg),
+            cred_rx,
+        });
+        Self { cfg, rest }
     }
 
     /// Construct with an explicit market-data REST client. Useful in tests.
-    /// The trading client is still resolved from the environment.
+    /// The trading client is still resolved from the configured credential
+    /// source.
     #[must_use]
     pub fn with_rest(cfg: AlpacaProviderConfig, rest: MarketDataClient) -> Self {
-        let trading = TradingClient::new(cfg.account_type).ok();
-        Self {
-            cfg,
-            rest: Some(rest),
-            trading,
+        // Ordering invariant — receiver before build: a rotation after
+        // capture triggers rebuild; before capture is included in the build.
+        let cred_rx = cfg.credentials.watch();
+        let mut clients = build_rest(&cfg);
+        clients.market_data = Some(rest);
+        let rest = std::sync::Mutex::new(RestState { clients, cred_rx });
+        Self { cfg, rest }
+    }
+
+    /// Current REST clients, rebuilt first if the credential source changed
+    /// since the last call. Cloning out of the mutex keeps the guard from
+    /// crossing an await (the clients are cheaply cloneable handles).
+    fn rest_clients(&self) -> RestClients {
+        let mut state = self.rest.lock().expect("REST client state poisoned");
+        if super::credentials::rest_credentials_changed(&mut state.cred_rx) {
+            state.clients = build_rest(&self.cfg);
         }
+        state.clients.clone()
     }
 }
 
@@ -188,15 +255,18 @@ impl Provider for AlpacaProvider {
         request: HistoryRequest,
         sink: mpsc::Sender<MarketEvent>,
     ) -> Result<()> {
-        let rest = self.rest.as_ref().ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
-        })?;
-        fetch_history_via(rest, request, sink).await
+        let rest = self
+            .rest_clients()
+            .market_data
+            .ok_or_else(|| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
+            })?;
+        fetch_history_via(&rest, request, sink).await
     }
 
     async fn list_instruments(&self) -> Result<Vec<Instrument>> {
-        let trading = self.trading.as_ref().ok_or_else(|| Error::Provider {
+        let trading = self.rest_clients().trading.ok_or_else(|| Error::Provider {
             provider: PROVIDER_ID.to_string(),
             message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
         })?;
@@ -303,7 +373,31 @@ async fn run_streaming_task(
             AlpacaStreamFeed::DelayedSip => StreamingFeed::DelayedSip,
             AlpacaStreamFeed::Test => StreamingFeed::Test,
         };
-        let connect_result = StreamingStockClient::new(cfg.account_type, feed).await;
+        // Fresh receiver per connect attempt: `watch()` marks the current
+        // value as seen on the clone (tokio's `Receiver::clone` would
+        // otherwise inherit the stored receiver's stale seen-version), so
+        // the hot-reconnect arm below only fires on rotations that land
+        // *after* this resolution.
+        let mut cred_rx = cfg.credentials.watch();
+        let connect_result = match cfg.credentials.current() {
+            Resolved::Env => StreamingStockClient::new(cfg.account_type, feed).await,
+            Resolved::Creds(c) => {
+                StreamingStockClient::new_with_credentials(cfg.account_type, feed, c.to_api_key())
+                    .await
+            }
+            Resolved::Missing => {
+                // No credentials yet: wait for provisioning instead of
+                // hammering bad auth, then retry the outer loop. Only a
+                // Watch source can resolve to Missing, so the receiver is
+                // always present here; exit defensively if it isn't (never
+                // busy-loop).
+                let Some(rx) = cred_rx.as_mut() else { return };
+                if !wait_for_credentials(rx, &mut cmd_rx).await {
+                    return;
+                }
+                continue 'outer;
+            }
+        };
 
         let mut client = match connect_result {
             Ok(client) => {
@@ -465,6 +559,98 @@ async fn run_streaming_task(
                             continue 'outer;
                         }
                     }
+                }
+                changed = async {
+                    match cred_rx.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        // Unreachable: the arm is guarded on `is_some()`.
+                        None => std::future::pending().await,
+                    }
+                }, if cred_rx.is_some() => {
+                    if changed.is_ok() {
+                        tracing::info!(
+                            provider = PROVIDER_ID,
+                            "credentials changed; reconnecting"
+                        );
+                        // Same in-band control the websocket error path
+                        // emits, then reconnect immediately with the new
+                        // credentials — reset the backoff, this is a
+                        // deliberate rotation, not a failure.
+                        emit_control(
+                            &sink,
+                            ControlKind::ProviderDisconnected {
+                                provider: PROVIDER_ID.to_string(),
+                                reason: "credentials rotated".to_string(),
+                            },
+                        )
+                        .await;
+                        let _ = client.shut_down().await;
+                        backoff = cfg.reconnect.initial_backoff_ms;
+                        continue 'outer;
+                    }
+                    // Watch sender dropped: no further rotations can
+                    // arrive. Disable this arm (a closed receiver would
+                    // otherwise resolve immediately and spin the select).
+                    cred_rx = None;
+                }
+            }
+        }
+    }
+}
+
+/// Waits for a `Watch` credential source to deliver a value, servicing the
+/// command channel meanwhile (same semantics as [`sleep_with_jitter`]: close
+/// exits, subscribe/unsubscribe fail fast). Returns `false` if the task
+/// should exit.
+async fn wait_for_credentials(
+    cred_rx: &mut watch::Receiver<Option<AlpacaCredentials>>,
+    cmd_rx: &mut mpsc::Receiver<LiveCommand>,
+) -> bool {
+    loop {
+        tokio::select! {
+            changed = cred_rx.changed() => {
+                if changed.is_ok() {
+                    // The outer loop re-resolves; if the new value is still
+                    // `None` it lands back here rather than spinning.
+                    return true;
+                }
+                // Sender dropped with no credentials: they can never
+                // arrive. Keep servicing commands so close still works.
+                loop {
+                    match cmd_rx.recv().await {
+                        Some(LiveCommand::Close(ack)) => {
+                            let _ = ack.send(());
+                            return false;
+                        }
+                        Some(
+                            LiveCommand::Subscribe(_, _, ack)
+                            | LiveCommand::Unsubscribe(_, _, ack),
+                        ) => {
+                            let _ = ack.send(Err(Error::Provider {
+                                provider: PROVIDER_ID.to_string(),
+                                message: "no credentials provisioned".to_string(),
+                            }));
+                        }
+                        None => return false,
+                    }
+                }
+            }
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(LiveCommand::Close(ack)) => {
+                        let _ = ack.send(());
+                        return false;
+                    }
+                    Some(
+                        LiveCommand::Subscribe(_, _, ack)
+                        | LiveCommand::Unsubscribe(_, _, ack),
+                    ) => {
+                        let _ = ack.send(Err(Error::Provider {
+                            provider: PROVIDER_ID.to_string(),
+                            message: "waiting for credentials".to_string(),
+                        }));
+                    }
+                    None => return false,
                 }
             }
         }

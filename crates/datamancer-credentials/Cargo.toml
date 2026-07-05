@@ -1,0 +1,36 @@
+[package]
+name = "datamancer-credentials"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Credential storage for datamancer providers: OS keychain with a locked-down file fallback"
+
+[dependencies]
+datamancer-core = { path = "../datamancer-core" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+directories = "6"
+keyring = { version = "4", default-features = false, features = ["v1"] }
+# keyring 4.1.3's `v1::Entry::new` auto-init has an inverted `compare_exchange`
+# check (see src/keychain.rs `init_default_store` doc comment) that never
+# actually installs a default store, so every `Entry::new` fails with
+# `NoDefaultStore`. We work around it by calling `keyring_core::set_default_store`
+# ourselves with the same platform stores the `v1` feature already pulls in —
+# these deps add no new crates to the tree, only a direct edge to ones already
+# present transitively.
+keyring-core = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = "1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = "1.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

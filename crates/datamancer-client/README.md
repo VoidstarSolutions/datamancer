@@ -205,9 +205,59 @@ wall-clock observability, never engine-decision inputs. `ProviderState`
 includes reserved `Unauthenticated` / `CompanionUnreachable` variants for a
 future IBKR-style provider that attaches to a local companion process;
 nothing produces them yet, but the wire shape is stable now so consumers
-already parse them. `daemon.version` comes from the `ping` handshake
-(`{"op":"ping"}` → `{"ok":true,"version":"…"}`), not the snapshot itself —
-see `datamancerd/README.md` for the control-protocol side of `ping`.
+already parse them. `daemon.version` and `daemon.credential_backend` come
+from the `ping` handshake (`{"op":"ping"}` →
+`{"ok":true,"version":"…","credential_backend":"…"}`), not the snapshot
+itself — see `datamancerd/README.md` for the control-protocol side of `ping`.
+`credential_backend` is `None` in exactly one case: an older daemon whose
+pong predates the field and omits it. A current daemon always reports a
+backend — it selects one at bootstrap and refuses to boot when none is
+available.
+
+### Credential methods
+
+`AppHandle` also exposes the credential-broker control ops directly (no new
+protocol semantics — they map to `set-credentials`/`get-credentials`/
+`clear-credentials`, documented in `datamancerd/README.md`):
+
+```rust,no_run
+# use datamancer_client::app::AppHandle;
+use datamancer_core::ProviderCredentials;
+
+# async fn run(handle: &mut AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+handle
+    .set_credentials(
+        "alpaca",
+        ProviderCredentials::ApiKeyPair {
+            key_id: "AKID".to_string(),
+            secret: "s3cr3t".to_string(),
+        },
+    )
+    .await?;
+let creds = handle.get_credentials("alpaca").await?;
+handle.clear_credentials("alpaca").await?;
+# let _ = creds;
+# Ok(())
+# }
+```
+
+- **`set_credentials`** stores (creating or rotating) credentials for a
+  configured provider and applies **live**: a configured provider reconnects
+  with the new credentials immediately, no daemon restart.
+- **`get_credentials`** reads back the stored credentials; a provider with
+  none stored rejects with the `credentials_missing` code.
+- **`clear_credentials`** removes the stored credentials but does **not**
+  unapply them from an already-running provider — that provider keeps its
+  last-applied credentials until it restarts.
+- All three are **same-host/UDS-only** (they round-trip over the same
+  control socket as `ping`/`snapshot`/…) and **peer-cred gated** on the
+  daemon side — an unprivileged caller's request is rejected with
+  `permission_denied` before it ever touches the credential backend. They are
+  deliberately **not** on the transport-generic `Client` trait: credential
+  ops are a facade/app-level concept, and the WS client must not grow them.
+- Rejections surface as `ClientError::Control` with the stable codes above
+  (plus `unknown_provider`, `bad_request`, `credential_backend_unavailable`)
+  — the same two-layer error model as every other `AppHandle` method.
 
 [`HealthView`]: ../datamancer-core/src/health.rs
 

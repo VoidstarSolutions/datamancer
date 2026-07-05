@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::control::{Reply, Request, SubscriptionSpec, codes, reply_from_library_error};
+use crate::credentials::{CredentialHub, credential_op_permitted};
 use crate::error::{DaemonError, Result};
 use crate::shutdown::{DrainClient, DrainRecorder, drain};
 
@@ -136,6 +137,13 @@ pub struct Server {
     /// The web layer's handle to the on-disk config file (Phase 6 config API).
     #[cfg(feature = "web-ui")]
     config_state: crate::web::ConfigState,
+    /// The credential broker. Held here so `run` can hand a clone to the
+    /// accept loop; credential ops never go through the actor's `dispatch`
+    /// (blocking store I/O runs off-actor in `handle_connection`).
+    hub: Arc<CredentialHub>,
+    /// The active credential-store backend name (for `ping`); threaded in at
+    /// bootstrap so the actor never touches the hub.
+    credential_backend: &'static str,
     /// `true` once a shutdown signal has been observed; rejects new requests.
     draining: bool,
 }
@@ -170,7 +178,14 @@ impl Server {
             "diagnostics cadence (cache-catalog split deferred; single cadence in use)"
         );
 
-        let built = config.build_runtime().await?;
+        // Open the credential store and seed per-provider watch channels
+        // before building the runtime, so each provider is constructed with
+        // its hot-apply credential source.
+        let providers = config.configured_providers();
+        let (hub, sources) = CredentialHub::bootstrap(&providers)?;
+        let credential_backend = hub.backend_name();
+
+        let built = config.build_runtime(&sources).await?;
         let dm = built.datamancer;
         let tap_log = built.tap_log;
 
@@ -223,6 +238,8 @@ impl Server {
             ws,
             #[cfg(feature = "web-ui")]
             config_state,
+            hub,
+            credential_backend,
             draining: false,
         })
     }
@@ -236,7 +253,16 @@ impl Server {
         let listener = self.bind_socket()?;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(256);
 
-        let accept = tokio::spawn(accept_loop(listener, cmd_tx.clone(), self.dm.clone()));
+        // The daemon's own effective uid: the credential-op peer-cred gate
+        // admits exactly this uid.
+        let own_euid = rustix::process::geteuid().as_raw();
+        let accept = tokio::spawn(accept_loop(
+            listener,
+            cmd_tx.clone(),
+            self.dm.clone(),
+            self.hub.clone(),
+            own_euid,
+        ));
 
         let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
             .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
@@ -532,7 +558,7 @@ impl Server {
                 }
             }
             Request::ListClients => Reply::clients(self.clients.keys().cloned().collect()),
-            Request::Ping => Reply::pong(env!("CARGO_PKG_VERSION")),
+            Request::Ping => Reply::pong(env!("CARGO_PKG_VERSION"), self.credential_backend),
             Request::Snapshot => match self.dm.snapshot().await {
                 Ok(snapshot) => Reply::snapshot(snapshot),
                 Err(e) => reply_from_library_error(&e),
@@ -548,6 +574,17 @@ impl Server {
                     Err(e) => reply_from_library_error(&e),
                 }
             }
+            // Dispatched off-actor in `handle_connection` (blocking store I/O
+            // behind `spawn_blocking`, peer-cred gated there — the gate needs
+            // the connection's peer uid, which never reaches the actor). This
+            // arm only exists for match exhaustiveness / defense in depth —
+            // it should be unreachable in normal operation.
+            Request::SetCredentials { .. }
+            | Request::GetCredentials { .. }
+            | Request::ClearCredentials { .. } => Reply::error(
+                codes::INTERNAL,
+                "credential ops are dispatched off-actor; this arm is unreachable",
+            ),
         }
     }
 
@@ -714,11 +751,23 @@ fn spawn_pump(mut stream: datamancer::EventStream, sink: Arc<dyn EventSink>) -> 
 }
 
 /// Accept control connections and spawn a reader per connection.
-async fn accept_loop(listener: UnixListener, cmd_tx: mpsc::Sender<ServerCommand>, dm: Datamancer) {
+async fn accept_loop(
+    listener: UnixListener,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+    dm: Datamancer,
+    hub: Arc<CredentialHub>,
+    own_euid: u32,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                tokio::spawn(handle_connection(stream, cmd_tx.clone(), dm.clone()));
+                tokio::spawn(handle_connection(
+                    stream,
+                    cmd_tx.clone(),
+                    dm.clone(),
+                    hub.clone(),
+                    own_euid,
+                ));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "control accept failed");
@@ -731,14 +780,23 @@ async fn accept_loop(listener: UnixListener, cmd_tx: mpsc::Sender<ServerCommand>
 /// forwards each to the server actor, writes the reply line. On EOF, if this
 /// connection had opened a client, signals an emergency teardown.
 ///
-/// `Request::Instruments` is dispatched here, off-actor, rather than forwarded
-/// to the actor: it awaits a live provider REST call and must not stall
-/// unrelated control traffic on the single-actor loop.
+/// `Request::Instruments` and the credential ops are dispatched here,
+/// off-actor, rather than forwarded to the actor: the former awaits a live
+/// provider REST call, the latter do blocking credential-store I/O (behind
+/// `spawn_blocking`) — neither may stall unrelated control traffic on the
+/// single-actor loop. Credential ops are additionally gated on the peer's
+/// uid matching the daemon's own effective uid, captured per-connection
+/// before the stream is split.
 async fn handle_connection(
     stream: UnixStream,
     cmd_tx: mpsc::Sender<ServerCommand>,
     dm: Datamancer,
+    hub: Arc<CredentialHub>,
+    own_euid: u32,
 ) {
+    // Kernel-reported peer credentials; unreadable peer = credential ops
+    // denied (never defaulted).
+    let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut opened_client: Option<String> = None;
@@ -759,6 +817,29 @@ async fn handle_connection(
                     match dm.instrument_catalog(filter.as_ref()).await {
                         Ok(catalog) => Reply::instruments(catalog),
                         Err(e) => reply_from_library_error(&e),
+                    }
+                } else if matches!(
+                    &request,
+                    Request::SetCredentials { .. }
+                        | Request::GetCredentials { .. }
+                        | Request::ClearCredentials { .. }
+                ) {
+                    if credential_op_permitted(peer_uid, own_euid) {
+                        match request {
+                            Request::SetCredentials {
+                                provider,
+                                credentials,
+                            } => hub.set(&provider, credentials).await,
+                            Request::GetCredentials { provider } => hub.get(&provider).await,
+                            Request::ClearCredentials { provider } => hub.clear(&provider).await,
+                            // Narrowed by the `matches!` above.
+                            _ => Reply::error(codes::INTERNAL, "unreachable credential dispatch"),
+                        }
+                    } else {
+                        Reply::error(
+                            codes::PERMISSION_DENIED,
+                            "credential ops require the daemon owner's uid",
+                        )
                     }
                 } else {
                     let open_client_name = match &request {

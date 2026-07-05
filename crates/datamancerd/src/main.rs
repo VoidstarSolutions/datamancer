@@ -20,6 +20,7 @@
 
 mod config;
 mod control;
+mod credentials;
 mod error;
 mod paths;
 mod server;

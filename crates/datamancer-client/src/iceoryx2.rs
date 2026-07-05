@@ -315,6 +315,25 @@ impl Client for Iceoryx2Client {
     }
 }
 
+impl Iceoryx2Client {
+    /// Raw control round-trip, `pub(crate)` for the `app` facade's credential
+    /// methods (see `crate::app::AppHandle`). Deliberately **not** part of
+    /// the `Client` trait: credential ops are same-host/UDS-only and must
+    /// not appear on the transport-generic trait the WS client also
+    /// implements.
+    pub(crate) async fn control_request(
+        &mut self,
+        req: &Request,
+    ) -> Result<Reply, ClientError<Iceoryx2ClientError>> {
+        let reply = self
+            .control
+            .request(req)
+            .await
+            .map_err(ClientError::Transport)?;
+        check(reply)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ControlConn, Iceoryx2ClientError, parse_client_id};

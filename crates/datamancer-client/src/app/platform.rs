@@ -12,7 +12,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 
-use crate::app::lifecycle::{ControlEndpoint, DaemonSpawner, ExitInfo, PingFailure, SpawnedDaemon};
+use crate::app::lifecycle::{
+    ControlEndpoint, DaemonHello, DaemonSpawner, ExitInfo, PingFailure, SpawnedDaemon,
+};
 use crate::protocol::uds::{Reply, Request};
 
 /// How much of the daemon log to quote in an exit diagnosis.
@@ -21,7 +23,7 @@ const LOG_TAIL_BYTES: u64 = 2048;
 pub(crate) struct TokioEndpoint;
 
 impl ControlEndpoint for TokioEndpoint {
-    async fn ping(&self, socket: &Path, timeout: Duration) -> Result<String, PingFailure> {
+    async fn ping(&self, socket: &Path, timeout: Duration) -> Result<DaemonHello, PingFailure> {
         let attempt = async {
             let stream = UnixStream::connect(socket)
                 .await
@@ -43,7 +45,10 @@ impl ControlEndpoint for TokioEndpoint {
             let reply: Reply = serde_json::from_str(&reply_line)
                 .map_err(|e| PingFailure(format!("decode: {e}")))?;
             match (reply.ok, reply.version) {
-                (true, Some(version)) => Ok(version),
+                (true, Some(version)) => Ok(DaemonHello {
+                    version,
+                    credential_backend: reply.credential_backend,
+                }),
                 (true, None) => Err(PingFailure("ping reply missing version".to_string())),
                 (false, _) => Err(PingFailure(format!(
                     "daemon rejected ping: {}",
@@ -164,11 +169,23 @@ mod tests {
     #[tokio::test]
     async fn ping_extracts_version_from_a_live_socket() {
         let path = fake_daemon(r#"{"ok":true,"version":"9.9.9"}"#);
-        let v = TokioEndpoint
+        let hello = TokioEndpoint
             .ping(&path, Duration::from_secs(1))
             .await
             .unwrap();
-        assert_eq!(v, "9.9.9");
+        assert_eq!(hello.version, "9.9.9");
+        assert!(hello.credential_backend.is_none());
+    }
+
+    #[tokio::test]
+    async fn ping_extracts_credential_backend_when_reported() {
+        let path = fake_daemon(r#"{"ok":true,"version":"9.9.9","credential_backend":"file"}"#);
+        let hello = TokioEndpoint
+            .ping(&path, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(hello.version, "9.9.9");
+        assert_eq!(hello.credential_backend.as_deref(), Some("file"));
     }
 
     #[tokio::test]
