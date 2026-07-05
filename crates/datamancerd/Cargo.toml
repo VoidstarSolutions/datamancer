@@ -61,7 +61,7 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false, feat
 ], optional = true }
 
 [dev-dependencies]
-datamancer-client = { path = "../datamancer-client", features = ["ws", "iceoryx2"] }
+datamancer-client = { path = "../datamancer-client", features = ["ws", "iceoryx2", "app"] }
 datamancer-core = { path = "../datamancer-core" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
