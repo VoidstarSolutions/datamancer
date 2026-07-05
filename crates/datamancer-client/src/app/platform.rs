@@ -122,17 +122,22 @@ impl SpawnedDaemon for UnixDaemonProcess {
     }
 }
 
-/// Last [`LOG_TAIL_BYTES`] of the daemon log, best effort (empty on any error).
+/// Last [`LOG_TAIL_BYTES`] of the daemon log, best effort (empty on any
+/// error). The seek offset can land mid-multibyte UTF-8 character, so the
+/// raw bytes are decoded lossily rather than with `read_to_string` (which
+/// would error on the truncated char and collapse the whole tail to "" right
+/// when a `DaemonExited` diagnosis needs it most).
 fn log_tail(path: &Path) -> String {
-    let read = || -> std::io::Result<String> {
+    let read = || -> std::io::Result<Vec<u8>> {
         let mut f = std::fs::File::open(path)?;
         let len = f.metadata()?.len();
         f.seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES)))?;
-        let mut buf = String::new();
-        f.read_to_string(&mut buf)?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
         Ok(buf)
     };
-    read().unwrap_or_default().trim().to_string()
+    let bytes = read().unwrap_or_default();
+    String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
 #[cfg(test)]
@@ -181,6 +186,48 @@ mod tests {
                 .ping(absent, Duration::from_millis(200))
                 .await
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn log_tail_returns_trailing_bytes_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.log");
+        // Bigger than LOG_TAIL_BYTES so the seek actually truncates.
+        let body = "x".repeat(3000);
+        std::fs::write(&path, format!("{body}\n")).unwrap();
+        let tail = log_tail(&path);
+        assert!(!tail.is_empty());
+        assert!(u64::try_from(tail.len()).unwrap() <= LOG_TAIL_BYTES);
+        assert!(tail.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn log_tail_is_lossy_across_a_multibyte_boundary() {
+        // '…' is a 3-byte UTF-8 char; 2048 is not a multiple of 3, so a run
+        // of them long enough to be truncated always has the cut point land
+        // mid-character (proof: for a run of N 3-byte chars the cut's
+        // position within the run is `3*N - 2048 (mod 3)` = `-2048 mod 3` =
+        // 1, independent of N — never 0, i.e. never a char boundary).
+        let content = "…".repeat(2000);
+        let cut = content
+            .len()
+            .saturating_sub(usize::try_from(LOG_TAIL_BYTES).unwrap());
+        assert!(
+            !content.is_char_boundary(cut),
+            "fixture must land mid multibyte char for this test to be meaningful"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.log");
+        std::fs::write(&path, &content).unwrap();
+
+        // `read_to_string` would hit InvalidData on the split char and the
+        // tail would collapse to "" — assert the lossy decode doesn't.
+        let tail = log_tail(&path);
+        assert!(
+            !tail.is_empty(),
+            "lossy decode across a multibyte boundary must not collapse to empty"
         );
     }
 

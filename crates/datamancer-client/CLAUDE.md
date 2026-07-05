@@ -25,7 +25,11 @@ Consumer-side surface for datamancerd: the shared control vocabulary
   `Control::Gap`. WS: stream end. Graceful close is marked by a terminal
   `SessionClosing`. The client never synthesizes events (`rx_ts` included).
 - **Pinned versions in lockstep:** tokio-tungstenite 0.29.0 and iceoryx2
-  0.9.2 must match the transport crates and `datamancerd`.
+  0.9.2 must match the transport crates and `datamancerd`. Separately, the
+  `datamancer-client` and `datamancerd` **crate versions** must also bump in
+  lockstep — `AppHandle`'s `ping` version gate compares `datamancer-client`'s
+  `CARGO_PKG_VERSION` against the daemon's, and pre-1.0 that gate requires
+  equal major.minor (regression-guarded by a test in `datamancerd`).
 
 ## `app` feature (find-or-spawn facade)
 

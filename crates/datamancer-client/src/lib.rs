@@ -25,3 +25,6 @@ pub mod ws;
 pub use client::Client;
 pub use error::ClientError;
 pub use paths::default_control_socket;
+
+/// This crate's version — the client side of the daemon's ping version gate.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
