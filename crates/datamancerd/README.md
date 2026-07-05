@@ -304,7 +304,7 @@ One JSON object per line; one reply line per request.
 {"op":"instruments","provider":"alpaca-crypto"}
   -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
-{"op":"ping"}          -> {"ok":true,"version":"0.2.0","credential_backend":"keychain"}
+{"op":"ping"}          -> {"ok":true,"version":"0.3.0","credential_backend":"keychain"}
 {"op":"set-credentials","provider":"alpaca-crypto","credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
   -> {"ok":true}
 {"op":"get-credentials","provider":"alpaca-crypto"}

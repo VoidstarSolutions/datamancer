@@ -81,7 +81,7 @@ Subscriptions accumulate; the client session's multiplexed stream **interleaves*
 
 A `LiveConfig` covers:
 
-- Provider selection and credentials (secrets handling — env, file, or OS keychain — is an implementation choice deferred until there's a second provider to motivate it).
+- Provider selection and credentials. Each provider config carries a `CredentialsSource` (`Env` — deprecated legacy `ALPACA_*` variables; `Static`; or `Watch`, a hot-reloadable channel) rather than the builder itself gaining a credential-source API; `datamancerd` wires `Watch` to its own credential broker (`datamancer-credentials`: OS keychain/secret-service with a file fallback, provisioned over the control socket).
 - Per-instrument provider mapping, once more than one provider is supported.
 - Reconnect and retry policy.
 - Buffer sizes and backpressure behavior.

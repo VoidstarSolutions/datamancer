@@ -224,6 +224,15 @@ is gated by a new **peer-credential (same-uid) check** on the UDS connection
 - The `[ws].auth_token` secret can migrate to the same store later, retiring
   the redaction dance in `GET/PUT /api/config`.
 
+**Status:** implemented on `feature/credential-broker`, with two recorded
+deviations from this section: (1) the credential-source API lands on each
+provider's config (`CredentialsSource::{Env,Static,Watch}`) rather than on
+the `Datamancer` builder itself — the builder consumes already-constructed
+providers, so this is the honest surface for the same one-store-two-consumers
+goal; (2) `clear-credentials` removes the stored entry but does not un-apply
+credentials already hot-applied to a running provider (no un-auth primitive
+exists) — a running stream keeps its last-applied credentials until restart.
+
 ### Cycle 3 — config
 
 ```jsonc
