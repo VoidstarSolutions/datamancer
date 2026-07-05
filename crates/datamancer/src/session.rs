@@ -62,9 +62,10 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use datamancer_core::{
     Adjustment, AuthoritativeSessionSnapshot, Bar, CacheKey, CacheSnapshot, ClientSessionSnapshot,
-    Control, ControlKind, Error, EventKind, EventSink, GapSpan, HistoricalCache, HistoryRequest,
-    Instrument, InstrumentInfo, LiveHandle, MarketEvent, Provider, ProviderId, ProviderSnapshot,
-    PublishOutcome, Quote, ReplayRequest, Result, Seq, SystemSnapshot, TapLog, Timestamp, Trade,
+    Control, ControlKind, Error, EventKind, EventSink, GapSpan, HealthView, HistoricalCache,
+    HistoryRequest, Instrument, InstrumentInfo, LiveHandle, MarketEvent, Provider, ProviderId,
+    ProviderSnapshot, PublishOutcome, Quote, ReplayRequest, Result, Seq, SystemSnapshot, TapLog,
+    Timestamp, Trade,
 };
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -534,6 +535,18 @@ impl Datamancer {
     #[must_use]
     pub fn snapshot_live(&self) -> SystemSnapshot {
         self.assemble_snapshot(CacheSnapshot::new(Vec::new(), None))
+    }
+
+    /// The app-facing [`HealthView`] reduction of [`Self::snapshot_live`] —
+    /// in-process parity with the daemon facade's `health()`. Uses the default
+    /// staleness threshold; embedders needing another threshold can call
+    /// [`HealthView::from_snapshot`] on a snapshot themselves.
+    #[must_use]
+    pub fn health(&self) -> HealthView {
+        let mut view =
+            HealthView::from_snapshot(&self.snapshot_live(), HealthView::DEFAULT_STALE_AFTER_NS);
+        view.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
+        view
     }
 
     /// Enumerate the instruments each registered provider can serve, with the

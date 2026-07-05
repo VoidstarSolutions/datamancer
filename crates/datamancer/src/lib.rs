@@ -40,10 +40,12 @@ pub use datamancer_core::traits;
 pub use datamancer_core::{
     Adjustment, AssetClass, AuthoritativeSessionSnapshot, Bar, BarInterval, CacheCatalogEntry,
     CacheCoverage, CacheKey, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
-    ConnectionState, Control, ControlKind, Error, EventKind, GapSpan, HistoricalCache,
-    HistoryRequest, Instrument, InstrumentInfo, LiveHandle, MarketEvent, Price, Provider,
-    ProviderId, ProviderMetrics, ProviderSnapshot, Quantity, Quote, ReplayRequest, ReplaySource,
-    Result, ResumeBufferSnapshot, Seq, SubscriptionRef, SystemSnapshot, TapLog, Timestamp, Trade,
+    ConnectionState, Control, ControlKind, DaemonHealth, Error, EventKind, GapSpan, HealthView,
+    HistoricalCache, HistoryRequest, Instrument, InstrumentInfo, LatencySummary, LiveHandle,
+    Liveness, MarketEvent, Price, Provider, ProviderHealth, ProviderId, ProviderMetrics,
+    ProviderSnapshot, ProviderState, Quantity, Quote, ReplayRequest, ReplaySource, Result,
+    ResumeBufferSnapshot, Seq, StreamHealth, SubscriptionRef, SystemSnapshot, TapLog, Timestamp,
+    Trade,
 };
 pub use session::{
     Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,
