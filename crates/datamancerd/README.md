@@ -321,7 +321,7 @@ One JSON object per line; one reply line per request.
 {"op":"instruments","provider":"alpaca-crypto"}
   -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
-{"op":"ping"}          -> {"ok":true,"version":"0.4.0","credential_backend":"keychain"}
+{"op":"ping"}          -> {"ok":true,"version":"0.5.0","credential_backend":"keychain"}
 {"op":"set-credentials","provider":"alpaca-crypto","credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
   -> {"ok":true}
 {"op":"get-credentials","provider":"alpaca-crypto"}
@@ -361,6 +361,24 @@ is no WS equivalent; WS consumers reduce their own `snapshot` reply
 client-side. `AppHandle::health()` sends this op rather than reducing
 `snapshot` itself, so the `HealthView.schema_version` field is the daemon's,
 not a client-side guess.
+
+### `datamancer/health` push plane (iceoryx2)
+
+Alongside the pull-style `health` op, the daemon periodically **publishes**
+the same daemon-stamped `HealthView` on a dedicated iceoryx2 service,
+`datamancer/health` — a single byte-slice pub-sub service, sibling to (and
+sharing its wire cap with) `datamancer/diagnostics`. Cadence is
+`[diagnostics] publish_interval_ms` (default 1000ms; the health/observability
+e2e uses 200ms). Like the diagnostics service, it is capped at 1 MiB per
+sample and built with `history_size(1)`, so a late-joining subscriber
+receives the most recent view immediately rather than waiting a full cadence
+tick. The service name is **host-global**, not scoped by `service_prefix` —
+the same one-`datamancerd`-per-host constraint noted above for the
+diagnostics service applies here too. `AppHandle::watch_health()` is the
+supported subscriber: a same-host shared-memory subscription independent of
+the control connection, returning an infallible `HealthStream`
+(`tokio_stream::wrappers::ReceiverStream<HealthView>`) that never errors —
+a setup failure ends the stream immediately instead.
 
 `get-config`/`configure-provider`/`remove-provider`/`shutdown` are the
 config-service ops (spec cycle 3); see the dedicated section below for

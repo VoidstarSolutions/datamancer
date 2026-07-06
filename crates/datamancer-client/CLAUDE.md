@@ -39,8 +39,13 @@ Consumer-side surface for datamancerd: the shared control vocabulary
   an existing control-surface op (`ping`, `open-client`/`connect`,
   `subscribe`, `unsubscribe`, `snapshot`, `close`, `set-credentials`/
   `get-credentials`/`clear-credentials`, `get-config`/`configure-provider`/
-  `remove-provider`, `shutdown`) — it composes, it does not extend, the
-  vocabulary this crate already owns.
+  `remove-provider`, `shutdown`, `health`) — it composes, it does not extend,
+  the vocabulary this crate already owns. `watch_health()` is the one
+  exception to "one method, one op": it is a read-only subscription onto the
+  daemon's `datamancer/health` iceoryx2 push plane, not a control-surface op
+  at all — it never touches the control connection `self.client` holds, so it
+  takes `&self` and cannot fail synchronously (a setup failure just ends the
+  returned `HealthStream` immediately).
 - **Platform seams are internal traits, not a public abstraction.**
   `ControlEndpoint` and `DaemonSpawner` (`app::lifecycle`) isolate the
   find-or-spawn state machine from the unix-specific `TokioEndpoint` /
