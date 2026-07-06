@@ -140,11 +140,88 @@ mod runtime {
             .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))
     }
 
+    /// Private generic core shared by the diagnostics and health byte-slice
+    /// publishers: same `publish_subscribe::<[u8]>()` + `history_size(1)` +
+    /// `initial_max_slice_len(DIAGNOSTICS_PAYLOAD_CAPACITY)` service shape,
+    /// only the service name and codec fn differ per plane. The public
+    /// per-plane types below are thin newtypes delegating here so the wire
+    /// format and public API stay exactly as documented.
+    struct BytePublisher {
+        publisher: Publisher<ipc_threadsafe::Service, [u8], ()>,
+    }
+
+    impl BytePublisher {
+        fn open(node: &Node<ipc_threadsafe::Service>, name: &ServiceName) -> Result<Self> {
+            let service = node
+                .service_builder(name)
+                .publish_subscribe::<[u8]>()
+                .history_size(1)
+                .open_or_create()
+                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+            let publisher = service
+                .publisher_builder()
+                .initial_max_slice_len(DIAGNOSTICS_PAYLOAD_CAPACITY)
+                .create()
+                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+            Ok(Self { publisher })
+        }
+
+        fn publish_bytes(&self, bytes: &[u8]) -> Result<()> {
+            let sample = self
+                .publisher
+                .loan_slice_uninit(bytes.len())
+                .map_err(|e| TransportError::Send(format!("{e:?}")))?;
+            let sample = sample.write_from_slice(bytes);
+            sample
+                .send()
+                .map_err(|e| TransportError::Send(format!("{e:?}")))?;
+            Ok(())
+        }
+    }
+
+    /// Private generic core shared by the diagnostics and health byte-slice
+    /// subscribers, mirroring [`BytePublisher`].
+    struct ByteSubscriber {
+        subscriber: Subscriber<ipc_threadsafe::Service, [u8], ()>,
+    }
+
+    impl ByteSubscriber {
+        fn open(node: &Node<ipc_threadsafe::Service>, name: &ServiceName) -> Result<Self> {
+            let service = node
+                .service_builder(name)
+                .publish_subscribe::<[u8]>()
+                .history_size(1)
+                .open_or_create()
+                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+            let subscriber = service
+                .subscriber_builder()
+                .create()
+                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+            Ok(Self { subscriber })
+        }
+
+        /// Drain to the latest sample, if any, decoding each with `decode`.
+        fn receive_latest<T>(
+            &self,
+            decode: impl Fn(&[u8]) -> std::result::Result<T, super::DiagnosticsError>,
+        ) -> Result<Option<T>> {
+            let mut latest = None;
+            while let Some(sample) = self
+                .subscriber
+                .receive()
+                .map_err(|e| TransportError::Send(format!("{e:?}")))?
+            {
+                latest = Some(decode(&sample).map_err(|e| TransportError::Send(e.to_string()))?);
+            }
+            Ok(latest)
+        }
+    }
+
     /// Single-instance diagnostics publisher (not per client). The daemon
     /// (Phase 5) drives its cadence from the existing tokio runtime — never a
     /// second runtime.
     pub struct Iceoryx2DiagnosticsPublisher {
-        publisher: Publisher<ipc_threadsafe::Service, [u8], ()>,
+        inner: BytePublisher,
     }
 
     impl Iceoryx2DiagnosticsPublisher {
@@ -156,18 +233,9 @@ mod runtime {
         /// Returns [`TransportError`] if the service or publisher cannot be
         /// created.
         pub fn new(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
-            let service = node
-                .service_builder(&diagnostics_name()?)
-                .publish_subscribe::<[u8]>()
-                .history_size(1)
-                .open_or_create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
-            let publisher = service
-                .publisher_builder()
-                .initial_max_slice_len(DIAGNOSTICS_PAYLOAD_CAPACITY)
-                .create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
-            Ok(Self { publisher })
+            Ok(Self {
+                inner: BytePublisher::open(node, &diagnostics_name()?)?,
+            })
         }
 
         /// Serialize and publish one snapshot sample.
@@ -179,21 +247,13 @@ mod runtime {
         pub fn publish(&self, snapshot: &SystemSnapshot) -> Result<()> {
             let bytes =
                 encode_snapshot(snapshot).map_err(|e| TransportError::Send(e.to_string()))?;
-            let sample = self
-                .publisher
-                .loan_slice_uninit(bytes.len())
-                .map_err(|e| TransportError::Send(format!("{e:?}")))?;
-            let sample = sample.write_from_slice(&bytes);
-            sample
-                .send()
-                .map_err(|e| TransportError::Send(format!("{e:?}")))?;
-            Ok(())
+            self.inner.publish_bytes(&bytes)
         }
     }
 
     /// Subscriber-side diagnostics helper (test + future operator tooling).
     pub struct Iceoryx2DiagnosticsSubscriber {
-        subscriber: Subscriber<ipc_threadsafe::Service, [u8], ()>,
+        inner: ByteSubscriber,
     }
 
     impl Iceoryx2DiagnosticsSubscriber {
@@ -204,17 +264,9 @@ mod runtime {
         /// Returns [`TransportError`] if the service or subscriber cannot be
         /// created.
         pub fn open(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
-            let service = node
-                .service_builder(&diagnostics_name()?)
-                .publish_subscribe::<[u8]>()
-                .history_size(1)
-                .open_or_create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
-            let subscriber = service
-                .subscriber_builder()
-                .create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
-            Ok(Self { subscriber })
+            Ok(Self {
+                inner: ByteSubscriber::open(node, &diagnostics_name()?)?,
+            })
         }
 
         /// Receive and decode the most recent snapshot, if one is available.
@@ -223,17 +275,7 @@ mod runtime {
         ///
         /// Returns [`TransportError`] on a receive or decode failure.
         pub fn receive(&self) -> Result<Option<SystemSnapshot>> {
-            let mut latest = None;
-            while let Some(sample) = self
-                .subscriber
-                .receive()
-                .map_err(|e| TransportError::Send(format!("{e:?}")))?
-            {
-                latest = Some(
-                    decode_snapshot(&sample).map_err(|e| TransportError::Send(e.to_string()))?,
-                );
-            }
-            Ok(latest)
+            self.inner.receive_latest(decode_snapshot)
         }
     }
 
@@ -242,7 +284,7 @@ mod runtime {
     /// The daemon drives its cadence from the same diagnostics ticker — one
     /// snapshot feeds both planes.
     pub struct Iceoryx2HealthPublisher {
-        publisher: Publisher<ipc_threadsafe::Service, [u8], ()>,
+        inner: BytePublisher,
     }
 
     impl Iceoryx2HealthPublisher {
@@ -254,18 +296,9 @@ mod runtime {
         /// Returns [`TransportError`] if the service or publisher cannot be
         /// created.
         pub fn new(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
-            let service = node
-                .service_builder(&health_name()?)
-                .publish_subscribe::<[u8]>()
-                .history_size(1)
-                .open_or_create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
-            let publisher = service
-                .publisher_builder()
-                .initial_max_slice_len(DIAGNOSTICS_PAYLOAD_CAPACITY)
-                .create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
-            Ok(Self { publisher })
+            Ok(Self {
+                inner: BytePublisher::open(node, &health_name()?)?,
+            })
         }
 
         /// Serialize and publish one health-view sample.
@@ -276,22 +309,14 @@ mod runtime {
         /// the iceoryx2 loan/send fails.
         pub fn publish(&self, view: &HealthView) -> Result<()> {
             let bytes = encode_health(view).map_err(|e| TransportError::Send(e.to_string()))?;
-            let sample = self
-                .publisher
-                .loan_slice_uninit(bytes.len())
-                .map_err(|e| TransportError::Send(format!("{e:?}")))?;
-            let sample = sample.write_from_slice(&bytes);
-            sample
-                .send()
-                .map_err(|e| TransportError::Send(format!("{e:?}")))?;
-            Ok(())
+            self.inner.publish_bytes(&bytes)
         }
     }
 
     /// Subscriber-side health helper (app-facing `watch_health` + future
     /// operator tooling), mirroring [`Iceoryx2DiagnosticsSubscriber`].
     pub struct Iceoryx2HealthSubscriber {
-        subscriber: Subscriber<ipc_threadsafe::Service, [u8], ()>,
+        inner: ByteSubscriber,
     }
 
     impl Iceoryx2HealthSubscriber {
@@ -302,17 +327,9 @@ mod runtime {
         /// Returns [`TransportError`] if the service or subscriber cannot be
         /// created.
         pub fn open(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
-            let service = node
-                .service_builder(&health_name()?)
-                .publish_subscribe::<[u8]>()
-                .history_size(1)
-                .open_or_create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
-            let subscriber = service
-                .subscriber_builder()
-                .create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
-            Ok(Self { subscriber })
+            Ok(Self {
+                inner: ByteSubscriber::open(node, &health_name()?)?,
+            })
         }
 
         /// Receive and decode the most recent health view, if one is
@@ -322,16 +339,7 @@ mod runtime {
         ///
         /// Returns [`TransportError`] on a receive or decode failure.
         pub fn receive(&self) -> Result<Option<HealthView>> {
-            let mut latest = None;
-            while let Some(sample) = self
-                .subscriber
-                .receive()
-                .map_err(|e| TransportError::Send(format!("{e:?}")))?
-            {
-                latest =
-                    Some(decode_health(&sample).map_err(|e| TransportError::Send(e.to_string()))?);
-            }
-            Ok(latest)
+            self.inner.receive_latest(decode_health)
         }
     }
 }

@@ -70,6 +70,23 @@ fn stop_daemon() {
     }
 }
 
+/// Best-effort safety net around the spawned daemon `Child`: if a later
+/// assertion panics before the end-of-test `shutdown_daemon`/`wait()`
+/// sequence runs, `Drop` kills and reaps the child rather than leaking it
+/// and its hold on the host-global single-instance lock. Not the primary
+/// shutdown path — the graceful `AppHandle::shutdown_daemon` + `child.wait()`
+/// flow is unchanged; `kill`/`wait` on an already-exited (reaped) process
+/// simply errors, which is ignored, so the guard is a harmless no-op on the
+/// success path.
+struct DaemonGuard(std::process::Child);
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs a live iceoryx2 runtime and spawns the daemon binary"]
 #[allow(clippy::too_many_lines)] // one sequential e2e narrative; splitting hides the story
@@ -80,20 +97,24 @@ async fn health_reflects_disabled_enabled_and_pushes() {
     // 1. Spawn with zero [provider.*] sections. Spawn directly (not through
     // the facade's spawner) with all four ALPACA_* env vars scrubbed and
     // DATAMANCER_CREDENTIALS_FILE pinned to the tempdir — same env hygiene
-    // as `credential_broker_e2e.rs`/`config_service_e2e.rs`.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_datamancerd"))
-        .arg("--config")
-        .arg(&config)
-        .env(
-            "DATAMANCER_CREDENTIALS_FILE",
-            dir.path().join("credentials.json"),
-        )
-        .env_remove("ALPACA_PAPER_API_KEY_ID")
-        .env_remove("ALPACA_PAPER_API_SECRET_KEY")
-        .env_remove("ALPACA_LIVE_API_KEY_ID")
-        .env_remove("ALPACA_LIVE_API_SECRET_KEY")
-        .spawn()
-        .expect("spawn datamancerd");
+    // as `credential_broker_e2e.rs`/`config_service_e2e.rs`. Wrapped in
+    // `DaemonGuard` so a panic in any assertion below still kills/reaps the
+    // process instead of leaking it.
+    let mut child = DaemonGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_datamancerd"))
+            .arg("--config")
+            .arg(&config)
+            .env(
+                "DATAMANCER_CREDENTIALS_FILE",
+                dir.path().join("credentials.json"),
+            )
+            .env_remove("ALPACA_PAPER_API_KEY_ID")
+            .env_remove("ALPACA_PAPER_API_SECRET_KEY")
+            .env_remove("ALPACA_LIVE_API_KEY_ID")
+            .env_remove("ALPACA_LIVE_API_SECRET_KEY")
+            .spawn()
+            .expect("spawn datamancerd"),
+    );
 
     let bind_deadline = Instant::now() + Duration::from_secs(10);
     while !socket.exists() {
@@ -227,6 +248,7 @@ async fn health_reflects_disabled_enabled_and_pushes() {
     handle.shutdown_daemon().await.expect("shutdown_daemon");
 
     let status = child
+        .0
         .wait()
         .expect("daemon process must exit after shutdown");
     assert!(status.success(), "daemon must exit 0 on graceful shutdown");

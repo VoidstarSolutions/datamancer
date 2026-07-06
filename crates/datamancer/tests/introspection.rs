@@ -759,9 +759,22 @@ async fn snapshot_reflects_backfilling_flag_while_seam_pending() {
     let a = auth_snap(&snap, "AAPL");
     assert!(a.backfilling, "backfill in flight should report true");
 
-    // Release the fetch and let the seam flush complete.
+    // Release the fetch and poll until the seam flush completes, rather than
+    // a fixed sleep (flaky under load) — generous deadline, short poll tick.
     release_tx.send(true).unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = dm.snapshot().await.unwrap();
+        let a = auth_snap(&snap, "AAPL");
+        if !a.backfilling {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "backfilling flag never cleared after the seam flush was released"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     let snap = dm.snapshot().await.unwrap();
     let a = auth_snap(&snap, "AAPL");
