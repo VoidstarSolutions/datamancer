@@ -27,7 +27,8 @@ mod symbol_table;
 
 pub use diagnostics::{
     DIAGNOSTICS_PAYLOAD_CAPACITY, DiagnosticsError, Iceoryx2DiagnosticsPublisher,
-    Iceoryx2DiagnosticsSubscriber, decode_snapshot, encode_snapshot,
+    Iceoryx2DiagnosticsSubscriber, Iceoryx2HealthPublisher, Iceoryx2HealthSubscriber,
+    decode_health, decode_snapshot, encode_health, encode_snapshot,
 };
 pub use error::{Result, TransportError};
 pub use naming::{WIRE_VERSION, announcement_service_name, data_service_name};

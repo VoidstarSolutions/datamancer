@@ -370,7 +370,57 @@ impl AppHandle {
     pub async fn close(self) -> Result<(), ClientError<Iceoryx2ClientError>> {
         self.client.close().await
     }
+
+    /// Subscribe to pushed health views on the `datamancer/health` plane (the
+    /// daemon publishes on its diagnostics cadence, daemon-stamped the same
+    /// way as [`Self::health`]). Late joiners immediately receive the most
+    /// recent view (`history_size(1)`).
+    ///
+    /// This is a same-host shared-memory subscription independent of the
+    /// control connection: it does not consume `self.client` and cannot fail
+    /// synchronously — a setup failure (node/service open) ends the returned
+    /// stream immediately instead. Drop the stream to stop the poll task.
+    #[must_use]
+    pub fn watch_health(&self) -> HealthStream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<HealthView>(4);
+        tokio::task::spawn_blocking(move || {
+            let Ok(node) = ::iceoryx2::prelude::NodeBuilder::new()
+                .create::<::iceoryx2::prelude::ipc_threadsafe::Service>()
+            else {
+                return; // stream ends; caller observes termination
+            };
+            let Ok(subscriber) =
+                datamancer_transport_iceoryx2::Iceoryx2HealthSubscriber::open(&node)
+            else {
+                return;
+            };
+            while !tx.is_closed() {
+                match subscriber.receive() {
+                    Ok(Some(view)) => {
+                        if tx.blocking_send(view).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => std::thread::sleep(HEALTH_POLL_INTERVAL),
+                    Err(_) => return,
+                }
+            }
+        });
+        tokio_stream::wrappers::ReceiverStream::new(rx)
+    }
 }
+
+/// Push stream of daemon-stamped [`HealthView`]s (the `datamancer/health`
+/// plane; the daemon publishes on its diagnostics cadence). The stream ends
+/// if the subscription fails; drop the stream to stop the poll task.
+pub type HealthStream = tokio_stream::wrappers::ReceiverStream<HealthView>;
+
+/// Idle-poll sleep for [`AppHandle::watch_health`]. Not derived from
+/// [`EnsureConfig::poll_interval`]: that value lives on the one-shot `ensure`
+/// config and isn't retained on `AppHandle`, and this loop's cadence is
+/// bounded above by the daemon's independent diagnostics publish interval
+/// regardless, so a fixed short poll is simplest.
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Map an ok `get-config` reply to [`DaemonConfig`], or a transport error if
 /// the reply is missing its `config` payload.
