@@ -404,7 +404,8 @@ impl Server {
 
         // Warm both swaps before serving so a handler never serves an empty
         // snapshot.
-        let mut refreshers = crate::web::refresh::Refreshers::warm(&self.dm).await?;
+        let mut refreshers =
+            crate::web::refresh::Refreshers::warm(&self.dm, self.credential_backend).await?;
         refreshers.spawn(
             self.dm.clone(),
             web.live_state_cadence_ms,

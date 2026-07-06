@@ -234,7 +234,7 @@ handler never serves an empty snapshot and never invokes the on-demand
 | `GET /api/cache` | cache catalog (slow swap): keys + ranges + est. bytes |
 | `GET /api/providers` | provider accounting |
 | `GET /api/sessions` | authoritative + client sessions (per-symbol) |
-| `GET /api/health` | process-up + per-provider connection rollup |
+| `GET /api/health` | `{"ready": bool, "health": <core HealthView>}` — readiness (at least one enabled provider, all enabled providers `Connected`; disabled providers never block readiness) plus the full app-facing `HealthView` |
 | `GET /api/stream` | SSE of the live-state envelope, one event per refresh |
 | `GET /api/config` | the on-disk config file + restart-required flag + path |
 | `PUT /api/config` | validate and atomically rewrite the config file |
