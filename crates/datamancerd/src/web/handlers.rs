@@ -82,12 +82,7 @@ pub(crate) struct HealthEnvelope {
 
 impl HealthEnvelope {
     pub(crate) fn from_snapshot(snap: &SystemSnapshot, credential_backend: &str) -> Self {
-        let mut health = datamancer::HealthView::from_snapshot(
-            snap,
-            datamancer::HealthView::DEFAULT_STALE_AFTER_NS,
-        );
-        health.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
-        health.daemon.credential_backend = Some(credential_backend.to_string());
+        let health = crate::server::stamped_health_view(snap, credential_backend);
         let enabled: Vec<_> = health
             .providers
             .iter()
@@ -226,6 +221,51 @@ mod tests {
             vec![],
         );
         assert!(!HealthEnvelope::from_snapshot(&snap, "file").ready);
+    }
+
+    #[test]
+    fn health_envelope_not_ready_when_one_enabled_provider_is_disconnected() {
+        // One provider Connected, one enabled-but-Disconnected: readiness
+        // requires *all* enabled providers Connected, so this must be false
+        // (the only readiness branch with no direct test until now).
+        let snap = SystemSnapshot::new(
+            Timestamp(1_000),
+            vec![
+                ProviderSnapshot::new(
+                    ProviderId::from_static("on"),
+                    ConnectionState::Connected,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                ),
+                ProviderSnapshot::new(
+                    ProviderId::from_static("flaky"),
+                    ConnectionState::Disconnected,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                ),
+            ],
+            CacheSnapshot::new(vec![], None),
+            vec![],
+            vec![],
+        );
+        let env = HealthEnvelope::from_snapshot(&snap, "keychain");
+        assert!(!env.ready);
+        assert_eq!(env.health.providers[0].state, ProviderState::Connected);
+        assert_eq!(env.health.providers[1].state, ProviderState::Disconnected);
     }
 
     fn config_state() -> ConfigState {

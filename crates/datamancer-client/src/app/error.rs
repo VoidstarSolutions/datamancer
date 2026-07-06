@@ -30,10 +30,13 @@ impl std::fmt::Display for ReadyDiagnosis {
             Self::DaemonExited {
                 status,
                 stderr_tail,
-            } => write!(
-                f,
-                "daemon exited (status: {status:?}), stderr tail: {stderr_tail}"
-            ),
+            } => {
+                let status = status.map_or_else(|| "unknown".to_string(), |s| s.to_string());
+                write!(
+                    f,
+                    "daemon exited (status: {status}), stderr tail: {stderr_tail}"
+                )
+            }
             Self::Unresponsive {
                 last_ping_failure: Some(reason),
             } => write!(f, "daemon unresponsive: {reason}"),

@@ -214,6 +214,12 @@ pong predates the field and omits it. A current daemon always reports a
 backend — it selects one at bootstrap and refuses to boot when none is
 available.
 
+`AppHandle::watch_health()` is a read-only subscription onto the daemon's
+`datamancer/health` push plane, distinct from the request/reply `health()`
+call above: it never touches the control connection, so it takes `&self`
+and is infallible — a setup failure just ends the returned stream
+immediately rather than surfacing an error.
+
 ### Credential methods
 
 `AppHandle` also exposes the credential-broker control ops directly (no new

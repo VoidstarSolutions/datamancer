@@ -37,6 +37,24 @@ use crate::shutdown::{DrainClient, DrainRecorder, drain};
 
 type Node = iceoryx2::prelude::Node<ipc_threadsafe::Service>;
 
+/// Reduce a [`datamancer::SystemSnapshot`] into the app-facing
+/// [`HealthView`] and stamp the two daemon-only fields the core reduction
+/// leaves `None` (`version`, `credential_backend`) — the one place this
+/// ritual happens, shared by the UDS `Request::Health` reply, the
+/// diagnostics-plane health publisher, and (when `web-ui` is enabled) the
+/// `/api/health` HTTP handler. Byte-identical behavior everywhere: same
+/// [`HealthView::DEFAULT_STALE_AFTER_NS`], same `CARGO_PKG_VERSION` (all call
+/// sites live in this crate, so the version constant is identical).
+pub(crate) fn stamped_health_view(
+    snapshot: &datamancer::SystemSnapshot,
+    credential_backend: &str,
+) -> HealthView {
+    let mut view = HealthView::from_snapshot(snapshot, HealthView::DEFAULT_STALE_AFTER_NS);
+    view.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
+    view.daemon.credential_backend = Some(credential_backend.to_string());
+    view
+}
+
 /// One connected client: its multiplexing session, its per-client data-plane
 /// sink, the pump task feeding the sink, and its service name.
 struct ClientEntry {
@@ -611,12 +629,7 @@ impl Server {
             // daemon is already draining.
             Request::Shutdown => Reply::error(codes::SHUTTING_DOWN, "daemon is shutting down"),
             Request::Health => {
-                let mut view = HealthView::from_snapshot(
-                    &self.dm.snapshot_live(),
-                    HealthView::DEFAULT_STALE_AFTER_NS,
-                );
-                view.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
-                view.daemon.credential_backend = Some(self.credential_backend.to_string());
+                let view = stamped_health_view(&self.dm.snapshot_live(), self.credential_backend);
                 Reply::health(view)
             }
         }
@@ -1014,10 +1027,7 @@ fn spawn_diagnostics(
                     if let Err(e) = publisher.publish(&snapshot) {
                         tracing::warn!(error = %e, "diagnostics publish failed");
                     }
-                    let mut view =
-                        HealthView::from_snapshot(&snapshot, HealthView::DEFAULT_STALE_AFTER_NS);
-                    view.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
-                    view.daemon.credential_backend = Some(credential_backend.to_string());
+                    let view = stamped_health_view(&snapshot, credential_backend);
                     if let Err(e) = health_publisher.publish(&view) {
                         tracing::warn!(error = %e, "health publish failed");
                     }

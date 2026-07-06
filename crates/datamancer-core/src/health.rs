@@ -398,6 +398,28 @@ mod tests {
     }
 
     #[test]
+    fn stale_short_circuits_before_gapped_even_with_a_recent_gap() {
+        // Stale data (30s old) with a *recent* gap (2s ago, inside the 5s
+        // window) must still resolve to Stale: proves the Stale branch is
+        // checked (and short-circuits) before Gapped is considered, not just
+        // that Stale wins when the gap also happens to be old.
+        let now = 100_000_000_000_i64;
+        let span = GapSpan {
+            from_source_ts: Timestamp(1),
+            to_source_ts: Timestamp(2),
+        };
+        let stale_with_recent_gap = stream_snapshot(Some(now - 30_000_000_000))
+            .with_gaps(vec![span], Some(Timestamp(now - 2_000_000_000)));
+        let snap = snapshot(
+            vec![provider_snapshot(ConnectionState::Connected, None)],
+            vec![stale_with_recent_gap],
+            now,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert!(matches!(view.streams[0].liveness, Liveness::Stale { .. }));
+    }
+
+    #[test]
     fn schema_version_is_2() {
         let snap = snapshot(vec![], vec![], 0);
         let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
