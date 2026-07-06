@@ -18,10 +18,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A failed readiness probe (absent socket, refused, stale socket, no/bad
 /// reply). The reason is diagnostic only: every failure means "not ready".
-// The reason string isn't read back out anywhere yet (only `Debug`-formatted
-// in tests) — it exists for a future richer `ReadyDiagnosis`/log line, not
-// dead scaffolding.
-#[allow(dead_code, reason = "diagnostic payload, not yet surfaced")]
+/// Surfaced to callers via `ReadyDiagnosis::Unresponsive::last_ping_failure`.
 #[derive(Debug, Clone)]
 pub(crate) struct PingFailure(pub String);
 
@@ -85,9 +82,11 @@ pub(crate) async fn ensure_daemon<E: ControlEndpoint, S: DaemonSpawner>(
         })?;
     let deadline = Instant::now() + cfg.ready_timeout;
     let mut observed_exit: Option<ExitInfo> = None;
+    let mut last_failure: Option<PingFailure>;
     loop {
-        if let Ok(hello) = endpoint.ping(socket, PROBE_TIMEOUT).await {
-            return Ok(hello);
+        match endpoint.ping(socket, PROBE_TIMEOUT).await {
+            Ok(hello) => return Ok(hello),
+            Err(f) => last_failure = Some(f),
         }
         if observed_exit.is_none() {
             observed_exit = proc_.poll_exit();
@@ -101,7 +100,9 @@ pub(crate) async fn ensure_daemon<E: ControlEndpoint, S: DaemonSpawner>(
                     status,
                     stderr_tail,
                 },
-                None => ReadyDiagnosis::Unresponsive,
+                None => ReadyDiagnosis::Unresponsive {
+                    last_ping_failure: last_failure.take().map(|f| f.0),
+                },
             };
             return Err(EnsureError::ReadyTimeout {
                 timeout: cfg.ready_timeout,
@@ -301,10 +302,28 @@ mod tests {
         });
         match ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock")).await {
             Err(EnsureError::ReadyTimeout {
-                diagnosis: ReadyDiagnosis::Unresponsive,
+                diagnosis: ReadyDiagnosis::Unresponsive { .. },
                 ..
             }) => {}
             other => panic!("expected Unresponsive diagnosis, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unresponsive_diagnosis_carries_last_ping_failure() {
+        // Endpoint never answers; spawned proc never exits → Unresponsive,
+        // and the last probe's reason must surface.
+        let ep = ScriptedEndpoint::new(vec![Err(PingFailure("connect refused (test)".into()))]);
+        let sp = ScriptedSpawner::ok(ScriptedProc {
+            alive_polls: usize::MAX,
+            exit: None,
+        });
+        match ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock")).await {
+            Err(EnsureError::ReadyTimeout {
+                diagnosis: ReadyDiagnosis::Unresponsive { last_ping_failure },
+                ..
+            }) => assert_eq!(last_ping_failure.as_deref(), Some("connect refused (test)")),
+            other => panic!("expected Unresponsive with reason, got {other:?}"),
         }
     }
 

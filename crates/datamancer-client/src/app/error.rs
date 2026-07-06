@@ -17,7 +17,31 @@ pub enum ReadyDiagnosis {
         stderr_tail: String,
     },
     /// The process appears alive but the socket never answered a ping.
-    Unresponsive,
+    Unresponsive {
+        /// The final probe's diagnostic reason (connect refused, stale
+        /// socket, bad reply…). `None` only if no probe ran.
+        last_ping_failure: Option<String>,
+    },
+}
+
+impl std::fmt::Display for ReadyDiagnosis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DaemonExited {
+                status,
+                stderr_tail,
+            } => write!(
+                f,
+                "daemon exited (status: {status:?}), stderr tail: {stderr_tail}"
+            ),
+            Self::Unresponsive {
+                last_ping_failure: Some(reason),
+            } => write!(f, "daemon unresponsive: {reason}"),
+            Self::Unresponsive {
+                last_ping_failure: None,
+            } => write!(f, "daemon unresponsive (no probe completed)"),
+        }
+    }
 }
 
 /// Failure to find-or-spawn-and-connect a daemon.
