@@ -141,6 +141,10 @@ scope = "live"                    # live | live_backfill
 backfill_from = "2026-06-01T00:00:00Z"   # required iff scope = live_backfill
 persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only | refresh | tap_only
 always_on = true                  # hold for the process lifetime regardless of clients
+
+[log]
+level = "info"                    # any tracing_subscriber::EnvFilter directive, e.g. "datamancerd=debug,info"
+format = "text"                   # text | json
 ```
 
 Compiled-in providers start disabled: the daemon boots with zero providers
@@ -150,6 +154,16 @@ restarting). Validation fails fast on the remaining cross-section invariants:
 a startup session using a cache preset requires `[cache]`; one writing the
 tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
 `backfill_from`.
+
+`[log]` configures the tracing subscriber installed at the very start of
+`main` — before the single-instance lock or config-file resolution/scaffolding
+run — via a best-effort, read-only peek of just the `[log]` section (a missing
+file, an unreadable path, or unparseable TOML all silently fall back to the
+defaults above; the real `Config::load` reports those problems properly once
+the normal load path runs). **`RUST_LOG` always wins**: when set, it overrides
+`level` entirely (the operator escape hatch for a one-off debug session
+without touching the config file). `format = "json"` emits newline-delimited
+JSON records instead of the default human-readable text.
 
 For `embedded`, `path` is optional and defaults to the platform-native
 data directory (`<data dir>` above): macOS

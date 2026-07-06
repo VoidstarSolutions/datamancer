@@ -38,7 +38,7 @@ serde_json = { workspace = true }
 toml = "0.8"
 thiserror = { workspace = true }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 # Safe flock(2) for the global single-instance lock (`fs`) and `geteuid` for

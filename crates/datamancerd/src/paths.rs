@@ -126,6 +126,13 @@ port = 8080
 # symbol = "BTC/USD"
 # kind = "trade"
 # always_on = true
+
+# Structured logging. The subscriber installs from a best-effort peek of this
+# section before the rest of config is even resolved, so RUST_LOG always
+# overrides `level` if set. Uncomment only to override the defaults below.
+# [log]
+# level = "info"
+# format = "text"
 "#
     .to_string()
 }
