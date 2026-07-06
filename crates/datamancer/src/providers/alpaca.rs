@@ -476,15 +476,41 @@ async fn run_streaming_task(
                 client
             }
             Err(err) => {
+                // StreamingAuth is not yet produced by oxidized_alpaca's
+                // market-data connect path (see
+                // ISSUE-streaming-auth-rejection-silent.md in that repo);
+                // classification is wired so the fix lights up here with no
+                // datamancer change.
+                let unauthenticated = matches!(err, oxidized_alpaca::Error::StreamingAuth);
                 emit_control(
                     &sink,
                     ControlKind::ProviderDisconnected {
                         provider: PROVIDER_ID.to_string(),
                         reason: format!("connect failed: {err}"),
-                        cause: DisconnectCause::Error,
+                        cause: if unauthenticated {
+                            DisconnectCause::Unauthenticated
+                        } else {
+                            DisconnectCause::Error
+                        },
                     },
                 )
                 .await;
+                if unauthenticated && let Some(rx) = cred_rx.as_mut() {
+                    // Rejected credentials: retrying cannot help. Park until
+                    // a rotation (set-credentials hot-apply) or disable —
+                    // mirrors the Missing-credentials park above. Static
+                    // sources can't rotate, so they fall through to backoff.
+                    if !wait_for_provisioning(
+                        rx,
+                        &mut cmd_rx,
+                        "waiting for new credentials after auth rejection",
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue 'outer;
+                }
                 if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
                     return;
                 }
