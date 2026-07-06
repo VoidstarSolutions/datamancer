@@ -116,10 +116,14 @@ async fn health_reflects_disabled_enabled_and_pushes() {
         health.schema_version, 2,
         "schema_version must be pinned to 2"
     );
+    // This test binary IS the datamancerd crate, so its CARGO_PKG_VERSION
+    // is the daemon crate version — assert against the constant directly
+    // rather than the facade's ping-derived echo (daemon-vs-daemon would be
+    // circular).
     assert_eq!(
         health.daemon.version.as_deref(),
-        Some(handle.daemon_version()),
-        "daemon.version must be daemon-stamped to the running daemon crate version"
+        Some(env!("CARGO_PKG_VERSION")),
+        "daemon.version must be daemon-stamped to the daemon crate version"
     );
     assert!(
         health.daemon.credential_backend.is_some(),
@@ -177,27 +181,45 @@ async fn health_reflects_disabled_enabled_and_pushes() {
     );
 
     // 4. watch_health(): a view arrives within 3s (publish cadence 200ms)
-    // and carries the same schema_version and provider states.
+    // and carries the same schema_version and provider states. The service
+    // is history_size(1), so a late joiner's FIRST sample can predate the
+    // hot-apply above — loop under one deadline until a view shows
+    // alpaca-crypto off Disabled rather than asserting on the first sample.
     let mut stream = handle.watch_health();
-    let pushed = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("a health view must arrive on the push plane within 3s")
-        .expect("the push stream must not end while the daemon is alive");
+    let pushed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let view = stream
+                .next()
+                .await
+                .expect("the push stream must not end while the daemon is alive");
+            let alpaca_crypto = view
+                .providers
+                .iter()
+                .find(|p| p.provider.as_str() == "alpaca-crypto")
+                .expect("alpaca-crypto must be enumerated in the pushed view");
+            if alpaca_crypto.state != ProviderState::Disabled {
+                return view;
+            }
+        }
+    })
+    .await
+    .expect(
+        "no pushed health view showed alpaca-crypto off Disabled within 3s \
+         (publish cadence 200ms) — push plane stale or hot-apply not reflected",
+    );
+    assert_eq!(pushed.schema_version, 2, "pushed view must carry schema 2");
     assert_eq!(pushed.schema_version, health_after_configure.schema_version);
-    let pushed_alpaca_crypto_state = pushed
-        .providers
-        .iter()
-        .find(|p| p.provider.as_str() == "alpaca-crypto")
-        .expect("alpaca-crypto must be enumerated in the pushed view")
-        .state;
-    assert_ne!(pushed_alpaca_crypto_state, ProviderState::Disabled);
     let pushed_alpaca_state = pushed
         .providers
         .iter()
         .find(|p| p.provider.as_str() == "alpaca")
         .expect("alpaca must be enumerated in the pushed view")
         .state;
-    assert_eq!(pushed_alpaca_state, ProviderState::Disabled);
+    assert_eq!(
+        pushed_alpaca_state,
+        ProviderState::Disabled,
+        "alpaca must remain Disabled in the pushed view — only alpaca-crypto was configured"
+    );
     drop(stream);
 
     // 5. shutdown_daemon; drop.
