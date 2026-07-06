@@ -623,16 +623,10 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                             }
                         }
                         Err(err) => {
-                            // oxidized_alpaca 0.0.9 surfaces mid-stream
-                            // server error envelopes as `Error::StreamingError`
-                            // from `next_message` (previously undifferentiated
-                            // or swallowed); `Error::StreamingSubscribe` can
-                            // also reach here in principle (it's the same
-                            // socket-read path). Neither variant is produced
-                            // by `next_message` for a rejected/expired auth —
-                            // `StreamingAuth` is connect-only upstream — but
-                            // classify it the same way as the connect path
-                            // defensively, in case that ever changes.
+                            // oxidized_alpaca 0.0.9: `Error::StreamingError`
+                            // (mid-stream server error envelope). A mid-stream
+                            // `StreamingAuth` is connect-only upstream today;
+                            // handled defensively, mirroring the connect arm.
                             let unauthenticated =
                                 matches!(err, oxidized_alpaca::Error::StreamingAuth);
                             broadcast_control(
@@ -649,6 +643,23 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                             )
                             .await;
                             drop(client);
+                            if unauthenticated && let Some(rx) = cred_rx.as_mut() {
+                                // Rejected credentials: retrying cannot help.
+                                // Park until a rotation or disable, exactly
+                                // as the connect-time arm does. Static
+                                // sources can't rotate, so they fall through
+                                // to backoff.
+                                if !wait_for_provisioning(
+                                    rx,
+                                    &mut cmd_rx,
+                                    "waiting for new credentials after auth rejection",
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                continue 'outer;
+                            }
                             if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
                                 return;
                             }
