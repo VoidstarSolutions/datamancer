@@ -266,6 +266,10 @@ impl Provider for AlpacaProvider {
         PROVIDER_ID
     }
 
+    fn enabled(&self) -> bool {
+        self.cfg.settings.current().is_some()
+    }
+
     fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool {
         if !matches!(
             instrument.asset_class(),

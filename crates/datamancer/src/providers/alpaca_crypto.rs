@@ -247,6 +247,10 @@ impl Provider for AlpacaCryptoProvider {
         PROVIDER_ID
     }
 
+    fn enabled(&self) -> bool {
+        self.cfg.settings.current().is_some()
+    }
+
     fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool {
         if instrument.asset_class() != AssetClass::Crypto {
             return false;

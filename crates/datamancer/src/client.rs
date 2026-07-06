@@ -232,11 +232,19 @@ pub(crate) struct LiveStats {
     last_source_ts: AtomicI64,
     last_rx_ts: AtomicI64,
     gap_count: AtomicU64,
+    /// Recent gap spans (bounded ring; cold mutex, written only on Gap).
+    recent_gaps: std::sync::Mutex<VecDeque<GapSpan>>,
+    has_gap_rx: AtomicBool,
+    last_gap_rx_ts: AtomicI64,
+    backfilling: AtomicBool,
     /// Live fan-out subscriber count (referrers actually attached). Distinct
     /// from the registry `Arc` strong count, which over-counts (a single
     /// referrer holds several strong `Arc<AuthoritativeSession>`).
     subscribers: AtomicU64,
 }
+
+/// Bounded per-symbol recent-gap detail (oldest evicted).
+const RECENT_GAPS_CAP: usize = 8;
 
 impl LiveStats {
     pub(crate) fn new() -> Self {
@@ -247,6 +255,10 @@ impl LiveStats {
             last_source_ts: AtomicI64::new(0),
             last_rx_ts: AtomicI64::new(0),
             gap_count: AtomicU64::new(0),
+            recent_gaps: std::sync::Mutex::new(VecDeque::new()),
+            has_gap_rx: AtomicBool::new(false),
+            last_gap_rx_ts: AtomicI64::new(0),
+            backfilling: AtomicBool::new(false),
             subscribers: AtomicU64::new(0),
         }
     }
@@ -278,8 +290,16 @@ impl LiveStats {
                 }
             }
             MarketEvent::Control(c) => {
-                if matches!(c.kind, ControlKind::Gap { .. }) {
+                if let ControlKind::Gap { span, .. } = &c.kind {
                     self.gap_count.fetch_add(1, Ordering::Relaxed);
+                    self.last_gap_rx_ts.store(c.rx_ts.0, Ordering::Relaxed);
+                    self.has_gap_rx.store(true, Ordering::Relaxed);
+                    if let Ok(mut ring) = self.recent_gaps.lock() {
+                        if ring.len() == RECENT_GAPS_CAP {
+                            ring.pop_front();
+                        }
+                        ring.push_back(span.clone());
+                    }
                 }
             }
             _ => {}
@@ -310,6 +330,32 @@ impl LiveStats {
     /// Cumulative `Control::Gap` count for this symbol.
     pub(crate) fn gap_count(&self) -> u64 {
         self.gap_count.load(Ordering::Relaxed)
+    }
+
+    /// Recent gap spans, oldest first (bounded at `RECENT_GAPS_CAP`).
+    pub(crate) fn recent_gaps(&self) -> Vec<GapSpan> {
+        self.recent_gaps
+            .lock()
+            .map(|ring| ring.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Wall-clock receipt of the most recent gap, or `None` before any.
+    pub(crate) fn last_gap_rx_ts(&self) -> Option<Timestamp> {
+        self.has_gap_rx
+            .load(Ordering::Relaxed)
+            .then(|| Timestamp(self.last_gap_rx_ts.load(Ordering::Relaxed)))
+    }
+
+    /// Whether a historical→live backfill is currently in progress.
+    pub(crate) fn backfilling(&self) -> bool {
+        self.backfilling.load(Ordering::Relaxed)
+    }
+
+    /// Mark backfill in progress (set by `run_backfill`, cleared at the seam
+    /// flush and on every backfill exit path).
+    pub(crate) fn set_backfilling(&self, active: bool) {
+        self.backfilling.store(active, Ordering::Relaxed);
     }
 }
 
@@ -1472,6 +1518,45 @@ mod live_stats_tests {
         assert_eq!(s.gap_count(), 1);
         // The gap also occupies a seq slot.
         assert_eq!(s.seq_position(), Some(Seq(7)));
+    }
+
+    #[test]
+    fn live_stats_retain_bounded_recent_gap_spans() {
+        let stats = LiveStats::new();
+        for i in 0..10_i64 {
+            stats.record_event(&MarketEvent::Control(Control {
+                source_ts: Timestamp(i),
+                rx_ts: Timestamp(1_000 + i),
+                seq: Seq(u64::try_from(i).unwrap()),
+                kind: ControlKind::Gap {
+                    provider: "p".to_string(),
+                    instrument: Instrument::new(
+                        ProviderId::from_static("p"),
+                        AssetClass::Equity,
+                        "X",
+                    ),
+                    span: GapSpan {
+                        from_source_ts: Timestamp(i),
+                        to_source_ts: Timestamp(i + 1),
+                    },
+                },
+            }));
+        }
+        let spans = stats.recent_gaps();
+        assert_eq!(spans.len(), 8); // RECENT_GAPS_CAP — oldest two evicted
+        assert_eq!(spans[0].from_source_ts, Timestamp(2));
+        assert_eq!(stats.last_gap_rx_ts(), Some(Timestamp(1_009)));
+        assert_eq!(stats.gap_count(), 10);
+    }
+
+    #[test]
+    fn backfilling_flag_sets_and_clears() {
+        let stats = LiveStats::new();
+        assert!(!stats.backfilling());
+        stats.set_backfilling(true);
+        assert!(stats.backfilling());
+        stats.set_backfilling(false);
+        assert!(!stats.backfilling());
     }
 }
 

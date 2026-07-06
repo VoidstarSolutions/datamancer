@@ -606,15 +606,12 @@ impl Datamancer {
             .provider_accounting
             .iter()
             .map(|(id, acc)| {
-                let metrics = self
-                    .inner
-                    .providers
-                    .iter()
-                    .find(|p| p.id() == id.as_str())
-                    .and_then(|p| p.metrics());
+                let provider = self.inner.providers.iter().find(|p| p.id() == id.as_str());
+                let metrics = provider.and_then(|p| p.metrics());
                 let (bytes, rate_limit_hits) = metrics.map_or((None, None), |m| {
                     (Some(m.bytes()), Some(m.rate_limit_hits()))
                 });
+                let enabled = provider.is_none_or(|p| p.enabled());
                 ProviderSnapshot::new(
                     id.clone(),
                     acc.connection_state(),
@@ -630,6 +627,7 @@ impl Datamancer {
                 )
                 .with_bytes(bytes)
                 .with_rate_limit_hits(rate_limit_hits)
+                .with_enabled(enabled)
             })
             .collect();
 
@@ -669,6 +667,8 @@ impl Datamancer {
                 AuthoritativeSessionSnapshot::new(instrument, kind, refcount, stats.gap_count())
                     .with_seq_position(stats.seq_position())
                     .with_timestamps(stats.last_source_ts(), stats.last_rx_ts())
+                    .with_gaps(stats.recent_gaps(), stats.last_gap_rx_ts())
+                    .with_backfilling(stats.backfilling())
             })
             .collect();
 
@@ -1728,6 +1728,10 @@ impl Controller {
         if from >= edge {
             return true;
         }
+        // Guard clears `backfilling` on every exit path (both early `return`s
+        // below and the fall-through after the seam flush), so a panic or a
+        // future added exit can't leave the flag stuck `true`.
+        let _backfilling_guard = BackfillingGuard::new(self.stats.clone());
         let options = *self
             .inner
             .persistence
@@ -2100,6 +2104,26 @@ impl Controller {
         {
             tracing::warn!(error = %e, "event sink flush failed at shutdown");
         }
+    }
+}
+
+/// RAII guard: marks `stats.backfilling()` true for its lifetime, clearing it
+/// back to `false` on drop regardless of which exit path `run_backfill` takes
+/// (early return, `Closed` outcome, or normal completion).
+struct BackfillingGuard {
+    stats: Arc<LiveStats>,
+}
+
+impl BackfillingGuard {
+    fn new(stats: Arc<LiveStats>) -> Self {
+        stats.set_backfilling(true);
+        Self { stats }
+    }
+}
+
+impl Drop for BackfillingGuard {
+    fn drop(&mut self) {
+        self.stats.set_backfilling(false);
     }
 }
 
