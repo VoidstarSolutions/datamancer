@@ -318,11 +318,20 @@ mod tests {
             alive_polls: usize::MAX,
             exit: None,
         });
-        match ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock")).await {
-            Err(EnsureError::ReadyTimeout {
+        let err = ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock"))
+            .await
+            .unwrap_err();
+        // The rendered error message (the surface apps actually log) must
+        // carry the reason too.
+        assert!(
+            err.to_string().contains("connect refused (test)"),
+            "rendered error should carry the ping-failure reason: {err}"
+        );
+        match err {
+            EnsureError::ReadyTimeout {
                 diagnosis: ReadyDiagnosis::Unresponsive { last_ping_failure },
                 ..
-            }) => assert_eq!(last_ping_failure.as_deref(), Some("connect refused (test)")),
+            } => assert_eq!(last_ping_failure.as_deref(), Some("connect refused (test)")),
             other => panic!("expected Unresponsive with reason, got {other:?}"),
         }
     }

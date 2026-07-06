@@ -61,7 +61,7 @@ pub enum EnsureError {
         #[source]
         source: std::io::Error,
     },
-    #[error("daemon not ready within {timeout:?}: {diagnosis:?}")]
+    #[error("daemon not ready within {timeout:?}: {diagnosis}")]
     ReadyTimeout {
         timeout: Duration,
         diagnosis: ReadyDiagnosis,
