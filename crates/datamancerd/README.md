@@ -322,6 +322,8 @@ One JSON object per line; one reply line per request.
   -> {"ok":true,"applied":"live"}
 {"op":"shutdown"}
   -> {"ok":true}
+{"op":"health"}
+  -> {"ok":true,"health":{ /* HealthView, schema_version 2, daemon-stamped */ }}
 ```
 
 `instruments` enumerates the discoverable catalog and, per entry, the
@@ -335,6 +337,16 @@ etc. traffic on other connections.
 `ping` needs no registered client and reports the daemon's crate version plus
 the active credential-store backend; the app facade uses it for
 spawn-readiness and version-skew detection.
+
+`health` returns the app-facing `HealthView` (the versioned, per-symbol-only
+reduction of `SystemSnapshot` — see `datamancer-core`'s `health.rs`), reduced
+and stamped **daemon-side**: `daemon.version` and `daemon.credential_backend`
+are filled from the daemon's own crate version and active credential backend,
+not the client's. It is **ungated** (like `snapshot`) and **UDS-only** — there
+is no WS equivalent; WS consumers reduce their own `snapshot` reply
+client-side. `AppHandle::health()` sends this op rather than reducing
+`snapshot` itself, so the `HealthView.schema_version` field is the daemon's,
+not a client-side guess.
 
 `get-config`/`configure-provider`/`remove-provider`/`shutdown` are the
 config-service ops (spec cycle 3); see the dedicated section below for

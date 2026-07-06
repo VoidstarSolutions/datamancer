@@ -16,7 +16,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer::transport::{Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher};
 use datamancer::{
-    ClientSession, Datamancer, EventKind, Instrument, ProviderId, Scope, Session, TapLog,
+    ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope, Session,
+    TapLog,
     traits::{EventSink, PublishOutcome},
 };
 use futures::StreamExt as _;
@@ -598,6 +599,15 @@ impl Server {
             // `handle` intercepts Shutdown before dispatch; reaching here means the
             // daemon is already draining.
             Request::Shutdown => Reply::error(codes::SHUTTING_DOWN, "daemon is shutting down"),
+            Request::Health => {
+                let mut view = HealthView::from_snapshot(
+                    &self.dm.snapshot_live(),
+                    HealthView::DEFAULT_STALE_AFTER_NS,
+                );
+                view.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
+                view.daemon.credential_backend = Some(self.credential_backend.to_string());
+                Reply::health(view)
+            }
         }
     }
 
