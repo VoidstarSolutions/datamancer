@@ -1,15 +1,20 @@
-//! App-facing health reduction of [`SystemSnapshot`] (spec 2026-07-05, cycle 1).
+//! App-facing health reduction of [`SystemSnapshot`] (spec 2026-07-05, cycle 4).
 //!
 //! Pure types + a pure reduction — assembly stays in `datamancer`, transport
 //! in `datamancer-client`. Per-symbol only: no cross-instrument aggregate is
 //! ever computed. `Liveness`/`latency` derive from wall-clock fields
 //! (`captured_at`, `last_rx_ts`, `latency_ns`) — observability only, never
 //! engine logic.
+//!
+//! Staleness boundary: the check is **strictly greater than** the threshold
+//! (`captured_at - last_rx_ts > stale_after_ns`), so exact-threshold age
+//! counts as `Live`, not `Stale` (a cycle-1 triage residual, locked in by a
+//! boundary test rather than "fixed").
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    event::{EventKind, Timestamp},
+    event::{EventKind, GapSpan, Timestamp},
     instrument::{Instrument, ProviderId},
     snapshot::{ConnectionState, SystemSnapshot},
 };
@@ -75,6 +80,9 @@ pub enum ProviderState {
     Unauthenticated,
     /// A required companion process (e.g. IB Gateway) is unreachable (reserved).
     CompanionUnreachable,
+    /// Compiled in but deliberately disabled (parked settings watch). Not an
+    /// error: enable via the daemon config service.
+    Disabled,
 }
 
 /// Per-`(instrument, kind)` stream health. Per-symbol only.
@@ -94,8 +102,15 @@ pub struct StreamHealth {
 
 /// Stream liveness, judged on wall-clock receipt (`rx_ts` vs the snapshot's
 /// `captured_at`) — observability only.
+///
+/// Precedence when multiple conditions could apply: `Backfilling` wins over
+/// everything (staleness judgment is suspended mid-seam); otherwise no
+/// `last_rx_ts` is `Idle`; otherwise data older than the staleness threshold
+/// is `Stale` (the boundary is **strict**: exact-threshold age is *not*
+/// stale — a cycle-1 triage residual, locked in); otherwise a `Control::Gap`
+/// received within the staleness window is `Gapped`; otherwise `Live`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Liveness {
     /// Subscribed, no data event observed yet.
@@ -105,6 +120,14 @@ pub enum Liveness {
     Stale {
         since: Timestamp,
     },
+    /// A `Control::Gap` was received within the staleness window; data is
+    /// otherwise flowing. `spans` is the bounded recent-gap detail.
+    Gapped {
+        spans: Vec<GapSpan>,
+    },
+    /// A historical→live backfill is in progress; staleness judgment is
+    /// suspended until the seam flushes.
+    Backfilling,
 }
 
 /// Latency summary for one stream (cycle 1: last observation only).
@@ -118,7 +141,7 @@ pub struct LatencySummary {
 
 impl HealthView {
     /// Shape version of the current reduction.
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
     /// Default staleness threshold: 5 seconds without a received event.
     pub const DEFAULT_STALE_AFTER_NS: i64 = 5_000_000_000;
 
@@ -132,10 +155,15 @@ impl HealthView {
             .iter()
             .map(|p| ProviderHealth {
                 provider: p.provider.clone(),
-                state: match p.connection_state {
-                    ConnectionState::Connected => ProviderState::Connected,
-                    ConnectionState::Disconnected => ProviderState::Disconnected,
-                    ConnectionState::Unknown => ProviderState::Connecting,
+                state: if p.enabled {
+                    match p.connection_state {
+                        ConnectionState::Connected => ProviderState::Connected,
+                        ConnectionState::Disconnected => ProviderState::Disconnected,
+                        ConnectionState::Unauthenticated => ProviderState::Unauthenticated,
+                        ConnectionState::Unknown => ProviderState::Connecting,
+                    }
+                } else {
+                    ProviderState::Disabled
                 },
                 detail: p.last_error.clone(),
             })
@@ -146,12 +174,23 @@ impl HealthView {
             .map(|s| StreamHealth {
                 instrument: s.instrument.clone(),
                 kind: s.kind,
-                liveness: match s.last_rx_ts {
-                    None => Liveness::Idle,
-                    Some(rx) if snapshot.captured_at.0 - rx.0 > stale_after_ns => {
-                        Liveness::Stale { since: rx }
+                liveness: if s.backfilling {
+                    Liveness::Backfilling
+                } else {
+                    match s.last_rx_ts {
+                        None => Liveness::Idle,
+                        Some(rx) if snapshot.captured_at.0 - rx.0 > stale_after_ns => {
+                            Liveness::Stale { since: rx }
+                        }
+                        Some(_) => match s.last_gap_rx_ts {
+                            Some(gap_rx) if snapshot.captured_at.0 - gap_rx.0 <= stale_after_ns => {
+                                Liveness::Gapped {
+                                    spans: s.recent_gaps.clone(),
+                                }
+                            }
+                            _ => Liveness::Live,
+                        },
                     }
-                    Some(_) => Liveness::Live,
                 },
                 last_event_source_ts: s.last_source_ts,
                 gap_count: s.gap_count,
@@ -176,7 +215,7 @@ mod tests {
     use super::{HealthView, Liveness, ProviderState};
     use crate::{
         AssetClass, AuthoritativeSessionSnapshot, CacheSnapshot, ConnectionState, EventKind,
-        Instrument, ProviderId, ProviderSnapshot, SystemSnapshot, Timestamp,
+        GapSpan, Instrument, ProviderId, ProviderSnapshot, SystemSnapshot, Timestamp,
     };
 
     fn provider_snapshot(state: ConnectionState, last_error: Option<&str>) -> ProviderSnapshot {
@@ -274,6 +313,144 @@ mod tests {
             }
         );
         assert_eq!(view.streams[2].gap_count, 2);
+    }
+
+    #[test]
+    fn disabled_provider_is_distinguishable() {
+        let snap = snapshot(
+            vec![provider_snapshot(ConnectionState::Unknown, None).with_enabled(false)],
+            vec![],
+            1_000,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert_eq!(view.providers[0].state, ProviderState::Disabled);
+    }
+
+    #[test]
+    fn unauthenticated_maps_through() {
+        let snap = snapshot(
+            vec![provider_snapshot(
+                ConnectionState::Unauthenticated,
+                Some("auth rejected"),
+            )],
+            vec![],
+            1_000,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert_eq!(view.providers[0].state, ProviderState::Unauthenticated);
+    }
+
+    #[test]
+    fn staleness_boundary_is_strictly_greater() {
+        // Exact-threshold age counts Live (cycle-1 triage residual, locked in).
+        let now = 100_000_000_000_i64;
+        let exactly = now - HealthView::DEFAULT_STALE_AFTER_NS;
+        let snap = snapshot(
+            vec![provider_snapshot(ConnectionState::Connected, None)],
+            vec![stream_snapshot(Some(exactly))],
+            now,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert_eq!(view.streams[0].liveness, Liveness::Live);
+    }
+
+    #[test]
+    fn gapped_when_recent_gap_and_not_stale() {
+        let now = 100_000_000_000_i64;
+        let span = GapSpan {
+            from_source_ts: Timestamp(1),
+            to_source_ts: Timestamp(2),
+        };
+        let s = stream_snapshot(Some(now - 1_000_000_000)) // fresh data
+            .with_gaps(vec![span.clone()], Some(Timestamp(now - 2_000_000_000))); // gap 2s ago
+        let snap = snapshot(
+            vec![provider_snapshot(ConnectionState::Connected, None)],
+            vec![s],
+            now,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert_eq!(
+            view.streams[0].liveness,
+            Liveness::Gapped { spans: vec![span] }
+        );
+    }
+
+    #[test]
+    fn stale_wins_over_gapped_and_backfilling_wins_over_all() {
+        let now = 100_000_000_000_i64;
+        let span = GapSpan {
+            from_source_ts: Timestamp(1),
+            to_source_ts: Timestamp(2),
+        };
+        // Stale data + old gap => Stale (gap outside window).
+        let stale = stream_snapshot(Some(now - 30_000_000_000))
+            .with_gaps(vec![span.clone()], Some(Timestamp(now - 30_000_000_000)));
+        // Backfilling => Backfilling even with stale data.
+        let backfilling = stream_snapshot(Some(now - 30_000_000_000)).with_backfilling(true);
+        let snap = snapshot(
+            vec![provider_snapshot(ConnectionState::Connected, None)],
+            vec![stale, backfilling],
+            now,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert!(matches!(view.streams[0].liveness, Liveness::Stale { .. }));
+        assert_eq!(view.streams[1].liveness, Liveness::Backfilling);
+    }
+
+    #[test]
+    fn stale_short_circuits_before_gapped_even_with_a_recent_gap() {
+        // Stale data (30s old) with a *recent* gap (2s ago, inside the 5s
+        // window) must still resolve to Stale: proves the Stale branch is
+        // checked (and short-circuits) before Gapped is considered, not just
+        // that Stale wins when the gap also happens to be old.
+        let now = 100_000_000_000_i64;
+        let span = GapSpan {
+            from_source_ts: Timestamp(1),
+            to_source_ts: Timestamp(2),
+        };
+        let stale_with_recent_gap = stream_snapshot(Some(now - 30_000_000_000))
+            .with_gaps(vec![span], Some(Timestamp(now - 2_000_000_000)));
+        let snap = snapshot(
+            vec![provider_snapshot(ConnectionState::Connected, None)],
+            vec![stale_with_recent_gap],
+            now,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert!(matches!(view.streams[0].liveness, Liveness::Stale { .. }));
+    }
+
+    #[test]
+    fn schema_version_is_2() {
+        let snap = snapshot(vec![], vec![], 0);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert_eq!(view.schema_version, 2);
+    }
+
+    #[test]
+    fn v2_wire_golden() {
+        // Golden JSON for the new variants, including hand-built
+        // CompanionUnreachable (nothing produces it — spec appendix fixture).
+        let span = GapSpan {
+            from_source_ts: Timestamp(1),
+            to_source_ts: Timestamp(2),
+        };
+        for (liveness, wire) in [
+            (Liveness::Backfilling, r#""backfilling""#.to_string()),
+            (
+                Liveness::Gapped { spans: vec![span] },
+                r#"{"gapped":{"spans":[{"from_source_ts":1,"to_source_ts":2}]}}"#.to_string(),
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&liveness).unwrap(), wire);
+        }
+        assert_eq!(
+            serde_json::to_string(&ProviderState::Disabled).unwrap(),
+            r#""disabled""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ProviderState::CompanionUnreachable).unwrap(),
+            r#""companion_unreachable""#
+        );
     }
 
     #[test]

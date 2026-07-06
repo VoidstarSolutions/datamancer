@@ -11,9 +11,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
-    AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, EventKind, GapSpan, Instrument,
-    LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ProviderSnapshot,
-    Result, Scope, Seq, Timestamp, Trade,
+    AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, DisconnectCause, EventKind,
+    GapSpan, Instrument, LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId,
+    ProviderSnapshot, Result, Scope, Seq, Timestamp, Trade,
 };
 use datamancer_core::{AuthoritativeSessionSnapshot, HistoryRequest};
 use futures::StreamExt;
@@ -413,6 +413,7 @@ fn disconnected(id: &str) -> MarketEvent {
         kind: ControlKind::ProviderDisconnected {
             provider: id.to_string(),
             reason: "drop".to_string(),
+            cause: DisconnectCause::Error,
         },
     })
 }
@@ -497,6 +498,11 @@ async fn snapshot_live_stats_reflects_events() {
     assert_eq!(a.latency_ns, Some(7));
     assert_eq!(a.gap_count, 1);
     assert!(a.seq_position.is_some());
+    assert_eq!(a.recent_gaps.len(), 1);
+    assert_eq!(a.recent_gaps[0].from_source_ts, Timestamp(1));
+    assert_eq!(a.recent_gaps[0].to_source_ts, Timestamp(4));
+    assert_eq!(a.last_gap_rx_ts, Some(Timestamp(5)));
+    assert!(!a.backfilling);
 
     // Provider accounting saw two live data messages and one gap.
     let p = provider_snap(&snap, "fake");
@@ -624,6 +630,155 @@ async fn snapshot_does_not_block_under_load() {
             .unwrap();
     }
     pump.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// `Provider::enabled()` threaded into `ProviderSnapshot.enabled`.
+// ---------------------------------------------------------------------------
+
+struct DisabledProvider {
+    id: String,
+}
+
+#[async_trait]
+impl Provider for DisabledProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn enabled(&self) -> bool {
+        false
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(NoopLive))
+    }
+    async fn fetch_history(
+        &self,
+        _request: HistoryRequest,
+        _sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn snapshot_reflects_provider_enabled_false() {
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(DisabledProvider {
+            id: "fake".to_string(),
+        }))
+        .build()
+        .unwrap();
+
+    let snap = dm.snapshot().await.unwrap();
+    let p = provider_snap(&snap, "fake");
+    assert!(!p.enabled);
+}
+
+#[tokio::test]
+async fn snapshot_reflects_provider_enabled_true_by_default() {
+    let (provider, _ctrl) = LiveProvider::new("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let snap = dm.snapshot().await.unwrap();
+    let p = provider_snap(&snap, "fake");
+    assert!(p.enabled);
+}
+
+// ---------------------------------------------------------------------------
+// `run_backfill` flips `AuthoritativeSessionSnapshot.backfilling` while a
+// stitched-live backfill fetch is in flight, and clears it once flushed.
+// ---------------------------------------------------------------------------
+
+struct GatedBackfillProvider {
+    id: String,
+    started: Arc<tokio::sync::Notify>,
+    release: watch::Receiver<bool>,
+}
+
+#[async_trait]
+impl Provider for GatedBackfillProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(NoopLive))
+    }
+    async fn fetch_history(
+        &self,
+        _request: HistoryRequest,
+        _sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        self.started.notify_one();
+        let mut rx = self.release.clone();
+        while !*rx.borrow() {
+            rx.changed().await.ok();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn snapshot_reflects_backfilling_flag_while_seam_pending() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (release_tx, release_rx) = watch::channel(false);
+    let provider = GatedBackfillProvider {
+        id: "fake".to_string(),
+        started: started.clone(),
+        release: release_rx,
+    };
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: Some(Timestamp(0)),
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let _stream = session.take_events().await.unwrap();
+
+    // The backfill's history fetch is now blocked in-flight.
+    started.notified().await;
+    let snap = dm.snapshot().await.unwrap();
+    let a = auth_snap(&snap, "AAPL");
+    assert!(a.backfilling, "backfill in flight should report true");
+
+    // Release the fetch and poll until the seam flush completes, rather than
+    // a fixed sleep (flaky under load) — generous deadline, short poll tick.
+    release_tx.send(true).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = dm.snapshot().await.unwrap();
+        let a = auth_snap(&snap, "AAPL");
+        if !a.backfilling {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "backfilling flag never cleared after the seam flush was released"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let snap = dm.snapshot().await.unwrap();
+    let a = auth_snap(&snap, "AAPL");
+    assert!(!a.backfilling, "cleared once the backfill seam flushes");
 }
 
 #[tokio::test]

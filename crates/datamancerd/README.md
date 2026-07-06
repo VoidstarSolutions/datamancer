@@ -141,6 +141,10 @@ scope = "live"                    # live | live_backfill
 backfill_from = "2026-06-01T00:00:00Z"   # required iff scope = live_backfill
 persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only | refresh | tap_only
 always_on = true                  # hold for the process lifetime regardless of clients
+
+[log]
+level = "info"                    # any tracing_subscriber::EnvFilter directive, e.g. "datamancerd=debug,info"
+format = "text"                   # text | json
 ```
 
 Compiled-in providers start disabled: the daemon boots with zero providers
@@ -150,6 +154,16 @@ restarting). Validation fails fast on the remaining cross-section invariants:
 a startup session using a cache preset requires `[cache]`; one writing the
 tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
 `backfill_from`.
+
+`[log]` configures the tracing subscriber installed at the very start of
+`main` — before the single-instance lock or config-file resolution/scaffolding
+run — via a best-effort, read-only peek of just the `[log]` section (a missing
+file, an unreadable path, or unparseable TOML all silently fall back to the
+defaults above; the real `Config::load` reports those problems properly once
+the normal load path runs). **`RUST_LOG` always wins**: when set, it overrides
+`level` entirely (the operator escape hatch for a one-off debug session
+without touching the config file). `format = "json"` emits newline-delimited
+JSON records instead of the default human-readable text.
 
 For `embedded`, `path` is optional and defaults to the platform-native
 data directory (`<data dir>` above): macOS
@@ -220,7 +234,7 @@ handler never serves an empty snapshot and never invokes the on-demand
 | `GET /api/cache` | cache catalog (slow swap): keys + ranges + est. bytes |
 | `GET /api/providers` | provider accounting |
 | `GET /api/sessions` | authoritative + client sessions (per-symbol) |
-| `GET /api/health` | process-up + per-provider connection rollup |
+| `GET /api/health` | `{"ready": bool, "health": <core HealthView>}` — readiness (at least one enabled provider, all enabled providers `Connected`; disabled providers never block readiness) plus the full app-facing `HealthView` |
 | `GET /api/stream` | SSE of the live-state envelope, one event per refresh |
 | `GET /api/config` | the on-disk config file + restart-required flag + path |
 | `PUT /api/config` | validate and atomically rewrite the config file |
@@ -307,7 +321,7 @@ One JSON object per line; one reply line per request.
 {"op":"instruments","provider":"alpaca-crypto"}
   -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
-{"op":"ping"}          -> {"ok":true,"version":"0.4.0","credential_backend":"keychain"}
+{"op":"ping"}          -> {"ok":true,"version":"0.5.0","credential_backend":"keychain"}
 {"op":"set-credentials","provider":"alpaca-crypto","credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
   -> {"ok":true}
 {"op":"get-credentials","provider":"alpaca-crypto"}
@@ -322,6 +336,8 @@ One JSON object per line; one reply line per request.
   -> {"ok":true,"applied":"live"}
 {"op":"shutdown"}
   -> {"ok":true}
+{"op":"health"}
+  -> {"ok":true,"health":{ /* HealthView, schema_version 2, daemon-stamped */ }}
 ```
 
 `instruments` enumerates the discoverable catalog and, per entry, the
@@ -335,6 +351,34 @@ etc. traffic on other connections.
 `ping` needs no registered client and reports the daemon's crate version plus
 the active credential-store backend; the app facade uses it for
 spawn-readiness and version-skew detection.
+
+`health` returns the app-facing `HealthView` (the versioned, per-symbol-only
+reduction of `SystemSnapshot` — see `datamancer-core`'s `health.rs`), reduced
+and stamped **daemon-side**: `daemon.version` and `daemon.credential_backend`
+are filled from the daemon's own crate version and active credential backend,
+not the client's. It is **ungated** (like `snapshot`) and **UDS-only** — there
+is no WS equivalent; WS consumers reduce their own `snapshot` reply
+client-side. `AppHandle::health()` sends this op rather than reducing
+`snapshot` itself, so the `HealthView.schema_version` field is the daemon's,
+not a client-side guess.
+
+### `datamancer/health` push plane (iceoryx2)
+
+Alongside the pull-style `health` op, the daemon periodically **publishes**
+the same daemon-stamped `HealthView` on a dedicated iceoryx2 service,
+`datamancer/health` — a single byte-slice pub-sub service, sibling to (and
+sharing its wire cap with) `datamancer/diagnostics`. Cadence is
+`[diagnostics] publish_interval_ms` (default 1000ms; the health/observability
+e2e uses 200ms). Like the diagnostics service, it is capped at 1 MiB per
+sample and built with `history_size(1)`, so a late-joining subscriber
+receives the most recent view immediately rather than waiting a full cadence
+tick. The service name is **host-global**, not scoped by `service_prefix` —
+the same one-`datamancerd`-per-host constraint noted above for the
+diagnostics service applies here too. `AppHandle::watch_health()` is the
+supported subscriber: a same-host shared-memory subscription independent of
+the control connection, returning an infallible `HealthStream`
+(`tokio_stream::wrappers::ReceiverStream<HealthView>`) that never errors —
+a setup failure ends the stream immediately instead.
 
 `get-config`/`configure-provider`/`remove-provider`/`shutdown` are the
 config-service ops (spec cycle 3); see the dedicated section below for

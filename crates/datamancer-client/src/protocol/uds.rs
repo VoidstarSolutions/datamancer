@@ -9,7 +9,7 @@
 //! Access control is filesystem permissions on the socket path only. This is
 //! **not** a network-safe surface.
 
-use datamancer_core::SystemSnapshot;
+use datamancer_core::{HealthView, SystemSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
@@ -83,6 +83,9 @@ pub enum Request {
     /// Graceful, deliberate daemon stop (the full drain path). UDS-only,
     /// peer-cred gated.
     Shutdown,
+    /// The app-facing `HealthView`, reduced and stamped daemon-side; ungated
+    /// read-only op.
+    Health,
 }
 
 /// A control reply (one per line). `ok` discriminates success from error; the
@@ -127,6 +130,9 @@ pub struct Reply {
     /// Applied scope for a mutating config op (on config mutations).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied: Option<String>,
+    /// The app-facing health view (on `health`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthView>,
 }
 
 impl Reply {
@@ -147,6 +153,7 @@ impl Reply {
             config: None,
             restart_required: None,
             applied: None,
+            health: None,
         }
     }
 
@@ -223,6 +230,7 @@ impl Reply {
             config: None,
             restart_required: None,
             applied: None,
+            health: None,
         }
     }
 
@@ -242,6 +250,15 @@ impl Reply {
     pub fn applied_live() -> Self {
         Self {
             applied: Some("live".to_string()),
+            ..Self::ok()
+        }
+    }
+
+    /// A successful `health` reply.
+    #[must_use]
+    pub fn health(view: HealthView) -> Self {
+        Self {
+            health: Some(view),
             ..Self::ok()
         }
     }
@@ -479,5 +496,25 @@ mod tests {
     fn new_config_codes_are_stable() {
         assert_eq!(crate::codes::RESTART_REQUIRED, "restart_required");
         assert_eq!(crate::codes::UNKNOWN_CONFIG_FIELD, "unknown_config_field");
+    }
+
+    #[test]
+    fn health_round_trips_and_reply_carries_view() {
+        use datamancer_core::{CacheSnapshot, HealthView, Timestamp};
+
+        let req: Request = serde_json::from_str(r#"{"op":"health"}"#).unwrap();
+        assert!(matches!(req, Request::Health));
+        let snap = SystemSnapshot::new(
+            Timestamp(1),
+            vec![],
+            CacheSnapshot::new(vec![], None),
+            vec![],
+            vec![],
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let line = serde_json::to_string(&Reply::health(view.clone())).unwrap();
+        let back: Reply = serde_json::from_str(&line).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.health, Some(view));
     }
 }

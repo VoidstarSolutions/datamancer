@@ -21,9 +21,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    Adjustment, AssetClass, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest,
-    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity, Result, Seq,
-    Timestamp, Trade,
+    Adjustment, AssetClass, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
+    HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity,
+    Result, Seq, Timestamp, Trade,
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
@@ -266,6 +266,10 @@ impl Provider for AlpacaProvider {
         PROVIDER_ID
     }
 
+    fn enabled(&self) -> bool {
+        self.cfg.settings.current().is_some()
+    }
+
     fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool {
         if !matches!(
             instrument.asset_class(),
@@ -472,14 +476,41 @@ async fn run_streaming_task(
                 client
             }
             Err(err) => {
+                // oxidized_alpaca 0.0.9 returns `Error::StreamingAuth` when
+                // the market-data connect handshake's auth response is not
+                // `Authenticated` (fixed upstream in
+                // fix(streaming): return StreamingAuth on rejected
+                // market-data credentials); this classification consumes it.
+                let unauthenticated = matches!(err, oxidized_alpaca::Error::StreamingAuth);
                 emit_control(
                     &sink,
                     ControlKind::ProviderDisconnected {
                         provider: PROVIDER_ID.to_string(),
                         reason: format!("connect failed: {err}"),
+                        cause: if unauthenticated {
+                            DisconnectCause::Unauthenticated
+                        } else {
+                            DisconnectCause::Error
+                        },
                     },
                 )
                 .await;
+                if unauthenticated && let Some(rx) = cred_rx.as_mut() {
+                    // Rejected credentials: retrying cannot help. Park until
+                    // a rotation (set-credentials hot-apply) or disable —
+                    // mirrors the Missing-credentials park above. Static
+                    // sources can't rotate, so they fall through to backoff.
+                    if !wait_for_provisioning(
+                        rx,
+                        &mut cmd_rx,
+                        "waiting for new credentials after auth rejection",
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue 'outer;
+                }
                 if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
                     return;
                 }
@@ -603,16 +634,44 @@ async fn run_streaming_task(
                             }
                         }
                         Err(err) => {
+                            // oxidized_alpaca 0.0.9: `Error::StreamingError`
+                            // (mid-stream server error envelope). A mid-stream
+                            // `StreamingAuth` is connect-only upstream today;
+                            // handled defensively, mirroring the connect arm.
+                            let unauthenticated =
+                                matches!(err, oxidized_alpaca::Error::StreamingAuth);
                             emit_control(
                                 &sink,
                                 ControlKind::ProviderDisconnected {
                                     provider: PROVIDER_ID.to_string(),
                                     reason: format!("websocket: {err}"),
+                                    cause: if unauthenticated {
+                                        DisconnectCause::Unauthenticated
+                                    } else {
+                                        DisconnectCause::Error
+                                    },
                                 },
                             )
                             .await;
                             // Drop the client and reconnect.
                             drop(client);
+                            if unauthenticated && let Some(rx) = cred_rx.as_mut() {
+                                // Rejected credentials: retrying cannot help.
+                                // Park until a rotation or disable, exactly
+                                // as the connect-time arm does. Static
+                                // sources can't rotate, so they fall through
+                                // to backoff.
+                                if !wait_for_provisioning(
+                                    rx,
+                                    &mut cmd_rx,
+                                    "waiting for new credentials after auth rejection",
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                continue 'outer;
+                            }
                             if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
                                 return;
                             }
@@ -641,6 +700,7 @@ async fn run_streaming_task(
                             ControlKind::ProviderDisconnected {
                                 provider: PROVIDER_ID.to_string(),
                                 reason: "credentials rotated".to_string(),
+                                cause: DisconnectCause::Error,
                             },
                         )
                         .await;
@@ -672,6 +732,7 @@ async fn run_streaming_task(
                             ControlKind::ProviderDisconnected {
                                 provider: PROVIDER_ID.to_string(),
                                 reason: reason.to_string(),
+                                cause: DisconnectCause::Error,
                             },
                         )
                         .await;

@@ -67,6 +67,40 @@ pub struct Config {
     /// Boot-time authoritative sessions held as lifecycle anchors.
     #[serde(default)]
     pub startup_session: Vec<StartupSession>,
+    /// Structured logging (subscriber installed before the config file is
+    /// even resolved via a best-effort peek — see `main::peek_log_config`).
+    #[serde(default)]
+    pub log: LogConfig,
+}
+
+/// Logging configuration. Both fields are cold (subscriber installs once at
+/// boot). `RUST_LOG` overrides `level` when set — the operator escape hatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LogConfig {
+    /// `tracing_subscriber::EnvFilter` directive (e.g. `"info"`,
+    /// `"datamancerd=debug,info"`).
+    pub level: String,
+    /// Output format: human `text` (default) or newline-delimited `json`.
+    pub format: LogFormat,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            format: LogFormat::Text,
+        }
+    }
+}
+
+/// Logging output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 /// Provider selection block. Compiled-in providers start disabled; none need be
@@ -1237,6 +1271,10 @@ enabled = true
 bind = "127.0.0.1"
 port = 8091
 
+[log]
+level = "debug"
+format = "json"
+
 [[startup_session]]
 provider = "alpaca-crypto"
 asset_class = "crypto"
@@ -1255,6 +1293,16 @@ always_on = true
         let text = toml::to_string_pretty(&config).expect("serialize");
         let back = Config::parse(&text).expect("reparse");
         assert_eq!(config, back);
+    }
+
+    #[test]
+    fn log_section_defaults_and_parses() {
+        let config = Config::parse("").expect("empty config is valid");
+        assert_eq!(config.log.level, "info");
+        assert_eq!(config.log.format, LogFormat::Text);
+        let config = Config::parse("[log]\nlevel = \"debug\"\nformat = \"json\"\n").expect("parse");
+        assert_eq!(config.log.level, "debug");
+        assert_eq!(config.log.format, LogFormat::Json);
     }
 
     #[test]

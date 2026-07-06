@@ -18,8 +18,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use datamancer::{
-    AuthoritativeSessionSnapshot, CacheSnapshot, ClientSessionSnapshot, ConnectionState,
-    ProviderSnapshot, SystemSnapshot,
+    AuthoritativeSessionSnapshot, CacheSnapshot, ClientSessionSnapshot, ProviderSnapshot,
+    SystemSnapshot,
 };
 use futures::Stream;
 use futures::StreamExt as _;
@@ -68,42 +68,40 @@ pub(crate) async fn sessions(State(state): State<WebState>) -> Json<SessionsView
     Json(SessionsView::from_snapshot(&state.live_snapshot()))
 }
 
-/// A liveness/readiness rollup. Cheap; suitable for frequent polling.
+/// The `/api/health` envelope: a cheap readiness boolean over the full
+/// app-facing [`datamancer::HealthView`] ("one type, one reduction" — the
+/// web surface is another consumer of the core reduction, not a fork).
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct HealthView {
-    /// `true` once every known provider reports a `Connected` state.
+pub(crate) struct HealthEnvelope {
+    /// `true` once every *enabled* provider reports `Connected` (and at
+    /// least one is enabled). Disabled providers are deliberate and do not
+    /// block readiness.
     pub ready: bool,
-    /// Per-provider connection-state rollup (per-provider, never conflated).
-    pub providers: Vec<ProviderHealth>,
+    pub health: datamancer::HealthView,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ProviderHealth {
-    pub provider: String,
-    pub connection_state: ConnectionState,
-}
-
-impl HealthView {
-    pub(crate) fn from_snapshot(snap: &SystemSnapshot) -> Self {
-        let providers: Vec<ProviderHealth> = snap
+impl HealthEnvelope {
+    pub(crate) fn from_snapshot(snap: &SystemSnapshot, credential_backend: &str) -> Self {
+        let health = crate::server::stamped_health_view(snap, credential_backend);
+        let enabled: Vec<_> = health
             .providers
             .iter()
-            .map(|p| ProviderHealth {
-                provider: p.provider.as_str().to_string(),
-                connection_state: p.connection_state,
-            })
+            .filter(|p| p.state != datamancer::ProviderState::Disabled)
             .collect();
-        let ready = !providers.is_empty()
-            && providers
+        let ready = !enabled.is_empty()
+            && enabled
                 .iter()
-                .all(|p| matches!(p.connection_state, ConnectionState::Connected));
-        Self { ready, providers }
+                .all(|p| p.state == datamancer::ProviderState::Connected);
+        Self { ready, health }
     }
 }
 
-/// `GET /api/health` — process-up + provider connection rollup.
-pub(crate) async fn health(State(state): State<WebState>) -> Json<HealthView> {
-    Json(HealthView::from_snapshot(&state.live_snapshot()))
+/// `GET /api/health` — readiness + the full app-facing health view.
+pub(crate) async fn health(State(state): State<WebState>) -> Json<HealthEnvelope> {
+    Json(HealthEnvelope::from_snapshot(
+        &state.live_snapshot(),
+        state.credential_backend(),
+    ))
 }
 
 /// The SSE event payload: the live snapshot plus the config restart flag, so
@@ -147,9 +145,128 @@ mod tests {
     use crate::web::config_api::ConfigState;
     use crate::web::testdata;
     use arc_swap::ArcSwap;
-    use datamancer::Timestamp;
+    use datamancer::{ConnectionState, ProviderId, ProviderState, Timestamp};
     use serde_json::Value;
     use tokio::sync::watch;
+
+    #[test]
+    fn health_envelope_ignores_disabled_providers_for_readiness() {
+        let snap = SystemSnapshot::new(
+            Timestamp(1_000),
+            vec![
+                ProviderSnapshot::new(
+                    ProviderId::from_static("on"),
+                    ConnectionState::Connected,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                ),
+                ProviderSnapshot::new(
+                    ProviderId::from_static("off"),
+                    ConnectionState::Unknown,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                )
+                .with_enabled(false),
+            ],
+            CacheSnapshot::new(vec![], None),
+            vec![],
+            vec![],
+        );
+        let env = HealthEnvelope::from_snapshot(&snap, "keychain");
+        assert!(env.ready); // the disabled provider does not block readiness
+        assert_eq!(env.health.schema_version, 2);
+        assert_eq!(
+            env.health.daemon.credential_backend.as_deref(),
+            Some("keychain")
+        );
+        assert_eq!(env.health.providers[1].state, ProviderState::Disabled);
+    }
+
+    #[test]
+    fn health_envelope_not_ready_when_no_enabled_provider() {
+        let snap = SystemSnapshot::new(
+            Timestamp(1_000),
+            vec![
+                ProviderSnapshot::new(
+                    ProviderId::from_static("off"),
+                    ConnectionState::Unknown,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                )
+                .with_enabled(false),
+            ],
+            CacheSnapshot::new(vec![], None),
+            vec![],
+            vec![],
+        );
+        assert!(!HealthEnvelope::from_snapshot(&snap, "file").ready);
+    }
+
+    #[test]
+    fn health_envelope_not_ready_when_one_enabled_provider_is_disconnected() {
+        // One provider Connected, one enabled-but-Disconnected: readiness
+        // requires *all* enabled providers Connected, so this must be false
+        // (the only readiness branch with no direct test until now).
+        let snap = SystemSnapshot::new(
+            Timestamp(1_000),
+            vec![
+                ProviderSnapshot::new(
+                    ProviderId::from_static("on"),
+                    ConnectionState::Connected,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                ),
+                ProviderSnapshot::new(
+                    ProviderId::from_static("flaky"),
+                    ConnectionState::Disconnected,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                ),
+            ],
+            CacheSnapshot::new(vec![], None),
+            vec![],
+            vec![],
+        );
+        let env = HealthEnvelope::from_snapshot(&snap, "keychain");
+        assert!(!env.ready);
+        assert_eq!(env.health.providers[0].state, ProviderState::Connected);
+        assert_eq!(env.health.providers[1].state, ProviderState::Disconnected);
+    }
 
     fn config_state() -> ConfigState {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -168,7 +285,7 @@ mod tests {
         let live = Arc::new(ArcSwap::from_pointee(testdata::snapshot()));
         let cache = Arc::new(ArcSwap::from_pointee(testdata::snapshot()));
         let (tx, rx) = watch::channel(0u64);
-        let state = WebState::new(live.clone(), cache, rx);
+        let state = WebState::new(live.clone(), cache, rx, "keychain");
         let config = config_state();
 
         let mut stream = Box::pin(live_json_stream(&state, config));

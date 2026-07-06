@@ -873,7 +873,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "datamancer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "datamancer-core",
  "datamancer-transport-iceoryx2",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-transport-iceoryx2"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "datamancer-core",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "datamancerd"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2729,8 +2729,8 @@ checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
 
 [[package]]
 name = "oxidized_alpaca"
-version = "0.0.8"
-source = "git+https://github.com/VoidstarSolutions/oxidized-alpaca?branch=main#3860340f89d4e0a94d20ba58aae68ece28a168af"
+version = "0.0.9"
+source = "git+https://github.com/VoidstarSolutions/oxidized-alpaca?branch=main#c4fc02ebc1e99f2f17362d4de9317e3404e7d338"
 dependencies = [
  "chrono",
  "futures",
@@ -4358,6 +4358,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4367,12 +4377,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]
@@ -4908,7 +4921,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

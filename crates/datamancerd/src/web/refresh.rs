@@ -38,7 +38,10 @@ impl Refreshers {
     ///
     /// Propagates the first `Datamancer::snapshot()` failure (so the daemon does
     /// not bind a web surface that cannot produce a snapshot).
-    pub async fn warm(dm: &Datamancer) -> datamancer::Result<Self> {
+    pub async fn warm(
+        dm: &Datamancer,
+        credential_backend: &'static str,
+    ) -> datamancer::Result<Self> {
         // Warm each swap with the shape its task will maintain: the live swap
         // with live-only state (no catalog walk), the cache swap with the full
         // snapshot (the catalog). The full snapshot also surfaces a catalog
@@ -48,7 +51,7 @@ impl Refreshers {
         let live = Arc::new(ArcSwap::from_pointee(dm.snapshot_live()));
         let cache = Arc::new(ArcSwap::from_pointee(cache_snap));
         let (live_tx, live_rx) = watch::channel(0);
-        let state = WebState::new(live.clone(), cache.clone(), live_rx);
+        let state = WebState::new(live.clone(), cache.clone(), live_rx, credential_backend);
         Ok(Self {
             state,
             live,
@@ -177,7 +180,7 @@ mod tests {
             .unwrap();
 
         // `warm` populates the cache swap with the freshly-enumerated catalog.
-        let refreshers = Refreshers::warm(&dm).await.unwrap();
+        let refreshers = Refreshers::warm(&dm, "keychain").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let boot =

@@ -14,12 +14,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use datamancer_core::{
-    AssetClass, CacheSnapshot, ConnectionState, Control, ControlKind, EventSink, Instrument,
-    MarketEvent, Price, ProviderId, ProviderSnapshot, Quantity, Seq, SystemSnapshot, Timestamp,
-    Trade,
+    AssetClass, CacheSnapshot, ConnectionState, Control, ControlKind, EventSink, HealthView,
+    Instrument, MarketEvent, Price, ProviderId, ProviderSnapshot, Quantity, Seq, SystemSnapshot,
+    Timestamp, Trade,
 };
 use datamancer_transport_iceoryx2::{
     DataSubscriber, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2DiagnosticsSubscriber,
+    Iceoryx2HealthPublisher, Iceoryx2HealthSubscriber,
 };
 use iceoryx2::prelude::{Node, NodeBuilder, ipc_threadsafe};
 
@@ -216,4 +217,46 @@ async fn diagnostics_subscriber_reconstructs_snapshot() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(received, Some(snapshot));
+}
+
+#[tokio::test]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn health_subscriber_reconstructs_view() {
+    let node = node();
+    let publisher = Iceoryx2HealthPublisher::new(&node).expect("health publisher");
+    let subscriber = Iceoryx2HealthSubscriber::open(&node).expect("health subscriber");
+
+    let snapshot = SystemSnapshot::new(
+        Timestamp(1_700_000_000),
+        vec![ProviderSnapshot::new(
+            ProviderId::from_static("alpaca"),
+            ConnectionState::Connected,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )],
+        CacheSnapshot::new(vec![], None),
+        vec![],
+        vec![],
+    );
+    let mut view = HealthView::from_snapshot(&snapshot, HealthView::DEFAULT_STALE_AFTER_NS);
+    view.daemon.version = Some("0.4.0".to_string());
+    view.daemon.credential_backend = Some("keychain".to_string());
+    publisher.publish(&view).expect("publish health view");
+
+    let mut received = None;
+    for _ in 0..200 {
+        if let Some(v) = subscriber.receive().expect("receive") {
+            received = Some(v);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(received, Some(view));
 }

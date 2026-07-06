@@ -60,19 +60,6 @@ fn check_version(daemon: &str) -> Result<(), EnsureError> {
     }
 }
 
-/// Reduce a snapshot and stamp the daemon version and credential backend
-/// onto it (both from the `ping` handshake, not the snapshot itself).
-fn fill_health(
-    snapshot: &SystemSnapshot,
-    daemon_version: &str,
-    credential_backend: Option<&str>,
-) -> HealthView {
-    let mut view = HealthView::from_snapshot(snapshot, HealthView::DEFAULT_STALE_AFTER_NS);
-    view.daemon.version = Some(daemon_version.to_string());
-    view.daemon.credential_backend = credential_backend.map(str::to_string);
-    view
-}
-
 /// Parameters for `AppHandle::ensure` (`AppHandle` lands with the facade).
 #[derive(Debug, Clone)]
 pub struct EnsureConfig {
@@ -174,20 +161,21 @@ impl AppHandle {
         &self.daemon_hello.version
     }
 
-    /// Typed health for app rendering: the daemon snapshot reduced to
-    /// [`HealthView`], with `daemon.version` and `daemon.credential_backend`
-    /// filled from the handshake.
+    /// The daemon's app-facing health view, reduced and stamped daemon-side
+    /// (version, credential backend, `schema_version`). The `ensure` version
+    /// gate makes daemon/client schema skew unrepresentable in practice; the
+    /// `schema_version` field is the detectable degradation if it ever isn't.
     ///
     /// # Errors
     ///
-    /// Propagates the underlying `snapshot` control/transport failure.
+    /// Propagates the underlying `health` control/transport failure.
     pub async fn health(&mut self) -> Result<HealthView, ClientError<Iceoryx2ClientError>> {
-        let snapshot = self.client.snapshot().await?;
-        Ok(fill_health(
-            &snapshot,
-            &self.daemon_hello.version,
-            self.daemon_hello.credential_backend.as_deref(),
-        ))
+        let reply = self.client.control_request(&Request::Health).await?;
+        reply.health.ok_or_else(|| {
+            ClientError::Transport(Iceoryx2ClientError::Protocol(
+                "ok health reply missing health payload".to_string(),
+            ))
+        })
     }
 
     /// Store (create or rotate) provider credentials in the daemon's broker.
@@ -382,7 +370,57 @@ impl AppHandle {
     pub async fn close(self) -> Result<(), ClientError<Iceoryx2ClientError>> {
         self.client.close().await
     }
+
+    /// Subscribe to pushed health views on the `datamancer/health` plane (the
+    /// daemon publishes on its diagnostics cadence, daemon-stamped the same
+    /// way as [`Self::health`]). Late joiners immediately receive the most
+    /// recent view (`history_size(1)`).
+    ///
+    /// This is a same-host shared-memory subscription independent of the
+    /// control connection: it does not consume `self.client` and cannot fail
+    /// synchronously — a setup failure (node/service open) ends the returned
+    /// stream immediately instead. Drop the stream to stop the poll task.
+    #[must_use]
+    pub fn watch_health(&self) -> HealthStream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<HealthView>(4);
+        tokio::task::spawn_blocking(move || {
+            let Ok(node) = ::iceoryx2::prelude::NodeBuilder::new()
+                .create::<::iceoryx2::prelude::ipc_threadsafe::Service>()
+            else {
+                return; // stream ends; caller observes termination
+            };
+            let Ok(subscriber) =
+                datamancer_transport_iceoryx2::Iceoryx2HealthSubscriber::open(&node)
+            else {
+                return;
+            };
+            while !tx.is_closed() {
+                match subscriber.receive() {
+                    Ok(Some(view)) => {
+                        if tx.blocking_send(view).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => std::thread::sleep(HEALTH_POLL_INTERVAL),
+                    Err(_) => return,
+                }
+            }
+        });
+        tokio_stream::wrappers::ReceiverStream::new(rx)
+    }
 }
+
+/// Push stream of daemon-stamped [`HealthView`]s (the `datamancer/health`
+/// plane; the daemon publishes on its diagnostics cadence). The stream ends
+/// if the subscription fails; drop the stream to stop the poll task.
+pub type HealthStream = tokio_stream::wrappers::ReceiverStream<HealthView>;
+
+/// Idle-poll sleep for [`AppHandle::watch_health`]. Not derived from
+/// [`EnsureConfig::poll_interval`]: that value lives on the one-shot `ensure`
+/// config and isn't retained on `AppHandle`, and this loop's cadence is
+/// bounded above by the daemon's independent diagnostics publish interval
+/// regardless, so a fixed short poll is simplest.
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Map an ok `get-config` reply to [`DaemonConfig`], or a transport error if
 /// the reply is missing its `config` payload.
@@ -431,37 +469,15 @@ mod tests {
         assert!(check_version(env!("CARGO_PKG_VERSION")).is_ok());
     }
 
-    #[test]
-    fn health_fill_sets_daemon_version() {
-        use datamancer_core::{CacheSnapshot, HealthView, SystemSnapshot, Timestamp};
-        let snap = SystemSnapshot::new(
-            Timestamp(1),
-            vec![],
-            CacheSnapshot::new(vec![], None),
-            vec![],
-            vec![],
-        );
-        let view = fill_health(&snap, "0.1.0", None);
-        assert_eq!(view.daemon.version.as_deref(), Some("0.1.0"));
-        assert_eq!(view.schema_version, HealthView::SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn health_fill_sets_backend_alongside_version() {
-        use datamancer_core::{CacheSnapshot, SystemSnapshot, Timestamp};
-        let snap = SystemSnapshot::new(
-            Timestamp(1),
-            vec![],
-            CacheSnapshot::new(vec![], None),
-            vec![],
-            vec![],
-        );
-        let view = fill_health(&snap, "0.3.0", Some("keychain"));
-        assert_eq!(view.daemon.version.as_deref(), Some("0.3.0"));
-        assert_eq!(view.daemon.credential_backend.as_deref(), Some("keychain"));
-        let older = fill_health(&snap, "0.3.0", None);
-        assert!(older.daemon.credential_backend.is_none());
-    }
+    // `fill_health` and its unit tests (`health_fill_sets_daemon_version`,
+    // `health_fill_sets_backend_alongside_version`) were removed with the
+    // client-side reduction: `health()` now sends `Request::Health` and the
+    // daemon stamps `version`/`credential_backend` server-side (see
+    // `datamancerd::server::Server::dispatch`'s `Request::Health` arm). The
+    // actor isn't unit-testable without a live `Datamancer`/iceoryx2
+    // runtime (no existing `dispatch` arm has a unit test for the same
+    // reason), so the stamping assertions move to the Task 11 daemon e2e
+    // test instead.
 
     #[test]
     fn applied_from_maps_restart_required() {

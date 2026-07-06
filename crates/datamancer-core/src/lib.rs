@@ -27,8 +27,8 @@ pub use adjustment::Adjustment;
 pub use credentials::ProviderCredentials;
 pub use error::{Error, Result};
 pub use event::{
-    Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, MarketEvent, Quote, Seq, Timestamp,
-    Trade,
+    Bar, BarInterval, Control, ControlKind, DisconnectCause, EventKind, GapSpan, MarketEvent,
+    Quote, Seq, Timestamp, Trade,
 };
 pub use health::{
     DaemonHealth, HealthView, LatencySummary, Liveness, ProviderHealth, ProviderState, StreamHealth,

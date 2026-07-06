@@ -14,9 +14,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use datamancer::transport::{Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher};
+use datamancer::transport::{
+    Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2HealthPublisher,
+};
 use datamancer::{
-    ClientSession, Datamancer, EventKind, Instrument, ProviderId, Scope, Session, TapLog,
+    ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope, Session,
+    TapLog,
     traits::{EventSink, PublishOutcome},
 };
 use futures::StreamExt as _;
@@ -33,6 +36,24 @@ use crate::error::{DaemonError, Result};
 use crate::shutdown::{DrainClient, DrainRecorder, drain};
 
 type Node = iceoryx2::prelude::Node<ipc_threadsafe::Service>;
+
+/// Reduce a [`datamancer::SystemSnapshot`] into the app-facing
+/// [`HealthView`] and stamp the two daemon-only fields the core reduction
+/// leaves `None` (`version`, `credential_backend`) — the one place this
+/// ritual happens, shared by the UDS `Request::Health` reply, the
+/// diagnostics-plane health publisher, and (when `web-ui` is enabled) the
+/// `/api/health` HTTP handler. Byte-identical behavior everywhere: same
+/// [`HealthView::DEFAULT_STALE_AFTER_NS`], same `CARGO_PKG_VERSION` (all call
+/// sites live in this crate, so the version constant is identical).
+pub(crate) fn stamped_health_view(
+    snapshot: &datamancer::SystemSnapshot,
+    credential_backend: &str,
+) -> HealthView {
+    let mut view = HealthView::from_snapshot(snapshot, HealthView::DEFAULT_STALE_AFTER_NS);
+    view.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
+    view.daemon.credential_backend = Some(credential_backend.to_string());
+    view
+}
 
 /// One connected client: its multiplexing session, its per-client data-plane
 /// sink, the pump task feeding the sink, and its service name.
@@ -276,7 +297,15 @@ impl Server {
 
         let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
             .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
-        let diagnostics = spawn_diagnostics(self.dm.clone(), publisher, self.diag_interval);
+        let health_publisher = Iceoryx2HealthPublisher::new(&self.node)
+            .map_err(|e| DaemonError::Transport(format!("health publisher: {e:?}")))?;
+        let diagnostics = spawn_diagnostics(
+            self.dm.clone(),
+            publisher,
+            health_publisher,
+            self.credential_backend,
+            self.diag_interval,
+        );
 
         #[cfg(feature = "web-ui")]
         let mut web_handles = self.start_web().await?;
@@ -393,7 +422,8 @@ impl Server {
 
         // Warm both swaps before serving so a handler never serves an empty
         // snapshot.
-        let mut refreshers = crate::web::refresh::Refreshers::warm(&self.dm).await?;
+        let mut refreshers =
+            crate::web::refresh::Refreshers::warm(&self.dm, self.credential_backend).await?;
         refreshers.spawn(
             self.dm.clone(),
             web.live_state_cadence_ms,
@@ -598,6 +628,10 @@ impl Server {
             // `handle` intercepts Shutdown before dispatch; reaching here means the
             // daemon is already draining.
             Request::Shutdown => Reply::error(codes::SHUTTING_DOWN, "daemon is shutting down"),
+            Request::Health => {
+                let view = stamped_health_view(&self.dm.snapshot_live(), self.credential_backend);
+                Reply::health(view)
+            }
         }
     }
 
@@ -971,11 +1005,16 @@ async fn handle_connection(
 }
 
 /// Spawn the diagnostics ticker: assemble the snapshot on cadence and publish
-/// it on the diagnostics plane. `snapshot()` is async (the cache catalog does
-/// I/O); awaiting it here keeps the ticker off the actor's critical path.
+/// it on both the diagnostics plane and the health plane (one snapshot feeds
+/// both — the health view is stamped with the daemon version and credential
+/// backend, same as the `Request::Health` dispatch arm). `snapshot()` is
+/// async (the cache catalog does I/O); awaiting it here keeps the ticker off
+/// the actor's critical path.
 fn spawn_diagnostics(
     dm: Datamancer,
     publisher: Iceoryx2DiagnosticsPublisher,
+    health_publisher: Iceoryx2HealthPublisher,
+    credential_backend: &'static str,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -987,6 +1026,10 @@ fn spawn_diagnostics(
                 Ok(snapshot) => {
                     if let Err(e) = publisher.publish(&snapshot) {
                         tracing::warn!(error = %e, "diagnostics publish failed");
+                    }
+                    let view = stamped_health_view(&snapshot, credential_backend);
+                    if let Err(e) = health_publisher.publish(&view) {
+                        tracing::warn!(error = %e, "health publish failed");
                     }
                 }
                 Err(e) => {

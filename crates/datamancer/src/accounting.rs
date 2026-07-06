@@ -22,7 +22,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use datamancer_core::{ConnectionState, ControlKind, MarketEvent};
+use datamancer_core::{ConnectionState, ControlKind, DisconnectCause, MarketEvent};
 
 /// Lock-free per-provider call/throughput counters.
 #[derive(Debug)]
@@ -46,6 +46,11 @@ pub(crate) struct ProviderAccounting {
     ever_connected: std::sync::atomic::AtomicBool,
     /// Last `ProviderError` message, behind a mutex (cold, set rarely).
     last_error: std::sync::Mutex<Option<String>>,
+    /// Set when the most recent disconnect carried `DisconnectCause::Unauthenticated`;
+    /// cleared on the next successful connect. Folded from `record_forwarded`
+    /// because only the in-band `Control` carries the classification — the
+    /// owning controller's up/down calls don't see it.
+    auth_failed: std::sync::atomic::AtomicBool,
 }
 
 impl Default for ProviderAccounting {
@@ -62,6 +67,7 @@ impl Default for ProviderAccounting {
             active_connections: AtomicU64::new(0),
             ever_connected: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
+            auth_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -121,8 +127,18 @@ impl ProviderAccounting {
                 // here off a single shared flag mis-attributed reconnects and let
                 // one substream's drop mark the whole provider down). The
                 // remaining controls carry no provider-level counter.
+                ControlKind::ProviderDisconnected { reason, cause, .. } => {
+                    // Up/down accounting stays with the owning controller
+                    // (see comment below); only the *classification* is
+                    // folded here, because the controller cannot see it.
+                    if *cause == DisconnectCause::Unauthenticated {
+                        self.auth_failed.store(true, Ordering::Relaxed);
+                        if let Ok(mut slot) = self.last_error.lock() {
+                            *slot = Some(reason.clone());
+                        }
+                    }
+                }
                 ControlKind::ProviderConnected { .. }
-                | ControlKind::ProviderDisconnected { .. }
                 | ControlKind::SubscriptionChanged { .. }
                 | ControlKind::SessionClosing => {}
             },
@@ -136,6 +152,7 @@ impl ProviderAccounting {
     pub(crate) fn record_connection_up(&self, reconnect: bool) {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
         self.ever_connected.store(true, Ordering::Relaxed);
+        self.auth_failed.store(false, Ordering::Relaxed);
         if reconnect {
             self.reconnects.fetch_add(1, Ordering::Relaxed);
         }
@@ -192,6 +209,8 @@ impl ProviderAccounting {
         // first connect.
         if self.active_connections.load(Ordering::Relaxed) > 0 {
             ConnectionState::Connected
+        } else if self.auth_failed.load(Ordering::Relaxed) {
+            ConnectionState::Unauthenticated
         } else if self.ever_connected.load(Ordering::Relaxed) {
             ConnectionState::Disconnected
         } else {
@@ -208,8 +227,8 @@ impl ProviderAccounting {
 mod tests {
     use super::ProviderAccounting;
     use datamancer_core::{
-        AssetClass, ConnectionState, Control, ControlKind, GapSpan, Instrument, MarketEvent, Price,
-        ProviderId, Seq, Timestamp, Trade,
+        AssetClass, ConnectionState, Control, ControlKind, DisconnectCause, GapSpan, Instrument,
+        MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
     };
 
     fn trade() -> MarketEvent {
@@ -285,6 +304,40 @@ mod tests {
         a.record_connection_down(); // B drops; now all down
         assert_eq!(a.connection_state(), ConnectionState::Disconnected);
         assert_eq!(a.reconnects(), 0);
+    }
+
+    #[test]
+    fn unauthenticated_disconnect_derives_state_until_next_connect() {
+        let a = ProviderAccounting::default();
+        a.record_forwarded(
+            &control(ControlKind::ProviderDisconnected {
+                provider: "p".to_string(),
+                reason: "auth rejected".to_string(),
+                cause: DisconnectCause::Unauthenticated,
+            }),
+            true,
+        );
+        assert_eq!(a.connection_state(), ConnectionState::Unauthenticated);
+        assert_eq!(a.last_error(), Some("auth rejected".to_string()));
+        // A successful (re)connect clears the flag.
+        a.record_connection_up(false);
+        assert_eq!(a.connection_state(), ConnectionState::Connected);
+        a.record_connection_down();
+        assert_eq!(a.connection_state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn plain_disconnect_does_not_mark_unauthenticated() {
+        let a = ProviderAccounting::default();
+        a.record_forwarded(
+            &control(ControlKind::ProviderDisconnected {
+                provider: "p".to_string(),
+                reason: "ws closed".to_string(),
+                cause: DisconnectCause::Error,
+            }),
+            true,
+        );
+        assert_eq!(a.connection_state(), ConnectionState::Unknown);
     }
 
     #[test]

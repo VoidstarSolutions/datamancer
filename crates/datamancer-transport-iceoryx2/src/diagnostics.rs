@@ -16,7 +16,7 @@
 //! exceeds the payload cap (chunking is deferred — see the plan's open
 //! questions), so the cap is never silently exceeded.
 
-use datamancer_core::SystemSnapshot;
+use datamancer_core::{HealthView, SystemSnapshot};
 
 /// Maximum serialized snapshot size, in bytes, carried in one diagnostics
 /// sample. Generous fixed cap; oversize is a clean error pending the deferred
@@ -49,6 +49,22 @@ impl std::fmt::Display for DiagnosticsError {
 
 impl std::error::Error for DiagnosticsError {}
 
+/// Serialize any `serde`-serializable value to wire bytes, enforcing the
+/// shared [`DIAGNOSTICS_PAYLOAD_CAPACITY`] payload cap.
+///
+/// # Errors
+///
+/// Returns [`DiagnosticsError::Codec`] on a serialization failure or
+/// [`DiagnosticsError::Oversize`] if the result exceeds
+/// [`DIAGNOSTICS_PAYLOAD_CAPACITY`].
+fn encode_capped<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, DiagnosticsError> {
+    let bytes = serde_json::to_vec(value).map_err(DiagnosticsError::Codec)?;
+    if bytes.len() > DIAGNOSTICS_PAYLOAD_CAPACITY {
+        return Err(DiagnosticsError::Oversize { len: bytes.len() });
+    }
+    Ok(bytes)
+}
+
 /// Serialize a snapshot to the diagnostics wire bytes, enforcing the payload
 /// cap.
 ///
@@ -58,11 +74,7 @@ impl std::error::Error for DiagnosticsError {}
 /// [`DiagnosticsError::Oversize`] if the result exceeds
 /// [`DIAGNOSTICS_PAYLOAD_CAPACITY`].
 pub fn encode_snapshot(snapshot: &SystemSnapshot) -> Result<Vec<u8>, DiagnosticsError> {
-    let bytes = serde_json::to_vec(snapshot).map_err(DiagnosticsError::Codec)?;
-    if bytes.len() > DIAGNOSTICS_PAYLOAD_CAPACITY {
-        return Err(DiagnosticsError::Oversize { len: bytes.len() });
-    }
-    Ok(bytes)
+    encode_capped(snapshot)
 }
 
 /// Reconstruct a snapshot from diagnostics wire bytes.
@@ -75,17 +87,46 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SystemSnapshot, DiagnosticsError>
     serde_json::from_slice(bytes).map_err(DiagnosticsError::Codec)
 }
 
-pub use runtime::{Iceoryx2DiagnosticsPublisher, Iceoryx2DiagnosticsSubscriber};
+/// Serialize a [`HealthView`] to the health-plane wire bytes, enforcing the
+/// same payload cap as the diagnostics plane.
+///
+/// # Errors
+///
+/// Returns [`DiagnosticsError::Codec`] on a serialization failure or
+/// [`DiagnosticsError::Oversize`] if the result exceeds
+/// [`DIAGNOSTICS_PAYLOAD_CAPACITY`].
+pub fn encode_health(view: &HealthView) -> Result<Vec<u8>, DiagnosticsError> {
+    encode_capped(view)
+}
+
+/// Reconstruct a [`HealthView`] from health-plane wire bytes.
+///
+/// # Errors
+///
+/// Returns [`DiagnosticsError::Codec`] if the bytes are not a valid serialized
+/// `HealthView`.
+pub fn decode_health(bytes: &[u8]) -> Result<HealthView, DiagnosticsError> {
+    serde_json::from_slice(bytes).map_err(DiagnosticsError::Codec)
+}
+
+pub use runtime::{
+    Iceoryx2DiagnosticsPublisher, Iceoryx2DiagnosticsSubscriber, Iceoryx2HealthPublisher,
+    Iceoryx2HealthSubscriber,
+};
 
 mod runtime {
-    use super::{DIAGNOSTICS_PAYLOAD_CAPACITY, decode_snapshot, encode_snapshot};
+    use super::{
+        DIAGNOSTICS_PAYLOAD_CAPACITY, decode_health, decode_snapshot, encode_health,
+        encode_snapshot,
+    };
     use crate::error::{Result, TransportError};
-    use datamancer_core::SystemSnapshot;
+    use datamancer_core::{HealthView, SystemSnapshot};
     use iceoryx2::port::publisher::Publisher;
     use iceoryx2::port::subscriber::Subscriber;
     use iceoryx2::prelude::{Node, ServiceName, ipc_threadsafe};
 
     const DIAGNOSTICS_SERVICE: &str = "datamancer/diagnostics";
+    const HEALTH_SERVICE: &str = "datamancer/health";
 
     fn diagnostics_name() -> Result<ServiceName> {
         DIAGNOSTICS_SERVICE
@@ -93,24 +134,26 @@ mod runtime {
             .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))
     }
 
-    /// Single-instance diagnostics publisher (not per client). The daemon
-    /// (Phase 5) drives its cadence from the existing tokio runtime — never a
-    /// second runtime.
-    pub struct Iceoryx2DiagnosticsPublisher {
+    fn health_name() -> Result<ServiceName> {
+        HEALTH_SERVICE
+            .try_into()
+            .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))
+    }
+
+    /// Private generic core shared by the diagnostics and health byte-slice
+    /// publishers: same `publish_subscribe::<[u8]>()` + `history_size(1)` +
+    /// `initial_max_slice_len(DIAGNOSTICS_PAYLOAD_CAPACITY)` service shape,
+    /// only the service name and codec fn differ per plane. The public
+    /// per-plane types below are thin newtypes delegating here so the wire
+    /// format and public API stay exactly as documented.
+    struct BytePublisher {
         publisher: Publisher<ipc_threadsafe::Service, [u8], ()>,
     }
 
-    impl Iceoryx2DiagnosticsPublisher {
-        /// Create the diagnostics service and its byte-slice publisher on
-        /// `node`, with `history_size(1)` for immediate late-joiner delivery.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError`] if the service or publisher cannot be
-        /// created.
-        pub fn new(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
+    impl BytePublisher {
+        fn open(node: &Node<ipc_threadsafe::Service>, name: &ServiceName) -> Result<Self> {
             let service = node
-                .service_builder(&diagnostics_name()?)
+                .service_builder(name)
                 .publish_subscribe::<[u8]>()
                 .history_size(1)
                 .open_or_create()
@@ -123,20 +166,12 @@ mod runtime {
             Ok(Self { publisher })
         }
 
-        /// Serialize and publish one snapshot sample.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError`] if encoding fails (including oversize) or
-        /// the iceoryx2 loan/send fails.
-        pub fn publish(&self, snapshot: &SystemSnapshot) -> Result<()> {
-            let bytes =
-                encode_snapshot(snapshot).map_err(|e| TransportError::Send(e.to_string()))?;
+        fn publish_bytes(&self, bytes: &[u8]) -> Result<()> {
             let sample = self
                 .publisher
                 .loan_slice_uninit(bytes.len())
                 .map_err(|e| TransportError::Send(format!("{e:?}")))?;
-            let sample = sample.write_from_slice(&bytes);
+            let sample = sample.write_from_slice(bytes);
             sample
                 .send()
                 .map_err(|e| TransportError::Send(format!("{e:?}")))?;
@@ -144,21 +179,16 @@ mod runtime {
         }
     }
 
-    /// Subscriber-side diagnostics helper (test + future operator tooling).
-    pub struct Iceoryx2DiagnosticsSubscriber {
+    /// Private generic core shared by the diagnostics and health byte-slice
+    /// subscribers, mirroring [`BytePublisher`].
+    struct ByteSubscriber {
         subscriber: Subscriber<ipc_threadsafe::Service, [u8], ()>,
     }
 
-    impl Iceoryx2DiagnosticsSubscriber {
-        /// Open the diagnostics service and a subscriber port on `node`.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError`] if the service or subscriber cannot be
-        /// created.
-        pub fn open(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
+    impl ByteSubscriber {
+        fn open(node: &Node<ipc_threadsafe::Service>, name: &ServiceName) -> Result<Self> {
             let service = node
-                .service_builder(&diagnostics_name()?)
+                .service_builder(name)
                 .publish_subscribe::<[u8]>()
                 .history_size(1)
                 .open_or_create()
@@ -170,30 +200,156 @@ mod runtime {
             Ok(Self { subscriber })
         }
 
-        /// Receive and decode the most recent snapshot, if one is available.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError`] on a receive or decode failure.
-        pub fn receive(&self) -> Result<Option<SystemSnapshot>> {
+        /// Drain to the latest sample, if any, decoding each with `decode`.
+        fn receive_latest<T>(
+            &self,
+            decode: impl Fn(&[u8]) -> std::result::Result<T, super::DiagnosticsError>,
+        ) -> Result<Option<T>> {
             let mut latest = None;
             while let Some(sample) = self
                 .subscriber
                 .receive()
                 .map_err(|e| TransportError::Send(format!("{e:?}")))?
             {
-                latest = Some(
-                    decode_snapshot(&sample).map_err(|e| TransportError::Send(e.to_string()))?,
-                );
+                latest = Some(decode(&sample).map_err(|e| TransportError::Send(e.to_string()))?);
             }
             Ok(latest)
+        }
+    }
+
+    /// Single-instance diagnostics publisher (not per client). The daemon
+    /// (Phase 5) drives its cadence from the existing tokio runtime — never a
+    /// second runtime.
+    pub struct Iceoryx2DiagnosticsPublisher {
+        inner: BytePublisher,
+    }
+
+    impl Iceoryx2DiagnosticsPublisher {
+        /// Create the diagnostics service and its byte-slice publisher on
+        /// `node`, with `history_size(1)` for immediate late-joiner delivery.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TransportError`] if the service or publisher cannot be
+        /// created.
+        pub fn new(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
+            Ok(Self {
+                inner: BytePublisher::open(node, &diagnostics_name()?)?,
+            })
+        }
+
+        /// Serialize and publish one snapshot sample.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TransportError`] if encoding fails (including oversize) or
+        /// the iceoryx2 loan/send fails.
+        pub fn publish(&self, snapshot: &SystemSnapshot) -> Result<()> {
+            let bytes =
+                encode_snapshot(snapshot).map_err(|e| TransportError::Send(e.to_string()))?;
+            self.inner.publish_bytes(&bytes)
+        }
+    }
+
+    /// Subscriber-side diagnostics helper (test + future operator tooling).
+    pub struct Iceoryx2DiagnosticsSubscriber {
+        inner: ByteSubscriber,
+    }
+
+    impl Iceoryx2DiagnosticsSubscriber {
+        /// Open the diagnostics service and a subscriber port on `node`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TransportError`] if the service or subscriber cannot be
+        /// created.
+        pub fn open(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
+            Ok(Self {
+                inner: ByteSubscriber::open(node, &diagnostics_name()?)?,
+            })
+        }
+
+        /// Receive and decode the most recent snapshot, if one is available.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TransportError`] on a receive or decode failure.
+        pub fn receive(&self) -> Result<Option<SystemSnapshot>> {
+            self.inner.receive_latest(decode_snapshot)
+        }
+    }
+
+    /// Single-instance health publisher (not per client), mirroring
+    /// [`Iceoryx2DiagnosticsPublisher`] on the `"datamancer/health"` service.
+    /// The daemon drives its cadence from the same diagnostics ticker — one
+    /// snapshot feeds both planes.
+    pub struct Iceoryx2HealthPublisher {
+        inner: BytePublisher,
+    }
+
+    impl Iceoryx2HealthPublisher {
+        /// Create the health service and its byte-slice publisher on `node`,
+        /// with `history_size(1)` for immediate late-joiner delivery.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TransportError`] if the service or publisher cannot be
+        /// created.
+        pub fn new(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
+            Ok(Self {
+                inner: BytePublisher::open(node, &health_name()?)?,
+            })
+        }
+
+        /// Serialize and publish one health-view sample.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TransportError`] if encoding fails (including oversize) or
+        /// the iceoryx2 loan/send fails.
+        pub fn publish(&self, view: &HealthView) -> Result<()> {
+            let bytes = encode_health(view).map_err(|e| TransportError::Send(e.to_string()))?;
+            self.inner.publish_bytes(&bytes)
+        }
+    }
+
+    /// Subscriber-side health helper (app-facing `watch_health` + future
+    /// operator tooling), mirroring [`Iceoryx2DiagnosticsSubscriber`].
+    pub struct Iceoryx2HealthSubscriber {
+        inner: ByteSubscriber,
+    }
+
+    impl Iceoryx2HealthSubscriber {
+        /// Open the health service and a subscriber port on `node`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TransportError`] if the service or subscriber cannot be
+        /// created.
+        pub fn open(node: &Node<ipc_threadsafe::Service>) -> Result<Self> {
+            Ok(Self {
+                inner: ByteSubscriber::open(node, &health_name()?)?,
+            })
+        }
+
+        /// Receive and decode the most recent health view, if one is
+        /// available.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`TransportError`] on a receive or decode failure.
+        pub fn receive(&self) -> Result<Option<HealthView>> {
+            self.inner.receive_latest(decode_health)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DIAGNOSTICS_PAYLOAD_CAPACITY, DiagnosticsError, decode_snapshot, encode_snapshot};
+    use super::{
+        DIAGNOSTICS_PAYLOAD_CAPACITY, DiagnosticsError, decode_health, decode_snapshot,
+        encode_health, encode_snapshot,
+    };
     use datamancer_core::{
         CacheSnapshot, ConnectionState, ProviderId, ProviderSnapshot, SystemSnapshot, Timestamp,
     };
@@ -245,6 +401,18 @@ mod tests {
             ConnectionState::Connected
         );
         assert_eq!(back.providers[0].last_error.as_deref(), Some("last error"));
+    }
+
+    #[test]
+    fn health_view_survives_health_plane_codec() {
+        let snap = sample_snapshot(1);
+        let view = datamancer_core::HealthView::from_snapshot(
+            &snap,
+            datamancer_core::HealthView::DEFAULT_STALE_AFTER_NS,
+        );
+        let bytes = encode_health(&view).unwrap();
+        assert!(bytes.len() <= DIAGNOSTICS_PAYLOAD_CAPACITY);
+        assert_eq!(decode_health(&bytes).unwrap(), view);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    event::{EventKind, Seq, Timestamp},
+    event::{EventKind, GapSpan, Seq, Timestamp},
     instrument::{Instrument, ProviderId},
     traits::storage::CacheCatalogEntry,
 };
@@ -58,6 +58,10 @@ pub enum ConnectionState {
     Unknown,
     Connected,
     Disconnected,
+    /// Credentials rejected or an auth session lapsed; reconnect without new
+    /// credentials cannot help. Derived from in-band
+    /// [`crate::DisconnectCause::Unauthenticated`].
+    Unauthenticated,
 }
 
 /// A consolidated, serializable view of datamancer's runtime state: provider
@@ -102,6 +106,18 @@ pub struct ProviderSnapshot {
     pub bytes: Option<u64>,
     pub gaps_emitted: u64,
     pub last_error: Option<String>,
+    /// Whether the provider is enabled (a daemon `Watch(None)` settings
+    /// source parks a compiled-in provider disabled; `Static` embedder
+    /// sources are always enabled). Disabled is *deliberate* — distinct
+    /// from enabled-but-not-yet-connected.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Old-frame default for [`ProviderSnapshot::enabled`]: pre-cycle-4 frames
+/// have no `enabled` key at all, and those providers were always enabled.
+fn default_true() -> bool {
+    true
 }
 
 /// The cache catalog plus an optional whole-store footprint.
@@ -134,6 +150,15 @@ pub struct AuthoritativeSessionSnapshot {
     /// Per-symbol provider/source `Control::Gap` count. Per-client resume-buffer
     /// drops live on [`ClientSessionSnapshot`] instead.
     pub gap_count: u64,
+    /// Most recent per-symbol `Control::Gap` spans (bounded ring; oldest
+    /// evicted). Detail behind `gap_count`.
+    #[serde(default)]
+    pub recent_gaps: Vec<GapSpan>,
+    /// Wall-clock receipt of the most recent `Control::Gap` (observability).
+    pub last_gap_rx_ts: Option<Timestamp>,
+    /// Whether a historical→live backfill is currently in progress.
+    #[serde(default)]
+    pub backfilling: bool,
 }
 
 /// One client session's per-client resume buffer occupancy.
@@ -222,6 +247,7 @@ impl ProviderSnapshot {
             bytes: None,
             gaps_emitted,
             last_error,
+            enabled: true,
         }
     }
 
@@ -236,6 +262,13 @@ impl ProviderSnapshot {
     #[must_use]
     pub fn with_bytes(mut self, bytes: Option<u64>) -> Self {
         self.bytes = bytes;
+        self
+    }
+
+    /// Mark the provider deliberately disabled (parked settings watch).
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
         self
     }
 }
@@ -270,6 +303,9 @@ impl AuthoritativeSessionSnapshot {
             last_rx_ts: None,
             latency_ns: None,
             gap_count,
+            recent_gaps: Vec::new(),
+            last_gap_rx_ts: None,
+            backfilling: false,
         }
     }
 
@@ -293,6 +329,25 @@ impl AuthoritativeSessionSnapshot {
             (Some(s), Some(r)) => Some(r.0 - s.0),
             _ => None,
         };
+        self
+    }
+
+    /// Set the recent gap-span detail.
+    #[must_use]
+    pub fn with_gaps(
+        mut self,
+        recent_gaps: Vec<GapSpan>,
+        last_gap_rx_ts: Option<Timestamp>,
+    ) -> Self {
+        self.recent_gaps = recent_gaps;
+        self.last_gap_rx_ts = last_gap_rx_ts;
+        self
+    }
+
+    /// Set the backfill-in-progress flag.
+    #[must_use]
+    pub fn with_backfilling(mut self, backfilling: bool) -> Self {
+        self.backfilling = backfilling;
         self
     }
 }
@@ -343,6 +398,41 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_enrichment_defaults_and_builders() {
+        let inst = Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, "AAPL");
+        let s = AuthoritativeSessionSnapshot::new(inst.clone(), EventKind::Trade, 1, 0);
+        assert!(s.recent_gaps.is_empty());
+        assert_eq!(s.last_gap_rx_ts, None);
+        assert!(!s.backfilling);
+        let span = GapSpan {
+            from_source_ts: Timestamp(1),
+            to_source_ts: Timestamp(2),
+        };
+        let s = s
+            .with_gaps(vec![span.clone()], Some(Timestamp(3)))
+            .with_backfilling(true);
+        assert_eq!(s.recent_gaps, vec![span]);
+        assert_eq!(s.last_gap_rx_ts, Some(Timestamp(3)));
+        assert!(s.backfilling);
+
+        let p = ProviderSnapshot::new(
+            ProviderId::from_static("p"),
+            ConnectionState::Unknown,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        );
+        assert!(p.enabled); // default: enabled (embedder Static sources)
+        assert!(!p.with_enabled(false).enabled);
+    }
+
+    #[test]
     fn snapshot_serde_round_trips() {
         let inst = Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, "AAPL");
         let snapshot = SystemSnapshot {
@@ -361,6 +451,7 @@ mod tests {
                 bytes: Some(4096),
                 gaps_emitted: 2,
                 last_error: Some("boom".to_string()),
+                enabled: false,
             }],
             cache: CacheSnapshot {
                 entries: vec![
@@ -389,6 +480,12 @@ mod tests {
                 last_rx_ts: Some(Timestamp(130)),
                 latency_ns: Some(7),
                 gap_count: 1,
+                recent_gaps: vec![GapSpan {
+                    from_source_ts: Timestamp(0),
+                    to_source_ts: Timestamp(100),
+                }],
+                last_gap_rx_ts: Some(Timestamp(9)),
+                backfilling: true,
             }],
             client_sessions: vec![ClientSessionSnapshot {
                 id: ClientSessionId(42),
@@ -406,5 +503,53 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         let back: SystemSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snapshot, back);
+    }
+
+    #[test]
+    fn provider_snapshot_enabled_defaults_true_on_old_frames() {
+        // A pre-cycle-4 frame has no `enabled` key at all; it must default to
+        // `true` (a bare `#[serde(default)]` would default to `false` and
+        // misrender every old-frame provider as Disabled).
+        let old = r#"{
+            "provider": "p",
+            "connection_state": "Connected",
+            "history_fetches": 0,
+            "history_fetch_coalesced": 0,
+            "live_starts": 0,
+            "subscribes": 0,
+            "unsubscribes": 0,
+            "reconnects": 0,
+            "rate_limit_hits": null,
+            "messages": 0,
+            "bytes": null,
+            "gaps_emitted": 0,
+            "last_error": null
+        }"#;
+        let p: ProviderSnapshot = serde_json::from_str(old).unwrap();
+        assert!(p.enabled);
+    }
+
+    #[test]
+    fn authoritative_session_snapshot_gap_and_backfill_fields_default_on_old_frames() {
+        // A pre-cycle-4 frame has no `recent_gaps`/`backfilling` keys.
+        // `last_gap_rx_ts` was already an `Option` and is fine as-is.
+        let inst = Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, "AAPL");
+        let json = serde_json::to_string(&AuthoritativeSessionSnapshot::new(
+            inst,
+            EventKind::Trade,
+            1,
+            0,
+        ))
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("recent_gaps");
+        obj.remove("backfilling");
+        let old = serde_json::to_string(&value).unwrap();
+
+        let s: AuthoritativeSessionSnapshot = serde_json::from_str(&old).unwrap();
+        assert!(s.recent_gaps.is_empty());
+        assert_eq!(s.last_gap_rx_ts, None);
+        assert!(!s.backfilling);
     }
 }

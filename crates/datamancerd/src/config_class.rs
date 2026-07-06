@@ -32,6 +32,7 @@ const CLASSIFICATION: &[(&str, FieldClass)] = &[
     ("web_ui.", FieldClass::Cold),
     ("ws.", FieldClass::Cold),
     ("startup_session.", FieldClass::Cold),
+    ("log.", FieldClass::Cold),
 ];
 
 /// The class for a dotted config path, or `None` for an unknown path.
@@ -145,6 +146,10 @@ assets_dir = "/tmp/dmc-assets"
 enabled = true
 auth_token = "t"
 
+[log]
+level = "debug"
+format = "json"
+
 [[startup_session]]
 provider = "alpaca-crypto"
 asset_class = "crypto"
@@ -190,6 +195,7 @@ persistence = "none"
             Some(FieldClass::Cold)
         );
         assert_eq!(classify("nonexistent.field"), None);
+        assert_eq!(classify("log.format"), Some(FieldClass::Cold));
     }
 
     #[test]

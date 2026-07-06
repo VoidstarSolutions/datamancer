@@ -102,6 +102,13 @@ pub trait Provider: Send + Sync + 'static {
     fn metrics(&self) -> Option<Arc<dyn ProviderMetrics>> {
         None
     }
+
+    /// Whether this provider is currently enabled. `Watch(None)` settings
+    /// sources (daemon-parked) report `false`; the default covers providers
+    /// without a runtime settings seam.
+    fn enabled(&self) -> bool {
+        true
+    }
 }
 
 /// Provider-side accounting sink for metrics invisible at datamancer's cold

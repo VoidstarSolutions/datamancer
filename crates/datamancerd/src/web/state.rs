@@ -30,21 +30,30 @@ pub struct WebState {
     cache: Arc<ArcSwap<SystemSnapshot>>,
     /// Bumped by the live-refresh task on every publish; drives SSE wakeups.
     live_version: watch::Receiver<u64>,
+    /// The active credential-store backend name (`"keychain"`,
+    /// `"secret-service"`, `"file"`), stamped into `/api/health`'s
+    /// `HealthView.daemon.credential_backend` — the same bootstrap fact the
+    /// daemon actor stamps onto `ping`/`Health` dispatch, threaded here so the
+    /// web layer is another consumer of one fact, not a second source of it.
+    credential_backend: &'static str,
 }
 
 impl WebState {
-    /// Build from the two shared swaps and the live-version receiver. The daemon
-    /// wires this; tests use [`WebState::fixed`].
+    /// Build from the two shared swaps, the live-version receiver, and the
+    /// bootstrap-time credential-backend name. The daemon wires this; tests
+    /// use [`WebState::fixed`].
     #[must_use]
     pub fn new(
         live: Arc<ArcSwap<SystemSnapshot>>,
         cache: Arc<ArcSwap<SystemSnapshot>>,
         live_version: watch::Receiver<u64>,
+        credential_backend: &'static str,
     ) -> Self {
         Self {
             live,
             cache,
             live_version,
+            credential_backend,
         }
     }
 
@@ -62,6 +71,7 @@ impl WebState {
             Arc::new(ArcSwap::from_pointee(live)),
             Arc::new(ArcSwap::from_pointee(cache)),
             rx,
+            "keychain",
         )
     }
 
@@ -81,5 +91,11 @@ impl WebState {
     #[must_use]
     pub(crate) fn live_version(&self) -> watch::Receiver<u64> {
         self.live_version.clone()
+    }
+
+    /// The active credential-store backend name, stamped into `/api/health`.
+    #[must_use]
+    pub(crate) fn credential_backend(&self) -> &'static str {
+        self.credential_backend
     }
 }
