@@ -136,6 +136,9 @@ impl HealthView {
                     ConnectionState::Connected => ProviderState::Connected,
                     ConnectionState::Disconnected => ProviderState::Disconnected,
                     ConnectionState::Unknown => ProviderState::Connecting,
+                    // Interim: Task 3 rewrites this reduction to map
+                    // Unauthenticated properly (and factor in `enabled`).
+                    ConnectionState::Unauthenticated => ProviderState::Unauthenticated,
                 },
                 detail: p.last_error.clone(),
             })
