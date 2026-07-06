@@ -187,12 +187,32 @@ pub struct Control {
     pub kind: ControlKind,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Why a provider connection is down — app-renderable classification.
+/// `Unauthenticated`: credentials rejected or an auth session lapsed;
+/// retrying without new credentials cannot help. `CompanionUnreachable` is
+/// reserved (spec appendix: IBKR's local gateway) — nothing emits it yet.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisconnectCause {
+    #[default]
+    Error,
+    Unauthenticated,
+    CompanionUnreachable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlKind {
     /// Provider connection established or re-established.
     ProviderConnected { provider: String },
     /// Provider connection lost; a reconnect attempt is scheduled or in flight.
-    ProviderDisconnected { provider: String, reason: String },
+    ProviderDisconnected {
+        provider: String,
+        reason: String,
+        /// Classified cause; `Error` on frames that predate the field.
+        #[serde(default)]
+        cause: DisconnectCause,
+    },
     /// Subscription state changed (acknowledged by the provider). Each
     /// session subscribes to exactly one `(instrument, kind)` pair, so the
     /// notification carries the same shape.
@@ -223,7 +243,40 @@ pub struct GapSpan {
 
 #[cfg(test)]
 mod serde_tests {
-    use super::{BarInterval, EventKind, GapSpan, Seq, Timestamp};
+    use super::{BarInterval, ControlKind, DisconnectCause, EventKind, GapSpan, Seq, Timestamp};
+
+    #[test]
+    fn provider_disconnected_cause_defaults_on_old_frames() {
+        // A pre-cycle-4 frame has no `cause`; it must parse as Error.
+        let old = r#"{"ProviderDisconnected":{"provider":"p","reason":"ws closed"}}"#;
+        let kind: ControlKind = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            kind,
+            ControlKind::ProviderDisconnected {
+                cause: DisconnectCause::Error,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn disconnect_cause_wire_names_are_stable() {
+        for (cause, wire) in [
+            (DisconnectCause::Error, "\"error\""),
+            (DisconnectCause::Unauthenticated, "\"unauthenticated\""),
+            (
+                DisconnectCause::CompanionUnreachable,
+                "\"companion_unreachable\"",
+            ),
+        ] {
+            let json = serde_json::to_string(&cause).unwrap();
+            assert_eq!(json, wire);
+            assert_eq!(
+                serde_json::from_str::<DisconnectCause>(&json).unwrap(),
+                cause
+            );
+        }
+    }
 
     #[test]
     fn seq_round_trips_transparently() {

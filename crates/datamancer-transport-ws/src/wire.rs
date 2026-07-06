@@ -306,8 +306,8 @@ fn control_from_wire(frame: &EventFrame) -> MarketEvent {
 mod tests {
     use super::{EventFrame, from_wire, to_wire};
     use datamancer_core::{
-        AssetClass, Bar, BarInterval, Control, ControlKind, EventKind, GapSpan, Instrument,
-        MarketEvent, Price, ProviderId, Quantity, Quote, Seq, Timestamp, Trade,
+        AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, EventKind, GapSpan,
+        Instrument, MarketEvent, Price, ProviderId, Quantity, Quote, Seq, Timestamp, Trade,
     };
 
     fn inst(symbol: &str) -> Instrument {
@@ -482,6 +482,7 @@ mod tests {
             ControlKind::ProviderDisconnected {
                 provider: "alpaca".to_string(),
                 reason: "boom".to_string(),
+                cause: DisconnectCause::Error,
             },
             ControlKind::ProviderError {
                 provider: "alpaca".to_string(),

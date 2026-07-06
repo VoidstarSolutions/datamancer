@@ -36,9 +36,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    AssetClass, Bar, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest,
-    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity, Quote, Result, Seq,
-    Timestamp, Trade,
+    AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
+    HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity,
+    Quote, Result, Seq, Timestamp, Trade,
 };
 use oxidized_alpaca::{
     AccountType, CryptoFeed, TradingClient,
@@ -468,6 +468,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                     ControlKind::ProviderDisconnected {
                         provider: PROVIDER_ID.to_string(),
                         reason: format!("connect failed: {}", error_chain(&err)),
+                        cause: DisconnectCause::Error,
                     },
                 )
                 .await;
@@ -597,6 +598,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                                 ControlKind::ProviderDisconnected {
                                     provider: PROVIDER_ID.to_string(),
                                     reason: format!("websocket: {}", error_chain(&err)),
+                                    cause: DisconnectCause::Error,
                                 },
                             )
                             .await;
@@ -629,6 +631,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                             ControlKind::ProviderDisconnected {
                                 provider: PROVIDER_ID.to_string(),
                                 reason: "credentials rotated".to_string(),
+                                cause: DisconnectCause::Error,
                             },
                         )
                         .await;
@@ -660,6 +663,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                             ControlKind::ProviderDisconnected {
                                 provider: PROVIDER_ID.to_string(),
                                 reason: reason.to_string(),
+                                cause: DisconnectCause::Error,
                             },
                         )
                         .await;

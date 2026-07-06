@@ -21,9 +21,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    Adjustment, AssetClass, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest,
-    Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity, Result, Seq,
-    Timestamp, Trade,
+    Adjustment, AssetClass, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
+    HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity,
+    Result, Seq, Timestamp, Trade,
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
@@ -477,6 +477,7 @@ async fn run_streaming_task(
                     ControlKind::ProviderDisconnected {
                         provider: PROVIDER_ID.to_string(),
                         reason: format!("connect failed: {err}"),
+                        cause: DisconnectCause::Error,
                     },
                 )
                 .await;
@@ -608,6 +609,7 @@ async fn run_streaming_task(
                                 ControlKind::ProviderDisconnected {
                                     provider: PROVIDER_ID.to_string(),
                                     reason: format!("websocket: {err}"),
+                                    cause: DisconnectCause::Error,
                                 },
                             )
                             .await;
@@ -641,6 +643,7 @@ async fn run_streaming_task(
                             ControlKind::ProviderDisconnected {
                                 provider: PROVIDER_ID.to_string(),
                                 reason: "credentials rotated".to_string(),
+                                cause: DisconnectCause::Error,
                             },
                         )
                         .await;
@@ -672,6 +675,7 @@ async fn run_streaming_task(
                             ControlKind::ProviderDisconnected {
                                 provider: PROVIDER_ID.to_string(),
                                 reason: reason.to_string(),
+                                cause: DisconnectCause::Error,
                             },
                         )
                         .await;

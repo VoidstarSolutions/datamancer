@@ -11,9 +11,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
-    AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, EventKind, GapSpan, Instrument,
-    LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ProviderSnapshot,
-    Result, Scope, Seq, Timestamp, Trade,
+    AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, DisconnectCause, EventKind,
+    GapSpan, Instrument, LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId,
+    ProviderSnapshot, Result, Scope, Seq, Timestamp, Trade,
 };
 use datamancer_core::{AuthoritativeSessionSnapshot, HistoryRequest};
 use futures::StreamExt;
@@ -413,6 +413,7 @@ fn disconnected(id: &str) -> MarketEvent {
         kind: ControlKind::ProviderDisconnected {
             provider: id.to_string(),
             reason: "drop".to_string(),
+            cause: DisconnectCause::Error,
         },
     })
 }
