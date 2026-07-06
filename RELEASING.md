@@ -83,7 +83,8 @@ or the first `chore: release` PR you merge after it), confirm:
 - **Exactly one** GitHub Release was created.
 - **Zero** crates.io / registry network activity in the workflow run logs.
 
-If release-plz instead attempts to create multiple Releases pointing at the
-same tag (one per crate), set `git_release_enable = false` on all but one
-`[[package]]` entry in `release-plz.toml` so only a single package authors
-the Release.
+The single-version workspace config produces exactly one tag and one Release,
+so this shouldn't happen. If release-plz ever does create multiple Releases
+pointing at the same tag (one per crate), add per-package overrides to
+`release-plz.toml` — a `[[package]]` block with `git_release_enable = false`
+for every crate except the one you want to author the Release.
