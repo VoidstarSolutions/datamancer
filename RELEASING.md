@@ -51,8 +51,19 @@ GitHub App instead.
 ## One-time setup: the baseline tag
 
 `git_only` mode computes "what changed since the last release" from git tags.
-Before the first automated run there are no release tags, so create one at the
-current unified version (see the bootstrap step in the plan / below):
+Before the first automated run there are no release tags, so `main` needs one
+at the current unified version, `v0.5.0`.
+
+**You don't have to do this manually.** The `release` job runs on every push
+to `main`, including the merge that lands this automation — with no `v0.5.0`
+tag yet, release-plz will likely create the `v0.5.0` tag and a GitHub Release
+for it itself on that first merge. This is harmless (no crates.io involved),
+but the changelog on that first auto-generated Release will cover the entire
+project history up to that point, which may be noisier than you want as a
+"baseline".
+
+If you'd rather have a clean, empty baseline, pre-create and push the tag
+**before** merging the PR that adds this automation:
 
 ```bash
 git checkout main && git pull
@@ -60,5 +71,19 @@ git tag -a v0.5.0 -m "Baseline release v0.5.0 (workspace version unification)"
 git push origin v0.5.0
 ```
 
-After this, the first `release-plz PR` run will propose the next version from
-commits made after `v0.5.0`.
+Either way, once `v0.5.0` exists, the first `release-plz PR` run will propose
+the next version from commits made after it.
+
+## First release: verify
+
+On the first real release (whether it's the auto-generated `v0.5.0` baseline
+or the first `chore: release` PR you merge after it), confirm:
+
+- **Exactly one** `vX.Y.Z` git tag was created — not one per crate.
+- **Exactly one** GitHub Release was created.
+- **Zero** crates.io / registry network activity in the workflow run logs.
+
+If release-plz instead attempts to create multiple Releases pointing at the
+same tag (one per crate), set `git_release_enable = false` on all but one
+`[[package]]` entry in `release-plz.toml` so only a single package authors
+the Release.

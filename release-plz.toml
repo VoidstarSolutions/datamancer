@@ -8,6 +8,7 @@
 
 [workspace]
 git_only = true                    # skip cargo publish; use git tags as the version baseline
+publish = false                    # explicit backstop: never run cargo publish, even if git_only is ever removed
 semver_check = false               # semver guarding stays in ci.yml's semver-checks.sh
 changelog_update = true            # maintain CHANGELOG.md as commits land
 git_tag_name = "v{{ version }}"    # one tag per release for the single-version workspace (e.g. v0.5.0)
