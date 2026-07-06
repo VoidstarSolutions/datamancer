@@ -467,11 +467,11 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                 client
             }
             Err(err) => {
-                // StreamingAuth is not yet produced by oxidized_alpaca's
-                // market-data connect path (see
-                // ISSUE-streaming-auth-rejection-silent.md in that repo);
-                // classification is wired so the fix lights up here with no
-                // datamancer change.
+                // oxidized_alpaca 0.0.9 returns `Error::StreamingAuth` when
+                // the market-data connect handshake's auth response is not
+                // `Authenticated` (fixed upstream in
+                // fix(streaming): return StreamingAuth on rejected
+                // market-data credentials); this classification consumes it.
                 let unauthenticated = matches!(err, oxidized_alpaca::Error::StreamingAuth);
                 broadcast_control(
                     &routes,
@@ -623,12 +623,28 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                             }
                         }
                         Err(err) => {
+                            // oxidized_alpaca 0.0.9 surfaces mid-stream
+                            // server error envelopes as `Error::StreamingError`
+                            // from `next_message` (previously undifferentiated
+                            // or swallowed); `Error::StreamingSubscribe` can
+                            // also reach here in principle (it's the same
+                            // socket-read path). Neither variant is produced
+                            // by `next_message` for a rejected/expired auth —
+                            // `StreamingAuth` is connect-only upstream — but
+                            // classify it the same way as the connect path
+                            // defensively, in case that ever changes.
+                            let unauthenticated =
+                                matches!(err, oxidized_alpaca::Error::StreamingAuth);
                             broadcast_control(
                                 &routes,
                                 ControlKind::ProviderDisconnected {
                                     provider: PROVIDER_ID.to_string(),
                                     reason: format!("websocket: {}", error_chain(&err)),
-                                    cause: DisconnectCause::Error,
+                                    cause: if unauthenticated {
+                                        DisconnectCause::Unauthenticated
+                                    } else {
+                                        DisconnectCause::Error
+                                    },
                                 },
                             )
                             .await;
