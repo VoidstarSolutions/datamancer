@@ -2730,7 +2730,8 @@ checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
 [[package]]
 name = "oxidized_alpaca"
 version = "0.0.9"
-source = "git+https://github.com/VoidstarSolutions/oxidized-alpaca?branch=main#c4fc02ebc1e99f2f17362d4de9317e3404e7d338"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ba6fde0aad15636036f0b5547a27873b8eb6c2d301245c069cb616a3a046ef5"
 dependencies = [
  "chrono",
  "futures",

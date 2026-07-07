@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Credential storage for datamancer providers: OS keychain with a locked-down file fallback"
 
 [dependencies]
-datamancer-core = { path = "../datamancer-core" }
+datamancer-core = { path = "../datamancer-core", version = "0.5.0" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 directories = "6"
