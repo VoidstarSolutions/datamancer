@@ -43,6 +43,7 @@ multiple-versions = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = [
-    "https://github.com/VoidstarSolutions/oxidized-alpaca", # datamancer's own Alpaca provider fork, not yet published to crates.io
-]
+# No git sources: oxidized_alpaca is now a published crates.io dependency
+# (all workspace deps must be registry-resolvable for release-plz's git_only
+# `cargo package --workspace` diffing to succeed — see RELEASING.md).
+allow-git = []

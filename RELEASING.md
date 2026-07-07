@@ -23,6 +23,38 @@ Semver/API-break protection is the existing `.github/scripts/semver-checks.sh`
 gate in `ci.yml` (cargo-semver-checks vs. the PR base). release-plz does not run
 its own semver check (`semver_check = false`).
 
+## Workspace manifest constraints (load-bearing for `git_only`)
+
+Even though we never publish, release-plz's `git_only` version diffing runs
+`cargo package --allow-dirty --workspace` at the previous release tag (to detect
+which crates changed). `cargo package` is strict about manifests, so the whole
+workspace must stay packageable or **every** release after the first fails
+(release-plz [#2595]). Three rules keep it green:
+
+1. **No git/path dependency without a registry `version`.** Every internal
+   path dep carries `version = "0.5.0"` alongside `path = "..."`
+   (`cargo package` rewrites `path` → registry and needs a version to write),
+   and external deps must resolve on crates.io — `oxidized_alpaca` is a
+   published crate (`version = "0.0.9"`), **not** a `git = ` dependency. If you
+   add a `git = ` dependency to any workspace member, `cargo package` cannot
+   package it and releases break; publish it (or a fork) to crates.io first.
+2. **No `publish = false` on a crate that another workspace member depends on.**
+   `cargo package --workspace` does *not* skip `publish = false` crates (that is
+   `cargo publish` behaviour only), and a `publish = false` crate is absent from
+   the temporary registry its dependents resolve against — so its dependents
+   fail to package. Only `datamancerd` keeps `publish = false` (nothing depends
+   on it; it is the binary and is never published). The library crates rely on
+   the release-plz backstops below, not `publish = false`, to stay off crates.io.
+3. **Every non-`publish = false` crate needs a `license` field.** `cargo deny`'s
+   licenses gate skips `publish = false` crates but requires a license on the
+   rest. All library crates declare `license = "MIT OR Apache-2.0"`.
+
+The real "never crates.io" backstops are in `release-plz.toml`
+(`git_only = true` + `publish = false` at the workspace level), not the
+per-crate `publish = false` — release-plz never runs `cargo publish`.
+
+[#2595]: https://github.com/release-plz/release-plz/issues/2595
+
 ## One-time setup: the GitHub App token
 
 release-plz opens a PR that must trigger CI. GitHub's default `GITHUB_TOKEN`
