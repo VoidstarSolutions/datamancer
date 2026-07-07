@@ -12,3 +12,14 @@ publish = false                    # explicit backstop: never run cargo publish,
 semver_check = false               # semver guarding stays in ci.yml's semver-checks.sh
 changelog_update = true            # maintain CHANGELOG.md as commits land
 git_tag_name = "v{{ version }}"    # one tag per release for the single-version workspace (e.g. v0.5.0)
+git_tag_enable = false             # default off; re-enabled only for the single tag/release owner below
+git_release_enable = false         # default off; re-enabled only for the single tag/release owner below
+
+# `datamancer` is the sole tag/release owner. Every crate shares one workspace
+# version, so without this every crate would try to create the same
+# `vX.Y.Z` tag and GitHub Release, and all but the first would 422 with
+# "Reference already exists".
+[[package]]
+name = "datamancer"
+git_tag_enable = true
+git_release_enable = true
