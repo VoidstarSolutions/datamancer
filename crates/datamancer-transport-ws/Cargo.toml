@@ -1,6 +1,6 @@
 [package]
 name = "datamancer-transport-ws"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "WebSocket client transport for datamancer (single bidirectional connection: JSON control + event frames)"
