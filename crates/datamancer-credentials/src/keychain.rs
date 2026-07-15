@@ -1,6 +1,6 @@
 //! The OS-keychain backend: macOS Keychain Services / Linux Secret Service
-//! (D-Bus), via the `keyring` crate's classic API. Windows Credential
-//! Manager is additive later through the same seam.
+//! (D-Bus) / Windows Credential Manager, via the `keyring` crate's classic
+//! API (each platform's store is wired in `init_default_store`).
 //!
 //! Entries live under service `"datamancer"`, username = provider id,
 //! password = the serde-JSON of the credential shape.

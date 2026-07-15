@@ -19,7 +19,7 @@ and a first-run setup flow with secure provider-key storage.
 | History | Rewrite with `git-filter-repo` (keep commit granularity, strip internal paths); full-history `gitleaks` scan first — any hit downgrades to squash |
 | Key storage | OS keychain via the `keyring` crate; resolution precedence env var → keychain → absent; env vars remain the headless-server path |
 | CI platforms | Full CI on Linux (PRs + main). Windows job covers only the ws-portable subset |
-| Release targets | `x86_64-unknown-linux-gnu` + `aarch64-apple-darwin` for the daemon (macOS is arm64-only; no x86_64 mac). Windows ships no daemon — its support boundary is the ws transport + `datamancer-client` (ws feature), enforced by CI, distributed via crates.io |
+| Release targets | `x86_64-unknown-linux-gnu` + `aarch64-apple-darwin` for the daemon (macOS is arm64-only; no x86_64 mac). Windows ships no daemon — its support boundary is the ws transport + `datamancer-client` (ws feature), enforced by CI, distributed via crates.io **(2026-07-15: being extended to the full native-Windows stack — see #29)** |
 | Release tooling | `cargo-dist` (installers, artifacts, `axoupdater` auto-update) + `release-plz` (crates.io publishing, changelogs, version bumps, semver gating) |
 | Versioning | Stays 0.x; `cargo-semver-checks` enforces compatibility within 0.x minor lines |
 

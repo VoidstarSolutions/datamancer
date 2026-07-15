@@ -31,7 +31,8 @@ pub struct WebState {
     /// Bumped by the live-refresh task on every publish; drives SSE wakeups.
     live_version: watch::Receiver<u64>,
     /// The active credential-store backend name (`"keychain"`,
-    /// `"secret-service"`, `"file"`), stamped into `/api/health`'s
+    /// `"secret-service"`, `"credential-manager"`, `"file"`), stamped into
+    /// `/api/health`'s
     /// `HealthView.daemon.credential_backend` — the same bootstrap fact the
     /// daemon actor stamps onto `ping`/`Health` dispatch, threaded here so the
     /// web layer is another consumer of one fact, not a second source of it.

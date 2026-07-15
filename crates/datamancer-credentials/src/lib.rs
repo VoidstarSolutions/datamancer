@@ -42,7 +42,8 @@ pub enum CredentialError {
 /// serde form of [`ProviderCredentials`].
 pub trait CredentialBackend: Send + Sync {
     /// Stable, human-readable backend name (`"keychain"`, `"secret-service"`,
-    /// `"file"`) — surfaced in health so a surprising fallback is visible.
+    /// `"credential-manager"`, `"file"`) — surfaced in health so a surprising
+    /// fallback is visible.
     fn name(&self) -> &'static str;
     /// The stored credentials for `provider`, `None` if absent.
     ///
