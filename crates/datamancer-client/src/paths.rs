@@ -84,5 +84,11 @@ mod tests {
             s.ends_with("datamancer/control.sock"),
             "documented Linux path drifted: {s}"
         );
+        #[cfg(windows)]
+        assert!(
+            s.replace('\\', "/")
+                .ends_with("datamancer/data/control.sock"),
+            "documented Windows path drifted: {s}"
+        );
     }
 }
