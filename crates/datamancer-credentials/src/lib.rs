@@ -306,7 +306,10 @@ mod tests {
         // An empty value does not divert to a file at "".
         let empty = CredentialStore::open_default_with_lookup(|_| Some(String::new()));
         if let Ok(s) = empty {
-            assert!(["keychain", "secret-service", "file"].contains(&s.backend_name()));
+            assert!(
+                ["keychain", "secret-service", "credential-manager", "file"]
+                    .contains(&s.backend_name())
+            );
         }
     }
 
@@ -316,6 +319,9 @@ mod tests {
         // platform store is up, else the file fallback. Never silently: the
         // name says which.
         let store = CredentialStore::open_default().expect("some backend");
-        assert!(["keychain", "secret-service", "file"].contains(&store.backend_name()));
+        assert!(
+            ["keychain", "secret-service", "credential-manager", "file"]
+                .contains(&store.backend_name())
+        );
     }
 }

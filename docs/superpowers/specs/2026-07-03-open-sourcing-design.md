@@ -117,8 +117,10 @@ SHAs break only once). PR #11 merges before any of this begins.
 
 ## Out of scope
 
-- Windows daemon support (UDS control socket and iceoryx2 shm are
-  POSIX-shaped; porting is a separate future decision).
+- ~~Windows daemon support (UDS control socket and iceoryx2 shm are
+  POSIX-shaped; porting is a separate future decision).~~ **Superseded
+  2026-07-15:** native Windows support for the full stack is now an active
+  goal — see [`2026-07-15-native-windows-support-design.md`](2026-07-15-native-windows-support-design.md) (#29).
 - x86_64 macOS.
 - Encrypted-file secret storage (keychain + env covers v1; revisit if
   headless demand appears).

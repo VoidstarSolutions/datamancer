@@ -308,6 +308,12 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         assert!(s.ends_with("datamancer/config.toml"), "{s}");
+        #[cfg(windows)]
+        assert!(
+            s.replace('\\', "/")
+                .ends_with("datamancer/config/config.toml"),
+            "documented Windows path drifted: {s}"
+        );
     }
 
     #[test]
