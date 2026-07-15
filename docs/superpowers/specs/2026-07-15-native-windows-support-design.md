@@ -61,9 +61,50 @@ daemon's control plane. It falls into five buckets, in rough order of size:
    from the ws subset to the full stack.
 
 **The single highest-risk item is the peer-credential auth port** — it is a
-security boundary, and a naive port silently reopens every privileged op. The
-single biggest *unknown* is **iceoryx2 shared-memory at runtime on Windows** —
-it compiles, but Tier-2 cross-process shm must be proven with a spike.
+security boundary, and a naive port silently reopens every privileged op.
+
+**The former "biggest unknown" — iceoryx2 shared memory on Windows — has been
+spiked and resolved: it does not work on Windows and won't in a production-viable
+way.** Windows therefore needs its **own data-transport path** to the same
+service. See §2.5.
+
+## 2.5 Spike result & Windows transport decision (2026-07-15)
+
+A build+runtime spike settled the biggest open question. **iceoryx2 0.9.2
+compiles on Windows** (once LLVM/`libclang` is installed — build succeeds in
+~20s) **but cannot create a node at runtime**: all six `#[ignore]`d
+cross-process tests fail with `create iceoryx2 node: InternalError`, root-caused
+to iceoryx2's PAL reading the POSIX user database `/etc/passwd` on Windows.
+
+Deep research confirms this is not a version/config nit but a standing limitation:
+
+- Windows is **Tier 2** ("restricted security and safety feature set") — never
+  Tier 1 ([README](https://github.com/eclipse-iceoryx/iceoryx2)).
+- Windows cross-process runtime has **multiple open, unresolved issues** — a
+  service-creation **hang** ([#149](https://github.com/eclipse-iceoryx/iceoryx2/issues/149)),
+  and the user-DB permission model ([#460](https://github.com/eclipse-iceoryx/iceoryx2/issues/460)).
+- The only bypass, the `dev_permissions` flag, is **explicitly not for production**
+  and grants all-process access — it would **break our same-uid security model**
+  ([FAQ](https://github.com/eclipse-iceoryx/iceoryx2/blob/main/FAQ.md)).
+- The **roadmap does not mention Windows** at all — no path to Tier 1
+  ([ROADMAP](https://github.com/eclipse-iceoryx/iceoryx2/blob/main/ROADMAP.md));
+  latest is the v0.9 line, v1.0 targeted end-2026, no Windows runtime fixes.
+
+**Decision.** iceoryx2 stays the Linux/macOS zero-copy transport (nothing is
+removed). Windows gets its **own transport path to the same service** — which the
+architecture already anticipates (WS is a second worked transport; a unified
+client-transport trait is the stated direction). iceoryx2 delivers *no* new
+semantics, so swapping the transport on Windows loses only *zero-copy* (a
+performance property), never a capability.
+
+| Option | Windows data transport | Effort | Trade-off |
+|---|---|---|---|
+| **C1 (recommended, now)** | Reuse the existing **WS transport over loopback** | ~zero new transport code (already built + portable) | Loses zero-copy on Windows; correct and functional |
+| **C2 (optional, later)** | **Windows-native shared-memory** transport — named-pipe control + memory-mapped shm ([`interprocess`](https://crates.io/crates/interprocess), [`memmap2`](https://crates.io/crates/mmap-io)/`winmmf`) | new transport crate | Restores zero-copy on Windows |
+
+**Recommendation for review:** ship **C1** to make Windows functional, treat **C2**
+as a later optimization only if Windows perf demands zero-copy. The control-plane
+port (§4.1–4.4) is required either way — only the *data transport* diverges.
 
 ## 3. Current-state inventory (source-anchored)
 
@@ -219,10 +260,12 @@ C5–C6); refactor client `ControlConn` (C3) and wire the client `app` platform
 switch (C4). **Ships with §4.2 auth (A1–A4)** — the security-critical piece,
 reviewed as a unit. This is the largest PR and the one to spike first.
 
-**Phase 4 — iceoryx2 runtime validation.** Spike + validate iceoryx2 0.9.2 shm
-publish/subscribe cross-process on Windows (data + diagnostics + health planes).
-This is a *runtime* gate that compilation can't prove; it may surface Tier-2
-restrictions requiring an upstream conversation.
+**Phase 4 — Windows data transport (WS-loopback).** *Spike complete — iceoryx2 is
+not viable on Windows (§2.5).* Instead, wire the existing WS transport as the
+Windows same-host data/diagnostics/health path (option C1), behind the unified
+client-transport seam, `#[cfg(windows)]`-selected. iceoryx2 remains the
+Linux/macOS transport, unchanged. (Optional later: a Windows-native shared-memory
+transport, C2, if zero-copy on Windows is required.)
 
 **Phase 5 — Full Windows CI + e2e.** Promote the Windows CI job to the full stack;
 port the e2e harnesses (B3); resolve the openssl-sys `--all-features` edge (B5);
@@ -230,11 +273,11 @@ decide required-vs-optional once green and stable.
 
 ## 6. Risk / uncertainty register (de-risking spikes, ranked)
 
-1. **iceoryx2 shm on Windows (Phase 4).** Highest *unknown*. Compiles, but Tier-2
-   cross-process shared memory + global mutex namespace must be proven for the
-   daemon↔client split. *Spike: publish/subscribe round-trip with the pinned
-   0.9.2 on Windows.* If it fails, the whole daemon-on-Windows story is gated on
-   an upstream fix — **validate this early, in parallel with Phase 1–2.**
+1. **iceoryx2 shm on Windows — RESOLVED (§2.5).** Spiked: iceoryx2 0.9.2 compiles
+   but node creation fails at runtime (`/etc/passwd`), Windows is Tier 2 with
+   unresolved runtime issues and no roadmap fix. **Decision: do not use iceoryx2
+   for the Windows data transport;** use WS-loopback now (C1), native shm later
+   (C2). No longer an open risk.
 2. **Peer-identity auth gate (Phase 3).** Highest *risk* (security boundary).
    *Spike: `ImpersonateNamedPipeClient` + token-SID equality, fail-closed, DACL.*
 3. **Named-pipe newline-JSON semantics (Phase 3).** *Spike: byte-mode
