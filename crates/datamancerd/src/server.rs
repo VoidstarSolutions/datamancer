@@ -25,6 +25,7 @@ use datamancer::{
 use futures::StreamExt as _;
 use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -280,20 +281,8 @@ impl Server {
     ///
     /// Propagates control-socket bind errors.
     pub async fn run(mut self) -> Result<()> {
-        let listener = self.bind_socket()?;
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(256);
-
-        // The daemon's own effective uid: the privileged-op peer-cred gate
-        // (credential ops, config mutation, shutdown) admits exactly this uid.
-        let own_euid = rustix::process::geteuid().as_raw();
-        let accept = tokio::spawn(accept_loop(
-            listener,
-            cmd_tx.clone(),
-            self.dm.clone(),
-            self.hub.clone(),
-            self.config_hub.clone(),
-            own_euid,
-        ));
+        let accept = self.spawn_control(cmd_tx.clone())?;
 
         let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
             .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
@@ -315,15 +304,20 @@ impl Server {
 
         tracing::info!(socket = %self.admin_socket.display(), "datamancerd listening");
 
-        let mut sigterm = unix_terminate()?;
+        // Platform terminate signal, selected on alongside Ctrl-C. Unix:
+        // SIGTERM. Windows: console CTRL_SHUTDOWN. Both expose `recv()`.
+        #[cfg(unix)]
+        let mut terminate = unix_terminate()?;
+        #[cfg(windows)]
+        let mut terminate = tokio::signal::windows::ctrl_shutdown()?;
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("SIGINT received; shutting down");
                     break;
                 }
-                _ = sigterm.recv() => {
-                    tracing::info!("SIGTERM received; shutting down");
+                _ = terminate.recv() => {
+                    tracing::info!("termination signal received; shutting down");
                     break;
                 }
                 maybe = cmd_rx.recv() => {
@@ -474,6 +468,43 @@ impl Server {
         (task, Some(shutdown))
     }
 
+    /// Spawn the control-surface accept task. Unix: bind the UDS control socket
+    /// and accept connections (the peer-cred gate admits exactly the daemon's
+    /// own uid). Windows: the named-pipe control transport and its token-SID
+    /// gate are not yet implemented (#29), so this is a no-op placeholder task
+    /// and the daemon runs without a control surface. Returns a uniform
+    /// `JoinHandle<()>` either way so the drain's `accept.abort()` is shared.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the control-socket bind error (Unix).
+    #[cfg(unix)]
+    fn spawn_control(&self, cmd_tx: mpsc::Sender<ServerCommand>) -> Result<JoinHandle<()>> {
+        let listener = self.bind_socket()?;
+        // The daemon's own effective uid: the privileged-op peer-cred gate
+        // (credential ops, config mutation, shutdown) admits exactly this uid.
+        let own_euid = rustix::process::geteuid().as_raw();
+        Ok(tokio::spawn(accept_loop(
+            listener,
+            cmd_tx,
+            self.dm.clone(),
+            self.hub.clone(),
+            self.config_hub.clone(),
+            own_euid,
+        )))
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)] // parity with the Unix arm
+    fn spawn_control(&self, _cmd_tx: mpsc::Sender<ServerCommand>) -> Result<JoinHandle<()>> {
+        tracing::warn!(
+            "control socket not yet supported on Windows; running without a \
+             control surface (native Windows support in progress, #29)"
+        );
+        Ok(tokio::spawn(async {}))
+    }
+
+    #[cfg(unix)]
     fn bind_socket(&self) -> Result<UnixListener> {
         if let Some(parent) = self.admin_socket.parent()
             && !parent.as_os_str().is_empty()
@@ -502,6 +533,7 @@ impl Server {
     /// the lock excludes another daemon but not an unrelated program, so a live
     /// listener here means `admin_socket` is misconfigured onto a foreign
     /// service rather than left stale.
+    #[cfg(unix)]
     fn clear_stale_socket(&self) -> Result<()> {
         use std::os::unix::fs::FileTypeExt;
         let meta = match std::fs::symlink_metadata(&self.admin_socket) {
@@ -798,6 +830,7 @@ fn spawn_pump(mut stream: datamancer::EventStream, sink: Arc<dyn EventSink>) -> 
 }
 
 /// Accept control connections and spawn a reader per connection.
+#[cfg(unix)]
 async fn accept_loop(
     listener: UnixListener,
     cmd_tx: mpsc::Sender<ServerCommand>,
@@ -892,6 +925,7 @@ async fn dispatch_config_op(
 /// gated on the peer's uid matching the daemon's own effective uid, captured
 /// per-connection before the stream is split. `shutdown` is forwarded to the
 /// actor (a run-loop decision, not hub state) once the gate passes.
+#[cfg(unix)]
 async fn handle_connection(
     stream: UnixStream,
     cmd_tx: mpsc::Sender<ServerCommand>,
@@ -1075,6 +1109,7 @@ async fn drain_servicing_late_requests(
 }
 
 /// A SIGTERM stream (Unix). Wrapped so `run` can `select!` on it.
+#[cfg(unix)]
 fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
     Ok(tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate(),

@@ -19,6 +19,10 @@
 //! cargo test -p datamancerd --test config_service_e2e -- --ignored --nocapture
 //! ```
 
+// Unix-domain control socket + POSIX process management; Windows named-pipe
+// harness port is Phase 5 (#29). Compile on Unix only until then.
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;

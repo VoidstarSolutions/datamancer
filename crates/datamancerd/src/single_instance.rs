@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::Path;
 
+#[cfg(unix)]
 use rustix::fs::{FlockOperation, flock};
 
 use crate::error::{DaemonError, Result};
@@ -64,16 +65,16 @@ impl InstanceLock {
             .truncate(false)
             .open(path)?;
 
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => {}
-            Err(e) if e == rustix::io::Errno::WOULDBLOCK || e == rustix::io::Errno::AGAIN => {
+        match try_lock_exclusive(&file) {
+            LockTry::Acquired => {}
+            LockTry::Contended => {
                 let pid = read_pid(&mut file);
                 return Err(DaemonError::AlreadyRunning {
                     pid,
                     path: path.to_path_buf(),
                 });
             }
-            Err(e) => return Err(std::io::Error::from(e).into()),
+            LockTry::Failed(e) => return Err(e.into()),
         }
 
         // Lock held. Record our PID for diagnostics only; the lock — not the
@@ -87,9 +88,42 @@ impl InstanceLock {
     }
 }
 
+/// Outcome of a non-blocking exclusive-lock attempt on the lockfile.
+enum LockTry {
+    Acquired,
+    Contended,
+    Failed(std::io::Error),
+}
+
+/// Take the exclusive lock without blocking. Unix: advisory `flock`. Windows:
+/// std file locking (stable since Rust 1.89), which maps to `LockFileEx`. Both
+/// are released by the kernel on process exit, and both scope per-user via the
+/// per-user data-dir lockfile path.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> LockTry {
+    match flock(file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => LockTry::Acquired,
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK || e == rustix::io::Errno::AGAIN => {
+            LockTry::Contended
+        }
+        Err(e) => LockTry::Failed(std::io::Error::from(e)),
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_exclusive(file: &File) -> LockTry {
+    match file.try_lock() {
+        Ok(()) => LockTry::Acquired,
+        Err(std::fs::TryLockError::WouldBlock) => LockTry::Contended,
+        Err(std::fs::TryLockError::Error(e)) => LockTry::Failed(e),
+    }
+}
+
 /// Best-effort read of the PID text a lock holder wrote. `None` if the file is
 /// empty or unparseable — there is a brief window between another process
-/// acquiring the lock and writing its PID.
+/// acquiring the lock and writing its PID. On Windows the holder's mandatory
+/// lock additionally blocks this read, so a contender always sees `None` there
+/// (the single-instance guarantee is unaffected; only the diagnostic PID is).
 fn read_pid(file: &mut File) -> Option<u32> {
     file.seek(std::io::SeekFrom::Start(0)).ok()?;
     let mut buf = String::new();
@@ -107,13 +141,15 @@ mod tests {
         let path = dir.path().join("nested/datamancerd.lock");
         let lock = InstanceLock::acquire_at(&path).expect("first acquire");
         assert!(path.exists(), "lockfile created under a fresh parent dir");
+        // Read the PID back only after releasing: Windows locks are mandatory,
+        // so another handle cannot read the locked range while it is held.
+        drop(lock);
         let contents = std::fs::read_to_string(&path).expect("read lockfile");
         assert_eq!(
             contents.trim(),
             std::process::id().to_string(),
             "lockfile records our PID"
         );
-        drop(lock);
     }
 
     #[test]
@@ -126,7 +162,13 @@ mod tests {
                 pid,
                 path: reported,
             }) => {
+                // Unix advisory locks let the contender read the holder's PID;
+                // Windows mandatory locks block that read, so the PID is absent
+                // there. The single-instance guarantee holds either way.
+                #[cfg(unix)]
                 assert_eq!(pid, Some(std::process::id()), "reports the holder PID");
+                #[cfg(windows)]
+                assert_eq!(pid, None, "mandatory lock blocks the contender's PID read");
                 assert_eq!(reported, path, "reports the lock path");
             }
             other => panic!("expected AlreadyRunning, got {other:?}"),
