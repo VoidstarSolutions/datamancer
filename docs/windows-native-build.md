@@ -10,7 +10,7 @@ The `datamancer-transport-iceoryx2` crate depends on iceoryx2, whose build scrip
 runs `bindgen`, which needs **libclang** at build time on every platform — Windows
 included. Without it, a full-workspace build fails with:
 
-```
+```text
 Unable to find libclang: "couldn't find any valid shared libraries matching:
 ['clang.dll', 'libclang.dll'], set the `LIBCLANG_PATH` environment variable ..."
 ```

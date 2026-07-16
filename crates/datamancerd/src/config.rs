@@ -261,16 +261,8 @@ impl Default for ServerConfig {
 }
 
 fn default_admin_socket() -> PathBuf {
-    datamancer_client::default_control_socket().unwrap_or_else(|| {
-        // Last-resort fallback, reached only when no home/runtime dir resolves.
-        // Avoid a bogus POSIX literal on Windows; the real Windows control
-        // transport (named pipe) is finalized by the native-Windows port (#29).
-        #[cfg(windows)]
-        let fallback = PathBuf::from(r"\\.\pipe\datamancer\control");
-        #[cfg(not(windows))]
-        let fallback = PathBuf::from("/run/datamancer/control.sock");
-        fallback
-    })
+    datamancer_client::default_control_socket()
+        .unwrap_or_else(|| PathBuf::from("/run/datamancer/control.sock"))
 }
 
 fn default_service_prefix() -> String {
