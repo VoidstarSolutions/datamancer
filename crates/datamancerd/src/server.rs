@@ -302,7 +302,10 @@ impl Server {
         #[cfg(feature = "ws")]
         let (ws_task, ws_shutdown) = self.start_ws();
 
+        #[cfg(unix)]
         tracing::info!(socket = %self.admin_socket.display(), "datamancerd listening");
+        #[cfg(windows)]
+        tracing::info!("datamancerd running; control surface not yet supported on Windows (#29)");
 
         // Platform terminate signal, selected on alongside Ctrl-C. Unix:
         // SIGTERM. Windows: console CTRL_SHUTDOWN. Both expose `recv()`.
@@ -317,7 +320,10 @@ impl Server {
                     break;
                 }
                 _ = terminate.recv() => {
-                    tracing::info!("termination signal received; shutting down");
+                    #[cfg(unix)]
+                    tracing::info!("SIGTERM received; shutting down");
+                    #[cfg(windows)]
+                    tracing::info!("CTRL_SHUTDOWN received; shutting down");
                     break;
                 }
                 maybe = cmd_rx.recv() => {

@@ -89,3 +89,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build + test the portable subset
         run: cargo test -p datamancer-transport-ws -p datamancer-client --features datamancer-client/ws
+
+  windows-native-check:
+    # Native-Windows compile guard (#29). The ws-portable job above does NOT
+    # build the daemon or the client `app`/`iceoryx2` features, so the
+    # in-progress native-Windows port would otherwise rot uncaught. Type-check
+    # the ported crates on Windows (compile-only; runtime lands with the
+    # named-pipe transport in a later phase). iceoryx2's bindgen needs libclang.
+    name: native compile-check (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install LLVM (libclang for iceoryx2 bindgen)
+        run: choco install llvm --no-progress -y
+      - name: cargo check (daemon + client app)
+        shell: bash
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          cargo check -p datamancerd
+          cargo check -p datamancer-client --features app

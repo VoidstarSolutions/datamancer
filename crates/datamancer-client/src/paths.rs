@@ -17,15 +17,21 @@ use directories::ProjectDirs;
 /// - **macOS:** `~/Library/Application Support/datamancer/control.sock`
 ///   (there is no runtime dir on macOS, so the data dir is used).
 /// - **Windows:** a named pipe `\\.\pipe\datamancer\<user>\control` — the pipe
-///   namespace is machine-global, so it is disambiguated per user.
+///   namespace is machine-global, so it is disambiguated per user. This is
+///   disambiguation, not access control: the Phase 3 server adds an owner-SID
+///   ACL plus client-side server-identity verification (#29).
 ///
-/// Returns `None` only on non-Windows when no home/runtime directory can be
-/// resolved; on Windows it always resolves.
+/// Returns `None` when the endpoint can't be resolved — no home/runtime dir on
+/// non-Windows, or no resolvable user on Windows.
 #[must_use]
 pub fn default_control_socket() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
+        // Fail closed (like the non-Windows arm) rather than invent a shared
+        // name if the user can't be resolved. USERNAME is disambiguation, not
+        // access control, and is not globally unique; a SID is the robust key
+        // (Phase 3, #29).
+        let user = std::env::var("USERNAME").ok().filter(|u| !u.is_empty())?;
         Some(PathBuf::from(format!(
             r"\\.\pipe\datamancer\{user}\control"
         )))
