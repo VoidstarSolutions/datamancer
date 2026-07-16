@@ -13,7 +13,8 @@ locked-down file fallback.
   blocking; async callers (`datamancerd`, embedders on tokio) wrap calls in
   `tokio::task::spawn_blocking`. Do not add an async variant here.
 - **`name()` strings are a health-surface contract.** `"keychain"`,
-  `"secret-service"`, `"file"` — whatever a backend returns is surfaced
+  `"secret-service"`, `"credential-manager"` (Windows), `"file"` — whatever a
+  backend returns is surfaced
   through `HealthView` so a silent fallback to the file backend is never
   invisible to an operator. Treat existing name strings as stable; adding a
   new backend adds a new name, it doesn't rename an old one.

@@ -19,7 +19,7 @@ and a first-run setup flow with secure provider-key storage.
 | History | Rewrite with `git-filter-repo` (keep commit granularity, strip internal paths); full-history `gitleaks` scan first — any hit downgrades to squash |
 | Key storage | OS keychain via the `keyring` crate; resolution precedence env var → keychain → absent; env vars remain the headless-server path |
 | CI platforms | Full CI on Linux (PRs + main). Windows job covers only the ws-portable subset |
-| Release targets | `x86_64-unknown-linux-gnu` + `aarch64-apple-darwin` for the daemon (macOS is arm64-only; no x86_64 mac). Windows ships no daemon — its support boundary is the ws transport + `datamancer-client` (ws feature), enforced by CI, distributed via crates.io |
+| Release targets | `x86_64-unknown-linux-gnu` + `aarch64-apple-darwin` for the daemon (macOS is arm64-only; no x86_64 mac). Windows ships no daemon — its support boundary is the ws transport + `datamancer-client` (ws feature), enforced by CI, distributed via crates.io **(2026-07-15: being extended to the full native-Windows stack — see #29)** |
 | Release tooling | `cargo-dist` (installers, artifacts, `axoupdater` auto-update) + `release-plz` (crates.io publishing, changelogs, version bumps, semver gating) |
 | Versioning | Stays 0.x; `cargo-semver-checks` enforces compatibility within 0.x minor lines |
 
@@ -117,8 +117,10 @@ SHAs break only once). PR #11 merges before any of this begins.
 
 ## Out of scope
 
-- Windows daemon support (UDS control socket and iceoryx2 shm are
-  POSIX-shaped; porting is a separate future decision).
+- ~~Windows daemon support (UDS control socket and iceoryx2 shm are
+  POSIX-shaped; porting is a separate future decision).~~ **Superseded
+  2026-07-15:** native Windows support for the full stack is now an active
+  goal — see [`2026-07-15-native-windows-support-design.md`](2026-07-15-native-windows-support-design.md) (#29).
 - x86_64 macOS.
 - Encrypted-file secret storage (keychain + env covers v1; revisit if
   headless demand appears).

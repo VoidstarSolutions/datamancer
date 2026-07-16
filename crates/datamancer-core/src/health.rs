@@ -42,7 +42,8 @@ pub struct DaemonHealth {
     /// assigns it, because the snapshot does not carry it.
     pub version: Option<String>,
     /// The daemon's active credential-store backend (`"keychain"`,
-    /// `"secret-service"`, `"file"`). `None` out of the pure reduction — the
+    /// `"secret-service"`, `"credential-manager"`, `"file"`). `None` out of the
+    /// pure reduction — the
     /// caller stamps it (facade, from the `ping` handshake), and `None` also
     /// means "daemon predates the credential broker". A surprising `"file"`
     /// on a desktop host is visible here rather than silent.

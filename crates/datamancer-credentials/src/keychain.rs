@@ -1,6 +1,6 @@
 //! The OS-keychain backend: macOS Keychain Services / Linux Secret Service
-//! (D-Bus), via the `keyring` crate's classic API. Windows Credential
-//! Manager is additive later through the same seam.
+//! (D-Bus) / Windows Credential Manager, via the `keyring` crate's classic
+//! API (each platform's store is wired in `init_default_store`).
 //!
 //! Entries live under service `"datamancer"`, username = provider id,
 //! password = the serde-JSON of the credential shape.
@@ -53,6 +53,10 @@ impl KeychainBackend {
     /// The platform's backend name (health-surface contract).
     pub const NAME: &'static str = if cfg!(target_os = "macos") {
         "keychain"
+    } else if cfg!(windows) {
+        // Windows Credential Manager (via windows-native-keyring-store) — not
+        // the Linux D-Bus Secret Service the `else` arm names.
+        "credential-manager"
     } else {
         "secret-service"
     };
@@ -128,6 +132,8 @@ mod tests {
     fn backend_name_is_platform_stable() {
         // Name is a health-surface contract even when the backend can't
         // construct (asserts the constant, not availability).
-        assert!(["keychain", "secret-service"].contains(&KeychainBackend::NAME));
+        assert!(
+            ["keychain", "secret-service", "credential-manager"].contains(&KeychainBackend::NAME)
+        );
     }
 }
