@@ -10,21 +10,32 @@ use std::path::PathBuf;
 
 use directories::ProjectDirs;
 
-/// The well-known per-platform default path for datamancerd's Unix control
-/// socket.
+/// The well-known per-platform default for datamancerd's control endpoint.
 ///
 /// - **Linux:** `$XDG_RUNTIME_DIR/datamancer/control.sock` (falls back to the
 ///   data dir when no runtime dir is set).
 /// - **macOS:** `~/Library/Application Support/datamancer/control.sock`
 ///   (there is no runtime dir on macOS, so the data dir is used).
+/// - **Windows:** a named pipe `\\.\pipe\datamancer\<user>\control` — the pipe
+///   namespace is machine-global, so it is disambiguated per user.
 ///
-/// Returns `None` when no home/runtime directory can be resolved for the
-/// current user.
+/// Returns `None` only on non-Windows when no home/runtime directory can be
+/// resolved; on Windows it always resolves.
 #[must_use]
 pub fn default_control_socket() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("", "", "datamancer")?;
-    let base = dirs.runtime_dir().unwrap_or_else(|| dirs.data_dir());
-    Some(base.join("control.sock"))
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
+        Some(PathBuf::from(format!(
+            r"\\.\pipe\datamancer\{user}\control"
+        )))
+    }
+    #[cfg(not(windows))]
+    {
+        let dirs = ProjectDirs::from("", "", "datamancer")?;
+        let base = dirs.runtime_dir().unwrap_or_else(|| dirs.data_dir());
+        Some(base.join("control.sock"))
+    }
 }
 
 /// Default destination for a facade-spawned daemon's stdout/stderr:
@@ -86,9 +97,8 @@ mod tests {
         );
         #[cfg(windows)]
         assert!(
-            s.replace('\\', "/")
-                .ends_with("datamancer/data/control.sock"),
-            "documented Windows path drifted: {s}"
+            s.starts_with(r"\\.\pipe\datamancer\") && s.ends_with(r"\control"),
+            "documented Windows pipe name drifted: {s}"
         );
     }
 }
