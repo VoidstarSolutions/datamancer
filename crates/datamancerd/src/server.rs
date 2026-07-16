@@ -8,6 +8,14 @@
 //! on it. Startup-session anchors hold authoritative sessions alive across
 //! client presence (`always_on=true` for the whole process lifetime).
 
+// Native Windows port, in progress (#29): this module's control-dispatch
+// machinery (accept loop, per-connection handler, dispatch helpers,
+// `ServerCommand` variants, unix-only fields) is reached only through the Unix
+// control socket, so it is transitionally dead on Windows until the named-pipe
+// transport revives it in Phase 3. Scoped allow — Unix/macOS stay lint-strict;
+// remove when Phase 3 lands.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

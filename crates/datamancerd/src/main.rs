@@ -17,14 +17,6 @@
 //! Access control is **filesystem permissions on the control socket only**
 //! (same-host, single-operator). This is **not** a network-safe surface.
 #![forbid(unsafe_code)]
-// Native Windows port, in progress (#29): the control-transport dispatch
-// subsystem (accept loop, per-connection handler, credential/config ops) is
-// reached only through the control socket, which is Unix-only until the Windows
-// named-pipe transport lands in Phase 3. That leaves the dispatch machinery
-// transitionally dead on Windows — the code is live and lint-strict on
-// Unix/macOS (unaffected here). Suppress the resulting dead-code/unused lints on
-// Windows only; remove this when Phase 3 revives the subsystem there.
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 mod config;
 mod config_class;

@@ -22,14 +22,13 @@ use crate::protocol::uds::{Reply, Request};
 /// How much of the daemon log to quote in an exit diagnosis.
 const LOG_TAIL_BYTES: u64 = 2048;
 
-// `CreateProcess` creation flags (winbase.h). Detach the daemon from the
-// spawning app: no inherited console (`CREATE_NO_WINDOW`), its own process
-// group (`CREATE_NEW_PROCESS_GROUP`), and no controlling console at all
-// (`DETACHED_PROCESS`) — the Windows analog of the Unix `process_group(0)`
-// session detach, so the shared host service outlives the app that spawned it.
+// `CreateProcess` creation flag (winbase.h): `DETACHED_PROCESS` gives the child
+// no console at all — the Windows analog of the Unix `process_group(0)` session
+// detach — so the shared host daemon outlives the app that spawned it and never
+// receives that app's console control events. `CREATE_NEW_PROCESS_GROUP` and
+// `CREATE_NO_WINDOW` are omitted: both are redundant with a console-less
+// detached child (and the former conflicts with `DETACHED_PROCESS`).
 const DETACHED_PROCESS: u32 = 0x0000_0008;
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub(crate) struct TokioEndpoint;
 
@@ -112,7 +111,7 @@ impl DaemonSpawner for ProcessSpawner {
         cmd.stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+            .creation_flags(DETACHED_PROCESS);
         let child = cmd.spawn()?;
         Ok(WindowsDaemonProcess {
             child,
