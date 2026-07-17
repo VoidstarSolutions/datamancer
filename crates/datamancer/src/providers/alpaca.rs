@@ -476,7 +476,7 @@ async fn run_streaming_task(
                 client
             }
             Err(err) => {
-                // oxidized_alpaca 0.0.9 returns `Error::StreamingAuth` when
+                // oxidized_alpaca 0.0.10 returns `Error::StreamingAuth` when
                 // the market-data connect handshake's auth response is not
                 // `Authenticated` (fixed upstream in
                 // fix(streaming): return StreamingAuth on rejected
@@ -634,7 +634,7 @@ async fn run_streaming_task(
                             }
                         }
                         Err(err) => {
-                            // oxidized_alpaca 0.0.9: `Error::StreamingError`
+                            // oxidized_alpaca 0.0.10: `Error::StreamingError`
                             // (mid-stream server error envelope). A mid-stream
                             // `StreamingAuth` is connect-only upstream today;
                             // handled defensively, mirroring the connect arm.
