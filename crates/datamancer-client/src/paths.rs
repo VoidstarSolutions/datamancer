@@ -10,21 +10,38 @@ use std::path::PathBuf;
 
 use directories::ProjectDirs;
 
-/// The well-known per-platform default path for datamancerd's Unix control
-/// socket.
+/// The well-known per-platform default for datamancerd's control endpoint.
 ///
 /// - **Linux:** `$XDG_RUNTIME_DIR/datamancer/control.sock` (falls back to the
 ///   data dir when no runtime dir is set).
 /// - **macOS:** `~/Library/Application Support/datamancer/control.sock`
 ///   (there is no runtime dir on macOS, so the data dir is used).
+/// - **Windows:** a named pipe `\\.\pipe\datamancer\<user>\control` — the pipe
+///   namespace is machine-global, so it is disambiguated per user. This is
+///   disambiguation, not access control: the Phase 3 server adds an owner-SID
+///   ACL plus client-side server-identity verification (#29).
 ///
-/// Returns `None` when no home/runtime directory can be resolved for the
-/// current user.
+/// Returns `None` when the endpoint can't be resolved — no home/runtime dir on
+/// non-Windows, or no resolvable user on Windows.
 #[must_use]
 pub fn default_control_socket() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("", "", "datamancer")?;
-    let base = dirs.runtime_dir().unwrap_or_else(|| dirs.data_dir());
-    Some(base.join("control.sock"))
+    #[cfg(windows)]
+    {
+        // Fail closed (like the non-Windows arm) rather than invent a shared
+        // name if the user can't be resolved. USERNAME is disambiguation, not
+        // access control, and is not globally unique; a SID is the robust key
+        // (Phase 3, #29).
+        let user = std::env::var("USERNAME").ok().filter(|u| !u.is_empty())?;
+        Some(PathBuf::from(format!(
+            r"\\.\pipe\datamancer\{user}\control"
+        )))
+    }
+    #[cfg(not(windows))]
+    {
+        let dirs = ProjectDirs::from("", "", "datamancer")?;
+        let base = dirs.runtime_dir().unwrap_or_else(|| dirs.data_dir());
+        Some(base.join("control.sock"))
+    }
 }
 
 /// Default destination for a facade-spawned daemon's stdout/stderr:
@@ -86,9 +103,8 @@ mod tests {
         );
         #[cfg(windows)]
         assert!(
-            s.replace('\\', "/")
-                .ends_with("datamancer/data/control.sock"),
-            "documented Windows path drifted: {s}"
+            s.starts_with(r"\\.\pipe\datamancer\") && s.ends_with(r"\control"),
+            "documented Windows pipe name drifted: {s}"
         );
     }
 }

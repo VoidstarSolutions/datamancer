@@ -17,8 +17,14 @@ use datamancer_transport_iceoryx2::DataSubscriber;
 // only because this module contains no item named `iceoryx2`).
 use ::iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
+#[cfg(windows)]
+use tokio::io::{ReadHalf, WriteHalf};
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(unix)]
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -93,16 +99,40 @@ fn check(reply: Reply) -> Result<Reply, ClientError<Iceoryx2ClientError>> {
     }
 }
 
-/// The serially-used UDS control connection (strict request→reply per line).
+/// The serially-used control connection (strict request→reply per line). UDS
+/// on Unix; a named pipe on Windows — the newline-JSON framing is identical.
+#[cfg(unix)]
 struct ControlConn {
     lines: Lines<BufReader<OwnedReadHalf>>,
     write: OwnedWriteHalf,
 }
 
+#[cfg(windows)]
+struct ControlConn {
+    lines: Lines<BufReader<ReadHalf<NamedPipeClient>>>,
+    write: WriteHalf<NamedPipeClient>,
+}
+
 impl ControlConn {
+    #[cfg(unix)]
     async fn connect(path: &Path) -> Result<Self, Iceoryx2ClientError> {
         let stream = UnixStream::connect(path).await?;
         let (read, write) = stream.into_split();
+        Ok(Self {
+            lines: BufReader::new(read).lines(),
+            write,
+        })
+    }
+
+    #[cfg(windows)]
+    // `ClientOptions::open` is synchronous, but `connect` stays `async` to
+    // match the Unix arm the caller awaits.
+    #[allow(clippy::unused_async)]
+    async fn connect(path: &Path) -> Result<Self, Iceoryx2ClientError> {
+        // The control-socket `Path` carries the pipe name on Windows
+        // (`\\.\pipe\datamancer\control-<user>`; see `crate::paths`).
+        let stream = ClientOptions::new().open(path)?;
+        let (read, write) = tokio::io::split(stream);
         Ok(Self {
             lines: BufReader::new(read).lines(),
             write,
@@ -336,11 +366,18 @@ impl Iceoryx2Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlConn, Iceoryx2ClientError, parse_client_id};
+    use super::parse_client_id;
+    #[cfg(unix)]
+    use super::{ControlConn, Iceoryx2ClientError};
+    #[cfg(unix)]
     use crate::codes;
+    #[cfg(unix)]
     use crate::error::ClientError;
+    #[cfg(unix)]
     use crate::protocol::uds::{Reply, Request};
+    #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     #[test]
@@ -366,6 +403,9 @@ mod tests {
     }
 
     /// Scripted fake UDS daemon: reads one request line, sends one reply line.
+    /// UDS-only; the Windows named-pipe control path is exercised by the
+    /// Phase 3 runtime tests.
+    #[cfg(unix)]
     fn fake_uds(replies: Vec<Reply>) -> std::path::PathBuf {
         let dir = tempfile::tempdir().unwrap().keep();
         let path = dir.join("control.sock");
@@ -384,6 +424,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_conn_round_trips_a_request() {
         let path = fake_uds(vec![Reply::service("datamancer/data/7")]);
@@ -399,6 +440,7 @@ mod tests {
         assert_eq!(reply.service.as_deref(), Some("datamancer/data/7"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_error_reply_maps_to_control_error() {
         let path = fake_uds(vec![Reply::error(codes::DUPLICATE_CLIENT, "name in use")]);
@@ -418,6 +460,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn close_sets_the_stop_flag_even_when_the_transport_fails() {
         use super::Iceoryx2Client;

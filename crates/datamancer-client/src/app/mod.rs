@@ -9,7 +9,12 @@
 
 mod error;
 mod lifecycle;
+#[cfg(unix)]
 mod platform;
+#[cfg(windows)]
+mod platform_windows;
+#[cfg(windows)]
+use platform_windows as platform;
 
 pub use error::{EnsureError, ReadyDiagnosis};
 

@@ -2,6 +2,12 @@
 //! configured provider, stable-coded replies. Ops run off-actor (blocking
 //! store I/O behind `spawn_blocking`) and are peer-cred gated same-uid.
 
+// Native Windows port (#29): the credential-broker ops here are reached only via
+// the Unix control socket, so they are transitionally dead on Windows until the
+// named-pipe transport revives them in Phase 3. Scoped allow — Unix/macOS stay
+// lint-strict; remove when Phase 3 lands.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
