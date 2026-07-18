@@ -35,7 +35,7 @@ pub use event::{
 pub use health::{
     DaemonHealth, HealthView, LatencySummary, Liveness, ProviderHealth, ProviderState, StreamHealth,
 };
-pub use instrument::{AssetClass, Instrument, InstrumentInfo, ProviderId};
+pub use instrument::{AssetClass, Instrument, InstrumentEntry, InstrumentInfo, ProviderId};
 pub use price::Price;
 pub use quantity::Quantity;
 pub use snapshot::{
