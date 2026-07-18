@@ -207,13 +207,13 @@ async fn seed_wins_when_no_live_data_yet() {
     // No live data pushed yet: the seed is the first event, stamped seq 0.
     let first = stream.next().await.expect("seed event");
     assert_eq!(trade_price(&first), 999.0);
-    assert_eq!(first.seq(), Seq(0));
+    assert_eq!(first.seq(), Some(Seq(0)));
 
     // Live ticks follow, stamped after the seed.
     ctrl.push_live(trade("AAPL", 100, 10.0)).await;
     let second = stream.next().await.expect("live event");
     assert_eq!(trade_price(&second), 10.0);
-    assert_eq!(second.seq(), Seq(1));
+    assert_eq!(second.seq(), Some(Seq(1)));
 }
 
 #[tokio::test]
@@ -239,7 +239,7 @@ async fn seed_discarded_when_live_data_wins() {
     ctrl.push_live(trade("AAPL", 100, 10.0)).await;
     let first = stream.next().await.expect("live event");
     assert_eq!(trade_price(&first), 10.0);
-    assert_eq!(first.seq(), Seq(0));
+    assert_eq!(first.seq(), Some(Seq(0)));
 
     // Release the seed: data was already delivered, so it must be discarded
     // (consuming no seq). A following live trade proves the seed never appears.
@@ -247,7 +247,7 @@ async fn seed_discarded_when_live_data_wins() {
     ctrl.push_live(trade("AAPL", 200, 11.0)).await;
     let second = stream.next().await.expect("live event");
     assert_eq!(trade_price(&second), 11.0);
-    assert_eq!(second.seq(), Seq(1));
+    assert_eq!(second.seq(), Some(Seq(1)));
 }
 
 #[tokio::test]
@@ -270,7 +270,7 @@ async fn no_seed_when_latest_returns_none() {
     ctrl.push_live(trade("AAPL", 100, 10.0)).await;
     let first = stream.next().await.expect("live event");
     assert_eq!(trade_price(&first), 10.0);
-    assert_eq!(first.seq(), Seq(0)); // no seed consumed seq 0
+    assert_eq!(first.seq(), Some(Seq(0))); // no seed consumed seq 0
 }
 
 #[tokio::test]
@@ -346,7 +346,9 @@ Note: `FakeProvider::new` returns `(Arc<Self>, FakeController)`; the `no_seed_un
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test -p datamancer --test session_integration seed_ no_seed_ 2>&1 | tail -30`
+Run: `cargo test -p datamancer --test session_integration 2>&1 | tail -30` (the
+whole target — `cargo test` takes only one name filter, so `seed_ no_seed_` is
+invalid; the full target covers both cohorts).
 Expected: compile error — `run_live` has no `seed_rx` and `Controller` has no `data_forwarded` (behavior not yet wired). The five new tests fail.
 
 - [ ] **Step 4: Add the `data_forwarded` field to `Controller`**
@@ -896,8 +898,11 @@ This is a minor bump for the additive `Provider::latest` method (no breaking cha
 
 - [ ] **Step 2: Update the lockfile**
 
-Run: `cargo update -w`
-Expected: workspace crates updated to 0.6.0 in `Cargo.lock`.
+Run: `cargo update -p datamancer-core -p datamancer -p datamancer-client -p datamancer-credentials -p datamancer-transport-iceoryx2 -p datamancer-transport-ws -p datamancerd --precise 0.6.0`
+(scoped to the workspace crates rather than `cargo update -w`, which can rewrite
+unrelated dependency resolutions). Then inspect the `Cargo.lock` diff and keep
+only the intended `0.5.0 → 0.6.0` version bumps.
+Expected: workspace crates updated to 0.6.0 in `Cargo.lock`, no unrelated churn.
 
 - [ ] **Step 3: Full workspace build + tests**
 
@@ -928,7 +933,10 @@ Expected: reports the `datamancer-core` change as a **minor** (non-breaking) add
 
 If Alpaca credentials are available, sanity-check the seed end-to-end against the real snapshot endpoint alongside the existing ignored suite:
 Run: `cargo test -p datamancer --test alpaca_real -- --ignored 2>&1 | tail -20`
-Expected: existing ignored tests still pass (this task adds no new ignored test, but confirms the provider still builds/links against the live surface).
+Expected: the ignored suite passes, including the two `latest()` smoke tests this
+work adds — `stock_latest_returns_snapshot_event` and
+`crypto_latest_returns_snapshot_event` — which exercise the real snapshot
+endpoint end-to-end (the crypto one guards the symbol-keyed-map lookup).
 
 - [ ] **Step 9: Commit**
 

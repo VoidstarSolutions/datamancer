@@ -27,7 +27,7 @@ use datamancer_core::{
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
-    AccountType, MarketDataClient, StreamingFeed, TradingClient,
+    AccountType, MarketDataClient, RestFeed, StreamingFeed, TradingClient,
     restful::{
         market_data::TimeFrame,
         market_data::stock::Adjustment as AlpacaAdjustment,
@@ -316,6 +316,15 @@ impl Provider for AlpacaProvider {
         instrument: &Instrument,
         kind: EventKind,
     ) -> Result<Option<MarketEvent>> {
+        // Seed from the same feed the live subscription streams, so the first
+        // painted value comes from the feed it is seeding — not Alpaca's
+        // snapshot default ("sip if unlimited, else iex"), which can diverge from
+        // an IEX stream. `Test` has no snapshot equivalent (it would silently hit
+        // the real production endpoint), so it no-ops like a provider with no
+        // snapshot surface.
+        let Some(feed) = snapshot_feed(self.cfg.stream_feed) else {
+            return Ok(None);
+        };
         let rest = self
             .rest_clients()
             .market_data
@@ -325,6 +334,7 @@ impl Provider for AlpacaProvider {
             })?;
         let snap = rest
             .stock_snapshot(instrument.symbol())
+            .feed(feed)
             .execute()
             .await
             .map_err(|e| Error::Provider {
@@ -1015,6 +1025,19 @@ fn translate_bar(b: &StockBar, interval: BarInterval, rx: Timestamp) -> Bar {
     }
 }
 
+/// The REST snapshot feed matching a live stream feed, so a live-seed snapshot
+/// is sourced from the same feed it seeds. `Test` has no snapshot equivalent
+/// (there is no synthetic snapshot endpoint), so it maps to `None` and the seed
+/// gracefully no-ops rather than silently querying the real production feed.
+fn snapshot_feed(stream_feed: AlpacaStreamFeed) -> Option<RestFeed> {
+    match stream_feed {
+        AlpacaStreamFeed::Iex => Some(RestFeed::IEX),
+        AlpacaStreamFeed::Sip => Some(RestFeed::SIP),
+        AlpacaStreamFeed::DelayedSip => Some(RestFeed::DelayedSip),
+        AlpacaStreamFeed::Test => None,
+    }
+}
+
 /// Map a stock snapshot onto the canonical event for `kind`, or `None` when the
 /// snapshot lacks that datum (or the bar interval has no snapshot field). `seq`
 /// is a placeholder; the authoritative controller re-stamps on delivery.
@@ -1189,6 +1212,18 @@ async fn fetch_history_via(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_feed_mirrors_stream_feed() {
+        assert_eq!(snapshot_feed(AlpacaStreamFeed::Iex), Some(RestFeed::IEX));
+        assert_eq!(snapshot_feed(AlpacaStreamFeed::Sip), Some(RestFeed::SIP));
+        assert_eq!(
+            snapshot_feed(AlpacaStreamFeed::DelayedSip),
+            Some(RestFeed::DelayedSip)
+        );
+        // Test has no snapshot equivalent -> seed no-ops instead of hitting prod.
+        assert_eq!(snapshot_feed(AlpacaStreamFeed::Test), None);
+    }
 
     #[test]
     fn snapshot_maps_kind_to_event() {
