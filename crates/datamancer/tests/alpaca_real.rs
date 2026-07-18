@@ -13,8 +13,8 @@
 use std::time::Duration;
 
 use datamancer::providers::{
-    AlpacaCredentials, AlpacaProvider, AlpacaProviderConfig, AlpacaSettings, AlpacaStreamFeed,
-    CredentialsSource, SettingsSource,
+    AlpacaCredentials, AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaProvider,
+    AlpacaProviderConfig, AlpacaSettings, AlpacaStreamFeed, CredentialsSource, SettingsSource,
 };
 use datamancer::{
     AssetClass, Datamancer, DisconnectCause, EventKind, Instrument, MarketEvent,
@@ -227,6 +227,65 @@ async fn bad_credentials_yield_unauthenticated_disconnect() {
     }
 
     let _ = handle.close().await;
+}
+
+/// Latest-value smoke test (stock): `Provider::latest` against Alpaca's real
+/// stock-snapshot surface — the live-seed source. `stock_snapshot` returns a
+/// single snapshot (no symbol-keyed map), so this just confirms the snapshot
+/// path decodes and maps to the requested `kind`. Off-hours the snapshot's
+/// `latest_trade` can be absent, so a `None` is acceptable; we only require the
+/// call to succeed and, when present, to be a `Trade`.
+#[tokio::test]
+#[ignore = "requires real Alpaca credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
+async fn stock_latest_returns_snapshot_event() {
+    let provider = AlpacaProvider::new(AlpacaProviderConfig::default());
+    let inst = Instrument::new(
+        ProviderId::from_static("alpaca"),
+        AssetClass::Equity,
+        "AAPL",
+    );
+    let got = provider
+        .latest(&inst, EventKind::Trade)
+        .await
+        .expect("latest() succeeds with real credentials");
+    eprintln!("stock latest(AAPL, Trade) = {got:?}");
+    if let Some(ev) = got {
+        assert!(
+            matches!(ev, MarketEvent::Trade(_)),
+            "latest(Trade) must map to a Trade, got {ev:?}"
+        );
+    }
+}
+
+/// Latest-value smoke test (crypto): `Provider::latest` against Alpaca's real
+/// crypto-snapshot surface. Unlike the stock path this goes through
+/// `crypto_snapshots(&[symbol], ..)`, which returns a **symbol-keyed map** the
+/// impl indexes with `snaps.remove(symbol)`. If Alpaca ever keyed the response
+/// by a normalized symbol (e.g. dropping the `/`), the lookup would silently
+/// miss and the seed would never fire — so this asserts a real `Some` for a
+/// 24/7 pair, directly guarding that key convention.
+#[tokio::test]
+#[ignore = "requires real Alpaca credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
+async fn crypto_latest_returns_snapshot_event() {
+    let provider = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig::default());
+    let inst = Instrument::new(
+        ProviderId::from_static("alpaca-crypto"),
+        AssetClass::Crypto,
+        "BTC/USD",
+    );
+    let got = provider
+        .latest(&inst, EventKind::Trade)
+        .await
+        .expect("latest() succeeds with real credentials");
+    eprintln!("crypto latest(BTC/USD, Trade) = {got:?}");
+    let ev = got.expect(
+        "crypto snapshot for a 24/7 pair should yield a latest trade; a None here likely means \
+         the response map key no longer matches the requested symbol",
+    );
+    assert!(
+        matches!(ev, MarketEvent::Trade(_)),
+        "latest(Trade) must map to a Trade, got {ev:?}"
+    );
 }
 
 /// Reference-data smoke test: `list_instruments` against Alpaca's real

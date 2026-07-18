@@ -27,7 +27,7 @@ use datamancer_core::{
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
-    AccountType, MarketDataClient, StreamingFeed, TradingClient,
+    AccountType, MarketDataClient, RestFeed, StreamingFeed, TradingClient,
     restful::{
         market_data::TimeFrame,
         market_data::stock::Adjustment as AlpacaAdjustment,
@@ -309,6 +309,39 @@ impl Provider for AlpacaProvider {
                 message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
             })?;
         fetch_history_via(&rest, request, sink).await
+    }
+
+    async fn latest(
+        &self,
+        instrument: &Instrument,
+        kind: EventKind,
+    ) -> Result<Option<MarketEvent>> {
+        // Seed from the same feed the live subscription streams, so the first
+        // painted value comes from the feed it is seeding — not Alpaca's
+        // snapshot default ("sip if unlimited, else iex"), which can diverge from
+        // an IEX stream. `Test` has no snapshot equivalent (it would silently hit
+        // the real production endpoint), so it no-ops like a provider with no
+        // snapshot surface.
+        let Some(feed) = snapshot_feed(self.cfg.stream_feed) else {
+            return Ok(None);
+        };
+        let rest = self
+            .rest_clients()
+            .market_data
+            .ok_or_else(|| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
+            })?;
+        let snap = rest
+            .stock_snapshot(instrument.symbol())
+            .feed(feed)
+            .execute()
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("stock_snapshot: {e}"),
+            })?;
+        Ok(snapshot_to_event(&snap, instrument, kind, wall_clock_ts()))
     }
 
     async fn list_instruments(&self) -> Result<Vec<Instrument>> {
@@ -992,6 +1025,73 @@ fn translate_bar(b: &StockBar, interval: BarInterval, rx: Timestamp) -> Bar {
     }
 }
 
+/// The REST snapshot feed matching a live stream feed, so a live-seed snapshot
+/// is sourced from the same feed it seeds. `Test` has no snapshot equivalent
+/// (there is no synthetic snapshot endpoint), so it maps to `None` and the seed
+/// gracefully no-ops rather than silently querying the real production feed.
+fn snapshot_feed(stream_feed: AlpacaStreamFeed) -> Option<RestFeed> {
+    match stream_feed {
+        AlpacaStreamFeed::Iex => Some(RestFeed::IEX),
+        AlpacaStreamFeed::Sip => Some(RestFeed::SIP),
+        AlpacaStreamFeed::DelayedSip => Some(RestFeed::DelayedSip),
+        AlpacaStreamFeed::Test => None,
+    }
+}
+
+/// Map a stock snapshot onto the canonical event for `kind`, or `None` when the
+/// snapshot lacks that datum (or the bar interval has no snapshot field). `seq`
+/// is a placeholder; the authoritative controller re-stamps on delivery.
+fn snapshot_to_event(
+    snap: &oxidized_alpaca::restful::market_data::stock::snapshots::StockSnapshot,
+    instrument: &Instrument,
+    kind: EventKind,
+    rx: Timestamp,
+) -> Option<MarketEvent> {
+    match kind {
+        EventKind::Trade => snap.latest_trade.as_ref().map(|t| {
+            MarketEvent::Trade(Trade {
+                instrument: instrument.clone(),
+                source_ts: chrono_to_ts(t.timestamp),
+                rx_ts: rx,
+                seq: Seq(0),
+                price: Price::from_f64_round(t.price),
+                size: Quantity::from_units(u64::from(t.size)),
+            })
+        }),
+        EventKind::Quote => snap.latest_quote.as_ref().map(|q| {
+            MarketEvent::Quote(Quote {
+                instrument: instrument.clone(),
+                source_ts: chrono_to_ts(q.timestamp),
+                rx_ts: rx,
+                seq: Seq(0),
+                bid: Price::from_f64_round(q.bid_price),
+                bid_size: Quantity::from_units(u64::from(q.bid_size)),
+                ask: Price::from_f64_round(q.ask_price),
+                ask_size: Quantity::from_units(u64::from(q.ask_size)),
+            })
+        }),
+        EventKind::Bar(interval) => {
+            let bar = match interval {
+                BarInterval::OneMinute => snap.minute_bar.as_ref(),
+                BarInterval::OneDay => snap.daily_bar.as_ref(),
+                _ => None,
+            }?;
+            Some(MarketEvent::Bar(Bar {
+                instrument: instrument.clone(),
+                interval,
+                source_ts: chrono_to_ts(bar.time),
+                rx_ts: rx,
+                seq: Seq(0),
+                open: Price::from_f64_round(bar.open),
+                high: Price::from_f64_round(bar.high),
+                low: Price::from_f64_round(bar.low),
+                close: Price::from_f64_round(bar.close),
+                volume: Quantity::from_units(bar.volume),
+            }))
+        }
+    }
+}
+
 fn chrono_to_ts(dt: DateTime<Utc>) -> Timestamp {
     Timestamp(dt.timestamp_nanos_opt().unwrap_or(0))
 }
@@ -1112,6 +1212,56 @@ async fn fetch_history_via(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_feed_mirrors_stream_feed() {
+        assert_eq!(snapshot_feed(AlpacaStreamFeed::Iex), Some(RestFeed::IEX));
+        assert_eq!(snapshot_feed(AlpacaStreamFeed::Sip), Some(RestFeed::SIP));
+        assert_eq!(
+            snapshot_feed(AlpacaStreamFeed::DelayedSip),
+            Some(RestFeed::DelayedSip)
+        );
+        // Test has no snapshot equivalent -> seed no-ops instead of hitting prod.
+        assert_eq!(snapshot_feed(AlpacaStreamFeed::Test), None);
+    }
+
+    #[test]
+    fn snapshot_maps_kind_to_event() {
+        use oxidized_alpaca::restful::market_data::stock::snapshots::StockSnapshot;
+
+        // Deserialize a snapshot fixture (Alpaca's wire field names).
+        let json = r#"{
+            "latestTrade": {"t":"2024-01-02T15:00:00Z","x":"V","p":187.5,"s":10,"c":[],"z":"C"},
+            "latestQuote": {"t":"2024-01-02T15:00:00Z","bx":"V","bp":187.4,"bs":3,"ax":"V","ap":187.6,"as":4,"c":[],"z":"C"},
+            "minuteBar": {"t":"2024-01-02T15:00:00Z","o":187.0,"c":187.5,"h":188.0,"l":186.5,"v":1000,"n":50,"vw":187.3},
+            "dailyBar": {"t":"2024-01-02T00:00:00Z","o":185.0,"c":187.5,"h":189.0,"l":184.0,"v":900000,"n":5000,"vw":186.9},
+            "prevDailyBar": null
+        }"#;
+        let snap: StockSnapshot = serde_json::from_str(json).unwrap();
+        let inst = provider_instrument("AAPL");
+        let rx = Timestamp(42);
+
+        assert!(matches!(
+            snapshot_to_event(&snap, &inst, EventKind::Trade, rx),
+            Some(MarketEvent::Trade(_))
+        ));
+        assert!(matches!(
+            snapshot_to_event(&snap, &inst, EventKind::Quote, rx),
+            Some(MarketEvent::Quote(_))
+        ));
+        assert!(matches!(
+            snapshot_to_event(&snap, &inst, EventKind::Bar(BarInterval::OneMinute), rx),
+            Some(MarketEvent::Bar(_))
+        ));
+        assert!(matches!(
+            snapshot_to_event(&snap, &inst, EventKind::Bar(BarInterval::OneDay), rx),
+            Some(MarketEvent::Bar(_))
+        ));
+        // Unsupported interval -> None.
+        assert!(
+            snapshot_to_event(&snap, &inst, EventKind::Bar(BarInterval::FiveMinute), rx).is_none()
+        );
+    }
 
     #[test]
     fn translates_trade_message() {

@@ -41,7 +41,7 @@ use datamancer_core::{
     Quote, Result, Seq, Timestamp, Trade,
 };
 use oxidized_alpaca::{
-    AccountType, CryptoFeed, TradingClient,
+    AccountType, CryptoFeed, MarketDataClient, TradingClient,
     restful::trading::assets::{
         Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus,
     },
@@ -102,6 +102,20 @@ pub enum AlpacaCryptoVenue {
     EuKraken,
 }
 
+/// Map a crypto venue onto the market-data snapshot API's location
+/// parameter (distinct from the streaming `CryptoFeed` enum used for the
+/// live websocket).
+fn venue_location(
+    venue: AlpacaCryptoVenue,
+) -> oxidized_alpaca::restful::market_data::crypto::CryptoLocation {
+    use oxidized_alpaca::restful::market_data::crypto::CryptoLocation;
+    match venue {
+        AlpacaCryptoVenue::Us => CryptoLocation::Us,
+        AlpacaCryptoVenue::UsKraken => CryptoLocation::Us1,
+        AlpacaCryptoVenue::EuKraken => CryptoLocation::Eu1,
+    }
+}
+
 /// Runtime settings for [`AlpacaCryptoProvider`] — the hot-reconfigurable
 /// subset of its configuration, delivered through a [`SettingsSource`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +165,9 @@ struct RestState {
     /// asset catalog). `None` when credentials aren't available —
     /// `list_instruments` then surfaces a Provider error.
     trading: Option<TradingClient>,
+    /// Market-data API client, used for the snapshot/latest surface. `None`
+    /// when credentials aren't available.
+    market_data: Option<MarketDataClient>,
     /// `Some` only for [`CredentialsSource::Watch`]; `has_changed` on this
     /// cached receiver is the rebuild trigger.
     cred_rx: Option<watch::Receiver<Option<AlpacaCredentials>>>,
@@ -165,6 +182,17 @@ fn build_trading(cfg: &AlpacaCryptoProviderConfig) -> Option<TradingClient> {
         Resolved::Env => TradingClient::new(settings.account_type).ok(),
         Resolved::Creds(c) => {
             TradingClient::new_with_credentials(settings.account_type, c.to_api_key()).ok()
+        }
+        Resolved::Missing => None,
+    }
+}
+
+fn build_market_data(cfg: &AlpacaCryptoProviderConfig) -> Option<MarketDataClient> {
+    let settings = cfg.settings.current()?;
+    match cfg.credentials.current() {
+        Resolved::Env => MarketDataClient::new(settings.account_type).ok(),
+        Resolved::Creds(c) => {
+            MarketDataClient::new_with_credentials(settings.account_type, c.to_api_key()).ok()
         }
         Resolved::Missing => None,
     }
@@ -198,6 +226,7 @@ impl AlpacaCryptoProvider {
         let settings_rx = cfg.settings.watch();
         let rest = std::sync::Mutex::new(RestState {
             trading: build_trading(&cfg),
+            market_data: build_market_data(&cfg),
             cred_rx,
             settings_rx,
         });
@@ -208,18 +237,32 @@ impl AlpacaCryptoProvider {
         }
     }
 
-    /// Current trading client, rebuilt first if the credential or settings
-    /// source changed since the last call. Cloning out of the mutex keeps
-    /// the guard from crossing an await (the client is a cheaply cloneable
-    /// handle).
-    fn trading_client(&self) -> Option<TradingClient> {
+    /// Lock the REST state, rebuilding **both** clients first if the credential
+    /// or settings source changed since the last check. Returns the locked guard
+    /// so the caller can clone out the one field it needs; cloning out of the
+    /// mutex keeps the guard from crossing an await (each client is a cheaply
+    /// cloneable handle). Both clients are rebuilt together off the same `changed`
+    /// detection so they stay in lockstep on a credential/settings watch bump.
+    fn refresh_rest(&self) -> std::sync::MutexGuard<'_, RestState> {
         let mut state = self.rest.lock().expect("REST client state poisoned");
         let changed = super::runtime::watch_changed(&mut state.cred_rx)
             | super::runtime::watch_changed(&mut state.settings_rx);
         if changed {
             state.trading = build_trading(&self.cfg);
+            state.market_data = build_market_data(&self.cfg);
         }
-        state.trading.clone()
+        state
+    }
+
+    /// Current trading client (see [`Self::refresh_rest`] for the rebuild rule).
+    fn trading_client(&self) -> Option<TradingClient> {
+        self.refresh_rest().trading.clone()
+    }
+
+    /// Current market-data client (see [`Self::refresh_rest`] for the rebuild
+    /// rule), used for the snapshot/latest surface.
+    fn current_market_data(&self) -> Option<MarketDataClient> {
+        self.refresh_rest().market_data.clone()
     }
 
     /// Lazily spawn the hub task and return its command channel.
@@ -281,6 +324,39 @@ impl Provider for AlpacaCryptoProvider {
             provider: PROVIDER_ID.to_string(),
             message: "crypto historical fetch is not wired up in this provider".to_string(),
         })
+    }
+
+    async fn latest(
+        &self,
+        instrument: &Instrument,
+        kind: EventKind,
+    ) -> Result<Option<MarketEvent>> {
+        let rest = self.current_market_data().ok_or_else(|| Error::Provider {
+            provider: PROVIDER_ID.to_string(),
+            message: "Market-data client not initialized (Alpaca credentials missing?)".to_string(),
+        })?;
+        let venue = self
+            .cfg
+            .settings
+            .current()
+            .map_or(AlpacaCryptoVenue::Us, |s| s.venue);
+        let symbol = instrument.symbol();
+        let mut snaps = rest
+            .crypto_snapshots(&[symbol], venue_location(venue))
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("crypto_snapshots: {e}"),
+            })?;
+        let Some(snap) = snaps.remove(symbol) else {
+            return Ok(None);
+        };
+        Ok(crypto_snapshot_to_event(
+            &snap,
+            instrument,
+            kind,
+            wall_clock_ts(),
+        ))
     }
 
     async fn list_instruments(&self) -> Result<Vec<Instrument>> {
@@ -1010,6 +1086,59 @@ fn chrono_to_ts(dt: DateTime<Utc>) -> Timestamp {
     Timestamp(dt.timestamp_nanos_opt().unwrap_or(0))
 }
 
+/// Map a crypto snapshot onto the canonical event for `kind`, or `None` when the
+/// snapshot lacks that datum. `seq` is a placeholder; the controller re-stamps.
+fn crypto_snapshot_to_event(
+    snap: &oxidized_alpaca::restful::market_data::crypto::CryptoSnapshot,
+    instrument: &Instrument,
+    kind: EventKind,
+    rx: Timestamp,
+) -> Option<MarketEvent> {
+    match kind {
+        EventKind::Trade => snap.latest_trade.as_ref().map(|t| {
+            MarketEvent::Trade(Trade {
+                instrument: instrument.clone(),
+                source_ts: chrono_to_ts(t.timestamp),
+                rx_ts: rx,
+                seq: Seq(0),
+                price: Price::from_f64_round(t.price),
+                size: Quantity::from_f64_round(t.size),
+            })
+        }),
+        EventKind::Quote => snap.latest_quote.as_ref().map(|q| {
+            MarketEvent::Quote(Quote {
+                instrument: instrument.clone(),
+                source_ts: chrono_to_ts(q.timestamp),
+                rx_ts: rx,
+                seq: Seq(0),
+                bid: Price::from_f64_round(q.bid_price),
+                bid_size: Quantity::from_f64_round(q.bid_size),
+                ask: Price::from_f64_round(q.ask_price),
+                ask_size: Quantity::from_f64_round(q.ask_size),
+            })
+        }),
+        EventKind::Bar(interval) => {
+            let bar = match interval {
+                BarInterval::OneMinute => snap.minute_bar.as_ref(),
+                BarInterval::OneDay => snap.daily_bar.as_ref(),
+                _ => None,
+            }?;
+            Some(MarketEvent::Bar(Bar {
+                instrument: instrument.clone(),
+                interval,
+                source_ts: chrono_to_ts(bar.timestamp),
+                rx_ts: rx,
+                seq: Seq(0),
+                open: Price::from_f64_round(bar.open),
+                high: Price::from_f64_round(bar.high),
+                low: Price::from_f64_round(bar.low),
+                close: Price::from_f64_round(bar.close),
+                volume: Quantity::from_f64_round(bar.volume),
+            }))
+        }
+    }
+}
+
 /// Walk a `std::error::Error` source chain to a single string. oxidized-alpaca
 /// 0.0.5 has a `{}, 0` thiserror format for its `WebsocketError` variant that
 /// prints the literal `0` instead of the wrapped error, so we extract the
@@ -1176,5 +1305,42 @@ mod tests {
             assert_eq!(i.provider().as_str(), PROVIDER_ID);
             assert_eq!(i.asset_class(), AssetClass::Crypto);
         }
+    }
+
+    #[test]
+    fn crypto_snapshot_maps_kind_to_event() {
+        use oxidized_alpaca::restful::market_data::crypto::CryptoSnapshot;
+
+        let json = r#"{
+            "latestTrade": {"t":"2024-01-02T15:00:00Z","p":42000.0,"s":0.5,"i":1,"tks":"B"},
+            "latestQuote": {"t":"2024-01-02T15:00:00Z","bp":41999.0,"bs":1.2,"ap":42001.0,"as":0.8},
+            "minuteBar": {"t":"2024-01-02T15:00:00Z","o":42000.0,"h":42100.0,"l":41900.0,"c":42050.0,"v":12.5,"n":10,"vw":42010.0},
+            "dailyBar": {"t":"2024-01-02T00:00:00Z","o":41000.0,"h":42500.0,"l":40800.0,"c":42050.0,"v":900.0,"n":500,"vw":41800.0},
+            "prevDailyBar": null
+        }"#;
+        let snap: CryptoSnapshot = serde_json::from_str(json).unwrap();
+        let inst = provider_instrument("BTC/USD");
+        let rx = Timestamp(42);
+
+        assert!(matches!(
+            crypto_snapshot_to_event(&snap, &inst, EventKind::Trade, rx),
+            Some(MarketEvent::Trade(_))
+        ));
+        assert!(matches!(
+            crypto_snapshot_to_event(&snap, &inst, EventKind::Quote, rx),
+            Some(MarketEvent::Quote(_))
+        ));
+        assert!(matches!(
+            crypto_snapshot_to_event(&snap, &inst, EventKind::Bar(BarInterval::OneMinute), rx),
+            Some(MarketEvent::Bar(_))
+        ));
+        assert!(matches!(
+            crypto_snapshot_to_event(&snap, &inst, EventKind::Bar(BarInterval::OneDay), rx),
+            Some(MarketEvent::Bar(_))
+        ));
+        assert!(
+            crypto_snapshot_to_event(&snap, &inst, EventKind::Bar(BarInterval::FiveMinute), rx)
+                .is_none()
+        );
     }
 }

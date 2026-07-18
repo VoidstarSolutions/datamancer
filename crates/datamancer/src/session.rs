@@ -308,6 +308,7 @@ impl Datamancer {
                     accounting,
                     connection_up: false,
                     connection_seen: false,
+                    data_forwarded: false,
                 };
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
                 Ok(Session {
@@ -468,19 +469,63 @@ impl Datamancer {
             accounting: accounting.clone(),
             connection_up: false,
             connection_seen: false,
+            data_forwarded: false,
         };
         let backfill_from = match scope {
             Scope::Live { backfill_from } => backfill_from,
             Scope::Historical { .. } => None,
         };
+        // Pure-live only: fire a non-gating "latest value" fetch concurrently
+        // with the live connect. The result is injected as the first data event
+        // (immediate UI feedback) unless a real live value wins the race, in
+        // which case run_live discards it. Backfill sessions already supply a
+        // first value, so they skip this.
+        let seed_rx = (backfill_from.is_none())
+            .then(|| Self::spawn_latest_seed(provider.clone(), instrument.clone(), kind));
         accounting.record_live_start();
         let live = provider.start_live(provider_tx).await?;
         accounting.record_subscribe();
         live.subscribe(instrument, kind).await?;
-        tokio::spawn(controller.run_live(live, backfill_from, provider_rx, cmd_rx, remove_rx));
+        tokio::spawn(controller.run_live(
+            live,
+            backfill_from,
+            provider_rx,
+            cmd_rx,
+            remove_rx,
+            seed_rx,
+        ));
 
         let guard = SubscriberGuard::new(authoritative.clone(), first_id);
         Ok((authoritative, guard, first_rx))
+    }
+
+    /// Spawn the non-gating `Provider::latest` fetch for a pure-live session
+    /// and return the receiver half. Fires concurrently with the live connect;
+    /// `run_live` injects the result as the first data event unless a real
+    /// live value wins the race first.
+    fn spawn_latest_seed(
+        provider: Arc<dyn Provider>,
+        instrument: Instrument,
+        kind: EventKind,
+    ) -> oneshot::Receiver<Option<MarketEvent>> {
+        let (seed_tx, seed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let seed = match provider.latest(&instrument, kind).await {
+                Ok(seed) => seed,
+                Err(e) => {
+                    tracing::debug!(
+                        instrument = %instrument,
+                        error = %e,
+                        "latest() fetch failed; no live seed"
+                    );
+                    None
+                }
+            };
+            // Receiver may already be gone (fast teardown / live won the
+            // race); a failed send is expected and ignored.
+            let _ = seed_tx.send(seed);
+        });
+        seed_rx
     }
 
     /// Open a new multiplexing [`ClientSession`] with an empty subscription set.
@@ -1202,6 +1247,10 @@ struct Controller {
     /// `ProviderConnected` is classified as a reconnect rather than a first
     /// connect.
     connection_seen: bool,
+    /// True once any data event (Trade/Quote/Bar) has been delivered on this
+    /// authoritative session. Gates the pure-live "latest value" seed: once a
+    /// real live value has been delivered, a late-arriving seed is discarded.
+    data_forwarded: bool,
 }
 
 impl Controller {
@@ -1815,6 +1864,7 @@ impl Controller {
         mut provider_rx: mpsc::Receiver<MarketEvent>,
         mut cmd_rx: mpsc::Receiver<SessionCommand>,
         mut remove_rx: mpsc::UnboundedReceiver<SubscriberId>,
+        mut seed_rx: Option<oneshot::Receiver<Option<MarketEvent>>>,
     ) {
         let live = Arc::new(Mutex::new(Some(live)));
         // Seed the subscriber count from the pre-seeded first referrer so the
@@ -1851,6 +1901,30 @@ impl Controller {
                         break; // provider task exited
                     };
                     self.forward(ev).await;
+                }
+                res = async {
+                    // `if seed_rx.is_some()` guards this branch, so this only
+                    // ever polls a live receiver; the `None` arm is
+                    // unreachable but must still type-check.
+                    match seed_rx.as_mut() {
+                        Some(rx) => rx.await,
+                        None => std::future::pending().await,
+                    }
+                }, if seed_rx.is_some() => {
+                    // Fire once, then disable this branch for the rest of the loop.
+                    seed_rx = None;
+                    if let Ok(Some(seed)) = res
+                        && !self.data_forwarded
+                    {
+                        // Stamp in canonical order (typically just after a
+                        // connect control, though this unbiased select! does not
+                        // guarantee seed-vs-control order — both keep seq
+                        // monotonic), tee to the tap log, and fan out. `forward`
+                        // sets data_forwarded so nothing else can seed.
+                        self.forward(seed).await;
+                    }
+                    // else: a live data event already won, or
+                    // Err(RecvError) / Ok(None) — nothing to seed.
                 }
             }
         }
@@ -1969,6 +2043,12 @@ impl Controller {
     /// the live tail lands in the log (backfill data belongs to the cache).
     async fn forward(&mut self, ev: MarketEvent) {
         let ev = self.stamp(ev);
+        if matches!(
+            ev,
+            MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)
+        ) {
+            self.data_forwarded = true;
+        }
         // Drive per-provider connection accounting from this controller's own
         // up/down phase, so one substream's drop never marks the whole provider
         // down and a second substream's first connect is never a reconnect.
