@@ -554,6 +554,7 @@ impl Server {
         Ok(tokio::spawn(win_accept_loop(
             pipe,
             first,
+            self.allow_any_integrity,
             cmd_tx,
             self.dm.clone(),
             self.hub.clone(),
@@ -959,11 +960,14 @@ async fn dispatch_capabilities(dm: &Datamancer, provider: &str, symbols: &[Strin
 async fn win_accept_loop(
     pipe: crate::win_control::ControlPipe,
     first: tokio::net::windows::named_pipe::NamedPipeServer,
+    allow_any: bool,
     cmd_tx: mpsc::Sender<ServerCommand>,
     dm: Datamancer,
     hub: Arc<CredentialHub>,
     config_hub: Arc<crate::config_hub::ConfigHub>,
 ) {
+    use std::os::windows::io::AsRawHandle as _;
+
     /// Mint the next pipe instance, retrying indefinitely with bounded backoff
     /// so a transient failure can't kill the control surface.
     async fn next_instance(
@@ -1006,18 +1010,63 @@ async fn win_accept_loop(
         // can always queue on a fresh instance.
         let next = next_instance(&pipe).await;
         let connected = std::mem::replace(&mut server, next);
+        // Read the client's integrity synchronously while we hold the raw handle
+        // (no await between here and the split).
+        let client_rid = datamancer_winsec::client_process_integrity(connected.as_raw_handle());
         let (read, write) = tokio::io::split(connected);
-        tokio::spawn(serve_connection(
-            read,
-            write,
-            // The owner-only pipe DACL enforced same-user at connect, so the
-            // per-op peer-cred gate (Unix) collapses to always-permitted here.
-            true,
-            cmd_tx.clone(),
-            dm.clone(),
-            hub.clone(),
-            config_hub.clone(),
-        ));
+        match client_rid {
+            Ok(rid) if datamancer_winsec::integrity_ok(rid, allow_any) => {
+                tokio::spawn(serve_connection(
+                    read,
+                    write,
+                    // The owner-only pipe DACL enforced same-user at connect, so
+                    // the per-op peer-cred gate (Unix) collapses to
+                    // always-permitted here.
+                    true,
+                    cmd_tx.clone(),
+                    dm.clone(),
+                    hub.clone(),
+                    config_hub.clone(),
+                ));
+            }
+            Ok(rid) => {
+                let level = datamancer_winsec::classify(rid).describe();
+                tracing::warn!(level, "rejecting control client at non-Medium integrity");
+                drop(read);
+                tokio::spawn(reject_connection(
+                    write,
+                    format!(
+                        "client is running at {level} integrity; the control \
+                         channel requires Medium integrity. Re-launch the client \
+                         without elevation (or below-Medium sandboxing)."
+                    ),
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot determine control client integrity; rejecting");
+                drop(read);
+                tokio::spawn(reject_connection(
+                    write,
+                    "unable to verify client integrity level".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Write one clear `integrity_rejected` error line to a refused control client,
+/// then close (drop). Runs in its own task so a slow/hostile client cannot stall
+/// the accept loop.
+#[cfg(windows)]
+async fn reject_connection<W>(mut write: W, message: String)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let reply = Reply::error(crate::control::codes::INTEGRITY_REJECTED, message);
+    if let Ok(mut line) = serde_json::to_vec(&reply) {
+        line.push(b'\n');
+        let _ = write.write_all(&line).await;
+        let _ = write.flush().await;
     }
 }
 

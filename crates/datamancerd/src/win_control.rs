@@ -301,4 +301,22 @@ mod tests {
             "expected access-denied for a non-granted principal, got {err:?}"
         );
     }
+
+    #[tokio::test]
+    async fn client_integrity_reads_medium_for_same_process_pipe() {
+        let name = r"\\.\pipe\datamancer-test-client-integrity";
+        let pipe = ControlPipe::bind(name).expect("bind");
+        let server = pipe.create_instance(true).expect("first instance");
+        let server_task = tokio::spawn(async move {
+            server.connect().await.expect("accept");
+            let rid = datamancer_winsec::client_process_integrity(server.as_raw_handle())
+                .expect("client rid");
+            assert!(
+                (0x2000..0x3000).contains(&rid),
+                "expected Medium client integrity, got {rid:#x}"
+            );
+        });
+        let _client = ClientOptions::new().open(name).expect("client connect");
+        server_task.await.expect("server task");
+    }
 }
