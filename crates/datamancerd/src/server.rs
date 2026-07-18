@@ -527,6 +527,19 @@ impl Server {
     /// serving an unsecured control surface. See [`crate::win_control`].
     #[cfg(windows)]
     fn spawn_control(&self, cmd_tx: mpsc::Sender<ServerCommand>) -> Result<JoinHandle<()>> {
+        let rid = datamancer_winsec::current_process_integrity()?;
+        if !datamancer_winsec::integrity_ok(rid, self.allow_any_integrity) {
+            return Err(DaemonError::from(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "datamancerd is running at {} integrity; the control pipe \
+                     requires Medium integrity so same-user clients can connect. \
+                     Re-launch without elevation, or set \
+                     [server].allow_any_integrity = true to override.",
+                    datamancer_winsec::classify(rid).describe()
+                ),
+            )));
+        }
         let pipe_name = self.admin_socket.to_str().ok_or_else(|| {
             DaemonError::from(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
