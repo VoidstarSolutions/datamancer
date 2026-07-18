@@ -4,12 +4,16 @@
 //! type: `i64` nanos of currency, `1e-9` resolution. Consumers that need a
 //! different representation convert at their own boundary.
 
+use serde::{Deserialize, Serialize};
+
 /// A price in fixed-point units of `1e-9` of the quoted currency.
 ///
 /// Universal scale across instruments — equities (2 dp), FX (5 dp), and
 /// crypto (8 dp) all fit without truncation. Negative values are valid
 /// (futures can settle negative; deltas and spreads are routinely signed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 pub struct Price(pub i64);
 
 impl Price {

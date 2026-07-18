@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 mod adjustment;
+mod capabilities;
 mod credentials;
 mod error;
 mod event;
@@ -24,6 +25,7 @@ mod snapshot;
 pub mod traits;
 
 pub use adjustment::Adjustment;
+pub use capabilities::{InstrumentCapabilities, OrderType, TimeInForce};
 pub use credentials::ProviderCredentials;
 pub use error::{Error, Result};
 pub use event::{
