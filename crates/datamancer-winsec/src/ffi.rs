@@ -123,12 +123,21 @@ fn token_integrity_rid(token: *mut core::ffi::c_void) -> io::Result<u32> {
             .read_unaligned()
     };
     let sid = label.Label.Sid;
-    // SAFETY: `sid` is a valid label SID within `buf`; the RID is its last
-    // sub-authority (count >= 1 for a label SID).
-    let rid = unsafe {
-        let count = *GetSidSubAuthorityCount(sid);
-        *GetSidSubAuthority(sid, u32::from(count.saturating_sub(1)))
-    };
+    // SAFETY: `sid` is a valid label SID within `buf`; `GetSidSubAuthorityCount`
+    // returns a pointer to its sub-authority count.
+    let count = unsafe { *GetSidSubAuthorityCount(sid) };
+    // A mandatory-label SID always carries its integrity RID as the last
+    // sub-authority, so a count of 0 is malformed — refuse rather than read out
+    // of bounds.
+    if count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "integrity-label SID has no sub-authorities",
+        ));
+    }
+    // SAFETY: `count >= 1`, so `count - 1` is a valid sub-authority index; the
+    // integrity RID is that last sub-authority.
+    let rid = unsafe { *GetSidSubAuthority(sid, u32::from(count - 1)) };
     Ok(rid)
 }
 

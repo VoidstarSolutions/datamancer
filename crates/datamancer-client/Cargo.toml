@@ -19,6 +19,9 @@ iceoryx2 = [
     "dep:iceoryx2",
     "dep:tokio",
     "dep:tokio-stream",
+    # win_pipe (the only winsec consumer) is cfg(all(windows, feature =
+    # "iceoryx2")); pull winsec only when it can actually be used.
+    "dep:datamancer-winsec",
 ]
 # App-facing find-or-spawn facade (Task 4+).
 app = ["iceoryx2"]
@@ -50,7 +53,7 @@ tempfile = "3"
 # Windows client-side server-identity + integrity checks delegate to the shared,
 # audited FFI crate; this crate itself stays forbid(unsafe_code).
 [target.'cfg(windows)'.dependencies]
-datamancer-winsec = { path = "../datamancer-winsec", version = "0.6.0" }
+datamancer-winsec = { path = "../datamancer-winsec", version = "0.6.0", optional = true }
 
 [lints]
 workspace = true
