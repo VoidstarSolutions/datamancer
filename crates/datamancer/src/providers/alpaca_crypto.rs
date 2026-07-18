@@ -237,11 +237,13 @@ impl AlpacaCryptoProvider {
         }
     }
 
-    /// Current trading client, rebuilt first if the credential or settings
-    /// source changed since the last call. Cloning out of the mutex keeps
-    /// the guard from crossing an await (the client is a cheaply cloneable
-    /// handle).
-    fn trading_client(&self) -> Option<TradingClient> {
+    /// Lock the REST state, rebuilding **both** clients first if the credential
+    /// or settings source changed since the last check. Returns the locked guard
+    /// so the caller can clone out the one field it needs; cloning out of the
+    /// mutex keeps the guard from crossing an await (each client is a cheaply
+    /// cloneable handle). Both clients are rebuilt together off the same `changed`
+    /// detection so they stay in lockstep on a credential/settings watch bump.
+    fn refresh_rest(&self) -> std::sync::MutexGuard<'_, RestState> {
         let mut state = self.rest.lock().expect("REST client state poisoned");
         let changed = super::runtime::watch_changed(&mut state.cred_rx)
             | super::runtime::watch_changed(&mut state.settings_rx);
@@ -249,23 +251,18 @@ impl AlpacaCryptoProvider {
             state.trading = build_trading(&self.cfg);
             state.market_data = build_market_data(&self.cfg);
         }
-        state.trading.clone()
+        state
     }
 
-    /// Current market-data client, rebuilt first if the credential or
-    /// settings source changed since the last call. Mirrors
-    /// [`Self::trading_client`]'s check-and-rebuild discipline, sharing the
-    /// same `changed` detection so both clients stay in lockstep on a
-    /// credential/settings watch bump.
+    /// Current trading client (see [`Self::refresh_rest`] for the rebuild rule).
+    fn trading_client(&self) -> Option<TradingClient> {
+        self.refresh_rest().trading.clone()
+    }
+
+    /// Current market-data client (see [`Self::refresh_rest`] for the rebuild
+    /// rule), used for the snapshot/latest surface.
     fn current_market_data(&self) -> Option<MarketDataClient> {
-        let mut state = self.rest.lock().expect("REST client state poisoned");
-        let changed = super::runtime::watch_changed(&mut state.cred_rx)
-            | super::runtime::watch_changed(&mut state.settings_rx);
-        if changed {
-            state.trading = build_trading(&self.cfg);
-            state.market_data = build_market_data(&self.cfg);
-        }
-        state.market_data.clone()
+        self.refresh_rest().market_data.clone()
     }
 
     /// Lazily spawn the hub task and return its command channel.

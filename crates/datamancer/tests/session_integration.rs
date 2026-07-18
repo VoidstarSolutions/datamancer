@@ -10,9 +10,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
 use datamancer::{
-    AssetClass, Bar, BarInterval, ControlKind, Datamancer, EventKind, Instrument, LiveHandle,
-    MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ReplayRequest, Result, Scope,
-    Seq, TapLog, Timestamp, Trade,
+    AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, EventKind, Instrument,
+    LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ReplayRequest,
+    Result, Scope, Seq, TapLog, Timestamp, Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -978,6 +978,75 @@ async fn seed_wins_when_no_live_data_yet() {
     let second = stream.next().await.expect("live event");
     assert_eq!(trade_price(&second), 10.0);
     assert_eq!(second.seq(), Some(Seq(1)));
+}
+
+/// Decision 4: a connectivity `Control` does **not** cancel the seed — only a
+/// delivered data event does. Gate the seed so the connect control is forwarded
+/// first, then release it and assert it still lands (after the control, with
+/// monotonic `seq`).
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn connect_control_does_not_cancel_seed() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    ctrl.set_latest_gate(gate.clone()).await; // hold the seed until the control is through
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.expect("take events");
+
+    // A connectivity control arrives first and is forwarded (seq 0). It is not a
+    // data event, so it must not trip the seed's discard gate.
+    ctrl.push_live(MarketEvent::Control(Control {
+        source_ts: Timestamp(50),
+        rx_ts: Timestamp(50),
+        seq: Seq(0),
+        kind: ControlKind::ProviderConnected {
+            provider: "fake".to_string(),
+        },
+    }))
+    .await;
+    let first = stream.next().await.expect("connect control");
+    assert!(
+        matches!(
+            first,
+            MarketEvent::Control(Control {
+                kind: ControlKind::ProviderConnected { .. },
+                ..
+            })
+        ),
+        "expected ProviderConnected first, got {first:?}"
+    );
+    assert_eq!(first.seq(), Some(Seq(0)));
+
+    // Release the seed: it must still be delivered, stamped after the control.
+    gate.notify_one();
+    let second = stream.next().await.expect("seed event");
+    assert_eq!(trade_price(&second), 999.0);
+    assert_eq!(second.seq(), Some(Seq(1)));
+
+    // A following live tick lands after the seed.
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let third = stream.next().await.expect("live event");
+    assert_eq!(trade_price(&third), 10.0);
+    assert_eq!(third.seq(), Some(Seq(2)));
 }
 
 #[tokio::test]
