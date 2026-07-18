@@ -339,10 +339,24 @@ not.
     privileged, `datamancer-client` verifies the connected pipe's **owner SID
     equals its own token SID**, so a bug that weakened the server DACL cannot
     silently leak credentials to a foreign or same-user-squatted endpoint.
-  - **Integrity levels.** The DACL keys on the user SID, not the integrity
-    level; Windows' mandatory "no-write-up" policy still applies. Run the daemon
-    and its clients at the **same integrity level** (both elevated or both not):
-    a medium-IL client may be denied write access to an elevated daemon's pipe.
+  - **Integrity levels — actively enforced, not just advisory.** The DACL keys
+    on the user SID, not the integrity level, so Windows' mandatory
+    "no-write-up" policy is a separate concern the daemon and client both
+    check explicitly: both the daemon and its clients must run at **Medium**
+    integrity. A daemon started elevated (High/System) or sandboxed
+    (Low/Untrusted) refuses to bind its control pipe at startup with a clear
+    error; a client at a non-Medium integrity level refuses to connect with a
+    clear error, and even if it didn't, the daemon independently reads each
+    connecting client's integrity off the raw pipe handle before serving it
+    and rejects a non-Medium client in-band (`integrity_rejected`).
+    Override, when elevation is genuinely required: `[server].allow_any_integrity
+    = true` in the daemon's config, or `DATAMANCER_ALLOW_ANY_INTEGRITY=1` in a
+    client's environment. **Asymmetry:** the client's env override relaxes
+    only that client's own self-check before it dials out — the daemon
+    remains the sole authority over what it accepts, and will still reject a
+    non-Medium client unless the *daemon* has set `allow_any_integrity = true`.
+    Setting the client override without also setting it on the daemon does not
+    let an elevated client through.
   - **Scope.** The named-pipe *control* surface is native-Windows (#29). The
     same-host *data* plane (iceoryx2) does not yet run on Windows; a portable
     WS-loopback data path is a later phase.

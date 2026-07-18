@@ -22,11 +22,20 @@
 //! (`datamancer_client`'s `win_pipe`, review B1), so a weakened server DACL
 //! cannot silently leak credentials.
 //!
-//! **Integrity-level caveat.** The DACL keys on the user SID, not the
-//! integrity level. Windows' mandatory "no-write-up" policy still applies: a
-//! same-user client at a *lower* integrity level than an elevated daemon may
-//! be denied write access to the (Medium-IL default) pipe. Run the daemon and
-//! its clients at the same integrity level (both elevated or both not).
+//! **Integrity-level enforcement.** The DACL keys on the user SID, not the
+//! integrity level, so Windows' mandatory "no-write-up" policy is enforced
+//! separately and actively: both the daemon and its clients are required to
+//! run at Medium integrity. The daemon refuses to bind its control pipe at
+//! startup if it is itself elevated (High/System) or sandboxed
+//! (Low/Untrusted) (`server::spawn_control`), and reads each connecting
+//! client's integrity off the raw pipe handle before serving it, rejecting a
+//! non-Medium client in-band with `integrity_rejected` (`server::win_accept_loop`).
+//! Override via `[server].allow_any_integrity = true`. This only relaxes the
+//! *daemon's* own checks; a client with a non-Medium daemon still needs the
+//! daemon to have set the override, since the daemon is always the accepting
+//! authority (see `datamancer_client::win_pipe`'s matching client-side
+//! self-check and its `DATAMANCER_ALLOW_ANY_INTEGRITY` override, which is
+//! independent and relaxes only the client's own pre-connect check).
 //!
 //! # EXT-1 unsafe policy
 //!

@@ -50,7 +50,7 @@ tempfile = "3"
 # Windows client-side server-identity + integrity checks delegate to the shared,
 # audited FFI crate; this crate itself stays forbid(unsafe_code).
 [target.'cfg(windows)'.dependencies]
-datamancer-winsec = { path = "../datamancer-winsec", version = "0.5.0" }
+datamancer-winsec = { path = "../datamancer-winsec", version = "0.6.0" }
 
 [lints]
 workspace = true

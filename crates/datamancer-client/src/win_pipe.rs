@@ -22,6 +22,15 @@
 //! Checking our own integrity first turns that into a clear message, and also
 //! refuses an elevated client (which the daemon would reject anyway).
 //! `DATAMANCER_ALLOW_ANY_INTEGRITY` overrides this local check.
+//!
+//! **Asymmetry.** This override relaxes only *this* client's own pre-connect
+//! self-check — it has no effect on what the daemon accepts. The daemon is
+//! always the authority: it independently re-reads every connecting client's
+//! integrity off the raw pipe handle and rejects a non-Medium client in-band
+//! (`integrity_rejected`) unless the *daemon* has separately set
+//! `[server].allow_any_integrity = true` (see `datamancerd::win_control`).
+//! Setting `DATAMANCER_ALLOW_ANY_INTEGRITY=1` on an elevated client without
+//! also relaxing the daemon does not let that client through.
 
 use std::io;
 use std::os::windows::io::AsRawHandle as _;
