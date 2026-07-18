@@ -48,8 +48,12 @@ Constraints from the request:
    tap-log encoding unchanged.
 4. **Discard rule:** only a delivered **data** event (`Trade`/`Quote`/`Bar`)
    cancels the seed. A `ProviderConnected` (or any connectivity `Control`) does
-   **not** — so the seed lands right after the connect control, before the first
-   live tick.
+   **not** — so the seed still lands before the first live *tick*, typically
+   just after the connect control. (The exact seed-vs-connect-control order is
+   not guaranteed: `run_live`'s `select!` is unbiased, so if a connect control
+   is already queued when the seed resolves, either may be stamped first. Both
+   orders keep `seq` monotonic and the control in-band — the only enforced
+   guarantee is that a delivered data event, not a control, cancels the seed.)
 5. **Tap log:** the seed **is** teed to the tap log (delivered via `forward`),
    so tap-log replay reproduces the delivered stream faithfully.
 6. **Providers wired now:** both `alpaca` (stock) and `alpaca_crypto`.

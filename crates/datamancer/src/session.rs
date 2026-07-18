@@ -1916,9 +1916,11 @@ impl Controller {
                     if let Ok(Some(seed)) = res
                         && !self.data_forwarded
                     {
-                        // Stamp (after any connect control already forwarded),
-                        // tee to the tap log, and fan out. `forward` sets
-                        // data_forwarded so nothing else can seed.
+                        // Stamp in canonical order (typically just after a
+                        // connect control, though this unbiased select! does not
+                        // guarantee seed-vs-control order — both keep seq
+                        // monotonic), tee to the tap log, and fan out. `forward`
+                        // sets data_forwarded so nothing else can seed.
                         self.forward(seed).await;
                     }
                     // else: a live data event already won, or
