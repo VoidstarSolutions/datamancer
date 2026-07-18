@@ -204,6 +204,10 @@ impl Server {
         let web = config.web_ui.clone();
         #[cfg(feature = "ws")]
         let ws = config.ws.clone();
+        // Read while `config` is still owned here — `build_runtime` below
+        // consumes it by value. `bool` is `Copy`; Windows-only (integrity gate).
+        #[cfg(windows)]
+        let allow_any_integrity = config.server.allow_any_integrity;
         tracing::debug!(
             live_state_ms = config.diagnostics.publish_interval_ms,
             cache_catalog_ms = config.diagnostics.cache_catalog_interval_ms,
@@ -258,9 +262,6 @@ impl Server {
             tracing::info!(symbol = %s.symbol, "anchored always_on startup session");
             anchors.push(session);
         }
-
-        #[cfg(windows)]
-        let allow_any_integrity = config.server.allow_any_integrity;
 
         Ok(Self {
             dm,
