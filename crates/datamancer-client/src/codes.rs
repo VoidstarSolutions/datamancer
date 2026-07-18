@@ -52,3 +52,6 @@ pub const RESTART_REQUIRED: &str = "restart_required";
 /// A configure-provider payload carried a field the provider's config
 /// section does not define.
 pub const UNKNOWN_CONFIG_FIELD: &str = "unknown_config_field";
+/// The connected process is not at Medium integrity, so the control channel
+/// refuses it (Windows only).
+pub const INTEGRITY_REJECTED: &str = "integrity_rejected";
