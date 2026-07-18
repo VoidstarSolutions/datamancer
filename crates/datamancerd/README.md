@@ -321,6 +321,8 @@ One JSON object per line; one reply line per request.
 {"op":"instruments","provider":"alpaca-crypto"}
   -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
+{"op":"capabilities","provider":"alpaca","symbols":["AAPL","MSFT"]}
+  -> {"ok":true,"capabilities":[{"instrument":{ /* Instrument */ },"capabilities":{ /* InstrumentCapabilities, optional */ }}]}
 {"op":"ping"}          -> {"ok":true,"version":"0.5.0","credential_backend":"keychain"}
 {"op":"set-credentials","provider":"alpaca-crypto","credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
   -> {"ok":true}
@@ -347,6 +349,21 @@ the filter when you know the provider). Because it awaits a live provider
 REST call, it is dispatched off the single-actor control loop (in the
 per-connection task) so it cannot stall unrelated `open-client`/`subscribe`/
 etc. traffic on other connections.
+
+`capabilities` looks up on-demand, per-instrument order/fractional
+capabilities (`InstrumentCapabilities`: things like fractionable, min order
+size, supported order types/time-in-force) for a provider's symbols; `provider`
+is required, `symbols` names the instruments to enrich. Like `instruments`, it
+is an **ungated** read op and, because it awaits a live provider REST call, is
+dispatched off the single-actor control loop so it cannot stall unrelated
+traffic on other connections. The reply is a list of `InstrumentEntry`
+(instrument + optional capabilities) — an absent/`None` field anywhere in a
+capabilities block means **unknown**, never "unsupported" or "false"; a
+provider that doesn't populate a field simply omits it rather than asserting
+`false`. The lookup is keyed by provider + symbol, not by asset class, so the
+echoed `instrument.asset_class` is **not authoritative** for this op — it is
+filled with the provider's default class (e.g. `equity` for Alpaca) even when
+the symbol is actually a crypto pair.
 
 `ping` needs no registered client and reports the daemon's crate version plus
 the active credential-store backend; the app facade uses it for
@@ -585,11 +602,14 @@ connection identifies the client):
   -> {"id":4,"ok":true}
 {"id":5,"op":"instruments","provider":"alpaca-crypto"}
   -> {"id":5,"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
+{"id":6,"op":"capabilities","provider":"alpaca","symbols":["AAPL","MSFT"]}
+  -> {"id":6,"ok":true,"capabilities":[{"instrument":{ /* Instrument */ },"capabilities":{ /* InstrumentCapabilities, optional */ }}]}
 ```
 
-Like on the UDS surface, `instruments` (optional `provider` filter) is
-dispatched per-connection rather than through any shared actor, so it never
-blocks other connections while it awaits a live provider REST call.
+Like on the UDS surface, `instruments` (optional `provider` filter) and
+`capabilities` (required `provider` + `symbols`) are dispatched per-connection
+rather than through any shared actor, so they never block other connections
+while they await a live provider REST call.
 
 Errors reuse the **same stable `codes` table** as the UDS control surface
 (`{"id":5,"ok":false,"code":"unsupported_event_kind","message":"…"}`). Event
