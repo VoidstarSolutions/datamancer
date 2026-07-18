@@ -91,24 +91,33 @@ jobs:
         run: cargo test -p datamancer-transport-ws -p datamancer-client --features datamancer-client/ws
 
   windows-native-check:
-    # Native-Windows compile guard (#29). The ws-portable job above does NOT
-    # build the daemon or the client `app`/`iceoryx2` features, so the
-    # in-progress native-Windows port would otherwise rot uncaught. Type-check
-    # the ported crates on Windows (compile-only; runtime lands with the
-    # named-pipe transport in a later phase). iceoryx2's bindgen needs libclang.
-    name: native compile-check (Windows)
+    # Native-Windows guard (#29). The ws-portable job above does NOT build the
+    # daemon or the client `app`/`iceoryx2` features, so the native-Windows port
+    # would otherwise rot uncaught. This job also carries the *only* CI coverage
+    # of the `cfg(windows)` Win32 code (the Linux clippy job never compiles it):
+    # clippy lints the ported crates and runs the named-pipe control-transport +
+    # owner-SID auth tests (Phase 3). iceoryx2's bindgen needs libclang.
+    name: native clippy + control-transport tests (Windows)
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: install LLVM (libclang for iceoryx2 bindgen)
         run: choco install llvm --no-progress -y
-      - name: cargo check (daemon + client app)
+      - name: clippy + control-transport tests (daemon + client app)
         shell: bash
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
         run: |
-          cargo check -p datamancerd
-          cargo check -p datamancer-client --features app
+          # Lints the Win32 modules (win_control / win_pipe) that no other job sees.
+          cargo clippy -p datamancerd --all-targets -- -D warnings
+          cargo clippy -p datamancer-client --features app --all-targets -- -D warnings
+          # Owner-DACL pipe + client owner-SID check. These create real pipes but
+          # no iceoryx2 node, so they run here (the full daemon needs an iceoryx2
+          # runtime, which is not yet available on Windows — a later phase).
+          cargo test -p datamancerd win_control
+          cargo test -p datamancer-client --features app win_pipe

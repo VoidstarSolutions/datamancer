@@ -6,17 +6,26 @@
 //! lifecycle + a control surface:
 //!
 //! 1. Build a [`datamancer::Datamancer`] from a TOML config.
-//! 2. Accept client connections over a Unix-domain control socket; per client
-//!    create a multiplexing client session wired to a per-client iceoryx2
-//!    data-plane service, and publish the diagnostics snapshot on the
+//! 2. Accept client connections over a control endpoint — a Unix-domain socket
+//!    on Unix, an owner-only-DACL named pipe on Windows (`win_control`); per
+//!    client create a multiplexing client session wired to a per-client
+//!    iceoryx2 data-plane service, and publish the diagnostics snapshot on the
 //!    diagnostics plane.
 //! 3. Hold authoritative sessions alive as the cross-process lifecycle anchor.
 //! 4. Expose a control surface for runtime `subscribe`/`unsubscribe`.
 //! 5. Graceful shutdown: stop accepting, flush sinks + tap log, drain.
 //!
-//! Access control is **filesystem permissions on the control socket only**
-//! (same-host, single-operator). This is **not** a network-safe surface.
-#![forbid(unsafe_code)]
+//! Access control is **same-host, single-operator**: Unix gates each
+//! privileged op on the peer's uid (`SO_PEERCRED`); Windows restricts the pipe
+//! with an owner-only DACL so only the daemon's user can open it (see
+//! `win_control`). This is **not** a network-safe surface.
+//!
+//! EXT-1: the crate is `#![forbid(unsafe_code)]` everywhere except Windows,
+//! where the named-pipe transport needs Win32 FFI. There it relaxes to
+//! `#![deny(unsafe_code)]` with a *single* scoped `#[allow(unsafe_code)]`
+//! confined to the audited `win_control` module.
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![cfg_attr(windows, deny(unsafe_code))]
 
 mod config;
 mod config_class;
@@ -30,6 +39,8 @@ mod shutdown;
 mod single_instance;
 #[cfg(feature = "web-ui")]
 mod web;
+#[cfg(windows)]
+mod win_control;
 #[cfg(feature = "ws")]
 mod ws;
 

@@ -2,12 +2,6 @@
 //! configured provider, stable-coded replies. Ops run off-actor (blocking
 //! store I/O behind `spawn_blocking`) and are peer-cred gated same-uid.
 
-// Native Windows port (#29): the credential-broker ops here are reached only via
-// the Unix control socket, so they are transitionally dead on Windows until the
-// named-pipe transport revives them in Phase 3. Scoped allow — Unix/macOS stay
-// lint-strict; remove when Phase 3 lands.
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,8 +14,13 @@ use tokio::sync::watch;
 use crate::control::{Reply, codes};
 use crate::error::{DaemonError, Result};
 
-/// Same-uid gate for credential and config-mutation ops (and `shutdown`).
-/// Unreadable peer credentials are denied, not defaulted.
+/// Same-uid gate for credential and config-mutation ops (and `shutdown`) on
+/// Unix, where the control socket is world-openable. Unreadable peer
+/// credentials are denied, not defaulted. Windows has no peer-cred equivalent:
+/// its named pipe is restricted by an owner-only DACL, so the OS enforces
+/// same-user at connect and the dispatch runs already-privileged (see
+/// `crate::win_control`).
+#[cfg(unix)]
 pub(crate) fn privileged_op_permitted(peer_uid: Option<u32>, own_euid: u32) -> bool {
     peer_uid == Some(own_euid)
 }
@@ -248,6 +247,8 @@ mod tests {
     use super::*;
     use datamancer_core::ProviderCredentials;
 
+    // The peer-cred gate is Unix-only (Windows uses the pipe owner DACL).
+    #[cfg(unix)]
     #[test]
     fn gate_requires_exact_uid_match() {
         assert!(privileged_op_permitted(Some(501), 501));

@@ -47,5 +47,18 @@ tokio-stream = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
 tempfile = "3"
 
+# Windows client-side server-identity check (#29, Phase 3): the connected
+# control pipe's owner SID must equal this process's token SID before any
+# privileged send (review B1). Windows-only — never enters the macOS/Linux
+# dependency tree. All Win32 use is confined to the single audited `win_pipe`
+# module (EXT-1: the crate stays `deny(unsafe_code)` with one scoped allow).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [lints]
 workspace = true

@@ -12,7 +12,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::net::windows::named_pipe::ClientOptions;
 
 use crate::app::lifecycle::{
     ControlEndpoint, DaemonHello, DaemonSpawner, ExitInfo, PingFailure, SpawnedDaemon,
@@ -36,9 +35,12 @@ impl ControlEndpoint for TokioEndpoint {
     async fn ping(&self, socket: &Path, timeout: Duration) -> Result<DaemonHello, PingFailure> {
         let attempt = async {
             // The control-socket `Path` carries the pipe name on Windows
-            // (`\\.\pipe\datamancer\control-<user>`; see `crate::paths`).
-            let stream = ClientOptions::new()
-                .open(socket)
+            // (`\\.\pipe\datamancer\<user>\control`; see `crate::paths`).
+            // `connect_verified` retries `ERROR_PIPE_BUSY` and verifies the
+            // pipe's owner SID is this user's (review B1) before we trust the
+            // daemon's hello.
+            let stream = crate::win_pipe::connect_verified(socket)
+                .await
                 .map_err(|e| PingFailure(format!("connect: {e}")))?;
             let (read, mut write) = tokio::io::split(stream);
             let mut line = serde_json::to_vec(&Request::Ping)

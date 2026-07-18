@@ -8,14 +8,6 @@
 //! on it. Startup-session anchors hold authoritative sessions alive across
 //! client presence (`always_on=true` for the whole process lifetime).
 
-// Native Windows port, in progress (#29): this module's control-dispatch
-// machinery (accept loop, per-connection handler, dispatch helpers,
-// `ServerCommand` variants, unix-only fields) is reached only through the Unix
-// control socket, so it is transitionally dead on Windows until the named-pipe
-// transport revives it in Phase 3. Scoped allow — Unix/macOS stay lint-strict;
-// remove when Phase 3 lands.
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,7 +32,11 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::control::{Reply, Request, SubscriptionSpec, codes, reply_from_library_error};
-use crate::credentials::{CredentialHub, privileged_op_permitted};
+use crate::credentials::CredentialHub;
+// Unix gates each privileged op on the peer uid; Windows uses the pipe's
+// owner-only DACL (connect-time), so this helper is Unix-only.
+#[cfg(unix)]
+use crate::credentials::privileged_op_permitted;
 use crate::error::{DaemonError, Result};
 use crate::shutdown::{DrainClient, DrainRecorder, drain};
 
@@ -313,7 +309,7 @@ impl Server {
         #[cfg(unix)]
         tracing::info!(socket = %self.admin_socket.display(), "datamancerd listening");
         #[cfg(windows)]
-        tracing::info!("datamancerd running; control surface not yet supported on Windows (#29)");
+        tracing::info!(pipe = %self.admin_socket.display(), "datamancerd listening");
 
         // Platform terminate signal, selected on alongside Ctrl-C. Unix:
         // SIGTERM. Windows: console CTRL_SHUTDOWN. Both expose `recv()`.
@@ -393,6 +389,10 @@ impl Server {
             tracing::error!("shutdown drain exceeded timeout; forcing exit");
         }
         tracing::debug!(phases = ?recorder.entries(), "drain phases");
+        // Unix: unlink the socket file. Windows named pipes are not filesystem
+        // objects — the instances close when their handles drop (accept abort +
+        // task exit), so there is nothing to unlink.
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.admin_socket);
         tracing::info!("datamancerd shutdown complete");
         Ok(())
@@ -508,14 +508,34 @@ impl Server {
         )))
     }
 
+    /// Windows: bind the owner-only-DACL named pipe and spawn its accept loop.
+    ///
+    /// Fail-closed (review B2/S5): resolving the daemon's token SID, building
+    /// the owner-only security descriptor, and minting the first pipe instance
+    /// (with `FILE_FLAG_FIRST_PIPE_INSTANCE`, which fails if the control name
+    /// was squatted) all happen here — any failure aborts startup rather than
+    /// serving an unsecured control surface. See [`crate::win_control`].
     #[cfg(windows)]
-    #[allow(clippy::unnecessary_wraps, clippy::unused_self)] // parity with the Unix arm
-    fn spawn_control(&self, _cmd_tx: mpsc::Sender<ServerCommand>) -> Result<JoinHandle<()>> {
-        tracing::warn!(
-            "control socket not yet supported on Windows; running without a \
-             control surface (native Windows support in progress, #29)"
-        );
-        Ok(tokio::spawn(async {}))
+    fn spawn_control(&self, cmd_tx: mpsc::Sender<ServerCommand>) -> Result<JoinHandle<()>> {
+        let pipe_name = self.admin_socket.to_str().ok_or_else(|| {
+            DaemonError::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "control pipe name is not valid Unicode: {}",
+                    self.admin_socket.display()
+                ),
+            ))
+        })?;
+        let pipe = crate::win_control::ControlPipe::bind(pipe_name)?;
+        let first = pipe.create_instance(true)?;
+        Ok(tokio::spawn(win_accept_loop(
+            pipe,
+            first,
+            cmd_tx,
+            self.dm.clone(),
+            self.hub.clone(),
+            self.config_hub.clone(),
+        )))
     }
 
     #[cfg(unix)]
@@ -898,6 +918,60 @@ async fn dispatch_capabilities(dm: &Datamancer, provider: &str, symbols: &[Strin
     }
 }
 
+/// Windows control accept loop. Named pipes have no single listener object:
+/// each waiting instance is a separate handle. The pattern is *mint → wait →
+/// pre-mint the next → serve*, so a client can always queue on a fresh instance
+/// while an earlier one is being served. Every accepted connection is the
+/// daemon owner's (the owner-only DACL enforced that at connect), so the shared
+/// dispatch runs with `privileged = true`. See [`crate::win_control`].
+#[cfg(windows)]
+async fn win_accept_loop(
+    pipe: crate::win_control::ControlPipe,
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+    dm: Datamancer,
+    hub: Arc<CredentialHub>,
+    config_hub: Arc<crate::config_hub::ConfigHub>,
+) {
+    let mut server = first;
+    loop {
+        if let Err(e) = server.connect().await {
+            tracing::warn!(error = %e, "control pipe connect failed; recreating instance");
+            match pipe.create_instance(false) {
+                Ok(next) => {
+                    server = next;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot recreate control pipe; accept loop stopping");
+                    return;
+                }
+            }
+        }
+        // Pre-create the next instance before serving this one.
+        let next = match pipe.create_instance(false) {
+            Ok(next) => next,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot create next control pipe instance; accept loop stopping");
+                return;
+            }
+        };
+        let connected = std::mem::replace(&mut server, next);
+        let (read, write) = tokio::io::split(connected);
+        tokio::spawn(serve_connection(
+            read,
+            write,
+            // The owner-only pipe DACL enforced same-user at connect, so the
+            // per-op peer-cred gate (Unix) collapses to always-permitted here.
+            true,
+            cmd_tx.clone(),
+            dm.clone(),
+            hub.clone(),
+            config_hub.clone(),
+        ));
+    }
+}
+
 /// Route an already-gated credential op to the credential hub.
 async fn dispatch_credential_op(request: Request, hub: &CredentialHub) -> Reply {
     match request {
@@ -949,22 +1023,10 @@ async fn dispatch_config_op(
     })
 }
 
-/// One long-lived control connection. Reads newline-delimited JSON requests,
-/// forwards each to the server actor, writes the reply line. On EOF, if this
-/// connection had opened a client, signals an emergency teardown.
-///
-/// `Request::Instruments`, the credential ops, and the config-service ops
-/// are dispatched here, off-actor, rather than forwarded to the actor: the
-/// first awaits a live provider REST call, the credential ops do blocking
-/// credential-store I/O (behind `spawn_blocking`) — neither may stall
-/// unrelated control traffic on the single-actor loop. `get-config` is
-/// ungated — credentials never live in the config, and the one
-/// secret-shaped field, `[ws].auth_token`, is redacted in its reply (see
-/// `ConfigHub::get_config`); the credential ops,
-/// `configure-provider`/`remove-provider`, and `shutdown` are additionally
-/// gated on the peer's uid matching the daemon's own effective uid, captured
-/// per-connection before the stream is split. `shutdown` is forwarded to the
-/// actor (a run-loop decision, not hub state) once the gate passes.
+/// Unix transport arm for one control connection: capture the peer-cred gate
+/// decision (`SO_PEERCRED` vs the daemon's own euid), split the `UnixStream`,
+/// and hand it to the shared [`serve_connection`] dispatch. The full
+/// request-routing and gating contract lives there.
 #[cfg(unix)]
 async fn handle_connection(
     stream: UnixStream,
@@ -975,9 +1037,50 @@ async fn handle_connection(
     own_euid: u32,
 ) {
     // Kernel-reported peer credentials; unreadable peer = privileged ops
-    // denied (never defaulted).
+    // denied (never defaulted). The UDS is world-openable, so the gate is a
+    // per-connection property computed here and passed into the shared
+    // dispatch. (On Windows the owner-only pipe DACL enforces this at connect,
+    // so that arm passes `privileged = true`; see `win_control`.)
     let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
-    let (read, mut write) = stream.into_split();
+    let privileged = privileged_op_permitted(peer_uid, own_euid);
+    let (read, write) = stream.into_split();
+    serve_connection(read, write, privileged, cmd_tx, dm, hub, config_hub).await;
+}
+
+/// Serve one control connection over any byte transport: read newline-JSON
+/// requests, dispatch each, write the reply line. Transport-agnostic — Unix
+/// drives it with the two halves of a `UnixStream`, Windows with the two
+/// halves of a `NamedPipeServer` — so the control vocabulary and its gating
+/// live in exactly one place.
+///
+/// `privileged` is the per-connection authorization decision (whether the peer
+/// is the daemon's owner). It is computed once by the transport arm — Unix from
+/// `SO_PEERCRED`, Windows from the connect-time owner-DACL — because it cannot
+/// change over a connection's life. The credential ops, config-mutation ops,
+/// and `shutdown` require it; every other op is ungated. `get-config` is
+/// ungated because credentials never live in the config and the one
+/// secret-shaped field, `[ws].auth_token`, is redacted in its reply (see
+/// `ConfigHub::get_config`).
+///
+/// `Request::Instruments`, the credential ops, and the config-service ops are
+/// dispatched here, off-actor, rather than forwarded to the actor: the first
+/// awaits a live provider REST call and the credential ops do blocking
+/// credential-store I/O (behind `spawn_blocking`) — neither may stall unrelated
+/// control traffic on the single-actor loop. `shutdown` is forwarded to the
+/// actor (a run-loop decision, not hub state) once the gate passes. On EOF, if
+/// this connection had opened a client, an emergency teardown is signalled.
+async fn serve_connection<R, W>(
+    read: R,
+    mut write: W,
+    privileged: bool,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+    dm: Datamancer,
+    hub: Arc<CredentialHub>,
+    config_hub: Arc<crate::config_hub::ConfigHub>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut lines = BufReader::new(read).lines();
     let mut opened_client: Option<String> = None;
 
@@ -1006,7 +1109,7 @@ async fn handle_connection(
                         | Request::GetCredentials { .. }
                         | Request::ClearCredentials { .. }
                 ) {
-                    if privileged_op_permitted(peer_uid, own_euid) {
+                    if privileged {
                         dispatch_credential_op(request, &hub).await
                     } else {
                         Reply::error(
@@ -1022,7 +1125,7 @@ async fn handle_connection(
                         | Request::RemoveProvider { .. }
                         | Request::Shutdown
                 ) {
-                    if privileged_op_permitted(peer_uid, own_euid) {
+                    if privileged {
                         match dispatch_config_op(request, &config_hub, &cmd_tx).await {
                             Some(reply) => reply,
                             None => break,
@@ -1162,6 +1265,8 @@ fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
 mod tests {
     use super::*;
 
+    // The peer-cred gate is Unix-only (Windows uses the pipe owner DACL).
+    #[cfg(unix)]
     #[test]
     fn privileged_gate_requires_exact_uid_match() {
         use crate::credentials::privileged_op_permitted;
