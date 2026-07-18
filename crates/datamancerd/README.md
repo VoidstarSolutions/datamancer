@@ -323,8 +323,10 @@ not.
 - **Windows — owner-only-DACL named pipe.** Bound at `admin_socket` (default
   `\\.\pipe\datamancer\<user>\control`). Access control is the **pipe object's
   DACL**, not the name: the daemon builds it granting access to exactly one
-  principal — its own process-token user SID (SDDL `D:P(A;;GA;;;<sid>)`;
-  protected, no inherited `Everyone` ACE, no `SYSTEM` ACE). A *different* user
+  principal — its own process-token user SID (SDDL `O:<sid>D:P(A;;GA;;;<sid>)`;
+  protected, no inherited `Everyone` ACE, no `SYSTEM` ACE; `O:` stamps the owner
+  as the token *user* SID so an elevated daemon's owner isn't the Administrators
+  group, which the client owner-check would otherwise reject). A *different* user
   therefore cannot open the pipe at all — the OS enforces same-user **at
   connect time** — so every accepted connection is already privileged (there is
   no per-op peer-cred check; the DACL is the gate). The first instance is

@@ -8,8 +8,10 @@
 //! [`crate::credentials::privileged_op_permitted`]). On Windows we instead
 //! restrict the *pipe object itself* with a discretionary ACL that grants
 //! access to exactly one principal: the daemon's own process-token user SID
-//! (SDDL `D:P(A;;GA;;;<sid>)` — `P` = protected, so no inherited `Everyone`
-//! ACE; no `SYSTEM` ACE either, review S3). The OS therefore enforces
+//! (SDDL `O:<sid>D:P(A;;GA;;;<sid>)` — `P` = protected, so no inherited
+//! `Everyone` ACE; no `SYSTEM` ACE either, review S3; `O:` stamps the owner as
+//! the token *user* SID so an elevated daemon's owner is not the Administrators
+//! group). The OS therefore enforces
 //! same-user **at connect time**: a different user cannot open the pipe at
 //! all. Every connection the daemon accepts is already the owner's, so the
 //! per-op gate collapses to "always permitted" on Windows (the caller passes
@@ -154,9 +156,20 @@ impl Drop for OwnerSecurityDescriptor {
 }
 
 /// Build the owner-only security descriptor for `owner_sid`
-/// (SDDL `D:P(A;;GA;;;<sid>)`).
+/// (SDDL `O:<sid>D:P(A;;GA;;;<sid>)`).
+///
+/// The `O:` component **explicitly stamps the owner** as the token *user* SID.
+/// Without it, Windows fills the owner from the token's default owner, which for
+/// an elevated process is the *Administrators* group SID — and the client's
+/// owner-SID check (`win_pipe`, review B1) compares against `TokenUser`, so a
+/// defaulted owner would make an elevated daemon's own client reject the pipe.
 fn build_owner_sd(owner_sid: &str) -> io::Result<OwnerSecurityDescriptor> {
-    let sddl = wide(&format!("D:P(A;;GA;;;{owner_sid})"));
+    build_sd(&format!("O:{owner_sid}D:P(A;;GA;;;{owner_sid})"))
+}
+
+/// Parse an SDDL string into a self-relative security descriptor.
+fn build_sd(sddl: &str) -> io::Result<OwnerSecurityDescriptor> {
+    let sddl = wide(sddl);
     let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `sddl` is a valid NUL-terminated wide SDDL string. On success
     // (return != 0) a self-relative SD is allocated into `psd`; ownership
@@ -220,47 +233,97 @@ impl ControlPipe {
     /// enough for `CreateNamedPipeW` to copy it into the new pipe object.
     pub(crate) fn create_instance(&self, first: bool) -> io::Result<NamedPipeServer> {
         let sd = build_owner_sd(&self.owner_sid)?;
-        let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
-        if first {
-            open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
-        }
-        let mut sa = SECURITY_ATTRIBUTES {
-            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
-                .expect("SECURITY_ATTRIBUTES size fits u32"),
-            lpSecurityDescriptor: sd.0,
-            bInheritHandle: 0,
-        };
-        // SAFETY: `self.name` is a valid NUL-terminated wide pipe name; `sa`
-        // carries our owner-only SD and is valid for the duration of the call.
-        // `CreateNamedPipeW` copies the SD, so `self.sd` may outlive/be reused
-        // across instances. Returns `INVALID_HANDLE_VALUE` on failure.
-        let handle = unsafe {
-            CreateNamedPipeW(
-                self.name.as_ptr(),
-                open_mode,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES,
-                PIPE_BUFFER_BYTES,
-                PIPE_BUFFER_BYTES,
-                0,
-                &raw mut sa,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(last_os_error("CreateNamedPipe"));
-        }
-        // SAFETY: `handle` is a valid, overlapped named-pipe instance we own
-        // and do not otherwise touch; `NamedPipeServer` takes ownership of it
-        // (and closes it on drop).
-        unsafe { NamedPipeServer::from_raw_handle(handle.cast()) }
+        create_named_pipe_instance(&self.name, &sd, first)
     }
+}
+
+/// Create one overlapped byte-mode named-pipe server instance carrying the
+/// given security descriptor, wrapped for tokio. `first` sets
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` (fail if the name already exists). The SD is
+/// borrowed for the duration of the call — long enough for `CreateNamedPipeW`
+/// to copy it into the new pipe object.
+fn create_named_pipe_instance(
+    name: &[u16],
+    sd: &OwnerSecurityDescriptor,
+    first: bool,
+) -> io::Result<NamedPipeServer> {
+    let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+    if first {
+        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
+    let mut sa = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+            .expect("SECURITY_ATTRIBUTES size fits u32"),
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: 0,
+    };
+    // SAFETY: `name` is a valid NUL-terminated wide pipe name; `sa` carries the
+    // SD and is valid for the duration of the call. `CreateNamedPipeW` copies
+    // the SD, so it may outlive/be reused across instances. Returns
+    // `INVALID_HANDLE_VALUE` on failure.
+    let handle = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            open_mode,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            PIPE_BUFFER_BYTES,
+            PIPE_BUFFER_BYTES,
+            0,
+            &raw mut sa,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(last_os_error("CreateNamedPipe"));
+    }
+    // SAFETY: `handle` is a valid, overlapped named-pipe instance we own and do
+    // not otherwise touch; `NamedPipeServer` takes ownership (closes on drop).
+    unsafe { NamedPipeServer::from_raw_handle(handle.cast()) }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::os::windows::io::AsRawHandle as _;
+
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
     use tokio::net::windows::named_pipe::ClientOptions;
+
+    use super::*;
+
+    /// The owner SID of a live pipe handle (test-only; mirrors the client's
+    /// `win_pipe::pipe_owner_sid`). Panics on any Win32 failure.
+    fn owner_sid_of(handle: std::os::windows::io::RawHandle) -> String {
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `handle` is a live pipe; `GetSecurityInfo` writes the owner SID
+        // (into the SD it allocates at `psd`) and returns 0 on success.
+        let rc = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &raw mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut psd,
+            )
+        };
+        assert_eq!(rc, 0, "GetSecurityInfo failed: {rc}");
+        let mut sid_str = std::ptr::null_mut();
+        // SAFETY: `owner` is valid within the still-live `psd`.
+        unsafe { ConvertSidToStringSidW(owner, &raw mut sid_str) };
+        let s = u16_ptr_to_string(sid_str);
+        // SAFETY: free both allocations.
+        unsafe {
+            LocalFree(sid_str.cast());
+            LocalFree(psd);
+        }
+        s
+    }
 
     #[test]
     fn process_token_sid_is_a_sid_string() {
@@ -317,5 +380,42 @@ mod tests {
         let reply = lines.next_line().await.expect("read").expect("reply line");
         assert!(reply.contains(r#""ok":true"#), "unexpected reply: {reply}");
         server_task.await.expect("server task");
+    }
+
+    /// The pipe's owner is explicitly stamped as the token *user* SID — not
+    /// left to Windows' default (which is the Administrators group for an
+    /// elevated process, and would break the client's owner-SID check).
+    #[tokio::test]
+    async fn owner_is_stamped_as_token_user() {
+        let name = r"\\.\pipe\datamancer-test-owner-stamp";
+        let pipe = ControlPipe::bind(name).expect("bind");
+        let server = pipe.create_instance(true).expect("first instance");
+        let owner = owner_sid_of(server.as_raw_handle());
+        let me = process_token_sid().expect("token SID");
+        assert_eq!(
+            owner, me,
+            "pipe owner must be the token user SID (elevated-safe), not defaulted"
+        );
+    }
+
+    /// A principal that is **not** in the DACL is denied at connect. The DACL
+    /// grants only `LocalSystem` (S-1-5-18) while the owner stays this user (so
+    /// creation succeeds); this non-SYSTEM test process must then be refused —
+    /// proving the owner-only DACL is the authorization boundary, without
+    /// needing a second user account (review B3).
+    #[tokio::test]
+    async fn owner_dacl_denies_a_non_granted_principal() {
+        let name = r"\\.\pipe\datamancer-test-foreign-dacl";
+        let me = process_token_sid().expect("token SID");
+        let sd = build_sd(&format!("O:{me}D:P(A;;GA;;;S-1-5-18)")).expect("build sd");
+        let _server = create_named_pipe_instance(&wide(name), &sd, true).expect("create");
+        let err = ClientOptions::new()
+            .open(name)
+            .expect_err("a principal not in the DACL must be denied");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::PermissionDenied,
+            "expected access-denied for a non-granted principal, got {err:?}"
+        );
     }
 }

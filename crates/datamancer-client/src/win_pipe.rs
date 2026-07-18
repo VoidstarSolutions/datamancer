@@ -4,12 +4,15 @@
 //! # Why the owner check
 //!
 //! The daemon restricts its control pipe with an owner-only DACL, so a
-//! *different* user cannot open it at all (the OS denies the connect). But a
-//! same-user process could squat the well-known name, and — defense in depth —
-//! a bug that weakened the server DACL must never cause a client to stream
-//! credentials to a foreign endpoint. So before sending anything, the client
-//! reads the connected pipe's owner SID and requires it to equal this
-//! process's own token SID. Any mismatch or failure is fail-closed: the
+//! *different* user cannot open it at all (the OS denies the connect). The
+//! owner check is defense in depth: before sending anything, the client reads
+//! the connected pipe's owner SID and requires it to equal its own token SID,
+//! so a bug that weakened the server DACL cannot cause a client to stream
+//! credentials to a **foreign-owner** endpoint (a pipe owned by another user).
+//! It does *not* defend against a *same-user* squatter — that pipe has the same
+//! owner SID — but same-user is inside the trust boundary anyway, and the
+//! daemon's `FILE_FLAG_FIRST_PIPE_INSTANCE` already refuses to start on a
+//! cross-user pre-squat. Any mismatch or Win32 failure is fail-closed: the
 //! connection is rejected.
 //!
 //! # EXT-1 unsafe policy

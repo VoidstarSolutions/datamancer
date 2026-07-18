@@ -130,7 +130,8 @@ impl ControlConn {
         // (`\\.\pipe\datamancer\<user>\control`; see `crate::paths`).
         // `connect_verified` retries `ERROR_PIPE_BUSY` and — critically —
         // rejects the pipe unless its owner SID is this user's (review B1), so
-        // credentials never flow to a squatted or foreign endpoint.
+        // credentials never flow to a foreign-owner endpoint (a pipe owned by
+        // a different user).
         let stream = crate::win_pipe::connect_verified(path).await?;
         let (read, write) = tokio::io::split(stream);
         Ok(Self {

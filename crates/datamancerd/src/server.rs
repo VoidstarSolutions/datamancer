@@ -924,6 +924,14 @@ async fn dispatch_capabilities(dm: &Datamancer, provider: &str, symbols: &[Strin
 /// while an earlier one is being served. Every accepted connection is the
 /// daemon owner's (the owner-only DACL enforced that at connect), so the shared
 /// dispatch runs with `privileged = true`. See [`crate::win_control`].
+///
+/// The loop is **resilient and never returns on its own** (mirroring the Unix
+/// `accept_loop`, which logs and continues on accept errors): a failure to mint
+/// a pipe instance would otherwise leave the daemon running with no control
+/// surface — no shutdown, config, or credential access — which must not happen
+/// silently. Instead it logs loudly and retries with bounded backoff until it
+/// recovers. The supervisor tears this task down explicitly via `accept.abort()`
+/// during drain.
 #[cfg(windows)]
 async fn win_accept_loop(
     pipe: crate::win_control::ControlPipe,
@@ -933,29 +941,47 @@ async fn win_accept_loop(
     hub: Arc<CredentialHub>,
     config_hub: Arc<crate::config_hub::ConfigHub>,
 ) {
-    let mut server = first;
-    loop {
-        if let Err(e) = server.connect().await {
-            tracing::warn!(error = %e, "control pipe connect failed; recreating instance");
+    /// Mint the next pipe instance, retrying indefinitely with bounded backoff
+    /// so a transient failure can't kill the control surface.
+    async fn next_instance(
+        pipe: &crate::win_control::ControlPipe,
+    ) -> tokio::net::windows::named_pipe::NamedPipeServer {
+        const BACKOFF_START: Duration = Duration::from_millis(100);
+        const BACKOFF_MAX: Duration = Duration::from_secs(5);
+        let mut backoff = BACKOFF_START;
+        loop {
             match pipe.create_instance(false) {
-                Ok(next) => {
-                    server = next;
-                    continue;
-                }
+                Ok(server) => return server,
                 Err(e) => {
-                    tracing::error!(error = %e, "cannot recreate control pipe; accept loop stopping");
-                    return;
+                    tracing::error!(
+                        error = %e,
+                        backoff_ms = backoff.as_millis(),
+                        "cannot create control pipe instance; retrying (control surface degraded)"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
                 }
             }
         }
-        // Pre-create the next instance before serving this one.
-        let next = match pipe.create_instance(false) {
-            Ok(next) => next,
-            Err(e) => {
-                tracing::error!(error = %e, "cannot create next control pipe instance; accept loop stopping");
-                return;
-            }
-        };
+    }
+
+    let mut server = first;
+    // Backoff for the connect-error path, so a *persistently* failing
+    // `connect()` (instance succeeds to mint but never accepts) can't hot-spin.
+    // Reset on every healthy accept.
+    let mut connect_backoff = Duration::from_millis(100);
+    loop {
+        if let Err(e) = server.connect().await {
+            tracing::warn!(error = %e, backoff_ms = connect_backoff.as_millis(), "control pipe connect failed; recreating instance after backoff");
+            tokio::time::sleep(connect_backoff).await;
+            connect_backoff = (connect_backoff * 2).min(Duration::from_secs(5));
+            server = next_instance(&pipe).await;
+            continue;
+        }
+        connect_backoff = Duration::from_millis(100);
+        // Pre-create the next instance before serving this one, so a new client
+        // can always queue on a fresh instance.
+        let next = next_instance(&pipe).await;
         let connected = std::mem::replace(&mut server, next);
         let (read, write) = tokio::io::split(connected);
         tokio::spawn(serve_connection(
