@@ -35,7 +35,7 @@ jobs:
       ALPACA_PAPER_API_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
       ALPACA_PAPER_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: fail fast when secrets are absent
         run: |
           if [ -z "$ALPACA_PAPER_API_KEY_ID" ]; then
