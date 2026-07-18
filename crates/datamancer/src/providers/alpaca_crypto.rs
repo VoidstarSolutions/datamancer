@@ -37,8 +37,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
-    HistoryRequest, Instrument, InstrumentEntry, LiveHandle, MarketEvent, Price, Provider,
-    ProviderId, Quantity, Quote, Result, Seq, Timestamp, Trade,
+    HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent,
+    OrderType, Price, Provider, ProviderId, Quantity, Quote, Result, Seq, TimeInForce, Timestamp,
+    Trade,
 };
 use oxidized_alpaca::{
     AccountType, CryptoFeed, MarketDataClient, TradingClient,
@@ -71,22 +72,53 @@ fn provider_instrument(symbol: impl Into<String>) -> Instrument {
     )
 }
 
+/// Order types Alpaca accepts for a fractional crypto order (provider
+/// policy; not advertised per-asset — sourced from Alpaca's fractional-
+/// trading docs). Mirrors `alpaca::FRACTIONAL_ORDER_TYPES`; duplicated here
+/// because the two provider modules don't share a policy module.
+const FRACTIONAL_ORDER_TYPES: [OrderType; 4] = [
+    OrderType::Market,
+    OrderType::Limit,
+    OrderType::Stop,
+    OrderType::StopLimit,
+];
+/// Times-in-force Alpaca accepts for a fractional crypto order (`day` only).
+const FRACTIONAL_TIF: [TimeInForce; 1] = [TimeInForce::Day];
+
+/// Build capabilities for one Alpaca crypto `Asset`. Mirrors
+/// `alpaca::equity_capabilities` policy but reads `fractionable` off the
+/// asset rather than hardcoding it — crypto rows report it trivially true,
+/// but the honest thing is still to read the field.
+fn crypto_capabilities(asset: &Asset) -> InstrumentCapabilities {
+    let mut caps = InstrumentCapabilities::default();
+    caps.fractionable = Some(asset.fractionable);
+    caps.supports_notional_orders = Some(true);
+    caps.allowed_order_types = Some(FRACTIONAL_ORDER_TYPES.to_vec());
+    caps.allowed_tif = Some(FRACTIONAL_TIF.to_vec());
+    // Sizing increments (min_qty/qty_increment/price_increment/min_notional)
+    // stay None: oxidized_alpaca 0.0.10 Asset carries no sizing fields.
+    caps
+}
+
 /// Translate Alpaca's `/v2/assets` crypto rows into the datamancer
 /// catalog. Pure function — no client, no I/O — so it can be exercised
 /// against canned JSON fixtures without credentials. Skips non-tradable
 /// rows and asset classes outside crypto (Alpaca's `Crypto` filter on the
 /// request side should already handle this, but the guard is cheap and
 /// defends against API drift).
-fn crypto_assets_to_instruments(assets: &[Asset]) -> Vec<Instrument> {
+fn assets_to_entries(assets: &[Asset]) -> Vec<InstrumentEntry> {
     assets
         .iter()
         .filter(|a| a.tradable && matches!(a.class, AlpacaAssetClass::Crypto))
         .map(|a| {
-            Instrument::new(
+            let instrument = Instrument::new(
                 ProviderId::from_static(PROVIDER_ID),
                 AssetClass::Crypto,
                 a.symbol.clone(),
-            )
+            );
+            let mut entry = InstrumentEntry::bare(instrument);
+            entry.capabilities = Some(crypto_capabilities(a));
+            entry
         })
         .collect()
 }
@@ -374,10 +406,25 @@ impl Provider for AlpacaCryptoProvider {
                 provider: PROVIDER_ID.to_string(),
                 message: format!("list_assets: {e}"),
             })?;
-        Ok(crypto_assets_to_instruments(&assets)
-            .into_iter()
-            .map(InstrumentEntry::bare)
-            .collect())
+        Ok(assets_to_entries(&assets))
+    }
+
+    async fn capabilities(
+        &self,
+        instrument: &Instrument,
+    ) -> Result<Option<InstrumentCapabilities>> {
+        let trading = self.trading_client().ok_or_else(|| Error::Provider {
+            provider: PROVIDER_ID.to_string(),
+            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        })?;
+        let asset = trading
+            .get_asset(instrument.symbol())
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("get_asset: {e}"),
+            })?;
+        Ok(Some(crypto_capabilities(&asset)))
     }
 }
 
@@ -1277,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn crypto_assets_to_instruments_filters_and_maps() {
+    fn assets_to_entries_filters_and_maps() {
         let json = r#"[
             {
                 "id":"1","class":"crypto","exchange":"CRYPTO","symbol":"BTC/USD",
@@ -1299,15 +1346,38 @@ mod tests {
             }
         ]"#;
         let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
-        let instruments = crypto_assets_to_instruments(&assets);
+        let entries = assets_to_entries(&assets);
         // BTC/USD passes; DOGE/USD filtered (not tradable); AAPL filtered
         // (wrong class — guards against API drift).
-        let symbols: Vec<&str> = instruments.iter().map(Instrument::symbol).collect();
+        let symbols: Vec<&str> = entries.iter().map(|e| e.instrument.symbol()).collect();
         assert_eq!(symbols, vec!["BTC/USD"]);
-        for i in &instruments {
-            assert_eq!(i.provider().as_str(), PROVIDER_ID);
-            assert_eq!(i.asset_class(), AssetClass::Crypto);
+        for e in &entries {
+            assert_eq!(e.instrument.provider().as_str(), PROVIDER_ID);
+            assert_eq!(e.instrument.asset_class(), AssetClass::Crypto);
         }
+    }
+
+    #[test]
+    fn assets_to_entries_maps_fractional_flag_and_policy() {
+        let json = r#"[
+            {
+                "id":"1","class":"crypto","exchange":"CRYPTO","symbol":"BTC/USD",
+                "name":"Bitcoin","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":true,"attributes":[]
+            }
+        ]"#;
+        let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
+        let entries = assets_to_entries(&assets);
+        let frac = entries
+            .iter()
+            .find(|e| e.instrument.symbol() == "BTC/USD")
+            .unwrap();
+        let caps = frac.capabilities.as_ref().unwrap();
+        assert_eq!(caps.fractionable, Some(true));
+        assert_eq!(caps.supports_notional_orders, Some(true));
+        assert_eq!(caps.allowed_tif.as_deref(), Some(&[TimeInForce::Day][..]));
+        assert!(caps.min_qty.is_none()); // not advertised
     }
 
     #[test]

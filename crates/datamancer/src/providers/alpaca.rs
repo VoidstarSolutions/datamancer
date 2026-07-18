@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     Adjustment, AssetClass, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
-    HistoryRequest, Instrument, InstrumentEntry, LiveHandle, MarketEvent, Price, Provider,
-    ProviderId, Quantity, Result, Seq, Timestamp, Trade,
+    HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent,
+    OrderType, Price, Provider, ProviderId, Quantity, Result, Seq, TimeInForce, Timestamp, Trade,
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
@@ -61,6 +61,29 @@ fn provider_instrument(symbol: impl Into<String>) -> Instrument {
     )
 }
 
+/// Order types Alpaca accepts for a fractional equity order (provider policy;
+/// not advertised per-asset — sourced from Alpaca's fractional-trading docs).
+const FRACTIONAL_ORDER_TYPES: [OrderType; 4] = [
+    OrderType::Market,
+    OrderType::Limit,
+    OrderType::Stop,
+    OrderType::StopLimit,
+];
+/// Times-in-force Alpaca accepts for a fractional equity order (`day` only).
+const FRACTIONAL_TIF: [TimeInForce; 1] = [TimeInForce::Day];
+
+/// Build capabilities for one Alpaca equity `Asset`.
+fn equity_capabilities(asset: &Asset) -> InstrumentCapabilities {
+    let mut caps = InstrumentCapabilities::default();
+    caps.fractionable = Some(asset.fractionable);
+    caps.supports_notional_orders = Some(true);
+    caps.allowed_order_types = Some(FRACTIONAL_ORDER_TYPES.to_vec());
+    caps.allowed_tif = Some(FRACTIONAL_TIF.to_vec());
+    // Sizing increments (min_qty/qty_increment/price_increment/min_notional)
+    // stay None: oxidized_alpaca 0.0.10 Asset carries no sizing fields.
+    caps
+}
+
 /// Translate Alpaca's `/v2/assets` rows into the datamancer instrument
 /// catalog. Pure function — no client, no I/O — so it can be exercised
 /// against canned JSON fixtures without credentials.
@@ -70,7 +93,7 @@ fn provider_instrument(symbol: impl Into<String>) -> Instrument {
 /// no explicit ETF flag on the row itself, so for now they land as
 /// [`AssetClass::Equity`]; a future revision can read the `attributes`
 /// vector (e.g. `"etp"`) to promote them to [`AssetClass::Etf`].
-fn assets_to_instruments(assets: &[Asset]) -> Vec<Instrument> {
+fn assets_to_entries(assets: &[Asset]) -> Vec<InstrumentEntry> {
     assets
         .iter()
         .filter(|a| a.tradable)
@@ -81,11 +104,14 @@ fn assets_to_instruments(assets: &[Asset]) -> Vec<Instrument> {
                 // the dedicated crypto provider handles plain crypto.
                 _ => return None,
             };
-            Some(Instrument::new(
+            let instrument = Instrument::new(
                 ProviderId::from_static(PROVIDER_ID),
                 asset_class,
                 a.symbol.clone(),
-            ))
+            );
+            let mut entry = InstrumentEntry::bare(instrument);
+            entry.capabilities = Some(equity_capabilities(a));
+            Some(entry)
         })
         .collect()
 }
@@ -363,10 +389,25 @@ impl Provider for AlpacaProvider {
                 provider: PROVIDER_ID.to_string(),
                 message: format!("list_assets: {e}"),
             })?;
-        Ok(assets_to_instruments(&assets)
-            .into_iter()
-            .map(InstrumentEntry::bare)
-            .collect())
+        Ok(assets_to_entries(&assets))
+    }
+
+    async fn capabilities(
+        &self,
+        instrument: &Instrument,
+    ) -> Result<Option<InstrumentCapabilities>> {
+        let trading = self.rest_clients().trading.ok_or_else(|| Error::Provider {
+            provider: PROVIDER_ID.to_string(),
+            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        })?;
+        let asset = trading
+            .get_asset(instrument.symbol())
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("get_asset: {e}"),
+            })?;
+        Ok(Some(equity_capabilities(&asset)))
     }
 }
 
@@ -1424,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn assets_to_instruments_filters_and_maps() {
+    fn assets_to_entries_filters_and_maps() {
         // Fixture mirrors Alpaca's `/v2/assets` JSON, including a row that
         // must be filtered (non-tradable) and an asset class outside v0.
         let json = r#"[
@@ -1454,13 +1495,49 @@ mod tests {
             }
         ]"#;
         let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
-        let instruments = assets_to_instruments(&assets);
+        let entries = assets_to_entries(&assets);
         // AAPL and SPY pass; GE filtered (not tradable); option skipped.
-        let symbols: Vec<&str> = instruments.iter().map(Instrument::symbol).collect();
+        let symbols: Vec<&str> = entries.iter().map(|e| e.instrument.symbol()).collect();
         assert_eq!(symbols, vec!["AAPL", "SPY"]);
-        for i in &instruments {
-            assert_eq!(i.provider().as_str(), PROVIDER_ID);
-            assert_eq!(i.asset_class(), AssetClass::Equity);
+        for e in &entries {
+            assert_eq!(e.instrument.provider().as_str(), PROVIDER_ID);
+            assert_eq!(e.instrument.asset_class(), AssetClass::Equity);
         }
+    }
+
+    #[test]
+    fn assets_to_entries_maps_fractional_flag_and_policy() {
+        let json = r#"[
+            {
+                "id":"1","class":"us_equity","exchange":"NASDAQ","symbol":"AAPL",
+                "name":"Apple Inc.","status":"active","tradable":true,
+                "marginable":true,"shortable":true,"easy_to_borrow":true,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"2","class":"us_equity","exchange":"NYSE","symbol":"GE",
+                "name":"General Electric","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":false,"attributes":[]
+            }
+        ]"#;
+        let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
+        let entries = assets_to_entries(&assets);
+        let frac = entries
+            .iter()
+            .find(|e| e.instrument.symbol() == "AAPL")
+            .unwrap();
+        let caps = frac.capabilities.as_ref().unwrap();
+        assert_eq!(caps.fractionable, Some(true));
+        assert_eq!(caps.supports_notional_orders, Some(true));
+        assert_eq!(caps.allowed_tif.as_deref(), Some(&[TimeInForce::Day][..]));
+        assert!(caps.min_qty.is_none()); // not advertised
+
+        let non_frac = entries
+            .iter()
+            .find(|e| e.instrument.symbol() == "GE")
+            .unwrap();
+        let non_frac_caps = non_frac.capabilities.as_ref().unwrap();
+        assert_eq!(non_frac_caps.fractionable, Some(false));
     }
 }
