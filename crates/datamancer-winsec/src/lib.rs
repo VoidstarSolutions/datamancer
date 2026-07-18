@@ -18,3 +18,10 @@
 
 mod integrity;
 pub use integrity::{IntegrityClass, classify, integrity_ok};
+
+#[cfg(windows)]
+mod ffi;
+#[cfg(windows)]
+pub use ffi::{
+    client_process_integrity, current_process_integrity, current_process_token_sid, owner_sid_of,
+};
