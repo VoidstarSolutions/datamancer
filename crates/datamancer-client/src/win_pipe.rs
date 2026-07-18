@@ -1,198 +1,96 @@
-//! Windows named-pipe client helpers: connect to the daemon's control pipe
-//! and **verify its owner** before trusting it (review B1).
+//! Windows named-pipe client helpers: connect to the daemon's control pipe and,
+//! before trusting it, (1) verify **this process** is at Medium integrity and
+//! (2) verify the connected pipe's **owner SID** equals this process's token SID
+//! (review B1).
 //!
-//! # Why the owner check
+//! All Win32 FFI lives in `datamancer-winsec`; this module is safe Rust (the
+//! crate is `#![forbid(unsafe_code)]`).
+//!
+//! # Owner check
 //!
 //! The daemon restricts its control pipe with an owner-only DACL, so a
-//! *different* user cannot open it at all (the OS denies the connect). The
-//! owner check is defense in depth: before sending anything, the client reads
-//! the connected pipe's owner SID and requires it to equal its own token SID,
-//! so a bug that weakened the server DACL cannot cause a client to stream
-//! credentials to a **foreign-owner** endpoint (a pipe owned by another user).
-//! It does *not* defend against a *same-user* squatter — that pipe has the same
-//! owner SID — but same-user is inside the trust boundary anyway, and the
-//! daemon's `FILE_FLAG_FIRST_PIPE_INSTANCE` already refuses to start on a
-//! cross-user pre-squat. Any mismatch or Win32 failure is fail-closed: the
-//! connection is rejected.
+//! *different* user cannot open it. The owner check is defense in depth: before
+//! sending anything, the client requires the connected pipe's owner SID to equal
+//! its own token SID, so a bug that weakened the server DACL cannot cause a
+//! client to stream credentials to a foreign-owner endpoint. Any mismatch or
+//! failure is fail-closed.
 //!
-//! # EXT-1 unsafe policy
+//! # Integrity self-check
 //!
-//! The crate is `#![deny(unsafe_code)]` on Windows (it stays `forbid` on
-//! Unix/macOS). This module is the crate's *single* `#[allow(unsafe_code)]`
-//! exception; all Win32 FFI is confined here, each `unsafe` block carries a
-//! `// SAFETY:` proof, and the public API is entirely safe Rust. The
-//! token-SID helper is intentionally duplicated from `datamancerd`'s
-//! `win_control` rather than shared through a third crate — keeping each
-//! crate's Win32 surface to one audited module (the `datamancer-credentials`
-//! crate stays `forbid(unsafe_code)`).
-#![allow(unsafe_code)]
+//! Mandatory Integrity Control gates the connect independently of the DACL: a
+//! below-Medium client is refused by the OS at connect (opaque access-denied).
+//! Checking our own integrity first turns that into a clear message, and also
+//! refuses an elevated client (which the daemon would reject anyway).
+//! `DATAMANCER_ALLOW_ANY_INTEGRITY` overrides this local check.
 
 use std::io;
-use std::os::windows::io::{AsRawHandle as _, RawHandle};
+use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 use std::time::Duration;
 
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_PIPE_BUSY, LocalFree};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT,
-};
-use windows_sys::Win32::Security::{
-    GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY,
-    TOKEN_USER, TokenUser,
-};
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// Bounded `ERROR_PIPE_BUSY` retry: all instances busy is transient (the daemon
-/// pre-creates the next instance on each accept), so back off briefly and
-/// retry rather than fail (review N6). ~20 × 50 ms ≈ 1 s ceiling.
+/// pre-creates the next instance on each accept), so back off briefly and retry.
+/// ~20 × 50 ms ≈ 1 s ceiling.
 const CONNECT_ATTEMPTS: u32 = 20;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
+/// Win32 `ERROR_PIPE_BUSY` (winerror.h). Kept as a literal so this crate needs
+/// no `windows-sys` dependency.
+const ERROR_PIPE_BUSY: i32 = 231;
 
-fn last_os_error(context: &str) -> io::Error {
-    let e = io::Error::last_os_error();
-    io::Error::new(e.kind(), format!("{context}: {e}"))
-}
-
-/// Read a NUL-terminated wide string allocated by a `*W` API into a `String`.
-fn u16_ptr_to_string(p: *const u16) -> String {
-    // SAFETY: `p` is a NUL-terminated wide string produced by a Win32 `*W`
-    // allocator (`ConvertSidToStringSidW`); we walk to the terminator to
-    // measure its length, reading only within the allocation.
-    let len = unsafe {
-        let mut n = 0usize;
-        while *p.add(n) != 0 {
-            n += 1;
-        }
-        n
-    };
-    // SAFETY: `p..p+len` is exactly the wide string just measured (excludes the
-    // terminator), valid for reads for `len` `u16`s.
-    let slice = unsafe { std::slice::from_raw_parts(p, len) };
-    String::from_utf16_lossy(slice)
-}
-
-/// This process token's **user SID** as an `S-1-…` string (review S1: the
-/// authoritative running-user identity, not a spoofable name lookup).
-fn own_token_sid() -> io::Result<String> {
-    let mut token = std::ptr::null_mut();
-    // SAFETY: `GetCurrentProcess` returns a pseudo-handle; `OpenProcessToken`
-    // writes a real, owned token handle into `token` on success (return != 0),
-    // closed below.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(last_os_error("OpenProcessToken"));
+/// Operator override: `DATAMANCER_ALLOW_ANY_INTEGRITY` set to a truthy value
+/// relaxes the client's own integrity self-check (the daemon remains the
+/// authority for what it accepts).
+fn integrity_override() -> bool {
+    match std::env::var("DATAMANCER_ALLOW_ANY_INTEGRITY") {
+        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
     }
-    let mut len = 0u32;
-    // SAFETY: documented size-probe form — null buffer + 0 length makes
-    // `GetTokenInformation` report the needed size in `len` and fail; the
-    // (unwritten) buffer is not read.
-    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut len) };
-    let mut buf = vec![0u8; len as usize];
-    // SAFETY: `buf` is exactly `len` bytes — the size the probe reported — into
-    // which `TokenUser` writes a `TOKEN_USER` (SID trailing).
-    let ok = unsafe {
-        GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &raw mut len)
-    };
-    // SAFETY: `token` is the handle we opened and still own; close it.
-    unsafe { CloseHandle(token) };
-    if ok == 0 {
-        return Err(last_os_error("GetTokenInformation"));
-    }
-    // SAFETY: on success `buf` holds a `TOKEN_USER`. Read it out *unaligned* —
-    // a `Vec<u8>` buffer is not guaranteed to meet `TOKEN_USER`'s alignment, so
-    // forming a `&TOKEN_USER` reference would be UB. The copied `User.Sid`
-    // still points into `buf`, which outlives the `ConvertSidToStringSidW`
-    // call below.
-    let token_user = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read_unaligned() };
-    let mut sid_str = std::ptr::null_mut();
-    // SAFETY: `token_user.User.Sid` is a valid SID within `buf`;
-    // `ConvertSidToStringSidW` allocates a wide string into `sid_str` on
-    // success (return != 0), freed below.
-    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &raw mut sid_str) } == 0 {
-        return Err(last_os_error("ConvertSidToStringSid"));
-    }
-    let s = u16_ptr_to_string(sid_str);
-    // SAFETY: `sid_str` was allocated by `ConvertSidToStringSidW`; free it.
-    unsafe { LocalFree(sid_str.cast()) };
-    Ok(s)
-}
-
-/// The **owner SID** of a connected pipe handle, as an `S-1-…` string.
-fn pipe_owner_sid(handle: RawHandle) -> io::Result<String> {
-    let mut owner: PSID = std::ptr::null_mut();
-    let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: `handle` is a live kernel object (a connected named pipe).
-    // `GetSecurityInfo` writes the owner SID (pointing within the SD it
-    // allocates into `psd`) and returns `ERROR_SUCCESS` (0) on success; `psd`
-    // is freed below. `owner` aliases into `psd`, so it must be read before the
-    // free.
-    let rc = unsafe {
-        GetSecurityInfo(
-            handle,
-            SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            &raw mut owner,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut psd,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::from_raw_os_error(rc.cast_signed()));
-    }
-    let mut sid_str = std::ptr::null_mut();
-    // SAFETY: `owner` is a valid SID within the still-live `psd`;
-    // `ConvertSidToStringSidW` allocates a wide string into `sid_str` on
-    // success (return != 0).
-    let ok = unsafe { ConvertSidToStringSidW(owner, &raw mut sid_str) };
-    let converted = if ok == 0 {
-        Err(last_os_error("ConvertSidToStringSid"))
-    } else {
-        Ok(u16_ptr_to_string(sid_str))
-    };
-    // SAFETY: free the SD allocated by `GetSecurityInfo` and, if allocated, the
-    // string from `ConvertSidToStringSidW`. `LocalFree(NULL)` is a no-op.
-    unsafe {
-        LocalFree(sid_str.cast());
-        LocalFree(psd);
-    }
-    converted
 }
 
 /// Fail-closed identity gate: the connected pipe's owner SID must equal this
 /// process's own token SID (review B1).
-fn verify_owner_is_self(handle: RawHandle) -> io::Result<()> {
-    let expected = own_token_sid()?;
-    let actual = pipe_owner_sid(handle)?;
+fn verify_owner_is_self(handle: std::os::windows::io::RawHandle) -> io::Result<()> {
+    let expected = datamancer_winsec::current_process_token_sid()?;
+    let actual = datamancer_winsec::owner_sid_of(handle)?;
     if expected == actual {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "control pipe owner SID ({actual}) does not match this user ({expected}); \
-                 refusing to use it"
+                "control pipe owner SID ({actual}) does not match this user \
+                 ({expected}); refusing to use it"
             ),
         ))
     }
 }
 
-/// Connect to the daemon's control pipe and verify its owner before returning.
-///
-/// Retries transient `ERROR_PIPE_BUSY` (all instances momentarily busy), then
-/// runs the B1 owner-identity check. Any owner mismatch or Win32 failure is
-/// returned as an `io::Error` — the caller must treat it as a hard connect
-/// failure and send nothing.
+/// Connect to the daemon's control pipe and verify integrity + owner before
+/// returning. Any failure is a hard connect error — the caller must send
+/// nothing.
 pub(crate) async fn connect_verified(path: &Path) -> io::Result<NamedPipeClient> {
+    // Integrity self-check first: a clear message beats an opaque access-denied.
+    let rid = datamancer_winsec::current_process_integrity()?;
+    if !datamancer_winsec::integrity_ok(rid, integrity_override()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "this process is running at {} integrity; the datamancer control \
+                 pipe requires Medium integrity to reach a same-user daemon. \
+                 Re-launch without elevation (or below-Medium sandboxing), or set \
+                 DATAMANCER_ALLOW_ANY_INTEGRITY=1 to override.",
+                datamancer_winsec::classify(rid).describe()
+            ),
+        ));
+    }
+
     let mut attempts = 0u32;
     let client = loop {
         match ClientOptions::new().open(path) {
             Ok(client) => break client,
-            Err(e)
-                if e.raw_os_error() == Some(ERROR_PIPE_BUSY.cast_signed())
-                    && attempts < CONNECT_ATTEMPTS =>
-            {
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempts < CONNECT_ATTEMPTS => {
                 attempts += 1;
                 tokio::time::sleep(CONNECT_RETRY_DELAY).await;
             }
@@ -201,15 +99,4 @@ pub(crate) async fn connect_verified(path: &Path) -> io::Result<NamedPipeClient>
     };
     verify_owner_is_self(client.as_raw_handle())?;
     Ok(client)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn own_token_sid_is_a_sid_string() {
-        let sid = own_token_sid().expect("token SID");
-        assert!(sid.starts_with("S-1-"), "not a SID: {sid}");
-    }
 }

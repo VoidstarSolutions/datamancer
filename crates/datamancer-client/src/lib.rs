@@ -7,13 +7,10 @@
 //! the JSON shapes and stable code strings here must not change without a
 //! breaking-change review — they are regression-guarded by tests.
 //!
-//! EXT-1: `#![forbid(unsafe_code)]` everywhere except Windows, where the
-//! named-pipe client verifies the daemon pipe's owner SID before sending
-//! credentials (review B1) and so needs Win32 FFI. There it relaxes to
-//! `#![deny(unsafe_code)]` with a *single* scoped `#[allow(unsafe_code)]`
-//! confined to the audited `win_pipe` module.
-#![cfg_attr(not(windows), forbid(unsafe_code))]
-#![cfg_attr(windows, deny(unsafe_code))]
+//! `#![forbid(unsafe_code)]` on every platform: the Windows named-pipe
+//! client's owner-SID + integrity checks (review B1) delegate all Win32 FFI
+//! to the shared, audited `datamancer-winsec` crate.
+#![forbid(unsafe_code)]
 
 mod client;
 mod error;

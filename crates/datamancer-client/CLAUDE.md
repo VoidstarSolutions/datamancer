@@ -6,10 +6,12 @@ Consumer-side surface for datamancerd: the shared control vocabulary
 
 ## Invariants / stance
 
-- **`#![forbid(unsafe_code)]`** (EXT-1 exception: on **Windows** the crate
-  relaxes to `#![deny(unsafe_code)]` with one scoped `#[allow(unsafe_code)]`
-  confined to `win_pipe` — the named-pipe owner-SID identity check before
-  privileged sends, #36; non-Windows stays `forbid`), `[lints] workspace = true`.
+- **`#![forbid(unsafe_code)]` on every platform** (no EXT-1 exception): the
+  Windows named-pipe owner-SID + integrity checks before privileged sends
+  (review B1, #36) live in `win_pipe`, but all Win32 FFI is delegated to the
+  shared, audited `datamancer-winsec` crate — this crate itself no longer
+  depends on `windows-sys` and has no `unsafe` of its own. `[lints] workspace
+  = true`.
 - **Depends on `datamancer-core` + the transport crates only — never the
   `datamancer` orchestrator.** The orchestrator re-exports this crate
   (features `client-ws`/`client-iceoryx2`), not the reverse.

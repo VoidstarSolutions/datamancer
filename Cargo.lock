@@ -901,6 +901,7 @@ dependencies = [
  "datamancer-core",
  "datamancer-transport-iceoryx2",
  "datamancer-transport-ws",
+ "datamancer-winsec",
  "directories",
  "futures",
  "iceoryx2",
@@ -911,7 +912,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
