@@ -109,6 +109,29 @@ pub trait Provider: Send + Sync + 'static {
     fn enabled(&self) -> bool {
         true
     }
+
+    /// One-shot most-recent value for a symbol, for immediate consumer feedback
+    /// when a live subscription opens. Cold-boundary, off the per-message hot
+    /// path — datamancer calls this at most once per authoritative live session
+    /// and never per websocket frame.
+    ///
+    /// Returns the most recent [`MarketEvent`] of `kind` for `instrument`, or
+    /// `None` when the provider has no snapshot surface or nothing is available.
+    /// `seq` on the returned event is a placeholder (`Seq(0)`); the authoritative
+    /// controller re-stamps it in canonical delivery order, exactly as for live
+    /// and backfill data.
+    ///
+    /// Default returns `None` — providers without a snapshot/latest endpoint
+    /// (test fakes, replay-only sources) leave this alone and the live-seed step
+    /// gracefully no-ops.
+    async fn latest(
+        &self,
+        instrument: &Instrument,
+        kind: EventKind,
+    ) -> Result<Option<MarketEvent>> {
+        let _ = (instrument, kind);
+        Ok(None)
+    }
 }
 
 /// Provider-side accounting sink for metrics invisible at datamancer's cold
@@ -211,5 +234,14 @@ mod tests {
     fn default_provider_metrics_is_none() {
         let p = BareProvider;
         assert!(p.metrics().is_none());
+    }
+
+    #[tokio::test]
+    async fn default_provider_latest_is_none() {
+        use crate::instrument::{AssetClass, ProviderId};
+        let p = BareProvider;
+        let inst = Instrument::new(ProviderId::from_static("bare"), AssetClass::Equity, "AAPL");
+        let got = p.latest(&inst, EventKind::Trade).await.unwrap();
+        assert!(got.is_none());
     }
 }
