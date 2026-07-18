@@ -52,9 +52,21 @@ const ERROR_PIPE_BUSY: i32 = 231;
 /// relaxes the client's own integrity self-check (the daemon remains the
 /// authority for what it accepts).
 fn integrity_override() -> bool {
-    match std::env::var("DATAMANCER_ALLOW_ANY_INTEGRITY") {
-        Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
+    integrity_override_from(
+        std::env::var("DATAMANCER_ALLOW_ANY_INTEGRITY")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse of the override value, split out from the env read (no I/O) so the
+/// truthy/falsy matrix is unit-tested without touching process env — the same
+/// pure-logic split winsec uses for `integrity_ok`. Truthy = present, non-empty,
+/// and not an explicit off value (`0` / `false`, case-insensitive).
+fn integrity_override_from(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+        None => false,
     }
 }
 
@@ -108,4 +120,26 @@ pub(crate) async fn connect_verified(path: &Path) -> io::Result<NamedPipeClient>
     };
     verify_owner_is_self(client.as_raw_handle())?;
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::integrity_override_from;
+
+    #[test]
+    fn override_parses_truthy_and_falsy() {
+        // Truthy: present and not one of the explicit "off" spellings.
+        assert!(integrity_override_from(Some("1")));
+        assert!(integrity_override_from(Some("true")));
+        assert!(integrity_override_from(Some("yes")));
+        assert!(integrity_override_from(Some("anything")));
+        // Falsy: absent (env unset), empty, or an explicit off value — the last
+        // case-insensitive so `FALSE`/`False` are honored too.
+        assert!(!integrity_override_from(None));
+        assert!(!integrity_override_from(Some("")));
+        assert!(!integrity_override_from(Some("0")));
+        assert!(!integrity_override_from(Some("false")));
+        assert!(!integrity_override_from(Some("FALSE")));
+        assert!(!integrity_override_from(Some("False")));
+    }
 }

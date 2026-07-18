@@ -120,6 +120,10 @@ jobs:
           # Lints the Win32 modules (win_control / win_pipe) that no other job sees.
           cargo clippy -p datamancerd --all-targets -- -D warnings
           cargo clippy -p datamancer-client --features app --all-targets -- -D warnings
+          # winsec's cfg(windows) Win32 FFI readers (token/owner SID + integrity)
+          # run nowhere else: the Linux job cannot compile them, and the pure
+          # classifier it does run covers only the branch logic, not the reads.
+          cargo test -p datamancer-winsec
           # Owner-DACL pipe + client owner-SID check. These create real pipes but
           # no iceoryx2 node, so they run here (the full daemon needs an iceoryx2
           # runtime, which is not yet available on Windows — a later phase).
