@@ -30,6 +30,13 @@ struct FakeProviderState {
     /// sending whatever `history` is queued — models a provider that fails the
     /// fetch (missing credentials, auth rejection, mid-stream transport fault).
     history_error: Option<String>,
+    /// Value returned by `latest`; `None` models a provider with no snapshot.
+    latest: Option<MarketEvent>,
+    /// Count of `latest` calls, so tests can assert it is never called under backfill.
+    latest_calls: usize,
+    /// When set, `latest` awaits this before returning — lets a test force a
+    /// live data event to win the race.
+    latest_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 struct FakeProvider {
@@ -76,6 +83,18 @@ impl FakeController {
     async fn set_history_error(&self, message: &str) {
         self.state.lock().await.history_error = Some(message.to_string());
     }
+
+    async fn set_latest(&self, ev: MarketEvent) {
+        self.state.lock().await.latest = Some(ev);
+    }
+
+    async fn set_latest_gate(&self, gate: Arc<tokio::sync::Notify>) {
+        self.state.lock().await.latest_gate = Some(gate);
+    }
+
+    async fn latest_calls(&self) -> usize {
+        self.state.lock().await.latest_calls
+    }
 }
 
 #[async_trait]
@@ -115,6 +134,21 @@ impl Provider for FakeProvider {
             });
         }
         Ok(())
+    }
+    async fn latest(
+        &self,
+        _instrument: &Instrument,
+        _kind: EventKind,
+    ) -> Result<Option<MarketEvent>> {
+        let (ev, gate) = {
+            let mut guard = self.state.lock().await;
+            guard.latest_calls += 1;
+            (guard.latest.clone(), guard.latest_gate.clone())
+        };
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        Ok(ev)
     }
 }
 
@@ -895,4 +929,211 @@ async fn write_tap_log_without_a_log_is_rejected() {
         Err(other) => panic!("expected PersistenceRequired, got {other:?}"),
         Ok(_) => panic!("expected PersistenceRequired, got Ok"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live latest-value seed tests
+// ---------------------------------------------------------------------------
+
+fn trade_price(ev: &MarketEvent) -> f64 {
+    match ev {
+        MarketEvent::Trade(t) => t.price.to_f64(),
+        other => panic!("expected Trade, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn seed_wins_when_no_live_data_yet() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.expect("take events");
+
+    // No live data pushed yet: the seed is the first event, stamped seq 0.
+    let first = stream.next().await.expect("seed event");
+    assert_eq!(trade_price(&first), 999.0);
+    assert_eq!(first.seq(), Some(Seq(0)));
+
+    // Live ticks follow, stamped after the seed.
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let second = stream.next().await.expect("live event");
+    assert_eq!(trade_price(&second), 10.0);
+    assert_eq!(second.seq(), Some(Seq(1)));
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn seed_discarded_when_live_data_wins() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await; // distinctive price
+    ctrl.set_latest_gate(gate.clone()).await; // latest() blocks until released
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.expect("take events");
+
+    // A live trade arrives and is delivered while latest() is still gated.
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let first = stream.next().await.expect("live event");
+    assert_eq!(trade_price(&first), 10.0);
+    assert_eq!(first.seq(), Some(Seq(0)));
+
+    // Release the seed: data was already delivered, so it must be discarded
+    // (consuming no seq). A following live trade proves the seed never appears.
+    gate.notify_one();
+    ctrl.push_live(trade("AAPL", 200, 11.0)).await;
+    let second = stream.next().await.expect("live event");
+    assert_eq!(trade_price(&second), 11.0);
+    assert_eq!(second.seq(), Some(Seq(1)));
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn no_seed_when_latest_returns_none() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    // latest not set -> returns None.
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.expect("take events");
+
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let first = stream.next().await.expect("live event");
+    assert_eq!(trade_price(&first), 10.0);
+    assert_eq!(first.seq(), Some(Seq(0))); // no seed consumed seq 0
+}
+
+#[tokio::test]
+async fn no_seed_under_backfill() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    ctrl.set_history(vec![trade("AAPL", 1, 1.0)]).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: Some(Timestamp(1)),
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.expect("take events");
+    // Drain the backfilled event so the session is fully wired before asserting.
+    let _ = stream.next().await;
+
+    assert_eq!(
+        ctrl.latest_calls().await,
+        0,
+        "latest must not be called under backfill"
+    );
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn seed_is_teed_to_tap_log() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    let log = std::sync::Arc::new(TursoTapLog::open(TursoTapLogConfig::Memory).await.unwrap());
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .tap_log_arc(log.clone())
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none().with_tap_log(true),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.expect("take events");
+
+    let first = stream.next().await.expect("seed event");
+    assert_eq!(trade_price(&first), 999.0);
+    log.flush().await.unwrap();
+
+    let source = log.as_replay_source();
+    let mut replay = source
+        .open(ReplayRequest {
+            instruments: vec![inst("AAPL")],
+            kinds: vec![EventKind::Trade],
+            from: Timestamp(i64::MIN),
+            to: Timestamp(i64::MAX),
+        })
+        .await
+        .unwrap();
+    let mut tss = Vec::new();
+    while let Some(ev) = replay.next().await {
+        if let MarketEvent::Trade(t) = ev {
+            tss.push(t.source_ts.0);
+        }
+    }
+    assert_eq!(tss, vec![5], "seed must be persisted to the tap log");
 }
