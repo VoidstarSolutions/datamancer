@@ -534,7 +534,8 @@ impl Server {
                 format!(
                     "datamancerd is running at {} integrity; the control pipe \
                      requires Medium integrity so same-user clients can connect. \
-                     Re-launch without elevation, or set \
+                     Re-launch the daemon at Medium integrity (neither elevated \
+                     nor below-Medium sandboxed), or set \
                      [server].allow_any_integrity = true to override.",
                     datamancer_winsec::classify(rid).describe()
                 ),
