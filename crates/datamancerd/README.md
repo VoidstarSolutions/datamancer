@@ -323,7 +323,7 @@ One JSON object per line; one reply line per request.
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
 {"op":"capabilities","provider":"alpaca","symbols":["AAPL","MSFT"]}
   -> {"ok":true,"capabilities":[{"instrument":{ /* Instrument */ },"capabilities":{ /* InstrumentCapabilities, optional */ }}]}
-{"op":"ping"}          -> {"ok":true,"version":"0.5.0","credential_backend":"keychain"}
+{"op":"ping"}          -> {"ok":true,"version":"0.7.0","credential_backend":"keychain"}
 {"op":"set-credentials","provider":"alpaca-crypto","credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
   -> {"ok":true}
 {"op":"get-credentials","provider":"alpaca-crypto"}

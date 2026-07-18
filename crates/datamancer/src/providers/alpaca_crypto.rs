@@ -422,7 +422,7 @@ impl Provider for AlpacaCryptoProvider {
             .await
             .map_err(|e| Error::Provider {
                 provider: PROVIDER_ID.to_string(),
-                message: format!("get_asset: {e}"),
+                message: format!("get_asset({}): {e}", instrument.symbol()),
             })?;
         Ok(Some(crypto_capabilities(&asset)))
     }

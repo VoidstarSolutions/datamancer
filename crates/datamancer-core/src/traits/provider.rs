@@ -97,6 +97,11 @@ pub trait Provider: Send + Sync + 'static {
     ///
     /// Default returns `None` — providers without a reference-data surface leave
     /// this alone.
+    ///
+    /// Implementations MUST key only on `instrument.symbol()`;
+    /// `instrument.asset_class()` may be a caller-supplied default (the daemon
+    /// builds lookups with a placeholder class) and is NOT authoritative for
+    /// this lookup.
     async fn capabilities(
         &self,
         instrument: &Instrument,

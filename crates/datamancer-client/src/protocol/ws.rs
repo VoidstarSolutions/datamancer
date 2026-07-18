@@ -230,6 +230,21 @@ mod tests {
     }
 
     #[test]
+    fn ws_capabilities_reply_round_trips() {
+        use datamancer_core::{AssetClass, Instrument, InstrumentEntry, ProviderId};
+        let entries = vec![InstrumentEntry::bare(Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        ))];
+        let reply = WsReply::capabilities(9, entries.clone());
+        let back: WsReply = serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        assert_eq!(back.capabilities, Some(entries));
+        assert!(back.ok);
+        assert_eq!(back.id, 9);
+    }
+
+    #[test]
     fn ws_control_vocabulary_shares_subscription_spec_with_uds() {
         // The same subscribe spec body parses under both control surfaces,
         // guarding the "one control vocabulary" claim.

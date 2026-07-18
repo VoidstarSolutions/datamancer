@@ -652,6 +652,11 @@ impl Datamancer {
     /// for providers without a bulk reference-data surface — the caller chooses
     /// the subset, the provider paces itself.
     ///
+    /// This op is **fail-fast**: any single instrument's capability-lookup
+    /// error aborts the whole batch and is returned as the error (which
+    /// identifies the failing symbol); callers wanting per-symbol resilience
+    /// should request symbols individually.
+    ///
     /// # Errors
     ///
     /// - [`Error::UnknownProvider`] — `provider` names no registered provider.
