@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use datamancer_core::{InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
+use datamancer_core::{InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
 use datamancer_transport_ws::{EventFrame, WS_SUBPROTOCOL, from_wire};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt as _, StreamExt as _};
@@ -287,6 +287,24 @@ impl Client for WsClient {
         reply.instruments.ok_or_else(|| {
             ClientError::Transport(WsClientError::Protocol(
                 "ok instruments reply missing instruments payload".to_string(),
+            ))
+        })
+    }
+
+    async fn capabilities(
+        &mut self,
+        provider: &ProviderId,
+        symbols: &[String],
+    ) -> Result<Vec<InstrumentEntry>, ClientError<Self::Error>> {
+        let req = WsRequest::Capabilities {
+            id: self.next_id(),
+            provider: provider.as_str().to_string(),
+            symbols: symbols.to_vec(),
+        };
+        let reply = self.request(&req).await?;
+        reply.capabilities.ok_or_else(|| {
+            ClientError::Transport(WsClientError::Protocol(
+                "ok capabilities reply missing capabilities payload".to_string(),
             ))
         })
     }

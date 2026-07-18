@@ -1,7 +1,7 @@
 //! The generic client-transport trait: one multiplexed consumer handle,
 //! transport chosen at compile time.
 
-use datamancer_core::{InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
+use datamancer_core::{InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
 use futures::Stream;
 
 use crate::error::ClientError;
@@ -70,6 +70,13 @@ pub trait Client: Sized + Send {
         provider: Option<&ProviderId>,
     ) -> impl Future<Output = Result<Vec<InstrumentInfo>, ClientError<Self::Error>>> + Send;
 
+    /// On-demand per-instrument capabilities for a named provider's symbols.
+    fn capabilities(
+        &mut self,
+        provider: &ProviderId,
+        symbols: &[String],
+    ) -> impl Future<Output = Result<Vec<InstrumentEntry>, ClientError<Self::Error>>> + Send;
+
     /// Graceful close: the daemon emits a terminal `SessionClosing` on the
     /// event stream and tears the client down.
     fn close(self) -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
@@ -80,7 +87,9 @@ mod tests {
     use super::Client;
     use crate::error::ClientError;
     use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
-    use datamancer_core::{InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
+    use datamancer_core::{
+        InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
+    };
     use futures::stream::{self, Empty};
 
     #[derive(Debug, thiserror::Error)]
@@ -121,6 +130,13 @@ mod tests {
             &mut self,
             _provider: Option<&ProviderId>,
         ) -> Result<Vec<InstrumentInfo>, ClientError<Self::Error>> {
+            Ok(Vec::new())
+        }
+        async fn capabilities(
+            &mut self,
+            _provider: &ProviderId,
+            _symbols: &[String],
+        ) -> Result<Vec<InstrumentEntry>, ClientError<Self::Error>> {
             Ok(Vec::new())
         }
         async fn close(self) -> Result<(), ClientError<Self::Error>> {
