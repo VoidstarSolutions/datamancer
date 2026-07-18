@@ -45,6 +45,11 @@ fn u16_ptr_to_string(p: *const u16) -> String {
 
 /// This process token's **user SID** as an `S-1-…` string. The authoritative
 /// running-user identity (not a spoofable name lookup).
+///
+/// # Errors
+///
+/// Returns the underlying OS error if opening the process token, querying its
+/// `TokenUser`, or converting the SID to a string fails.
 pub fn current_process_token_sid() -> io::Result<String> {
     let mut token = std::ptr::null_mut();
     // SAFETY: GetCurrentProcess returns a pseudo-handle; OpenProcessToken writes
@@ -142,6 +147,11 @@ fn token_integrity_rid(token: *mut core::ffi::c_void) -> io::Result<u32> {
 }
 
 /// This process's integrity-level RID.
+///
+/// # Errors
+///
+/// Returns the underlying OS error if opening the process token or reading its
+/// integrity-level label fails.
 pub fn current_process_integrity() -> io::Result<u32> {
     let mut token = std::ptr::null_mut();
     // SAFETY: GetCurrentProcess returns a pseudo-handle; OpenProcessToken writes
@@ -157,6 +167,16 @@ pub fn current_process_integrity() -> io::Result<u32> {
 
 /// The **owner SID** of a connected kernel handle (e.g. a named pipe), as an
 /// `S-1-…` string.
+///
+/// # Errors
+///
+/// Returns the underlying OS error if querying the handle's security info or
+/// converting the owner SID to a string fails.
+// `handle` is an opaque Windows kernel-object `HANDLE`, not a dereferenceable
+// Rust pointer: it is passed by value to `GetSecurityInfo`, which resolves it
+// kernel-side — nothing here reads through it. A safe public API is the crate's
+// contract, so the function stays safe.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn owner_sid_of(handle: RawHandle) -> io::Result<String> {
     let mut owner: PSID = std::ptr::null_mut();
     let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -202,6 +222,16 @@ pub fn owner_sid_of(handle: RawHandle) -> io::Result<String> {
 /// its token integrity. No impersonation (no thread-local identity to leak).
 /// Small race: if the client exits between connect and `OpenProcess`, this
 /// fails (fail-closed reject upstream).
+///
+/// # Errors
+///
+/// Returns the underlying OS error if the client PID cannot be read from the
+/// pipe, the client process cannot be opened, or its integrity label cannot be
+/// read.
+// `handle` is an opaque Windows kernel-object `HANDLE`, not a dereferenceable
+// Rust pointer: it is passed by value to `GetNamedPipeClientProcessId`, which
+// resolves it kernel-side. A safe public API is the crate's contract.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn client_process_integrity(handle: RawHandle) -> io::Result<u32> {
     let mut pid = 0u32;
     // SAFETY: `handle` is a live connected named-pipe server endpoint;
