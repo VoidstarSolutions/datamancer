@@ -987,6 +987,7 @@ dependencies = [
  "datamancer-client",
  "datamancer-core",
  "datamancer-credentials",
+ "datamancer-winsec",
  "directories",
  "futures",
  "http-body-util",

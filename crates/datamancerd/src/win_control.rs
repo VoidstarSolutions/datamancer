@@ -40,21 +40,17 @@
 use std::io;
 
 use tokio::net::windows::named_pipe::NamedPipeServer;
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows_sys::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-    TokenUser,
-};
+use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// In/out buffer advice for the pipe (bytes). Control traffic is small
 /// newline-JSON; this is a hint, not a hard cap.
@@ -68,78 +64,6 @@ fn wide(s: &str) -> Vec<u16> {
 fn last_os_error(context: &str) -> io::Error {
     let e = io::Error::last_os_error();
     io::Error::new(e.kind(), format!("{context}: {e}"))
-}
-
-/// Read a NUL-terminated wide string allocated by a `*W` API into a `String`.
-fn u16_ptr_to_string(p: *const u16) -> String {
-    // SAFETY: `p` is a NUL-terminated wide string produced by a Win32 `*W`
-    // allocator (e.g. `ConvertSidToStringSidW`); we walk to the terminator to
-    // measure its length, reading only within the allocation.
-    let len = unsafe {
-        let mut n = 0usize;
-        while *p.add(n) != 0 {
-            n += 1;
-        }
-        n
-    };
-    // SAFETY: `p..p+len` is exactly the wide string just measured (excludes the
-    // terminator), valid for reads for `len` `u16`s.
-    let slice = unsafe { std::slice::from_raw_parts(p, len) };
-    String::from_utf16_lossy(slice)
-}
-
-/// The current process token's **user SID** as an `S-1-…` string.
-///
-/// This is the authoritative running-user identity (review S1): unlike a
-/// `USERNAME`→SID name lookup it cannot be spoofed via the environment and is
-/// unambiguous across domains.
-fn process_token_sid() -> io::Result<String> {
-    let mut token = std::ptr::null_mut();
-    // SAFETY: `GetCurrentProcess` returns a pseudo-handle (no lifetime to
-    // manage). `OpenProcessToken` writes a real, owned token handle into
-    // `token` on success (return != 0), which we close below.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(last_os_error("OpenProcessToken"));
-    }
-
-    // Size query: null buffer + 0 length asks for the required byte count.
-    let mut len = 0u32;
-    // SAFETY: documented size-probe form — a null buffer with 0 length makes
-    // `GetTokenInformation` write the needed size into `len` and fail; we do
-    // not read the (unwritten) buffer.
-    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut len) };
-
-    let mut buf = vec![0u8; len as usize];
-    // SAFETY: `buf` is exactly `len` bytes — the size the probe just reported —
-    // and `TokenUser` writes a `TOKEN_USER` (with its SID trailing) into it.
-    let ok = unsafe {
-        GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &raw mut len)
-    };
-    // SAFETY: `token` is the handle we opened above and still own; close it
-    // regardless of the query result.
-    unsafe { CloseHandle(token) };
-    if ok == 0 {
-        return Err(last_os_error("GetTokenInformation"));
-    }
-
-    // SAFETY: on success `buf` holds a `TOKEN_USER`. Read it out *unaligned* —
-    // a `Vec<u8>` buffer is not guaranteed to meet `TOKEN_USER`'s alignment, so
-    // forming a `&TOKEN_USER` reference would be UB. The copied `User.Sid`
-    // still points into `buf`, which outlives the `ConvertSidToStringSidW` call
-    // below.
-    let token_user = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read_unaligned() };
-    let mut sid_str = std::ptr::null_mut();
-    // SAFETY: `token_user.User.Sid` is a valid SID within `buf`;
-    // `ConvertSidToStringSidW` allocates a wide string into `sid_str` on
-    // success (return != 0), freed below.
-    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &raw mut sid_str) } == 0 {
-        return Err(last_os_error("ConvertSidToStringSid"));
-    }
-    let s = u16_ptr_to_string(sid_str);
-    // SAFETY: `sid_str` was allocated by `ConvertSidToStringSidW`; free it with
-    // `LocalFree` per its contract.
-    unsafe { LocalFree(sid_str.cast()) };
-    Ok(s)
 }
 
 /// A self-relative security descriptor allocated by
@@ -211,7 +135,7 @@ impl ControlPipe {
     /// (world-openable) pipe DACL. The SD is built once here to surface a
     /// malformed-SDDL failure at bind time, then rebuilt per instance.
     pub(crate) fn bind(pipe_name: &str) -> io::Result<Self> {
-        let owner_sid = process_token_sid()?;
+        let owner_sid = datamancer_winsec::current_process_token_sid()?;
         let _validate = build_owner_sd(&owner_sid)?;
         Ok(Self {
             name: wide(pipe_name),
@@ -290,47 +214,6 @@ mod tests {
 
     use super::*;
 
-    /// The owner SID of a live pipe handle (test-only; mirrors the client's
-    /// `win_pipe::pipe_owner_sid`). Panics on any Win32 failure.
-    fn owner_sid_of(handle: std::os::windows::io::RawHandle) -> String {
-        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
-        use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
-
-        let mut owner: PSID = std::ptr::null_mut();
-        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: `handle` is a live pipe; `GetSecurityInfo` writes the owner SID
-        // (into the SD it allocates at `psd`) and returns 0 on success.
-        let rc = unsafe {
-            GetSecurityInfo(
-                handle,
-                SE_KERNEL_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                &raw mut owner,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &raw mut psd,
-            )
-        };
-        assert_eq!(rc, 0, "GetSecurityInfo failed: {rc}");
-        let mut sid_str = std::ptr::null_mut();
-        // SAFETY: `owner` is valid within the still-live `psd`.
-        unsafe { ConvertSidToStringSidW(owner, &raw mut sid_str) };
-        let s = u16_ptr_to_string(sid_str);
-        // SAFETY: free both allocations.
-        unsafe {
-            LocalFree(sid_str.cast());
-            LocalFree(psd);
-        }
-        s
-    }
-
-    #[test]
-    fn process_token_sid_is_a_sid_string() {
-        let sid = process_token_sid().expect("token SID");
-        assert!(sid.starts_with("S-1-"), "not a SID: {sid}");
-    }
-
     // `#[tokio::test]`: `create_instance` wraps the pipe with tokio's
     // `NamedPipeServer::from_raw_handle`, which requires a running reactor.
     #[tokio::test]
@@ -390,8 +273,8 @@ mod tests {
         let name = r"\\.\pipe\datamancer-test-owner-stamp";
         let pipe = ControlPipe::bind(name).expect("bind");
         let server = pipe.create_instance(true).expect("first instance");
-        let owner = owner_sid_of(server.as_raw_handle());
-        let me = process_token_sid().expect("token SID");
+        let owner = datamancer_winsec::owner_sid_of(server.as_raw_handle()).expect("owner sid");
+        let me = datamancer_winsec::current_process_token_sid().expect("token SID");
         assert_eq!(
             owner, me,
             "pipe owner must be the token user SID (elevated-safe), not defaulted"
@@ -406,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn owner_dacl_denies_a_non_granted_principal() {
         let name = r"\\.\pipe\datamancer-test-foreign-dacl";
-        let me = process_token_sid().expect("token SID");
+        let me = datamancer_winsec::current_process_token_sid().expect("token SID");
         let sd = build_sd(&format!("O:{me}D:P(A;;GA;;;S-1-5-18)")).expect("build sd");
         let _server = create_named_pipe_instance(&wide(name), &sd, true).expect("create");
         let err = ClientOptions::new()
