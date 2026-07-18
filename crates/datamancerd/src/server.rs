@@ -175,6 +175,11 @@ pub struct Server {
     /// The active credential-store backend name (for `ping`); threaded in at
     /// bootstrap so the actor never touches the hub.
     credential_backend: &'static str,
+    /// Windows: accept a daemon/client at any integrity level (operator
+    /// override for the Medium-integrity requirement). Read in `spawn_control`
+    /// and `win_accept_loop`.
+    #[cfg(windows)]
+    allow_any_integrity: bool,
     /// `true` once a shutdown signal has been observed; rejects new requests.
     draining: bool,
 }
@@ -254,6 +259,9 @@ impl Server {
             anchors.push(session);
         }
 
+        #[cfg(windows)]
+        let allow_any_integrity = config.server.allow_any_integrity;
+
         Ok(Self {
             dm,
             node,
@@ -275,6 +283,8 @@ impl Server {
             hub,
             config_hub,
             credential_backend,
+            #[cfg(windows)]
+            allow_any_integrity,
             draining: false,
         })
     }
