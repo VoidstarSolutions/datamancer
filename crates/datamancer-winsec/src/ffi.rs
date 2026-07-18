@@ -68,10 +68,13 @@ pub fn current_process_token_sid() -> io::Result<String> {
     let ok = unsafe {
         GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &raw mut len)
     };
+    // Capture the failure error *before* CloseHandle, which can overwrite the
+    // thread-local last-error and mask GetTokenInformation's.
+    let query_err = (ok == 0).then(|| last_os_error("GetTokenInformation"));
     // SAFETY: `token` is the handle we opened and own; close it regardless.
     unsafe { CloseHandle(token) };
-    if ok == 0 {
-        return Err(last_os_error("GetTokenInformation"));
+    if let Some(err) = query_err {
+        return Err(err);
     }
     // SAFETY: on success `buf` holds a TOKEN_USER. Read it out *unaligned* — a
     // Vec<u8> is not guaranteed to meet the struct alignment. The copied
@@ -249,10 +252,12 @@ pub fn client_process_integrity(handle: RawHandle) -> io::Result<u32> {
     // SAFETY: `proc` is a valid process handle; OpenProcessToken writes an owned
     // token handle into `token` on success (return != 0).
     let opened = unsafe { OpenProcessToken(proc, TOKEN_QUERY, &raw mut token) };
+    // Capture the failure error before CloseHandle can overwrite the last-error.
+    let open_err = (opened == 0).then(|| last_os_error("OpenProcessToken(client)"));
     // SAFETY: done with the process handle regardless of the result.
     unsafe { CloseHandle(proc) };
-    if opened == 0 {
-        return Err(last_os_error("OpenProcessToken(client)"));
+    if let Some(err) = open_err {
+        return Err(err);
     }
     let rid = token_integrity_rid(token);
     // SAFETY: `token` is the client token handle we own; close it.
@@ -271,11 +276,21 @@ mod tests {
     }
 
     #[test]
-    fn current_integrity_is_medium_in_ci() {
+    fn current_integrity_reads_medium_or_elevated() {
+        // A normal user process is Medium; an elevated one (e.g. the GitHub
+        // windows-latest runner) is High/System — never below Medium. Assert the
+        // FFI read lands in one of those bands via the shared classifier rather
+        // than a fixed level, so the test holds on both a developer machine and
+        // an elevated CI runner.
         let rid = current_process_integrity().expect("integrity rid");
+        let class = crate::classify(rid);
         assert!(
-            (0x2000..0x3000).contains(&rid),
-            "expected Medium integrity in CI, got {rid:#x}"
+            matches!(
+                class,
+                crate::IntegrityClass::Medium | crate::IntegrityClass::Elevated
+            ),
+            "expected Medium or elevated integrity, got {rid:#x} ({})",
+            class.describe()
         );
     }
 }
