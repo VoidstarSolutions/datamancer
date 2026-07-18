@@ -550,6 +550,21 @@ impl Server {
                 ),
             ))
         })?;
+        // A non-pipe name here is almost always the Unix-shaped default that
+        // `default_admin_socket` yields when USERNAME is unset (review #1);
+        // surface it clearly instead of letting CreateNamedPipeW fail opaquely
+        // on a `/run/...`-style path.
+        if !(pipe_name.starts_with(r"\\.\pipe\") || pipe_name.starts_with(r"\\?\pipe\")) {
+            return Err(DaemonError::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "control pipe name must be a Windows named pipe \
+                     (\\\\.\\pipe\\...), got {pipe_name:?}; set \
+                     [server].admin_socket, or ensure USERNAME is set so the \
+                     default (\\\\.\\pipe\\datamancer\\<user>\\control) resolves",
+                ),
+            )));
+        }
         let pipe = crate::win_control::ControlPipe::bind(pipe_name)?;
         let first = pipe.create_instance(true)?;
         Ok(tokio::spawn(win_accept_loop(
