@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_integrity_reads_medium_for_same_process_pipe() {
+    async fn client_integrity_matches_own_for_same_process_pipe() {
         let name = r"\\.\pipe\datamancer-test-client-integrity";
         let pipe = ControlPipe::bind(name).expect("bind");
         let server = pipe.create_instance(true).expect("first instance");
@@ -320,9 +320,15 @@ mod tests {
             server.connect().await.expect("accept");
             let rid = datamancer_winsec::client_process_integrity(server.as_raw_handle())
                 .expect("client rid");
-            assert!(
-                (0x2000..0x3000).contains(&rid),
-                "expected Medium client integrity, got {rid:#x}"
+            // Client and server are the same test process, so the integrity read
+            // off the pipe handle must equal this process's own — whatever the
+            // environment's level (Medium for a normal user, High on an elevated
+            // CI runner). Asserting a fixed Medium here would fail under an
+            // elevated runner even though the read is correct.
+            let own = datamancer_winsec::current_process_integrity().expect("own rid");
+            assert_eq!(
+                rid, own,
+                "same-process client integrity ({rid:#x}) must equal own ({own:#x})"
             );
         });
         let _client = ClientOptions::new().open(name).expect("client connect");
