@@ -54,18 +54,38 @@ impl Provider for VaryingFake {
     }
 
     async fn list_instruments(&self) -> datamancer::Result<Vec<InstrumentEntry>> {
+        let mut btc = InstrumentEntry::bare(Instrument::new(
+            ProviderId::from_static(self.id),
+            AssetClass::Crypto,
+            "BTC/USD",
+        ));
+        if self.id == "fake" {
+            let mut caps = datamancer::InstrumentCapabilities::default();
+            caps.fractionable = Some(true);
+            btc.capabilities = Some(caps);
+        }
         Ok(vec![
-            InstrumentEntry::bare(Instrument::new(
-                ProviderId::from_static(self.id),
-                AssetClass::Crypto,
-                "BTC/USD",
-            )),
+            btc,
             InstrumentEntry::bare(Instrument::new(
                 ProviderId::from_static(self.id),
                 AssetClass::Crypto,
                 "IDX",
             )),
         ])
+    }
+
+    async fn capabilities(
+        &self,
+        instrument: &Instrument,
+    ) -> datamancer::Result<Option<datamancer::InstrumentCapabilities>> {
+        if self.id == "fake" && instrument.symbol() == "BTC/USD" {
+            let mut caps = datamancer::InstrumentCapabilities::default();
+            caps.fractionable = Some(true);
+            caps.supports_notional_orders = Some(true);
+            Ok(Some(caps))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -136,4 +156,45 @@ async fn unknown_provider_filter_is_an_error() {
         .await
         .expect_err("unknown provider");
     assert!(matches!(err, Error::UnknownProvider(p) if p == "nope"));
+}
+
+#[tokio::test]
+async fn catalog_carries_capabilities_and_enrichment_works() {
+    let dm = Datamancer::builder()
+        .provider(Box::new(VaryingFake { id: "fake" }))
+        .build()
+        .expect("build");
+    let pid = ProviderId::from_static("fake");
+
+    let catalog = dm.instrument_catalog(Some(&pid)).await.unwrap();
+    let btc = catalog
+        .iter()
+        .find(|i| i.instrument.symbol() == "BTC/USD")
+        .unwrap();
+    assert_eq!(btc.capabilities.as_ref().unwrap().fractionable, Some(true));
+    let idx = catalog
+        .iter()
+        .find(|i| i.instrument.symbol() == "IDX")
+        .unwrap();
+    assert!(idx.capabilities.is_none());
+
+    let want = vec![
+        Instrument::new(
+            ProviderId::from_static("fake"),
+            AssetClass::Crypto,
+            "BTC/USD",
+        ),
+        Instrument::new(ProviderId::from_static("fake"), AssetClass::Crypto, "IDX"),
+    ];
+    let enriched = dm.instrument_capabilities(&pid, &want).await.unwrap();
+    assert_eq!(enriched.len(), 2);
+    assert_eq!(
+        enriched[0]
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .supports_notional_orders,
+        Some(true)
+    );
+    assert!(enriched[1].capabilities.is_none());
 }

@@ -63,9 +63,9 @@ use async_trait::async_trait;
 use datamancer_core::{
     Adjustment, AuthoritativeSessionSnapshot, Bar, CacheKey, CacheSnapshot, ClientSessionSnapshot,
     Control, ControlKind, Error, EventKind, EventSink, GapSpan, HealthView, HistoricalCache,
-    HistoryRequest, Instrument, InstrumentInfo, LiveHandle, MarketEvent, Provider, ProviderId,
-    ProviderSnapshot, PublishOutcome, Quote, ReplayRequest, Result, Seq, SystemSnapshot, TapLog,
-    Timestamp, Trade,
+    HistoryRequest, Instrument, InstrumentEntry, InstrumentInfo, LiveHandle, MarketEvent, Provider,
+    ProviderId, ProviderSnapshot, PublishOutcome, Quote, ReplayRequest, Result, Seq,
+    SystemSnapshot, TapLog, Timestamp, Trade,
 };
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -641,6 +641,40 @@ impl Datamancer {
             }
         }
         Ok(catalog)
+    }
+
+    /// Enrich a specific set of instruments with on-demand capabilities from a
+    /// single named provider.
+    ///
+    /// Loops [`Provider::capabilities`] over `instruments`, returning one
+    /// [`InstrumentEntry`] per input (input order preserved; `capabilities:
+    /// None` where the provider reported nothing). This is the expensive path
+    /// for providers without a bulk reference-data surface — the caller chooses
+    /// the subset, the provider paces itself.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::UnknownProvider`] — `provider` names no registered provider.
+    /// - Any error surfaced by the provider's `capabilities` call.
+    pub async fn instrument_capabilities(
+        &self,
+        provider: &ProviderId,
+        instruments: &[Instrument],
+    ) -> Result<Vec<InstrumentEntry>> {
+        let p = self
+            .inner
+            .providers
+            .iter()
+            .find(|p| p.id() == provider.as_str())
+            .ok_or_else(|| Error::UnknownProvider(provider.as_str().to_string()))?;
+        let mut out = Vec::with_capacity(instruments.len());
+        for instrument in instruments {
+            let capabilities = p.capabilities(instrument).await?;
+            let mut entry = InstrumentEntry::bare(instrument.clone());
+            entry.capabilities = capabilities;
+            out.push(entry);
+        }
+        Ok(out)
     }
 
     /// Assemble the synchronous snapshot parts (provider accounting + live
