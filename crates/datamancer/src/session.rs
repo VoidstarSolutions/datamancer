@@ -629,11 +629,15 @@ impl Datamancer {
         };
         let mut catalog = Vec::new();
         for p in providers {
-            for instrument in p.list_instruments().await? {
+            for entry in p.list_instruments().await? {
                 let kinds: Vec<EventKind> = EventKind::enumerate()
-                    .filter(|kind| p.supports(&instrument, *kind))
+                    .filter(|kind| p.supports(&entry.instrument, *kind))
                     .collect();
-                catalog.push(InstrumentInfo { instrument, kinds });
+                catalog.push(InstrumentInfo {
+                    instrument: entry.instrument,
+                    kinds,
+                    capabilities: entry.capabilities,
+                });
             }
         }
         Ok(catalog)

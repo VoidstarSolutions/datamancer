@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::{
+    InstrumentCapabilities, InstrumentEntry,
     adjustment::Adjustment,
     error::Result,
     event::{EventKind, MarketEvent, Timestamp},
@@ -77,8 +78,31 @@ pub trait Provider: Send + Sync + 'static {
     /// this alone. Network-backed providers should override it; the cold
     /// boundary already pays for dynamic dispatch, so per-call overhead is
     /// not a concern.
-    async fn list_instruments(&self) -> Result<Vec<Instrument>> {
+    async fn list_instruments(&self) -> Result<Vec<InstrumentEntry>> {
         Ok(Vec::new())
+    }
+
+    /// On-demand per-instrument capability lookup — the expensive counterpart to
+    /// the inline capabilities on [`Self::list_instruments`]'s [`InstrumentEntry`]
+    /// rows.
+    ///
+    /// One call maps to one native per-contract lookup (e.g. Alpaca
+    /// `/v2/assets/{symbol}`, IBKR `reqContractDetails`). Callers loop the
+    /// subset they care about; the provider MAY hold an internal pacer so
+    /// rate-limiting stays inside the provider. Capabilities population is
+    /// **best-effort and may be partial** — a provider fills what it can and
+    /// leaves the rest `None`; `None` means unknown, never unsupported. A
+    /// provider is never required to fan out per-symbol during
+    /// [`Self::list_instruments`].
+    ///
+    /// Default returns `None` — providers without a reference-data surface leave
+    /// this alone.
+    async fn capabilities(
+        &self,
+        instrument: &Instrument,
+    ) -> Result<Option<InstrumentCapabilities>> {
+        let _ = instrument;
+        Ok(None)
     }
 
     /// Optional accounting sink for metrics datamancer cannot observe at the

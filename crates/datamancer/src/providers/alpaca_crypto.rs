@@ -37,8 +37,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
-    HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity,
-    Quote, Result, Seq, Timestamp, Trade,
+    HistoryRequest, Instrument, InstrumentEntry, LiveHandle, MarketEvent, Price, Provider,
+    ProviderId, Quantity, Quote, Result, Seq, Timestamp, Trade,
 };
 use oxidized_alpaca::{
     AccountType, CryptoFeed, MarketDataClient, TradingClient,
@@ -359,7 +359,7 @@ impl Provider for AlpacaCryptoProvider {
         ))
     }
 
-    async fn list_instruments(&self) -> Result<Vec<Instrument>> {
+    async fn list_instruments(&self) -> Result<Vec<InstrumentEntry>> {
         let trading = self.trading_client().ok_or_else(|| Error::Provider {
             provider: PROVIDER_ID.to_string(),
             message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
@@ -374,7 +374,10 @@ impl Provider for AlpacaCryptoProvider {
                 provider: PROVIDER_ID.to_string(),
                 message: format!("list_assets: {e}"),
             })?;
-        Ok(crypto_assets_to_instruments(&assets))
+        Ok(crypto_assets_to_instruments(&assets)
+            .into_iter()
+            .map(InstrumentEntry::bare)
+            .collect())
     }
 }
 

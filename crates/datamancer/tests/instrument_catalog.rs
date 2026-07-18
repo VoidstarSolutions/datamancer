@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use datamancer::{
-    AssetClass, BarInterval, Datamancer, Error, EventKind, Instrument, InstrumentInfo, LiveHandle,
-    MarketEvent, Provider, ProviderId,
+    AssetClass, BarInterval, Datamancer, Error, EventKind, Instrument, InstrumentEntry,
+    InstrumentInfo, LiveHandle, MarketEvent, Provider, ProviderId,
 };
 use datamancer_core::HistoryRequest;
 use tokio::sync::mpsc;
@@ -53,14 +53,18 @@ impl Provider for VaryingFake {
         Ok(())
     }
 
-    async fn list_instruments(&self) -> datamancer::Result<Vec<Instrument>> {
+    async fn list_instruments(&self) -> datamancer::Result<Vec<InstrumentEntry>> {
         Ok(vec![
-            Instrument::new(
+            InstrumentEntry::bare(Instrument::new(
                 ProviderId::from_static(self.id),
                 AssetClass::Crypto,
                 "BTC/USD",
-            ),
-            Instrument::new(ProviderId::from_static(self.id), AssetClass::Crypto, "IDX"),
+            )),
+            InstrumentEntry::bare(Instrument::new(
+                ProviderId::from_static(self.id),
+                AssetClass::Crypto,
+                "IDX",
+            )),
         ])
     }
 }
@@ -93,6 +97,7 @@ async fn catalog_derives_kinds_per_instrument() {
                     EventKind::Quote,
                     EventKind::Bar(BarInterval::OneDay),
                 ],
+                capabilities: None,
             },
             InstrumentInfo {
                 instrument: Instrument::new(
@@ -101,6 +106,7 @@ async fn catalog_derives_kinds_per_instrument() {
                     "IDX"
                 ),
                 kinds: vec![EventKind::Bar(BarInterval::OneDay)],
+                capabilities: None,
             },
         ]
     );

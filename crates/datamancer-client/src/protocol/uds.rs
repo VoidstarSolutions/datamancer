@@ -438,6 +438,7 @@ mod tests {
                 "BTC/USD",
             ),
             kinds: vec![EventKind::Trade],
+            capabilities: None,
         }]);
         let line = serde_json::to_string(&reply).unwrap();
         let back: Reply = serde_json::from_str(&line).unwrap();
