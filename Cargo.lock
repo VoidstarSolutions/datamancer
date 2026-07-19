@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-winsec"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "windows-sys 0.59.0",
 ]
