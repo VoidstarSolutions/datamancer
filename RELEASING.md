@@ -49,9 +49,21 @@ All seven crates share one version, so every release re-tags the whole
 workspace together. This keeps `datamancer-client` and `datamancerd` in
 lockstep for the ping version gate.
 
-Semver/API-break protection is the existing `.github/scripts/semver-checks.sh`
-gate in `ci.yml` (cargo-semver-checks vs. the PR base). release-plz does not run
-its own semver check (`semver_check = false`).
+Semver/API-break protection is the `.github/scripts/semver-checks.sh` gate in
+`ci.yml` (cargo-semver-checks vs. the PR base). release-plz does not run its own
+semver check (`semver_check = false`).
+
+Because release-plz owns the version, every PR is checked at an *unchanged*
+version, so `check-release` reports "requires new major/minor" for any API
+change — it cannot be a plain pass/fail on the bump. The gate therefore
+enforces **declaration** instead: a detected break must be marked by some commit
+in the PR range (`type!: subject` or a `BREAKING CHANGE:` footer). That marker
+is precisely what release-plz reads to size the bump, so the gate is really
+asking "will the release PR pick the right version for this change?" — with an
+undeclared break the answer is no. Additive-only changes pass with a note.
+
+Do not silence the gate by adding a marker to a break you didn't intend; make
+the change additive instead.
 
 ## Workspace manifest constraints (load-bearing for `git_only`)
 
