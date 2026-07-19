@@ -360,10 +360,14 @@ traffic on other connections. The reply is a list of `InstrumentEntry`
 (instrument + optional capabilities) — an absent/`None` field anywhere in a
 capabilities block means **unknown**, never "unsupported" or "false"; a
 provider that doesn't populate a field simply omits it rather than asserting
-`false`. The lookup is keyed by provider + symbol, not by asset class, so the
-echoed `instrument.asset_class` is **not authoritative** for this op — it is
-filled with the provider's default class (e.g. `equity` for Alpaca) even when
-the symbol is actually a crypto pair.
+`false`. The lookup is keyed by provider + symbol, not by asset class: the
+daemon builds each lookup with a placeholder `asset_class`, but a provider that
+resolves the symbol **corrects it** on the returned `instrument`, so the echoed
+`asset_class` is authoritative whenever capabilities come back populated (Alpaca
+returns the real class — `crypto` for a crypto pair, `equity` for an equity). A
+provider with no reference-data surface returns nothing to correct, so its rows
+echo the placeholder class unchanged; treat the class as authoritative only
+alongside populated capabilities.
 
 `ping` needs no registered client and reports the daemon's crate version plus
 the active credential-store backend; the app facade uses it for

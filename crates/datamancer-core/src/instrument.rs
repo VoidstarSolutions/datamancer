@@ -147,6 +147,11 @@ impl fmt::Display for Instrument {
 /// (`Provider::list_instruments` + `supports` probed over
 /// [`EventKind::enumerate`]); carried on the daemon's `instruments` control
 /// op.
+///
+/// `#[non_exhaustive]` (like its sibling [`InstrumentEntry`]): construct via
+/// [`InstrumentInfo::new`] and set the public fields you need, so adding a
+/// future row field is a non-breaking change for downstream constructors.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstrumentInfo {
     pub instrument: Instrument,
@@ -159,6 +164,20 @@ pub struct InstrumentInfo {
     /// inner field means unknown, never unsupported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<crate::InstrumentCapabilities>,
+}
+
+impl InstrumentInfo {
+    /// A catalog row for `instrument` serving `kinds`, with no capabilities
+    /// populated. Set the public `capabilities` field afterwards if the
+    /// provider filled them inline.
+    #[must_use]
+    pub fn new(instrument: Instrument, kinds: Vec<EventKind>) -> Self {
+        Self {
+            instrument,
+            kinds,
+            capabilities: None,
+        }
+    }
 }
 
 /// One row of a provider's bulk instrument listing: the instrument plus any

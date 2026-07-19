@@ -885,6 +885,9 @@ async fn accept_loop(
 /// dispatched off-actor.
 async fn dispatch_capabilities(dm: &Datamancer, provider: &str, symbols: &[String]) -> Reply {
     let pid = ProviderId::new(provider.to_string());
+    // `capabilities` is keyed on symbol; the asset class here is a placeholder
+    // the provider overwrites with the authoritative class on the returned
+    // entry (see `Provider::capabilities`). Do not treat it as a real class.
     let instruments: Vec<Instrument> = symbols
         .iter()
         .map(|s| Instrument::new(pid.clone(), AssetClass::Equity, s.clone()))

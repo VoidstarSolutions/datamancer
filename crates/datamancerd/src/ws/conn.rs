@@ -302,6 +302,9 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
             provider, symbols, ..
         } => {
             let pid = ProviderId::new(provider);
+            // Placeholder asset class — the provider overwrites it with the
+            // authoritative class on the returned entry (see
+            // `Provider::capabilities`); `capabilities` is keyed on symbol.
             let instruments: Vec<Instrument> = symbols
                 .iter()
                 .map(|s| Instrument::new(pid.clone(), AssetClass::Equity, s.clone()))

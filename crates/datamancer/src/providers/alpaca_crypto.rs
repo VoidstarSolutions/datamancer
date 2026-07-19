@@ -72,32 +72,42 @@ fn provider_instrument(symbol: impl Into<String>) -> Instrument {
     )
 }
 
-/// Order types Alpaca accepts for a fractional crypto order (provider
-/// policy; not advertised per-asset — sourced from Alpaca's fractional-
-/// trading docs). Mirrors `alpaca::FRACTIONAL_ORDER_TYPES`; duplicated here
-/// because the two provider modules don't share a policy module.
-const FRACTIONAL_ORDER_TYPES: [OrderType; 4] = [
-    OrderType::Market,
-    OrderType::Limit,
-    OrderType::Stop,
-    OrderType::StopLimit,
-];
-/// Times-in-force Alpaca accepts for a fractional crypto order (`day` only).
-const FRACTIONAL_TIF: [TimeInForce; 1] = [TimeInForce::Day];
+// Crypto order policy is NOT the equity fractional policy: Alpaca crypto
+// accepts market/limit/stop-limit (no plain stop) with GTC/IOC time-in-force
+// (no day/opg/cls). Verified against https://docs.alpaca.markets/docs/crypto-orders.
+const CRYPTO_ORDER_TYPES: [OrderType; 3] =
+    [OrderType::Market, OrderType::Limit, OrderType::StopLimit];
+const CRYPTO_TIF: [TimeInForce; 2] = [TimeInForce::Gtc, TimeInForce::Ioc];
 
-/// Build capabilities for one Alpaca crypto `Asset`. Mirrors
-/// `alpaca::equity_capabilities` policy but reads `fractionable` off the
-/// asset rather than hardcoding it — crypto rows report it trivially true,
-/// but the honest thing is still to read the field.
+/// Build capabilities for one Alpaca crypto `Asset`. Notional (dollar) orders
+/// are supported; order types and time-in-force follow crypto's own policy
+/// (see [`CRYPTO_ORDER_TYPES`]/[`CRYPTO_TIF`]), which differs from equities.
+/// `fractionable` is read off the asset rather than hardcoded — crypto rows
+/// report it trivially true, but the honest thing is still to read the field.
 fn crypto_capabilities(asset: &Asset) -> InstrumentCapabilities {
     let mut caps = InstrumentCapabilities::default();
     caps.fractionable = Some(asset.fractionable);
     caps.supports_notional_orders = Some(true);
-    caps.allowed_order_types = Some(FRACTIONAL_ORDER_TYPES.to_vec());
-    caps.allowed_tif = Some(FRACTIONAL_TIF.to_vec());
+    caps.allowed_order_types = Some(CRYPTO_ORDER_TYPES.to_vec());
+    caps.allowed_tif = Some(CRYPTO_TIF.to_vec());
     // Sizing increments (min_qty/qty_increment/price_increment/min_notional)
     // stay None: oxidized_alpaca 0.0.10 Asset carries no sizing fields.
     caps
+}
+
+/// Build a catalog entry for one Alpaca crypto `Asset`: the instrument stamped
+/// with the authoritative [`AssetClass::Crypto`] plus its capabilities. Shared
+/// by bulk listing and the on-demand `capabilities` lookup so both stamp the
+/// same class (and the on-demand path corrects the daemon's placeholder).
+fn crypto_entry(asset: &Asset) -> InstrumentEntry {
+    let instrument = Instrument::new(
+        ProviderId::from_static(PROVIDER_ID),
+        AssetClass::Crypto,
+        asset.symbol.clone(),
+    );
+    let mut entry = InstrumentEntry::bare(instrument);
+    entry.capabilities = Some(crypto_capabilities(asset));
+    entry
 }
 
 /// Translate Alpaca's `/v2/assets` crypto rows into the datamancer
@@ -110,16 +120,7 @@ fn assets_to_entries(assets: &[Asset]) -> Vec<InstrumentEntry> {
     assets
         .iter()
         .filter(|a| a.tradable && matches!(a.class, AlpacaAssetClass::Crypto))
-        .map(|a| {
-            let instrument = Instrument::new(
-                ProviderId::from_static(PROVIDER_ID),
-                AssetClass::Crypto,
-                a.symbol.clone(),
-            );
-            let mut entry = InstrumentEntry::bare(instrument);
-            entry.capabilities = Some(crypto_capabilities(a));
-            entry
-        })
+        .map(crypto_entry)
         .collect()
 }
 
@@ -409,10 +410,7 @@ impl Provider for AlpacaCryptoProvider {
         Ok(assets_to_entries(&assets))
     }
 
-    async fn capabilities(
-        &self,
-        instrument: &Instrument,
-    ) -> Result<Option<InstrumentCapabilities>> {
+    async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
         let trading = self.trading_client().ok_or_else(|| Error::Provider {
             provider: PROVIDER_ID.to_string(),
             message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
@@ -424,7 +422,7 @@ impl Provider for AlpacaCryptoProvider {
                 provider: PROVIDER_ID.to_string(),
                 message: format!("get_asset({}): {e}", instrument.symbol()),
             })?;
-        Ok(Some(crypto_capabilities(&asset)))
+        Ok(Some(crypto_entry(&asset)))
     }
 }
 
@@ -1373,10 +1371,20 @@ mod tests {
             .iter()
             .find(|e| e.instrument.symbol() == "BTC/USD")
             .unwrap();
+        assert_eq!(frac.instrument.asset_class(), AssetClass::Crypto);
         let caps = frac.capabilities.as_ref().unwrap();
         assert_eq!(caps.fractionable, Some(true));
         assert_eq!(caps.supports_notional_orders, Some(true));
-        assert_eq!(caps.allowed_tif.as_deref(), Some(&[TimeInForce::Day][..]));
+        // Crypto policy, NOT the equity fractional policy: market/limit/stop-limit
+        // (no plain stop), GTC/IOC (no day).
+        assert_eq!(
+            caps.allowed_order_types.as_deref(),
+            Some(&[OrderType::Market, OrderType::Limit, OrderType::StopLimit][..])
+        );
+        assert_eq!(
+            caps.allowed_tif.as_deref(),
+            Some(&[TimeInForce::Gtc, TimeInForce::Ioc][..])
+        );
         assert!(caps.min_qty.is_none()); // not advertised
     }
 

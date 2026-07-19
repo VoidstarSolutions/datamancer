@@ -633,11 +633,9 @@ impl Datamancer {
                 let kinds: Vec<EventKind> = EventKind::enumerate()
                     .filter(|kind| p.supports(&entry.instrument, *kind))
                     .collect();
-                catalog.push(InstrumentInfo {
-                    instrument: entry.instrument,
-                    kinds,
-                    capabilities: entry.capabilities,
-                });
+                let mut info = InstrumentInfo::new(entry.instrument, kinds);
+                info.capabilities = entry.capabilities;
+                catalog.push(info);
             }
         }
         Ok(catalog)
@@ -674,9 +672,15 @@ impl Datamancer {
             .ok_or_else(|| Error::UnknownProvider(provider.as_str().to_string()))?;
         let mut out = Vec::with_capacity(instruments.len());
         for instrument in instruments {
-            let capabilities = p.capabilities(instrument).await?;
-            let mut entry = InstrumentEntry::bare(instrument.clone());
-            entry.capabilities = capabilities;
+            // The provider is the authority on asset class: when it resolves
+            // the symbol it returns an entry whose instrument carries the real
+            // class, correcting the daemon's placeholder. Providers with no
+            // reference-data surface return `None`, so we keep the caller's
+            // instrument (placeholder class and all — no better answer exists).
+            let entry = p
+                .capabilities(instrument)
+                .await?
+                .unwrap_or_else(|| InstrumentEntry::bare(instrument.clone()));
             out.push(entry);
         }
         Ok(out)

@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::{
-    InstrumentCapabilities, InstrumentEntry,
+    InstrumentEntry,
     adjustment::Adjustment,
     error::Result,
     event::{EventKind, MarketEvent, Timestamp},
@@ -101,11 +101,13 @@ pub trait Provider: Send + Sync + 'static {
     /// Implementations MUST key only on `instrument.symbol()`;
     /// `instrument.asset_class()` may be a caller-supplied default (the daemon
     /// builds lookups with a placeholder class) and is NOT authoritative for
-    /// this lookup.
-    async fn capabilities(
-        &self,
-        instrument: &Instrument,
-    ) -> Result<Option<InstrumentCapabilities>> {
+    /// this lookup. A provider that resolves the symbol therefore returns an
+    /// [`InstrumentEntry`] whose `instrument` carries the **authoritative**
+    /// asset class (the placeholder is corrected here), not merely the bare
+    /// [`crate::InstrumentCapabilities`]. Returning `None` means the provider has no
+    /// reference-data surface at all — the caller then keeps the instrument it
+    /// passed in (placeholder class included).
+    async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
         let _ = instrument;
         Ok(None)
     }

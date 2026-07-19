@@ -451,15 +451,14 @@ mod tests {
     #[test]
     fn instruments_reply_round_trips() {
         use datamancer_core::{AssetClass, EventKind, Instrument, InstrumentInfo, ProviderId};
-        let reply = Reply::instruments(vec![InstrumentInfo {
-            instrument: Instrument::new(
+        let reply = Reply::instruments(vec![InstrumentInfo::new(
+            Instrument::new(
                 ProviderId::from_static("alpaca-crypto"),
                 AssetClass::Crypto,
                 "BTC/USD",
             ),
-            kinds: vec![EventKind::Trade],
-            capabilities: None,
-        }]);
+            vec![EventKind::Trade],
+        )]);
         let line = serde_json::to_string(&reply).unwrap();
         let back: Reply = serde_json::from_str(&line).unwrap();
         assert_eq!(reply, back);

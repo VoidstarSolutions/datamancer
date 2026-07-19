@@ -84,6 +84,21 @@ fn equity_capabilities(asset: &Asset) -> InstrumentCapabilities {
     caps
 }
 
+/// Build a catalog entry for one Alpaca equity `Asset`: the instrument stamped
+/// with the authoritative [`AssetClass::Equity`] plus its capabilities. Shared
+/// by bulk listing and the on-demand `capabilities` lookup so both stamp the
+/// same class (and the on-demand path corrects the daemon's placeholder).
+fn equity_entry(asset: &Asset) -> InstrumentEntry {
+    let instrument = Instrument::new(
+        ProviderId::from_static(PROVIDER_ID),
+        AssetClass::Equity,
+        asset.symbol.clone(),
+    );
+    let mut entry = InstrumentEntry::bare(instrument);
+    entry.capabilities = Some(equity_capabilities(asset));
+    entry
+}
+
 /// Translate Alpaca's `/v2/assets` rows into the datamancer instrument
 /// catalog. Pure function — no client, no I/O — so it can be exercised
 /// against canned JSON fixtures without credentials.
@@ -97,21 +112,11 @@ fn assets_to_entries(assets: &[Asset]) -> Vec<InstrumentEntry> {
     assets
         .iter()
         .filter(|a| a.tradable)
-        .filter_map(|a| {
-            let asset_class = match a.class {
-                AlpacaAssetClass::UsEquity => AssetClass::Equity,
-                // Options and crypto-perp aren't part of v0's taxonomy;
-                // the dedicated crypto provider handles plain crypto.
-                _ => return None,
-            };
-            let instrument = Instrument::new(
-                ProviderId::from_static(PROVIDER_ID),
-                asset_class,
-                a.symbol.clone(),
-            );
-            let mut entry = InstrumentEntry::bare(instrument);
-            entry.capabilities = Some(equity_capabilities(a));
-            Some(entry)
+        .filter_map(|a| match a.class {
+            AlpacaAssetClass::UsEquity => Some(equity_entry(a)),
+            // Options and crypto-perp aren't part of v0's taxonomy;
+            // the dedicated crypto provider handles plain crypto.
+            _ => None,
         })
         .collect()
 }
@@ -392,10 +397,7 @@ impl Provider for AlpacaProvider {
         Ok(assets_to_entries(&assets))
     }
 
-    async fn capabilities(
-        &self,
-        instrument: &Instrument,
-    ) -> Result<Option<InstrumentCapabilities>> {
+    async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
         let trading = self.rest_clients().trading.ok_or_else(|| Error::Provider {
             provider: PROVIDER_ID.to_string(),
             message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
@@ -407,7 +409,7 @@ impl Provider for AlpacaProvider {
                 provider: PROVIDER_ID.to_string(),
                 message: format!("get_asset({}): {e}", instrument.symbol()),
             })?;
-        Ok(Some(equity_capabilities(&asset)))
+        Ok(Some(equity_entry(&asset)))
     }
 }
 
