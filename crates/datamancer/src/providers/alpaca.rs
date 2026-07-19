@@ -31,6 +31,7 @@ use oxidized_alpaca::{
     restful::{
         market_data::TimeFrame,
         market_data::stock::Adjustment as AlpacaAdjustment,
+        market_data::stock::quotes::StockQuote,
         trading::assets::{Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus},
     },
     streaming::{
@@ -1067,6 +1068,25 @@ fn translate_quote(q: &StockQuoteEvent, rx: Timestamp) -> Quote {
     }
 }
 
+/// Map a historical REST quote onto the canonical [`Quote`], mirroring
+/// [`translate_quote`]'s live mapping field for field so a backfilled quote is
+/// indistinguishable from a streamed one. The REST payload is keyed by the
+/// request path and carries no symbol, so `instrument` is supplied by the
+/// caller. `seq` is a placeholder; the authoritative controller re-stamps on
+/// delivery.
+fn rest_quote_to_quote(q: &StockQuote, instrument: &Instrument, rx: Timestamp) -> Quote {
+    Quote {
+        instrument: instrument.clone(),
+        source_ts: chrono_to_ts(q.timestamp),
+        rx_ts: rx,
+        seq: Seq(0),
+        bid: Price::from_f64_round(q.bid_price),
+        bid_size: Quantity::from_units(u64::from(q.bid_size)),
+        ask: Price::from_f64_round(q.ask_price),
+        ask_size: Quantity::from_units(u64::from(q.ask_size)),
+    }
+}
+
 fn translate_bar(b: &StockBar, interval: BarInterval, rx: Timestamp) -> Bar {
     Bar {
         instrument: provider_instrument(&b.symbol),
@@ -1211,13 +1231,22 @@ async fn fetch_history_via(
             }
         }
         EventKind::Quote => {
-            // The REST stock_quotes builder mirrors stock_trades; oxidized-alpaca
-            // does expose it through `MarketDataClient::stock_quotes`.
-            // Implementation parity guarded by feature presence.
-            return Err(Error::Provider {
-                provider: PROVIDER_ID.to_string(),
-                message: "historical quotes not yet wired through fetch_history".to_string(),
-            });
+            let quotes = rest
+                .stock_quotes(symbol)
+                .start(from)
+                .end(to)
+                .execute()
+                .await
+                .map_err(|e| Error::Provider {
+                    provider: PROVIDER_ID.to_string(),
+                    message: format!("stock_quotes: {e}"),
+                })?;
+            for q in &quotes {
+                let quote = rest_quote_to_quote(q, &request.instrument, rx);
+                if sink.send(MarketEvent::Quote(quote)).await.is_err() {
+                    return Ok(());
+                }
+            }
         }
         EventKind::Bar(interval) => {
             let timeframe = match interval {
@@ -1353,6 +1382,48 @@ mod tests {
             }
             other => panic!("expected Quote, got {other:?}"),
         }
+    }
+
+    /// The REST quote payload carries no symbol (it is keyed by the request
+    /// path), so the instrument must come from the `HistoryRequest` rather than
+    /// the wire — unlike the streaming quote, which is self-describing.
+    #[test]
+    fn translates_rest_quote() {
+        let json = r#"{"t":"2024-01-02T15:30:00Z","bx":"V","bp":420.05,"bs":2,"ax":"V","ap":420.10,"as":3,"c":["R"],"z":"C"}"#;
+        let rest: StockQuote = serde_json::from_str(json).unwrap();
+        let instrument = provider_instrument("MSFT");
+        let rx = Timestamp(1_700_000_000_000_000_000);
+
+        let q = rest_quote_to_quote(&rest, &instrument, rx);
+
+        assert_eq!(q.instrument, instrument);
+        assert_eq!(q.bid, Price::from_f64_round(420.05));
+        assert_eq!(q.ask, Price::from_f64_round(420.10));
+        assert_eq!(q.bid_size, Quantity::from_units(2));
+        assert_eq!(q.ask_size, Quantity::from_units(3));
+        assert_eq!(q.rx_ts, rx);
+        // Placeholder; the authoritative controller re-stamps on delivery.
+        assert_eq!(q.seq, Seq(0));
+    }
+
+    /// The historical and live paths must agree on the mapped result, so a
+    /// consumer cannot tell a backfilled quote from a streamed one.
+    #[test]
+    fn rest_and_streaming_quotes_agree() {
+        let rest: StockQuote = serde_json::from_str(
+            r#"{"t":"2024-01-02T15:30:00Z","bx":"V","bp":420.05,"bs":2,"ax":"V","ap":420.10,"as":3,"c":["R"],"z":"C"}"#,
+        )
+        .unwrap();
+        let live: StockQuoteEvent = serde_json::from_str(
+            r#"{"T":"q","S":"MSFT","ax":"V","ap":420.10,"as":3,"bx":"V","bp":420.05,"bs":2,"c":["R"],"t":"2024-01-02T15:30:00Z","z":"C"}"#,
+        )
+        .unwrap();
+        let rx = Timestamp(1_700_000_000_000_000_000);
+
+        let from_rest = rest_quote_to_quote(&rest, &provider_instrument("MSFT"), rx);
+        let from_live = translate_quote(&live, rx);
+
+        assert_eq!(from_rest, from_live);
     }
 
     #[test]
