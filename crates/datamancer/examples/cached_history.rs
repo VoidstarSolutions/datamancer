@@ -68,8 +68,10 @@ impl Provider for SyntheticProvider {
         PROVIDER
     }
 
-    fn supports(&self, _instrument: &Instrument, kind: EventKind, _surface: Surface) -> bool {
-        matches!(kind, EventKind::Bar(BarInterval::OneDay))
+    // History only: `start_live` below rejects outright, so advertising the live
+    // surface would promise a stream this provider cannot open.
+    fn supports(&self, _instrument: &Instrument, kind: EventKind, surface: Surface) -> bool {
+        surface == Surface::History && matches!(kind, EventKind::Bar(BarInterval::OneDay))
     }
 
     async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {

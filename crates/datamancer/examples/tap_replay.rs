@@ -36,8 +36,12 @@ impl Provider for SyntheticProvider {
         PROVIDER
     }
 
-    fn supports(&self, _instrument: &Instrument, kind: EventKind, _surface: Surface) -> bool {
-        matches!(kind, EventKind::Trade)
+    // Live only: `fetch_history` below is a no-op that sends nothing, so
+    // advertising the history surface would promise a backfill that silently
+    // yields an empty range — worse than refusing, since the caller gets no
+    // signal that nothing was served.
+    fn supports(&self, _instrument: &Instrument, kind: EventKind, surface: Surface) -> bool {
+        surface == Surface::Live && matches!(kind, EventKind::Trade)
     }
 
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
