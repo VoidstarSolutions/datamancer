@@ -13,8 +13,9 @@ use crate::{Price, Quantity};
 ///
 /// All fields optional: coverage is ragged across providers and asset classes
 /// (e.g. Alpaca equities advertise `fractionable` but no per-asset sizing;
-/// crypto advertises sizing but trivially-true `fractionable`; IBKR advertises
-/// sizing but gates fractional eligibility on the account). `None` = unknown.
+/// Alpaca crypto likewise advertises no sizing and reports `fractionable`
+/// trivially true; IBKR advertises sizing but gates fractional eligibility on
+/// the account). `None` = unknown.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstrumentCapabilities {

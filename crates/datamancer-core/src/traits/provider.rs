@@ -104,9 +104,11 @@ pub trait Provider: Send + Sync + 'static {
     /// this lookup. A provider that resolves the symbol therefore returns an
     /// [`InstrumentEntry`] whose `instrument` carries the **authoritative**
     /// asset class (the placeholder is corrected here), not merely the bare
-    /// [`crate::InstrumentCapabilities`]. Returning `None` means the provider has no
-    /// reference-data surface at all — the caller then keeps the instrument it
-    /// passed in (placeholder class included).
+    /// [`crate::InstrumentCapabilities`]. Returning `None` means no authoritative
+    /// entry was resolved — either the provider has no reference-data surface at
+    /// all, or the symbol is unknown / ineligible for this provider (e.g. a
+    /// crypto symbol asked of an equities provider). In every `None` case the
+    /// caller keeps the instrument it passed in, placeholder class included.
     async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
         let _ = instrument;
         Ok(None)
