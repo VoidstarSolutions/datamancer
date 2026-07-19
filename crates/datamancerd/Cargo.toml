@@ -78,7 +78,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 # Shared, audited Windows identity/integrity FFI (token SID, owner SID, integrity
 # level). win_control creates the pipe here; identity reads delegate to winsec.
-datamancer-winsec = { path = "../datamancer-winsec", version = "0.6.0" }
+datamancer-winsec = { path = "../datamancer-winsec", version = "0.7.0" }
 
 [dev-dependencies]
 datamancer-client = { path = "../datamancer-client", version = "0.8.0", features = ["ws", "iceoryx2", "app"] }
