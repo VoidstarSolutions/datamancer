@@ -10,16 +10,33 @@
 git_only = true                    # skip cargo publish; use git tags as the version baseline
 publish = false                    # explicit backstop: never run cargo publish, even if git_only is ever removed
 semver_check = false               # semver guarding stays in ci.yml's semver-checks.sh
-changelog_update = true            # maintain CHANGELOG.md as commits land
+changelog_update = false           # default off; the single changelog owner below re-enables it
 git_tag_name = "v{{ version }}"    # one tag per release for the single-version workspace (e.g. v0.5.0)
 git_tag_enable = false             # default off; re-enabled only for the single tag/release owner below
 git_release_enable = false         # default off; re-enabled only for the single tag/release owner below
 
-# `datamancer` is the sole tag/release owner. Every crate shares one workspace
-# version, so without this every crate would try to create the same
-# `vX.Y.Z` tag and GitHub Release, and all but the first would 422 with
+# `datamancer` is the sole tag/release AND changelog owner. Every crate shares
+# one workspace version, so without this every crate would try to create the
+# same `vX.Y.Z` tag and GitHub Release, and all but the first would 422 with
 # "Reference already exists".
+#
+# The changelog follows the same shape: one version and one tag deserve one
+# changelog, so this crate owns the root `CHANGELOG.md` (the path is relative
+# to the root Cargo.toml) and `changelog_include` folds in the commits of the
+# other six crates. Pointing all seven packages at the same file would be the
+# other way to get one changelog, but multiple writers of one path is
+# undocumented in release-plz and risks interleaved or duplicated sections.
 [[package]]
 name = "datamancer"
 git_tag_enable = true
 git_release_enable = true
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = [
+  "datamancer-core",
+  "datamancer-credentials",
+  "datamancer-transport-iceoryx2",
+  "datamancer-transport-ws",
+  "datamancer-client",
+  "datamancerd",
+]

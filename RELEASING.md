@@ -6,8 +6,8 @@ crates.io. Config: `release-plz.toml`. Workflow: `.github/workflows/release-plz.
 
 ## How a release happens
 
-1. You merge normal PRs to `main` using [Conventional Commits]
-   (`fix:` → patch, `feat:` → minor, `feat!:`/`BREAKING CHANGE:` → major).
+1. You merge normal PRs to `main` using [Conventional Commits] — **without
+   touching the version**. See "Never bump the version by hand" below.
 2. The `release-plz PR` job opens/updates a **"chore: release"** PR that bumps
    the single workspace version (`[workspace.package] version` in the root
    `Cargo.toml`) and updates changelogs. It runs through normal CI.
@@ -15,13 +15,67 @@ crates.io. Config: `release-plz.toml`. Workflow: `.github/workflows/release-plz.
 4. The `release-plz release` job creates the git tag (`vX.Y.Z`) and a GitHub
    Release with the changelog. Done — no crates.io.
 
+### Never bump the version by hand
+
+The version field belongs to release-plz. The `release` job runs on **every**
+push to `main` and asks one question: is there a tag for the version in
+`Cargo.toml`? If you hand-bump the version in a feature PR, merging that PR
+tags and releases it immediately — ahead of any release PR — and the standing
+`chore: release` PR then rebases onto that surprise tag and proposes a version
+you didn't intend.
+
+That is exactly what happened to `v0.6.0`, `v0.7.0`, and `v0.8.0`: each was
+tagged by a feature merge rather than a release PR, so the standing release PR
+(#39) was never the thing that released, and **every one of those GitHub
+Releases has empty notes** — the release PR is the only step that writes
+`CHANGELOG.md`, and it never merged. The tags themselves are fine; the
+changelogs are the casualty.
+
+Merge your feature PRs at the *current released version*. The release PR is the
+only thing that edits `[workspace.package] version`.
+
+### How the next version is computed (we're pre-1.0 — this is not plain semver)
+
+While the major version is `0`, release-plz ([`next_version`]) demotes every
+bump one level. Note especially that a plain `feat:` is **not** a minor bump:
+
+| Commit | 0.x.y (today) | ≥1.0.0 (later) |
+| --- | --- | --- |
+| `fix:` / non-conventional | patch (0.7.0 → 0.7.1) | patch |
+| `feat:` | patch (0.7.0 → 0.7.1) | minor |
+| `feat!:` / `BREAKING CHANGE:` | **minor** (0.7.0 → 0.8.0) | major |
+
+So a release cycle only reaches the next minor when it contains a breaking
+change. If you want a minor bump for a non-breaking milestone, say so in the
+release PR — override it there, not in a feature branch.
+
+[`next_version`]: https://docs.rs/next_version/latest/next_version/
+
 All seven crates share one version, so every release re-tags the whole
 workspace together. This keeps `datamancer-client` and `datamancerd` in
 lockstep for the ping version gate.
 
-Semver/API-break protection is the existing `.github/scripts/semver-checks.sh`
-gate in `ci.yml` (cargo-semver-checks vs. the PR base). release-plz does not run
-its own semver check (`semver_check = false`).
+One version and one tag get **one changelog**: the root `CHANGELOG.md`, owned
+by the `datamancer` package (`changelog_path` + `changelog_include` in
+`release-plz.toml`) exactly as it owns the tag and the Release. The other six
+crates have `changelog_update = false` so there is a single writer — releases
+before `v0.9.0` were backfilled with git-cliff and carry no per-crate history.
+
+Semver/API-break protection is the `.github/scripts/semver-checks.sh` gate in
+`ci.yml` (cargo-semver-checks vs. the PR base). release-plz does not run its own
+semver check (`semver_check = false`).
+
+Because release-plz owns the version, every PR is checked at an *unchanged*
+version, so `check-release` reports "requires new major/minor" for any API
+change — it cannot be a plain pass/fail on the bump. The gate therefore
+enforces **declaration** instead: a detected break must be marked by some commit
+in the PR range (`type!: subject` or a `BREAKING CHANGE:` footer). That marker
+is precisely what release-plz reads to size the bump, so the gate is really
+asking "will the release PR pick the right version for this change?" — with an
+undeclared break the answer is no. Additive-only changes pass with a note.
+
+Do not silence the gate by adding a marker to a break you didn't intend; make
+the change additive instead.
 
 ## Workspace manifest constraints (load-bearing for `git_only`)
 

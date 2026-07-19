@@ -42,7 +42,13 @@ cargo deny check                              # licenses, advisories, sources
 .github/scripts/semver-checks.sh origin/main  # semver vs the PR base (needs cargo-semver-checks)
 ```
 
-`cargo-semver-checks` treats any public-API addition to an exhaustive type as breaking (new enum variant, new pub field on a constructible struct) — wire-compatible JSON additions still require a version bump, and `datamancer-client`/`datamancerd` bump **in lockstep** (the ping version gate compares them; regression-guarded in datamancerd). Windows CI builds only the ws-portable subset — path-shape assertions in tests must be cfg'd per-OS (Windows data dirs nest `data\`).
+## Versioning — release-plz owns it, never bump by hand
+
+All seven crates share `[workspace.package] version` in the root `Cargo.toml`, which keeps `datamancer-client`/`datamancerd` in lockstep for the ping version gate. **release-plz owns that field**: it bumps it in the `chore: release` PR, and merging that PR is what tags `vX.Y.Z`. Do not edit the version in a feature PR — the `release` job tags whatever version lands on `main`, so a hand-bump self-releases on merge and leaves the standing release PR computing against a surprise tag. Full flow and the pre-1.0 bump table (while major is `0`, release-plz demotes every bump: `feat:` → patch, `feat!:` → minor) live in `RELEASING.md`.
+
+Because the version is unchanged in every PR, `semver-checks.sh` does not require a bump. It requires a **declaration**: if `cargo-semver-checks` reports a break, some commit in the PR range must carry a Conventional Commits breaking marker (`type!: subject` or a `BREAKING CHANGE:` footer) — that marker is what release-plz reads to compute the bump, so an undeclared break is the one case that would ship under a too-small version. Additive-only changes pass with a note. If the break was unintentional, make the change additive rather than adding the marker.
+
+`cargo-semver-checks` treats any public-API addition to an exhaustive type as breaking (new enum variant, new pub field on a constructible struct) — so wire-compatible JSON additions still count as breaks. Windows CI builds only the ws-portable subset — path-shape assertions in tests must be cfg'd per-OS (Windows data dirs nest `data\`).
 
 ## Architectural invariants
 
