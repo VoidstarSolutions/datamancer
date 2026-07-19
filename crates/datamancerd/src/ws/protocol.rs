@@ -5,7 +5,7 @@
 //! `codes` table); this module re-exports it under its historical path plus
 //! the daemon-side glue that needs the orchestrator's `datamancer` crate.
 
-pub use datamancer_client::protocol::ws::{WsReply, WsRequest};
+pub use datamancer_client::protocol::ws::{WsHealthPush, WsReply, WsRequest};
 
 use crate::control::error_code;
 

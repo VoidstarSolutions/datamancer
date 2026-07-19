@@ -484,8 +484,10 @@ impl Server {
         };
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let dm = self.dm.clone();
+        let credential_backend = self.credential_backend;
+        let diag_interval = self.diag_interval;
         let task = tokio::spawn(async move {
-            crate::ws::serve(dm, cfg, async move {
+            crate::ws::serve(dm, cfg, credential_backend, diag_interval, async move {
                 let _ = shutdown_rx.await;
             })
             .await

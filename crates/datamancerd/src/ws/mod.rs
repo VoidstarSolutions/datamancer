@@ -9,4 +9,4 @@ mod listener;
 mod protocol;
 
 pub use listener::serve;
-pub use protocol::{WsReply, WsRequest};
+pub use protocol::{WsHealthPush, WsReply, WsRequest};

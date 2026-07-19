@@ -22,16 +22,21 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 
 use crate::control::codes;
 use crate::ws::protocol::ws_reply_from_library_error;
-use crate::ws::{WsReply, WsRequest};
+use crate::ws::{WsHealthPush, WsReply, WsRequest};
 
 /// Accept the WS handshake (enforcing the bearer token if configured), then run
 /// the bridge until the socket closes or the client session ends.
+// 8 params: transport + auth + the two health-push inputs + shutdown. Bundling
+// them into a struct would add indirection without added clarity.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_connection(
     tcp: TcpStream,
     peer: SocketAddr,
     dm: Datamancer,
     auth_token: Option<Arc<String>>,
     channel_depth: usize,
+    credential_backend: &'static str,
+    diag_interval: Duration,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let ws = match accept_with_auth(tcp, auth_token).await {
@@ -79,6 +84,9 @@ pub async fn handle_connection(
     // this connection's teardown instead of leaving it blocked on the read.
     let mut closed_by_client = false;
     let mut drained = false;
+    // Health-push tasks started by `watch-health` subscribes on this connection.
+    // Each holds a `tx` clone; teardown aborts them so the writer channel closes.
+    let mut health_pushers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     loop {
         let msg = tokio::select! {
             // Any resolution of `recv` — Ok(()), Lagged, or Closed — means "shut
@@ -108,7 +116,7 @@ pub async fn handle_connection(
         };
         // `dispatch` also reports whether the frame was a `close-client`, so the
         // read loop need not re-parse it to compute `close_after`.
-        let (reply, was_close_client) = dispatch(&session, &dm, &text).await;
+        let (reply, was_close_client, start_health) = dispatch(&session, &dm, &text).await;
         let close_after = was_close_client && reply.ok;
         if let Ok(line) = serde_json::to_string(&reply) {
             // Enqueue the reply, but stay responsive to teardown while doing so.
@@ -134,6 +142,16 @@ pub async fn handle_connection(
                 }
             }
         }
+        // Once the `watch-health` ack is enqueued, start the periodic HealthView
+        // push for this connection (aborted on teardown).
+        if start_health && reply.ok {
+            health_pushers.push(spawn_health_push(
+                tx.clone(),
+                dm.clone(),
+                credential_backend,
+                diag_interval,
+            ));
+        }
         if close_after {
             closed_by_client = true;
             break;
@@ -144,6 +162,11 @@ pub async fn handle_connection(
     // daemon shutdown): close the session (emits terminal `session_closing` on
     // the stream), let the pump drain under a bound, then drop the writer so
     // `run_writer` emits the clean WS Close frame once the channel empties.
+    // Abort health-push tasks first: each holds a `tx` clone, so this lets the
+    // writer channel close once the pump and control loop release theirs.
+    for task in &health_pushers {
+        task.abort();
+    }
     let _ = session.close().await;
     if tokio::time::timeout(Duration::from_secs(2), pump)
         .await
@@ -241,18 +264,20 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Dispatch one parsed control frame against the connection's session. Returns
 /// the reply plus whether the frame was a `close-client` (so the caller need not
 /// re-parse the line to decide on a graceful close).
-async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsReply, bool) {
+async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsReply, bool, bool) {
     let req = match serde_json::from_str::<WsRequest>(line) {
         Ok(req) => req,
         Err(e) => {
             return (
                 WsReply::error(0, codes::BAD_REQUEST, format!("invalid request: {e}")),
                 false,
+                false,
             );
         }
     };
     let id = req.id();
     let is_close_client = matches!(req, WsRequest::CloseClient { .. });
+    let is_watch_health = matches!(req, WsRequest::WatchHealth { .. });
     let reply = match req {
         WsRequest::Subscribe { spec, .. } => {
             let instrument = Instrument::new(
@@ -290,7 +315,10 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
             Ok(snapshot) => WsReply::snapshot(id, snapshot),
             Err(e) => ws_reply_from_library_error(id, &e),
         },
-        WsRequest::CloseClient { .. } => WsReply::ok(id),
+        // Both are a bare ack; their effects are driven by the `is_close_client`
+        // / `is_watch_health` flags in `handle_connection` (close the connection
+        // / start the health push).
+        WsRequest::CloseClient { .. } | WsRequest::WatchHealth { .. } => WsReply::ok(id),
         WsRequest::Instruments { provider, .. } => {
             let filter = provider.map(ProviderId::new);
             match dm.instrument_catalog(filter.as_ref()).await {
@@ -315,7 +343,7 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
             }
         }
     };
-    (reply, is_close_client)
+    (reply, is_close_client, is_watch_health)
 }
 
 /// Pump the client's multiplexed stream into the WS sink, in arrival order.
@@ -339,6 +367,34 @@ fn spawn_pump(
             }
         }
         let _ = sink.flush().await;
+    })
+}
+
+/// Spawn a task that pushes the stamped `HealthView` onto this connection's
+/// writer channel on the daemon's diagnostics cadence, until the connection is
+/// torn down (the caller aborts it). Health is a periodic snapshot: `try_send`
+/// drops a stale push on a full channel and never applies backpressure to the
+/// writer.
+fn spawn_health_push(
+    tx: mpsc::Sender<String>,
+    dm: Datamancer,
+    credential_backend: &'static str,
+    diag_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(diag_interval);
+        loop {
+            ticker.tick().await;
+            let view = crate::server::stamped_health_view(&dm.snapshot_live(), credential_backend);
+            let Ok(line) = serde_json::to_string(&WsHealthPush { view }) else {
+                continue;
+            };
+            // Ok and Full both fall through (drop-on-full); only a closed channel
+            // (the connection is gone) ends the loop.
+            if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(line) {
+                break;
+            }
+        }
     })
 }
 
