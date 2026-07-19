@@ -27,6 +27,10 @@ pub mod spec;
 // connection and the app-facade ping (both named-pipe clients).
 #[cfg(all(windows, feature = "iceoryx2"))]
 mod win_pipe;
+// Standalone named-pipe control client for the Windows hybrid admin plane
+// (Phase 4): admin ops over the pipe, data over WS.
+#[cfg(all(windows, feature = "iceoryx2"))]
+mod pipe_control;
 #[cfg(feature = "ws")]
 pub mod ws;
 
