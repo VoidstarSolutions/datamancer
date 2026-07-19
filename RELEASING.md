@@ -55,6 +55,12 @@ All seven crates share one version, so every release re-tags the whole
 workspace together. This keeps `datamancer-client` and `datamancerd` in
 lockstep for the ping version gate.
 
+One version and one tag get **one changelog**: the root `CHANGELOG.md`, owned
+by the `datamancer` package (`changelog_path` + `changelog_include` in
+`release-plz.toml`) exactly as it owns the tag and the Release. The other six
+crates have `changelog_update = false` so there is a single writer — releases
+before `v0.9.0` were backfilled with git-cliff and carry no per-crate history.
+
 Semver/API-break protection is the `.github/scripts/semver-checks.sh` gate in
 `ci.yml` (cargo-semver-checks vs. the PR base). release-plz does not run its own
 semver check (`semver_check = false`).
