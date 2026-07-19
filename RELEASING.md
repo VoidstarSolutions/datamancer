@@ -22,8 +22,14 @@ push to `main` and asks one question: is there a tag for the version in
 `Cargo.toml`? If you hand-bump the version in a feature PR, merging that PR
 tags and releases it immediately — ahead of any release PR — and the standing
 `chore: release` PR then rebases onto that surprise tag and proposes a version
-you didn't intend. (This is exactly what produced the stray `v0.6.0`/`v0.7.0`
-tags on feature merges, and the perpetually-wrong PR #39.)
+you didn't intend.
+
+That is exactly what happened to `v0.6.0`, `v0.7.0`, and `v0.8.0`: each was
+tagged by a feature merge rather than a release PR, so the standing release PR
+(#39) was never the thing that released, and **every one of those GitHub
+Releases has empty notes** — the release PR is the only step that writes
+`CHANGELOG.md`, and it never merged. The tags themselves are fine; the
+changelogs are the casualty.
 
 Merge your feature PRs at the *current released version*. The release PR is the
 only thing that edits `[workspace.package] version`.
