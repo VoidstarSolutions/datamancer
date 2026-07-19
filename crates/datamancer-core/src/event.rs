@@ -93,12 +93,44 @@ pub enum EventKind {
 impl EventKind {
     /// Every subscribable kind: `Trade`, `Quote`, and one `Bar` per
     /// [`BarInterval`]. Used to derive an instrument's capability list by
-    /// probing [`crate::Provider::supports`] over the full kind space.
+    /// probing [`crate::Provider::supports`] over the full kind space, once per
+    /// [`Surface`].
     pub fn enumerate() -> impl Iterator<Item = EventKind> {
         [EventKind::Trade, EventKind::Quote]
             .into_iter()
             .chain(BarInterval::ALL.into_iter().map(EventKind::Bar))
     }
+}
+
+/// Which of a provider's two data surfaces a capability question is about.
+///
+/// The two genuinely differ and neither contains the other. Alpaca's equity
+/// websocket streams only minute and daily bars while its REST bar endpoint
+/// serves five intervals; conversely a provider may stream a kind it cannot
+/// backfill at all. Collapsing them into one predicate makes a provider either
+/// over-promise (advertise a backfill it cannot serve) or under-promise (reject
+/// a historical request it could serve) — datamancer shipped both bugs before
+/// this axis existed.
+///
+/// Deliberately **not** `#[non_exhaustive]`. Marking it so would force `_ =>`
+/// arms in every out-of-crate provider, meaning a future variant would silently
+/// inherit whatever answer that wildcard gives — reintroducing exactly the
+/// class of bug this type exists to prevent. An exhaustive enum makes adding a
+/// surface a compile error every provider must consciously answer.
+/// [`crate::Provider::latest`] is such a future variant: it is a third surface
+/// in all but name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Surface {
+    /// The streaming subscription path ([`crate::Provider::start_live`]).
+    Live,
+    /// The bounded historical-fetch path ([`crate::Provider::fetch_history`]).
+    History,
+}
+
+impl Surface {
+    /// Both surfaces, in declaration order. Lets callers probe the full
+    /// capability matrix without hard-coding the variant list.
+    pub const ALL: [Surface; 2] = [Surface::Live, Surface::History];
 }
 
 /// The unified output stream entry.

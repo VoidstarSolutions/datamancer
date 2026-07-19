@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use datamancer::Surface;
 use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, EventKind, Instrument,
@@ -102,7 +103,7 @@ impl Provider for FakeProvider {
     fn id(&self) -> &str {
         &self.id
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {

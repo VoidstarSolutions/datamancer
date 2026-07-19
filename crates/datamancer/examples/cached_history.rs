@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use datamancer::Surface;
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, ControlKind, Datamancer, EventKind, HistoryRequest, Instrument,
@@ -67,7 +68,7 @@ impl Provider for SyntheticProvider {
         PROVIDER
     }
 
-    fn supports(&self, _instrument: &Instrument, kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, kind: EventKind, _surface: Surface) -> bool {
         matches!(kind, EventKind::Bar(BarInterval::OneDay))
     }
 

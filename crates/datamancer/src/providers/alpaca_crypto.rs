@@ -38,8 +38,8 @@ use chrono::{DateTime, Utc};
 use datamancer_core::{
     AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
     HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent,
-    OrderType, Price, Provider, ProviderId, Quantity, Quote, Result, Seq, TimeInForce, Timestamp,
-    Trade,
+    OrderType, Price, Provider, ProviderId, Quantity, Quote, Result, Seq, Surface, TimeInForce,
+    Timestamp, Trade,
 };
 use oxidized_alpaca::{
     AccountType, CryptoFeed, MarketDataClient, TradingClient,
@@ -335,15 +335,24 @@ impl Provider for AlpacaCryptoProvider {
         self.cfg.settings.current().is_some()
     }
 
-    fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool {
+    fn supports(&self, instrument: &Instrument, kind: EventKind, surface: Surface) -> bool {
         if instrument.asset_class() != AssetClass::Crypto {
             return false;
         }
-        match kind {
-            EventKind::Trade
-            | EventKind::Quote
-            | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
-            EventKind::Bar(_) => false,
+        match surface {
+            Surface::Live => match kind {
+                EventKind::Trade
+                | EventKind::Quote
+                | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
+                EventKind::Bar(_) => false,
+            },
+            // No historical surface is wired yet: `oxidized_alpaca` exposes only
+            // `crypto_latest_*`, not the historical crypto trade/quote
+            // endpoints, and `fetch_history` below errors unconditionally.
+            // Declaring the empty set keeps that honest — the request is refused
+            // at routing rather than after a network round trip. Widen this in
+            // lockstep with `fetch_history`, never ahead of it.
+            Surface::History => false,
         }
     }
 
@@ -1253,14 +1262,34 @@ mod tests {
     }
 
     #[test]
-    fn provider_supports_kinds() {
+    fn provider_supports_live_kinds() {
         let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig::default());
         let inst = provider_instrument("BTC/USD");
-        assert!(p.supports(&inst, EventKind::Trade));
-        assert!(p.supports(&inst, EventKind::Quote));
-        assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneMinute)));
-        assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneDay)));
-        assert!(!p.supports(&inst, EventKind::Bar(BarInterval::FiveMinute)));
+        assert!(p.supports(&inst, EventKind::Trade, Surface::Live));
+        assert!(p.supports(&inst, EventKind::Quote, Surface::Live));
+        assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneMinute), Surface::Live));
+        assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneDay), Surface::Live));
+        assert!(!p.supports(
+            &inst,
+            EventKind::Bar(BarInterval::FiveMinute),
+            Surface::Live
+        ));
+    }
+
+    /// Crypto has no historical surface at all until the upstream
+    /// `oxidized_alpaca` endpoints land. Declaring the empty set honestly turns
+    /// what was a string `Error::Provider` raised at network time into a typed
+    /// `UnsupportedEventKind` caught at routing.
+    #[test]
+    fn provider_supports_no_history_kinds() {
+        let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig::default());
+        let inst = provider_instrument("BTC/USD");
+        for kind in EventKind::enumerate() {
+            assert!(
+                !p.supports(&inst, kind, Surface::History),
+                "crypto history is not wired; {kind:?} must not be advertised"
+            );
+        }
     }
 
     #[test]

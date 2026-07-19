@@ -319,11 +319,11 @@ One JSON object per line; one reply line per request.
 {"op":"list-clients"}  -> {"ok":true,"clients":["exec-1"]}
 {"op":"snapshot"}      -> {"ok":true,"snapshot":{ /* SystemSnapshot */ }}
 {"op":"instruments","provider":"alpaca-crypto"}
-  -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
+  -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"live_kinds":["trade"],"history_kinds":[]}]}
 {"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
 {"op":"capabilities","provider":"alpaca","symbols":["AAPL","MSFT"]}
   -> {"ok":true,"capabilities":[{"instrument":{ /* Instrument */ },"capabilities":{ /* InstrumentCapabilities, optional */ }}]}
-{"op":"ping"}          -> {"ok":true,"version":"0.7.0","credential_backend":"keychain"}
+{"op":"ping"}          -> {"ok":true,"version":"0.8.0","credential_backend":"keychain"}
 {"op":"set-credentials","provider":"alpaca-crypto","credentials":{"type":"api_key_pair","key_id":"AK…","secret":"…"}}
   -> {"ok":true}
 {"op":"get-credentials","provider":"alpaca-crypto"}
@@ -605,7 +605,7 @@ connection identifies the client):
 {"id":4,"op":"close-client"}
   -> {"id":4,"ok":true}
 {"id":5,"op":"instruments","provider":"alpaca-crypto"}
-  -> {"id":5,"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"kinds":["trade"]}]}
+  -> {"id":5,"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"live_kinds":["trade"],"history_kinds":[]}]}
 {"id":6,"op":"capabilities","provider":"alpaca","symbols":["AAPL","MSFT"]}
   -> {"id":6,"ok":true,"capabilities":[{"instrument":{ /* Instrument */ },"capabilities":{ /* InstrumentCapabilities, optional */ }}]}
 ```
@@ -614,6 +614,22 @@ Like on the UDS surface, `instruments` (optional `provider` filter) and
 `capabilities` (required `provider` + `symbols`) are dispatched per-connection
 rather than through any shared actor, so they never block other connections
 while they await a live provider REST call.
+
+### `instruments` rows: `live_kinds` and `history_kinds`
+
+Each catalog row reports the kinds a provider streams and the kinds it can
+backfill **separately**. The two genuinely differ and neither contains the
+other: Alpaca equities stream only minute and daily bars while backfilling five
+intervals, and a provider may stream a kind it cannot backfill at all.
+
+There is no combined `kinds` field. Compute the union client-side if you want
+it — a single list is what let a consumer read "quotes are supported" and
+conclude it could backfill quotes, which is the ambiguity this split removes.
+
+**Breaking in 0.8.0.** Rows before 0.8.0 carried one `kinds` array. Neither new
+field has a default, so a pre-0.8.0 payload now fails to parse rather than
+silently deserializing as "supports nothing." `datamancer-client` and
+`datamancerd` bump in lockstep and the `ping` version gate rejects the skew.
 
 Errors reuse the **same stable `codes` table** as the UDS control surface
 (`{"id":5,"ok":false,"code":"unsupported_event_kind","message":"…"}`). Event

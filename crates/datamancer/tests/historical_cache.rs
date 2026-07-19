@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use datamancer::Surface;
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     Adjustment, AssetClass, Bar, BarInterval, CacheKey, ControlKind, Datamancer, EventKind,
@@ -60,7 +61,7 @@ impl Provider for RecordingProvider {
     fn id(&self) -> &str {
         &self.id
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
@@ -509,7 +510,7 @@ impl Provider for GatedProvider {
     fn id(&self) -> &str {
         &self.id
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
@@ -733,7 +734,7 @@ impl Provider for GatedFailingProvider {
     fn id(&self) -> &str {
         &self.id
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {

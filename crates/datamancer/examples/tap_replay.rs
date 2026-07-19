@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datamancer::Surface;
 use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
 use datamancer::{
     AssetClass, Datamancer, EventKind, HistoryRequest, Instrument, LiveHandle, MarketEvent,
@@ -35,7 +36,7 @@ impl Provider for SyntheticProvider {
         PROVIDER
     }
 
-    fn supports(&self, _instrument: &Instrument, kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, kind: EventKind, _surface: Surface) -> bool {
         matches!(kind, EventKind::Trade)
     }
 

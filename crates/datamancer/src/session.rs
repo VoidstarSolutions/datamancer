@@ -64,7 +64,7 @@ use datamancer_core::{
     Adjustment, AuthoritativeSessionSnapshot, Bar, CacheKey, CacheSnapshot, ClientSessionSnapshot,
     Control, ControlKind, Error, EventKind, EventSink, GapSpan, HealthView, HistoricalCache,
     HistoryRequest, Instrument, InstrumentEntry, InstrumentInfo, LiveHandle, MarketEvent, Provider,
-    ProviderId, ProviderSnapshot, PublishOutcome, Quote, ReplayRequest, Result, Seq,
+    ProviderId, ProviderSnapshot, PublishOutcome, Quote, ReplayRequest, Result, Seq, Surface,
     SystemSnapshot, TapLog, Timestamp, Trade,
 };
 use futures::StreamExt;
@@ -279,7 +279,7 @@ impl Datamancer {
                 // Historical sessions do not participate in the live registry
                 // (concurrent reads for the same pair run independently) and keep
                 // the single-consumer controller verbatim.
-                let provider = self.route(&instrument, kind)?;
+                let provider = self.route(&instrument, kind, &[Surface::History])?;
                 let accounting = self.inner.accounting_for(provider.id());
                 let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(8);
                 let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
@@ -357,7 +357,16 @@ impl Datamancer {
         SubscriberGuard,
         mpsc::Receiver<MarketEvent>,
     )> {
-        let provider = self.route(&instrument, kind)?;
+        // A backfilling live session seams a historical fetch into the live
+        // tail, so it needs both surfaces from the one provider that will serve
+        // the whole substream.
+        let surfaces: &[Surface] = match scope {
+            Scope::Live {
+                backfill_from: Some(_),
+            } => &[Surface::Live, Surface::History],
+            _ => &[Surface::Live],
+        };
+        let provider = self.route(&instrument, kind, surfaces)?;
         let key = (instrument.clone(), kind);
 
         // Probe under the lock; if a live session exists, try to share it.
@@ -598,9 +607,11 @@ impl Datamancer {
     /// event kinds each instrument supports.
     ///
     /// Kinds are derived by probing [`Provider::supports`] over
-    /// [`EventKind::enumerate`] for every instrument returned by
-    /// [`Provider::list_instruments`] — the kind space is finite and closed, so
-    /// no provider-side enumeration surface is needed. Pass `provider` to
+    /// [`EventKind::enumerate`] once per [`Surface`] for every instrument
+    /// returned by [`Provider::list_instruments`] — the kind space is finite and
+    /// closed, so no provider-side enumeration surface is needed. The live and
+    /// history lists are reported separately because they genuinely differ;
+    /// there is no combined field. Pass `provider` to
     /// restrict the catalog (a full equities list is ~10k rows).
     ///
     /// Freshness is pass-through: every call hits the provider's
@@ -630,10 +641,13 @@ impl Datamancer {
         let mut catalog = Vec::new();
         for p in providers {
             for entry in p.list_instruments().await? {
-                let kinds: Vec<EventKind> = EventKind::enumerate()
-                    .filter(|kind| p.supports(&entry.instrument, *kind))
+                let live_kinds: Vec<EventKind> = EventKind::enumerate()
+                    .filter(|kind| p.supports(&entry.instrument, *kind, Surface::Live))
                     .collect();
-                let mut info = InstrumentInfo::new(entry.instrument, kinds);
+                let history_kinds: Vec<EventKind> = EventKind::enumerate()
+                    .filter(|kind| p.supports(&entry.instrument, *kind, Surface::History))
+                    .collect();
+                let mut info = InstrumentInfo::new(entry.instrument, live_kinds, history_kinds);
                 info.capabilities = entry.capabilities;
                 catalog.push(info);
             }
@@ -808,14 +822,26 @@ impl Datamancer {
             .ok_or_else(|| Error::UnknownProvider(id.to_string()))
     }
 
-    /// Pick the provider for `(instrument, kind)`: an explicit
-    /// `instrument_provider` pin if one exists, else the **first** registered
-    /// provider whose `supports()` matches. Load-bearing precondition: no two
-    /// registered providers may claim the same (asset-class, kind) space,
-    /// since an unpinned instrument in that overlap silently routes to
-    /// whichever was registered first — overlapping providers require
-    /// instrument→provider pinning to disambiguate.
-    fn route(&self, instrument: &Instrument, kind: EventKind) -> Result<Arc<dyn Provider>> {
+    /// Pick the provider for `(instrument, kind)` that serves **every** surface
+    /// in `surfaces`: an explicit `instrument_provider` pin if one exists, else
+    /// the **first** registered provider whose `supports()` matches. Load-bearing
+    /// precondition: no two registered providers may claim the same
+    /// (asset-class, kind) space, since an unpinned instrument in that overlap
+    /// silently routes to whichever was registered first — overlapping providers
+    /// require instrument→provider pinning to disambiguate.
+    ///
+    /// `surfaces` carries more than one entry for a backfilling live session,
+    /// which needs history *and* live from a **single** provider. Satisfying the
+    /// two halves from different providers would splice two upstreams into one
+    /// `(instrument, seq)` substream at the historical→live seam, breaking the
+    /// per-symbol determinism the ordering model rests on — so this requires one
+    /// provider to answer for all of them rather than routing each separately.
+    fn route(
+        &self,
+        instrument: &Instrument,
+        kind: EventKind,
+        surfaces: &[Surface],
+    ) -> Result<Arc<dyn Provider>> {
         let pinned = self
             .inner
             .instrument_provider
@@ -823,24 +849,42 @@ impl Datamancer {
             .find(|(i, _)| i == instrument)
             .map(|(_, p)| p.as_str());
 
+        let serves_all =
+            |p: &Arc<dyn Provider>| surfaces.iter().all(|s| p.supports(instrument, kind, *s));
+
         let candidate = if let Some(id) = pinned {
             self.inner
                 .providers
                 .iter()
-                .find(|p| p.id() == id && p.supports(instrument, kind))
+                .find(|p| p.id() == id && serves_all(p))
         } else {
-            self.inner
-                .providers
-                .iter()
-                .find(|p| p.supports(instrument, kind))
+            self.inner.providers.iter().find(|p| serves_all(p))
         };
 
-        candidate
-            .cloned()
-            .ok_or_else(|| Error::UnsupportedEventKind {
+        candidate.cloned().ok_or_else(|| {
+            // Report the first surface no provider could serve, so a failed
+            // backfill names the missing half instead of the whole request.
+            let missing = surfaces
+                .iter()
+                .copied()
+                .find(|s| {
+                    !self
+                        .inner
+                        .providers
+                        .iter()
+                        .any(|p| p.supports(instrument, kind, *s))
+                })
+                // Every surface is served by *some* provider, but no single one
+                // serves all — the split-across-providers case a backfilling
+                // session cannot use. Name the first requested surface.
+                .or_else(|| surfaces.first().copied())
+                .unwrap_or(Surface::Live);
+            Error::UnsupportedEventKind {
                 kind,
                 instrument: instrument.clone(),
-            })
+                surface: missing,
+            }
+        })
     }
 }
 

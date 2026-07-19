@@ -2,6 +2,7 @@
 //! `list_instruments` + `supports`, with an optional provider filter.
 
 use async_trait::async_trait;
+use datamancer::Surface;
 use datamancer::{
     AssetClass, BarInterval, Datamancer, Error, EventKind, Instrument, InstrumentEntry,
     InstrumentInfo, LiveHandle, MarketEvent, Provider, ProviderId,
@@ -9,9 +10,13 @@ use datamancer::{
 use datamancer_core::HistoryRequest;
 use tokio::sync::mpsc;
 
-/// Fake provider whose kind support varies **by instrument** — guards the
-/// per-instrument catalog shape (a provider-wide kinds list would collapse
-/// this distinction).
+/// Fake provider whose kind support varies **by instrument and by surface** —
+/// guards the per-instrument catalog shape (a provider-wide kinds list would
+/// collapse the first distinction, a single `kinds` field the second).
+///
+/// The two symbols model the two real asymmetries, in opposite directions:
+/// `BTC/USD` streams ticks it cannot backfill, `IDX` backfills a finer bar than
+/// it streams (which is what Alpaca equities actually do).
 struct VaryingFake {
     id: &'static str,
 }
@@ -22,15 +27,22 @@ impl Provider for VaryingFake {
         self.id
     }
 
-    fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool {
-        match instrument.symbol() {
-            // Full-service symbol.
-            "BTC/USD" => matches!(
+    fn supports(&self, instrument: &Instrument, kind: EventKind, surface: Surface) -> bool {
+        match (instrument.symbol(), surface) {
+            // Full-service live symbol, but only its daily bar is backfillable.
+            ("BTC/USD", Surface::Live) => matches!(
                 kind,
                 EventKind::Trade | EventKind::Quote | EventKind::Bar(BarInterval::OneDay)
             ),
-            // Bars-only symbol.
-            "IDX" => matches!(kind, EventKind::Bar(BarInterval::OneDay)),
+            ("BTC/USD", Surface::History) => {
+                matches!(kind, EventKind::Bar(BarInterval::OneDay))
+            }
+            // Bars-only symbol whose history reaches an interval it never streams.
+            ("IDX", Surface::Live) => matches!(kind, EventKind::Bar(BarInterval::OneDay)),
+            ("IDX", Surface::History) => matches!(
+                kind,
+                EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay)
+            ),
             _ => false,
         }
     }
@@ -125,10 +137,17 @@ async fn catalog_derives_kinds_per_instrument() {
                     EventKind::Quote,
                     EventKind::Bar(BarInterval::OneDay),
                 ],
+                vec![EventKind::Bar(BarInterval::OneDay)],
             ),
             InstrumentInfo::new(
                 Instrument::new(ProviderId::from_static("fake-a"), AssetClass::Crypto, "IDX"),
                 vec![EventKind::Bar(BarInterval::OneDay)],
+                // In `EventKind::enumerate` order, so the minute bar precedes
+                // the daily one.
+                vec![
+                    EventKind::Bar(BarInterval::OneMinute),
+                    EventKind::Bar(BarInterval::OneDay),
+                ],
             ),
         ]
     );

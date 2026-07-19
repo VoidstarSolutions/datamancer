@@ -155,9 +155,20 @@ impl fmt::Display for Instrument {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstrumentInfo {
     pub instrument: Instrument,
-    /// Kinds this provider serves for this instrument, in
+    /// Kinds this provider streams for this instrument, in
     /// [`EventKind::enumerate`] order.
-    pub kinds: Vec<EventKind>,
+    pub live_kinds: Vec<EventKind>,
+    /// Kinds this provider can backfill for this instrument, in
+    /// [`EventKind::enumerate`] order.
+    ///
+    /// Not a subset or superset of `live_kinds` — the two are independent. A
+    /// provider may stream minute bars it cannot backfill, or backfill
+    /// five-minute bars it never streams (Alpaca equities do the latter). There
+    /// is deliberately no combined `kinds` field: a union is what let a consumer
+    /// read "Quote is supported" and conclude it could backfill quotes, which is
+    /// the bug this split exists to fix. Callers wanting the union compute it
+    /// from these two.
+    pub history_kinds: Vec<EventKind>,
     /// Order/fractional capabilities the provider could populate cheaply while
     /// listing this instrument. `None` = not populated inline (the on-demand
     /// `Provider::capabilities` path may still supply them). Absence of an
@@ -167,14 +178,20 @@ pub struct InstrumentInfo {
 }
 
 impl InstrumentInfo {
-    /// A catalog row for `instrument` serving `kinds`, with no capabilities
-    /// populated. Set the public `capabilities` field afterwards if the
-    /// provider filled them inline.
+    /// A catalog row for `instrument` serving `live_kinds` on the streaming
+    /// surface and `history_kinds` on the backfill surface, with no capabilities
+    /// populated. Set the public `capabilities` field afterwards if the provider
+    /// filled them inline.
     #[must_use]
-    pub fn new(instrument: Instrument, kinds: Vec<EventKind>) -> Self {
+    pub fn new(
+        instrument: Instrument,
+        live_kinds: Vec<EventKind>,
+        history_kinds: Vec<EventKind>,
+    ) -> Self {
         Self {
             instrument,
-            kinds,
+            live_kinds,
+            history_kinds,
             capabilities: None,
         }
     }
@@ -216,16 +233,59 @@ mod tests {
                 AssetClass::Crypto,
                 "BTC/USD",
             ),
-            kinds: vec![
+            live_kinds: vec![
                 EventKind::Trade,
                 EventKind::Quote,
                 EventKind::Bar(BarInterval::OneDay),
             ],
+            history_kinds: vec![EventKind::Bar(BarInterval::OneDay)],
             capabilities: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: InstrumentInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(info, back);
+    }
+
+    /// The two lists are independent: neither is derivable from the other, and
+    /// a row where they differ must survive the wire intact.
+    #[test]
+    fn instrument_info_keeps_surfaces_distinct() {
+        let info = InstrumentInfo::new(
+            Instrument::new(
+                ProviderId::from_static("alpaca"),
+                AssetClass::Equity,
+                "AAPL",
+            ),
+            vec![EventKind::Bar(BarInterval::OneMinute)],
+            vec![
+                EventKind::Bar(BarInterval::OneMinute),
+                EventKind::Bar(BarInterval::FiveMinute),
+            ],
+        );
+        let back: InstrumentInfo =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(
+            back.live_kinds,
+            vec![EventKind::Bar(BarInterval::OneMinute)]
+        );
+        assert_eq!(
+            back.history_kinds,
+            vec![
+                EventKind::Bar(BarInterval::OneMinute),
+                EventKind::Bar(BarInterval::FiveMinute)
+            ]
+        );
+    }
+
+    /// The pre-split single `kinds` field is a hard break, not a silent
+    /// migration. Neither new field carries a serde default: defaulting to an
+    /// empty list would make an old peer look like a provider that supports
+    /// nothing, and defaulting to the union would resurrect the ambiguity the
+    /// split removes. An old peer must fail loudly and be upgraded.
+    #[test]
+    fn instrument_info_rejects_pre_split_kinds_field() {
+        let legacy = r#"{"instrument":{"provider":"alpaca","asset_class":"Equity","symbol":"AAPL"},"kinds":["Trade"]}"#;
+        assert!(serde_json::from_str::<InstrumentInfo>(legacy).is_err());
     }
 
     #[test]
@@ -238,7 +298,8 @@ mod tests {
         );
         let info = InstrumentInfo {
             instrument: inst.clone(),
-            kinds: vec![EventKind::Trade],
+            live_kinds: vec![EventKind::Trade],
+            history_kinds: vec![EventKind::Trade],
             capabilities: Some(InstrumentCapabilities {
                 fractionable: Some(true),
                 ..Default::default()
@@ -248,9 +309,9 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
         assert_eq!(info, back);
 
-        // Old-shape JSON (no capabilities key) still deserializes.
-        let legacy = r#"{"instrument":{"provider":"alpaca","asset_class":"Equity","symbol":"AAPL"},"kinds":["Trade"]}"#;
-        let parsed: InstrumentInfo = serde_json::from_str(legacy).unwrap();
+        // JSON without the optional capabilities key still deserializes.
+        let bare = r#"{"instrument":{"provider":"alpaca","asset_class":"Equity","symbol":"AAPL"},"live_kinds":["Trade"],"history_kinds":[]}"#;
+        let parsed: InstrumentInfo = serde_json::from_str(bare).unwrap();
         assert!(parsed.capabilities.is_none());
 
         // InstrumentEntry::bare has no capabilities.

@@ -14,10 +14,17 @@ pub enum Error {
 
     /// The requested event kind is not supported by any registered provider
     /// capable of serving the requested instrument.
-    #[error("no registered provider supports event kind {kind:?} for {instrument}")]
+    #[error(
+        "no registered provider supports event kind {kind:?} for {instrument} on the {surface:?} surface"
+    )]
     UnsupportedEventKind {
         kind: crate::EventKind,
         instrument: crate::Instrument,
+        /// Which surface was missing. A backfilling live session requires both
+        /// [`crate::Surface::Live`] and [`crate::Surface::History`] from one
+        /// provider, so this names the half that failed rather than leaving the
+        /// caller to guess.
+        surface: crate::Surface,
     },
 
     /// A live session for `(instrument, kind)` is already active. Datamancer
