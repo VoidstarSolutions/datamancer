@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.7.0...v0.8.0) - 2026-07-19
 
 ### Added
+
 - [**breaking**] split Provider::supports into live and history surfaces
 
 ### Fixed
+
 - *(alpaca)* wire historical quotes through fetch_history
 - *(datamancerd)* update client_transport_e2e for the kinds split
 - *(examples)* declare only the surfaces each example provider implements
@@ -19,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.7.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.6.0...v0.7.0) - 2026-07-19
 
 ### Added
+
 - *(core)* add InstrumentCapabilities, OrderType, TimeInForce
 - *(core)* InstrumentEntry + optional capabilities on InstrumentInfo
 - *(core)* list_instruments returns InstrumentEntry; add Provider::capabilities
@@ -28,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - capabilities control op (client trait, transports, daemon dispatch)
 
 ### Fixed
+
 - surface failing symbol on capabilities op; docs + ws reply test (review follow-ups)
 - provider stamps authoritative asset class on capabilities; correct crypto policy
 - gate fractional caps on fractionable; eligibility-filter capability lookups
@@ -35,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.6.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.5.0...v0.6.0) - 2026-07-18
 
 ### Added
+
 - *(windows)* Phase 1 cleanups + open-sourcing spec consolidation
 - *(windows)* client app compiles on Windows (named-pipe control + detached spawn)
 - *(windows)* daemon compiles on Windows (real lock+signals, fail-closed control stub)
@@ -44,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(alpaca-crypto)* implement Provider::latest via crypto snapshot
 
 ### Fixed
+
 - pin documented Windows control-socket path in test
 - *(windows)* address review — defer admin-socket fallback, fence lang
 - *(windows)* audit cleanup -- fail-closed pipe, byte-exact logs, native CI guard
@@ -51,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(alpaca)* seed stock latest() from the configured stream feed
 
 ### Other
+
 - add native Windows support design spec
 - record iceoryx2 Windows spike result and transport decision
 - *(windows)* complete the credential-backend name contract
