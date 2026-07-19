@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use datamancer::Surface;
 use datamancer::{
     AssetClass, ControlKind, Datamancer, EventKind, Instrument, LiveHandle, MarketEvent,
     PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq, Timestamp, Trade,
@@ -97,7 +98,7 @@ impl Provider for FakeProvider {
     fn id(&self) -> &str {
         &self.id
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {

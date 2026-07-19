@@ -181,7 +181,15 @@ async fn exercise<C: Client>(cfg: C::Config, tolerate_missed_closing: bool) {
     let catalog = client.instruments(None).await.expect("instruments");
     assert!(!catalog.is_empty(), "catalog must not be empty");
     let info = &catalog[0];
-    assert!(!info.kinds.is_empty(), "kinds derived per instrument");
+    // Live kinds are the discovery contract this test depends on — it goes on to
+    // subscribe. `history_kinds` is deliberately not asserted: it legitimately
+    // varies by provider (the crypto provider reports none until the upstream
+    // historical endpoints land), so pinning it here would couple a live
+    // transport test to that gap.
+    assert!(
+        !info.live_kinds.is_empty(),
+        "live kinds derived per instrument"
+    );
 
     // Subscribe to the same (provider, symbol, kind) the existing e2e tests
     // use against the real paper-crypto feed.

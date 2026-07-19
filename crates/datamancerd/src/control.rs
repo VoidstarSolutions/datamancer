@@ -64,6 +64,7 @@ mod tests {
             error_code(&Error::UnsupportedEventKind {
                 instrument: inst.clone(),
                 kind: EventKind::Trade,
+                surface: datamancer::Surface::History,
             }),
             codes::UNSUPPORTED_EVENT_KIND
         );

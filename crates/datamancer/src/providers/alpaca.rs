@@ -23,7 +23,8 @@ use chrono::{DateTime, Utc};
 use datamancer_core::{
     Adjustment, AssetClass, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
     HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent,
-    OrderType, Price, Provider, ProviderId, Quantity, Result, Seq, TimeInForce, Timestamp, Trade,
+    OrderType, Price, Provider, ProviderId, Quantity, Result, Seq, Surface, TimeInForce, Timestamp,
+    Trade,
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
@@ -310,18 +311,31 @@ impl Provider for AlpacaProvider {
         self.cfg.settings.current().is_some()
     }
 
-    fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool {
+    fn supports(&self, instrument: &Instrument, kind: EventKind, surface: Surface) -> bool {
         if !matches!(
             instrument.asset_class(),
             AssetClass::Equity | AssetClass::Etf
         ) {
             return false;
         }
-        match kind {
-            EventKind::Trade
-            | EventKind::Quote
-            | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
-            EventKind::Bar(_) => false,
+        match surface {
+            // The equity websocket streams trades, quotes, and only minute and
+            // daily bars.
+            Surface::Live => match kind {
+                EventKind::Trade
+                | EventKind::Quote
+                | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
+                EventKind::Bar(_) => false,
+            },
+            // The REST bar surface is wider than the streamed one: `stock_bars`
+            // accepts every interval `fetch_history_via` maps except one-second,
+            // which has no endpoint. Keep this in step with that match — an
+            // over-promise here routes a request that then fails at network time.
+            Surface::History => match kind {
+                // No REST second-bar endpoint; every other interval is served.
+                EventKind::Bar(BarInterval::OneSecond) => false,
+                EventKind::Trade | EventKind::Quote | EventKind::Bar(_) => true,
+            },
         }
     }
 
@@ -1254,6 +1268,7 @@ async fn fetch_history_via(
                     return Err(Error::UnsupportedEventKind {
                         kind: EventKind::Bar(interval),
                         instrument: request.instrument.clone(),
+                        surface: Surface::History,
                     });
                 }
                 BarInterval::OneMinute => TimeFrame::ONE_MINUTE,
@@ -1507,14 +1522,63 @@ mod tests {
     }
 
     #[test]
-    fn provider_supports_kinds() {
+    fn provider_supports_live_kinds() {
         let p = AlpacaProvider::new(AlpacaProviderConfig::default());
         let inst = provider_instrument("AAPL");
-        assert!(p.supports(&inst, EventKind::Trade));
-        assert!(p.supports(&inst, EventKind::Quote));
-        assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneMinute)));
-        assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneDay)));
-        assert!(!p.supports(&inst, EventKind::Bar(BarInterval::FiveMinute)));
+        assert!(p.supports(&inst, EventKind::Trade, Surface::Live));
+        assert!(p.supports(&inst, EventKind::Quote, Surface::Live));
+        assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneMinute), Surface::Live));
+        assert!(p.supports(&inst, EventKind::Bar(BarInterval::OneDay), Surface::Live));
+        // The websocket streams only minute and daily bars.
+        assert!(!p.supports(
+            &inst,
+            EventKind::Bar(BarInterval::FiveMinute),
+            Surface::Live
+        ));
+        assert!(!p.supports(&inst, EventKind::Bar(BarInterval::OneSecond), Surface::Live));
+    }
+
+    /// The REST bar surface is strictly wider than the streamed one: `stock_bars`
+    /// serves five intervals where the websocket streams two. Under the old flat
+    /// predicate this asymmetry was unrepresentable, and historical 5m/15m/1h
+    /// requests were rejected for a provider that could serve them.
+    #[test]
+    fn provider_supports_history_kinds() {
+        let p = AlpacaProvider::new(AlpacaProviderConfig::default());
+        let inst = provider_instrument("AAPL");
+        assert!(p.supports(&inst, EventKind::Trade, Surface::History));
+        assert!(p.supports(&inst, EventKind::Quote, Surface::History));
+        for interval in [
+            BarInterval::OneMinute,
+            BarInterval::FiveMinute,
+            BarInterval::FifteenMinute,
+            BarInterval::OneHour,
+            BarInterval::OneDay,
+        ] {
+            assert!(
+                p.supports(&inst, EventKind::Bar(interval), Surface::History),
+                "history should serve {interval:?}"
+            );
+        }
+        // No REST second-bar endpoint.
+        assert!(!p.supports(
+            &inst,
+            EventKind::Bar(BarInterval::OneSecond),
+            Surface::History
+        ));
+    }
+
+    #[test]
+    fn provider_rejects_foreign_asset_class_on_both_surfaces() {
+        let p = AlpacaProvider::new(AlpacaProviderConfig::default());
+        let crypto = Instrument::new(
+            ProviderId::from_static(PROVIDER_ID),
+            AssetClass::Crypto,
+            "BTC/USD",
+        );
+        for surface in [Surface::Live, Surface::History] {
+            assert!(!p.supports(&crypto, EventKind::Trade, surface));
+        }
     }
 
     #[tokio::test]

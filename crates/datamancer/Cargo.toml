@@ -15,7 +15,7 @@ client-iceoryx2 = ["dep:datamancer-client", "datamancer-client/iceoryx2"]
 
 [dependencies]
 async-trait = "0.1"
-datamancer-core = { path = "../datamancer-core", version = "0.7.0" }
+datamancer-core = { path = "../datamancer-core", version = "0.8.0" }
 fastrand = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
@@ -32,13 +32,13 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 # transport-iceoryx2
-datamancer-transport-iceoryx2 = { path = "../datamancer-transport-iceoryx2", version = "0.7.0", optional = true }
+datamancer-transport-iceoryx2 = { path = "../datamancer-transport-iceoryx2", version = "0.8.0", optional = true }
 
 # transport-ws
-datamancer-transport-ws = { path = "../datamancer-transport-ws", version = "0.7.0", optional = true }
+datamancer-transport-ws = { path = "../datamancer-transport-ws", version = "0.8.0", optional = true }
 
 # client-ws / client-iceoryx2
-datamancer-client = { path = "../datamancer-client", version = "0.7.0", optional = true, default-features = false }
+datamancer-client = { path = "../datamancer-client", version = "0.8.0", optional = true, default-features = false }
 
 [dev-dependencies]
 serde_json = { workspace = true }

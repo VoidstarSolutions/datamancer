@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use datamancer::Surface;
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, DisconnectCause, EventKind,
@@ -89,7 +90,7 @@ impl Provider for ServingProvider {
     fn id(&self) -> &str {
         &self.id
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
@@ -195,7 +196,7 @@ impl Provider for GatedProvider {
     fn id(&self) -> &str {
         &self.id
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
@@ -341,7 +342,7 @@ impl Provider for LiveProvider {
     fn id(&self) -> &str {
         &self.id
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
@@ -648,7 +649,7 @@ impl Provider for DisabledProvider {
     fn enabled(&self) -> bool {
         false
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
@@ -706,7 +707,7 @@ impl Provider for GatedBackfillProvider {
     fn id(&self) -> &str {
         &self.id
     }
-    fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
     }
     async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {

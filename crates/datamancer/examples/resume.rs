@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use datamancer::Surface;
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     AssetClass, Datamancer, EventKind, Instrument, LiveHandle, MarketEvent, PersistenceOptions,
@@ -59,7 +60,7 @@ impl Provider for SyntheticProvider {
     fn id(&self) -> &str {
         PROVIDER
     }
-    fn supports(&self, _instrument: &Instrument, kind: EventKind) -> bool {
+    fn supports(&self, _instrument: &Instrument, kind: EventKind, _surface: Surface) -> bool {
         kind == EventKind::Trade
     }
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {

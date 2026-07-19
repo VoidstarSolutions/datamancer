@@ -30,7 +30,7 @@ pub use credentials::ProviderCredentials;
 pub use error::{Error, Result};
 pub use event::{
     Bar, BarInterval, Control, ControlKind, DisconnectCause, EventKind, GapSpan, MarketEvent,
-    Quote, Seq, Timestamp, Trade,
+    Quote, Seq, Surface, Timestamp, Trade,
 };
 pub use health::{
     DaemonHealth, HealthView, LatencySummary, Liveness, ProviderHealth, ProviderState, StreamHealth,

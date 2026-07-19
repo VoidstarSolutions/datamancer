@@ -23,7 +23,7 @@ use crate::{
     InstrumentEntry,
     adjustment::Adjustment,
     error::Result,
-    event::{EventKind, MarketEvent, Timestamp},
+    event::{EventKind, MarketEvent, Surface, Timestamp},
     instrument::Instrument,
 };
 
@@ -34,11 +34,19 @@ pub trait Provider: Send + Sync + 'static {
     /// configuration, control events, and storage keys.
     fn id(&self) -> &str;
 
-    /// Whether this provider can serve `kind` for `instrument`. Datamancer
-    /// uses this when routing subscriptions across multiple registered
-    /// providers; a provider that doesn't know the instrument should return
-    /// `false` rather than fail later.
-    fn supports(&self, instrument: &Instrument, kind: EventKind) -> bool;
+    /// Whether this provider can serve `kind` for `instrument` on `surface`.
+    /// Datamancer uses this when routing subscriptions across multiple
+    /// registered providers; a provider that doesn't know the instrument should
+    /// return `false` rather than fail later.
+    ///
+    /// Answer each [`Surface`] independently — they are not required to agree,
+    /// and neither contains the other. A `true` for [`Surface::History`] is a
+    /// promise that [`Self::fetch_history`] will serve that kind, and a `true`
+    /// for [`Surface::Live`] the same promise for [`Self::start_live`]. Do not
+    /// answer for a surface you have not wired: an over-promise routes a
+    /// request here that then fails at network time, and an under-promise makes
+    /// datamancer reject a request you could have served.
+    fn supports(&self, instrument: &Instrument, kind: EventKind, surface: Surface) -> bool;
 
     /// Open a live session against this provider.
     ///
@@ -228,7 +236,7 @@ mod tests {
     use super::{LiveHandle, Provider};
     use crate::{
         error::Result,
-        event::{EventKind, MarketEvent},
+        event::{EventKind, MarketEvent, Surface},
         instrument::Instrument,
     };
     use async_trait::async_trait;
@@ -245,7 +253,7 @@ mod tests {
         fn id(&self) -> &str {
             "bare"
         }
-        fn supports(&self, _instrument: &Instrument, _kind: EventKind) -> bool {
+        fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
             false
         }
         async fn start_live(
