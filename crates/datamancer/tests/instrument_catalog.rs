@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use datamancer::{
-    AssetClass, BarInterval, Datamancer, Error, EventKind, Instrument, InstrumentInfo, LiveHandle,
-    MarketEvent, Provider, ProviderId,
+    AssetClass, BarInterval, Datamancer, Error, EventKind, Instrument, InstrumentEntry,
+    InstrumentInfo, LiveHandle, MarketEvent, Provider, ProviderId,
 };
 use datamancer_core::HistoryRequest;
 use tokio::sync::mpsc;
@@ -53,15 +53,47 @@ impl Provider for VaryingFake {
         Ok(())
     }
 
-    async fn list_instruments(&self) -> datamancer::Result<Vec<Instrument>> {
+    async fn list_instruments(&self) -> datamancer::Result<Vec<InstrumentEntry>> {
+        let mut btc = InstrumentEntry::bare(Instrument::new(
+            ProviderId::from_static(self.id),
+            AssetClass::Crypto,
+            "BTC/USD",
+        ));
+        if self.id == "fake" {
+            let mut caps = datamancer::InstrumentCapabilities::default();
+            caps.fractionable = Some(true);
+            btc.capabilities = Some(caps);
+        }
         Ok(vec![
-            Instrument::new(
+            btc,
+            InstrumentEntry::bare(Instrument::new(
                 ProviderId::from_static(self.id),
                 AssetClass::Crypto,
-                "BTC/USD",
-            ),
-            Instrument::new(ProviderId::from_static(self.id), AssetClass::Crypto, "IDX"),
+                "IDX",
+            )),
         ])
+    }
+
+    async fn capabilities(
+        &self,
+        instrument: &Instrument,
+    ) -> datamancer::Result<Option<InstrumentEntry>> {
+        if self.id == "fake" && instrument.symbol() == "BTC/USD" {
+            // Return the provider's authoritative instrument (Crypto), NOT the
+            // caller's — this is where a daemon placeholder class gets corrected.
+            let mut entry = InstrumentEntry::bare(Instrument::new(
+                ProviderId::from_static(self.id),
+                AssetClass::Crypto,
+                instrument.symbol().to_string(),
+            ));
+            let mut caps = datamancer::InstrumentCapabilities::default();
+            caps.fractionable = Some(true);
+            caps.supports_notional_orders = Some(true);
+            entry.capabilities = Some(caps);
+            Ok(Some(entry))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -82,26 +114,22 @@ async fn catalog_derives_kinds_per_instrument() {
     assert_eq!(
         catalog,
         vec![
-            InstrumentInfo {
-                instrument: Instrument::new(
+            InstrumentInfo::new(
+                Instrument::new(
                     ProviderId::from_static("fake-a"),
                     AssetClass::Crypto,
                     "BTC/USD"
                 ),
-                kinds: vec![
+                vec![
                     EventKind::Trade,
                     EventKind::Quote,
                     EventKind::Bar(BarInterval::OneDay),
                 ],
-            },
-            InstrumentInfo {
-                instrument: Instrument::new(
-                    ProviderId::from_static("fake-a"),
-                    AssetClass::Crypto,
-                    "IDX"
-                ),
-                kinds: vec![EventKind::Bar(BarInterval::OneDay)],
-            },
+            ),
+            InstrumentInfo::new(
+                Instrument::new(ProviderId::from_static("fake-a"), AssetClass::Crypto, "IDX"),
+                vec![EventKind::Bar(BarInterval::OneDay)],
+            ),
         ]
     );
 }
@@ -130,4 +158,53 @@ async fn unknown_provider_filter_is_an_error() {
         .await
         .expect_err("unknown provider");
     assert!(matches!(err, Error::UnknownProvider(p) if p == "nope"));
+}
+
+#[tokio::test]
+async fn catalog_carries_capabilities_and_enrichment_works() {
+    let dm = Datamancer::builder()
+        .provider(Box::new(VaryingFake { id: "fake" }))
+        .build()
+        .expect("build");
+    let pid = ProviderId::from_static("fake");
+
+    let catalog = dm.instrument_catalog(Some(&pid)).await.unwrap();
+    let btc = catalog
+        .iter()
+        .find(|i| i.instrument.symbol() == "BTC/USD")
+        .unwrap();
+    assert_eq!(btc.capabilities.as_ref().unwrap().fractionable, Some(true));
+    let idx = catalog
+        .iter()
+        .find(|i| i.instrument.symbol() == "IDX")
+        .unwrap();
+    assert!(idx.capabilities.is_none());
+
+    // The daemon builds lookups with a placeholder class; the provider must
+    // correct it on the returned entry (#1). Pass a deliberately-wrong Equity
+    // placeholder for both and assert what happens to each.
+    let want = vec![
+        Instrument::new(
+            ProviderId::from_static("fake"),
+            AssetClass::Equity, // wrong on purpose — a daemon-style placeholder
+            "BTC/USD",
+        ),
+        Instrument::new(ProviderId::from_static("fake"), AssetClass::Equity, "IDX"),
+    ];
+    let enriched = dm.instrument_capabilities(&pid, &want).await.unwrap();
+    assert_eq!(enriched.len(), 2);
+    // BTC/USD resolved: provider stamped the authoritative Crypto class and caps.
+    assert_eq!(enriched[0].instrument.asset_class(), AssetClass::Crypto);
+    assert_eq!(
+        enriched[0]
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .supports_notional_orders,
+        Some(true)
+    );
+    // IDX unresolved (provider returned None): the input is echoed back
+    // unchanged — placeholder class and all — since no authority can correct it.
+    assert_eq!(enriched[1].instrument.asset_class(), AssetClass::Equity);
+    assert!(enriched[1].capabilities.is_none());
 }

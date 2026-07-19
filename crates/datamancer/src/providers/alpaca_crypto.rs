@@ -37,8 +37,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
-    HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity,
-    Quote, Result, Seq, Timestamp, Trade,
+    HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent,
+    OrderType, Price, Provider, ProviderId, Quantity, Quote, Result, Seq, TimeInForce, Timestamp,
+    Trade,
 };
 use oxidized_alpaca::{
     AccountType, CryptoFeed, MarketDataClient, TradingClient,
@@ -71,24 +72,64 @@ fn provider_instrument(symbol: impl Into<String>) -> Instrument {
     )
 }
 
-/// Translate Alpaca's `/v2/assets` crypto rows into the datamancer
-/// catalog. Pure function — no client, no I/O — so it can be exercised
-/// against canned JSON fixtures without credentials. Skips non-tradable
-/// rows and asset classes outside crypto (Alpaca's `Crypto` filter on the
-/// request side should already handle this, but the guard is cheap and
-/// defends against API drift).
-fn crypto_assets_to_instruments(assets: &[Asset]) -> Vec<Instrument> {
-    assets
-        .iter()
-        .filter(|a| a.tradable && matches!(a.class, AlpacaAssetClass::Crypto))
-        .map(|a| {
-            Instrument::new(
-                ProviderId::from_static(PROVIDER_ID),
-                AssetClass::Crypto,
-                a.symbol.clone(),
-            )
-        })
-        .collect()
+// Crypto order policy is NOT the equity fractional policy: Alpaca crypto
+// accepts market/limit/stop-limit (no plain stop) with GTC/IOC time-in-force
+// (no day/opg/cls). Verified against https://docs.alpaca.markets/docs/crypto-orders.
+const CRYPTO_ORDER_TYPES: [OrderType; 3] =
+    [OrderType::Market, OrderType::Limit, OrderType::StopLimit];
+const CRYPTO_TIF: [TimeInForce; 2] = [TimeInForce::Gtc, TimeInForce::Ioc];
+
+/// Build capabilities for one Alpaca crypto `Asset`. Order types and
+/// time-in-force follow crypto's own policy (see
+/// [`CRYPTO_ORDER_TYPES`]/[`CRYPTO_TIF`]), which differs from equities. As on
+/// the equity side, notional and the fractional `allowed_*` vocabulary only
+/// apply to fractional orders, so they are gated on `fractionable` — crypto
+/// rows report it trivially true, so in practice this is always populated, but
+/// the gate keeps the contract honest if Alpaca ever reports otherwise.
+fn crypto_capabilities(asset: &Asset) -> InstrumentCapabilities {
+    let mut caps = InstrumentCapabilities::default();
+    caps.fractionable = Some(asset.fractionable);
+    caps.supports_notional_orders = Some(asset.fractionable);
+    if asset.fractionable {
+        caps.allowed_order_types = Some(CRYPTO_ORDER_TYPES.to_vec());
+        caps.allowed_tif = Some(CRYPTO_TIF.to_vec());
+    }
+    // Sizing increments (min_qty/qty_increment/price_increment/min_notional)
+    // stay None: oxidized_alpaca 0.0.10 Asset carries no sizing fields.
+    caps
+}
+
+/// Build a catalog entry for one Alpaca crypto `Asset`: the instrument stamped
+/// with the authoritative [`AssetClass::Crypto`] plus its capabilities. Shared
+/// by bulk listing and the on-demand `capabilities` lookup so both stamp the
+/// same class (and the on-demand path corrects the daemon's placeholder).
+fn crypto_entry(asset: &Asset) -> InstrumentEntry {
+    let instrument = Instrument::new(
+        ProviderId::from_static(PROVIDER_ID),
+        AssetClass::Crypto,
+        asset.symbol.clone(),
+    );
+    let mut entry = InstrumentEntry::bare(instrument);
+    entry.capabilities = Some(crypto_capabilities(asset));
+    entry
+}
+
+/// Map one Alpaca `Asset` to a catalog entry **iff** it is eligible for this
+/// crypto provider: tradable and [`AlpacaAssetClass::Crypto`]. Non-tradable
+/// rows and non-crypto classes map to `None`, so neither bulk listing nor the
+/// on-demand `capabilities` lookup ever stamps an ineligible asset as an
+/// authoritative crypto instrument. (Alpaca's `Crypto` request-side filter
+/// should already exclude these, but the guard is cheap and defends against
+/// API drift — and the `capabilities` path has no such request-side filter.)
+fn asset_to_entry(asset: &Asset) -> Option<InstrumentEntry> {
+    (asset.tradable && matches!(asset.class, AlpacaAssetClass::Crypto)).then(|| crypto_entry(asset))
+}
+
+/// Translate Alpaca's `/v2/assets` crypto rows into the datamancer catalog.
+/// Pure function — no client, no I/O — so it can be exercised against canned
+/// JSON fixtures without credentials. Eligibility is per [`asset_to_entry`].
+fn assets_to_entries(assets: &[Asset]) -> Vec<InstrumentEntry> {
+    assets.iter().filter_map(asset_to_entry).collect()
 }
 
 /// Which Alpaca crypto venue to stream from.
@@ -359,7 +400,7 @@ impl Provider for AlpacaCryptoProvider {
         ))
     }
 
-    async fn list_instruments(&self) -> Result<Vec<Instrument>> {
+    async fn list_instruments(&self) -> Result<Vec<InstrumentEntry>> {
         let trading = self.trading_client().ok_or_else(|| Error::Provider {
             provider: PROVIDER_ID.to_string(),
             message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
@@ -374,7 +415,25 @@ impl Provider for AlpacaCryptoProvider {
                 provider: PROVIDER_ID.to_string(),
                 message: format!("list_assets: {e}"),
             })?;
-        Ok(crypto_assets_to_instruments(&assets))
+        Ok(assets_to_entries(&assets))
+    }
+
+    async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
+        let trading = self.trading_client().ok_or_else(|| Error::Provider {
+            provider: PROVIDER_ID.to_string(),
+            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        })?;
+        let asset = trading
+            .get_asset(instrument.symbol())
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("get_asset({}): {e}", instrument.symbol()),
+            })?;
+        // Same eligibility gate as bulk listing: an ineligible asset (equity,
+        // non-tradable) resolves to `None`, so the caller keeps its placeholder
+        // instrument rather than a mislabeled authoritative crypto instrument.
+        Ok(asset_to_entry(&asset))
     }
 }
 
@@ -1274,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn crypto_assets_to_instruments_filters_and_maps() {
+    fn assets_to_entries_filters_and_maps() {
         let json = r#"[
             {
                 "id":"1","class":"crypto","exchange":"CRYPTO","symbol":"BTC/USD",
@@ -1296,15 +1355,84 @@ mod tests {
             }
         ]"#;
         let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
-        let instruments = crypto_assets_to_instruments(&assets);
+        let entries = assets_to_entries(&assets);
         // BTC/USD passes; DOGE/USD filtered (not tradable); AAPL filtered
         // (wrong class — guards against API drift).
-        let symbols: Vec<&str> = instruments.iter().map(Instrument::symbol).collect();
+        let symbols: Vec<&str> = entries.iter().map(|e| e.instrument.symbol()).collect();
         assert_eq!(symbols, vec!["BTC/USD"]);
-        for i in &instruments {
-            assert_eq!(i.provider().as_str(), PROVIDER_ID);
-            assert_eq!(i.asset_class(), AssetClass::Crypto);
+        for e in &entries {
+            assert_eq!(e.instrument.provider().as_str(), PROVIDER_ID);
+            assert_eq!(e.instrument.asset_class(), AssetClass::Crypto);
         }
+    }
+
+    #[test]
+    fn assets_to_entries_maps_fractional_flag_and_policy() {
+        let json = r#"[
+            {
+                "id":"1","class":"crypto","exchange":"CRYPTO","symbol":"BTC/USD",
+                "name":"Bitcoin","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":true,"attributes":[]
+            }
+        ]"#;
+        let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
+        let entries = assets_to_entries(&assets);
+        let frac = entries
+            .iter()
+            .find(|e| e.instrument.symbol() == "BTC/USD")
+            .unwrap();
+        assert_eq!(frac.instrument.asset_class(), AssetClass::Crypto);
+        let caps = frac.capabilities.as_ref().unwrap();
+        assert_eq!(caps.fractionable, Some(true));
+        assert_eq!(caps.supports_notional_orders, Some(true));
+        // Crypto policy, NOT the equity fractional policy: market/limit/stop-limit
+        // (no plain stop), GTC/IOC (no day).
+        assert_eq!(
+            caps.allowed_order_types.as_deref(),
+            Some(&[OrderType::Market, OrderType::Limit, OrderType::StopLimit][..])
+        );
+        assert_eq!(
+            caps.allowed_tif.as_deref(),
+            Some(&[TimeInForce::Gtc, TimeInForce::Ioc][..])
+        );
+        assert!(caps.min_qty.is_none()); // not advertised
+    }
+
+    #[test]
+    fn asset_to_entry_rejects_ineligible_assets() {
+        // An equity or non-tradable asset resolved through the crypto provider
+        // must NOT become an authoritative crypto entry — the on-demand
+        // `capabilities` lookup relies on this gate to avoid mislabeling.
+        let json = r#"[
+            {
+                "id":"1","class":"us_equity","exchange":"NASDAQ","symbol":"AAPL",
+                "name":"Apple Inc.","status":"active","tradable":true,
+                "marginable":true,"shortable":true,"easy_to_borrow":true,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"2","class":"crypto","exchange":"CRYPTO","symbol":"DEAD/USD",
+                "name":"Delisted","status":"active","tradable":false,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"3","class":"crypto","exchange":"CRYPTO","symbol":"BTC/USD",
+                "name":"Bitcoin","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":true,"attributes":[]
+            }
+        ]"#;
+        let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
+        assert!(asset_to_entry(&assets[0]).is_none(), "equity rejected");
+        assert!(
+            asset_to_entry(&assets[1]).is_none(),
+            "non-tradable rejected"
+        );
+        let ok = asset_to_entry(&assets[2]).expect("eligible crypto");
+        assert_eq!(ok.instrument.symbol(), "BTC/USD");
+        assert_eq!(ok.instrument.asset_class(), AssetClass::Crypto);
     }
 
     #[test]

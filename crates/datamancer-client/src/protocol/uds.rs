@@ -49,6 +49,12 @@ pub enum Request {
         #[serde(default)]
         provider: Option<String>,
     },
+    /// On-demand per-instrument capabilities for a named provider's symbols.
+    Capabilities {
+        provider: String,
+        #[serde(default)]
+        symbols: Vec<String>,
+    },
     /// Liveness/version probe. Answerable before `open-client`; used by the
     /// app facade for spawn-readiness and version-skew detection.
     Ping,
@@ -105,6 +111,9 @@ pub struct Reply {
     /// The instrument catalog (on `instruments`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruments: Option<Vec<datamancer_core::InstrumentInfo>>,
+    /// The per-instrument capabilities (on `capabilities`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<datamancer_core::InstrumentEntry>>,
     /// The daemon's crate version (on `ping`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -145,6 +154,7 @@ impl Reply {
             clients: None,
             snapshot: None,
             instruments: None,
+            capabilities: None,
             version: None,
             credentials: None,
             credential_backend: None,
@@ -193,6 +203,15 @@ impl Reply {
         }
     }
 
+    /// Success carrying per-instrument capabilities.
+    #[must_use]
+    pub fn capabilities(entries: Vec<datamancer_core::InstrumentEntry>) -> Self {
+        Self {
+            capabilities: Some(entries),
+            ..Self::ok()
+        }
+    }
+
     /// Success carrying stored credentials (on `get-credentials`).
     #[must_use]
     pub fn credentials(creds: datamancer_core::ProviderCredentials) -> Self {
@@ -222,6 +241,7 @@ impl Reply {
             clients: None,
             snapshot: None,
             instruments: None,
+            capabilities: None,
             version: None,
             credentials: None,
             credential_backend: None,
@@ -431,19 +451,46 @@ mod tests {
     #[test]
     fn instruments_reply_round_trips() {
         use datamancer_core::{AssetClass, EventKind, Instrument, InstrumentInfo, ProviderId};
-        let reply = Reply::instruments(vec![InstrumentInfo {
-            instrument: Instrument::new(
+        let reply = Reply::instruments(vec![InstrumentInfo::new(
+            Instrument::new(
                 ProviderId::from_static("alpaca-crypto"),
                 AssetClass::Crypto,
                 "BTC/USD",
             ),
-            kinds: vec![EventKind::Trade],
-        }]);
+            vec![EventKind::Trade],
+        )]);
         let line = serde_json::to_string(&reply).unwrap();
         let back: Reply = serde_json::from_str(&line).unwrap();
         assert_eq!(reply, back);
         assert!(back.ok);
         assert_eq!(back.instruments.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn capabilities_request_parses() {
+        let req: Request = serde_json::from_str(
+            r#"{"op":"capabilities","provider":"alpaca","symbols":["AAPL","MSFT"]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &req,
+            Request::Capabilities { provider, symbols }
+                if provider == "alpaca" && symbols == &["AAPL", "MSFT"]
+        ));
+    }
+
+    #[test]
+    fn capabilities_reply_round_trips() {
+        use datamancer_core::{AssetClass, Instrument, InstrumentEntry, ProviderId};
+        let entries = vec![InstrumentEntry::bare(Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        ))];
+        let reply = Reply::capabilities(entries.clone());
+        let back: Reply = serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        assert_eq!(back.capabilities, Some(entries));
+        assert!(back.ok);
     }
 
     #[test]

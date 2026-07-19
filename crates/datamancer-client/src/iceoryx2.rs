@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use datamancer_core::{InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
+use datamancer_core::{InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
 use datamancer_transport_iceoryx2::DataSubscriber;
 // `::` prefix: this module is itself named `iceoryx2`, so the extern crate is
 // named explicitly (bare paths here happen to resolve to the crate today, but
@@ -315,6 +315,27 @@ impl Client for Iceoryx2Client {
         reply.instruments.ok_or_else(|| {
             ClientError::Transport(Iceoryx2ClientError::Protocol(
                 "ok instruments reply missing instruments payload".to_string(),
+            ))
+        })
+    }
+
+    async fn capabilities(
+        &mut self,
+        provider: &ProviderId,
+        symbols: &[String],
+    ) -> Result<Vec<InstrumentEntry>, ClientError<Self::Error>> {
+        let reply = self
+            .control
+            .request(&Request::Capabilities {
+                provider: provider.as_str().to_string(),
+                symbols: symbols.to_vec(),
+            })
+            .await
+            .map_err(ClientError::Transport)?;
+        let reply = check(reply)?;
+        reply.capabilities.ok_or_else(|| {
+            ClientError::Transport(Iceoryx2ClientError::Protocol(
+                "ok capabilities reply missing capabilities payload".to_string(),
             ))
         })
     }

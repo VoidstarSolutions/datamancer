@@ -307,8 +307,10 @@ async fn list_instruments_returns_known_symbols() {
         "expected a sizable equity catalog, got {}",
         instruments.len()
     );
-    let symbols: std::collections::HashSet<&str> =
-        instruments.iter().map(Instrument::symbol).collect();
+    let symbols: std::collections::HashSet<&str> = instruments
+        .iter()
+        .map(|entry| entry.instrument.symbol())
+        .collect();
     for expected in ["AAPL", "MSFT", "SPY"] {
         assert!(
             symbols.contains(expected),
@@ -317,8 +319,8 @@ async fn list_instruments_returns_known_symbols() {
     }
     // Every returned instrument should be stamped with our provider id and
     // (for the equity surface) the Equity asset class.
-    for i in &instruments {
-        assert_eq!(i.provider().as_str(), "alpaca");
-        assert_eq!(i.asset_class(), AssetClass::Equity);
+    for entry in &instruments {
+        assert_eq!(entry.instrument.provider().as_str(), "alpaca");
+        assert_eq!(entry.instrument.asset_class(), AssetClass::Equity);
     }
 }

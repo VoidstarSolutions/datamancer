@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use datamancer::traits::{EventSink, PublishOutcome};
 use datamancer::transport_ws::{WS_SUBPROTOCOL, WsDataSink, run_writer};
-use datamancer::{ClientSession, Datamancer, Instrument, ProviderId, Scope};
+use datamancer::{AssetClass, ClientSession, Datamancer, Instrument, ProviderId, Scope};
 use futures::StreamExt as _;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -295,6 +295,22 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
             let filter = provider.map(ProviderId::new);
             match dm.instrument_catalog(filter.as_ref()).await {
                 Ok(catalog) => WsReply::instruments(id, catalog),
+                Err(e) => ws_reply_from_library_error(id, &e),
+            }
+        }
+        WsRequest::Capabilities {
+            provider, symbols, ..
+        } => {
+            let pid = ProviderId::new(provider);
+            // Placeholder asset class — the provider overwrites it with the
+            // authoritative class on the returned entry (see
+            // `Provider::capabilities`); `capabilities` is keyed on symbol.
+            let instruments: Vec<Instrument> = symbols
+                .iter()
+                .map(|s| Instrument::new(pid.clone(), AssetClass::Equity, s.clone()))
+                .collect();
+            match dm.instrument_capabilities(&pid, &instruments).await {
+                Ok(entries) => WsReply::capabilities(id, entries),
                 Err(e) => ws_reply_from_library_error(id, &e),
             }
         }

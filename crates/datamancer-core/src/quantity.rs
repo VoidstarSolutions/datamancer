@@ -5,6 +5,8 @@
 //! instrument's base unit (shares, coins, contracts). Consumers that need a
 //! different representation convert at their own boundary.
 
+use serde::{Deserialize, Serialize};
+
 /// A size or volume in fixed-point units of `1e-9` of the instrument's base
 /// unit (shares, coins, contracts).
 ///
@@ -12,7 +14,9 @@
 /// satoshi-granular (`1e-8`) crypto sizes both fit without truncation. Sizes
 /// are non-negative by definition, hence `u64` (unlike [`crate::Price`], which
 /// is signed because prices and spreads can be negative).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 pub struct Quantity(pub u64);
 
 impl Quantity {

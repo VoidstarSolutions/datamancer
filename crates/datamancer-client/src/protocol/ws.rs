@@ -39,6 +39,13 @@ pub enum WsRequest {
         #[serde(default)]
         provider: Option<String>,
     },
+    /// On-demand per-instrument capabilities for a named provider's symbols.
+    Capabilities {
+        id: u64,
+        provider: String,
+        #[serde(default)]
+        symbols: Vec<String>,
+    },
 }
 
 impl WsRequest {
@@ -50,7 +57,8 @@ impl WsRequest {
             | Self::Unsubscribe { id, .. }
             | Self::Snapshot { id }
             | Self::CloseClient { id }
-            | Self::Instruments { id, .. } => *id,
+            | Self::Instruments { id, .. }
+            | Self::Capabilities { id, .. } => *id,
         }
     }
 }
@@ -68,6 +76,8 @@ pub struct WsReply {
     pub snapshot: Option<SystemSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruments: Option<Vec<datamancer_core::InstrumentInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<datamancer_core::InstrumentEntry>>,
 }
 
 impl WsReply {
@@ -80,6 +90,7 @@ impl WsReply {
             message: None,
             snapshot: None,
             instruments: None,
+            capabilities: None,
         }
     }
 
@@ -92,6 +103,7 @@ impl WsReply {
             message: Some(message.into()),
             snapshot: None,
             instruments: None,
+            capabilities: None,
         }
     }
 
@@ -104,6 +116,7 @@ impl WsReply {
             message: None,
             snapshot: Some(snapshot),
             instruments: None,
+            capabilities: None,
         }
     }
 
@@ -116,6 +129,20 @@ impl WsReply {
             message: None,
             snapshot: None,
             instruments: Some(catalog),
+            capabilities: None,
+        }
+    }
+
+    #[must_use]
+    pub fn capabilities(id: u64, entries: Vec<datamancer_core::InstrumentEntry>) -> Self {
+        Self {
+            id,
+            ok: true,
+            code: None,
+            message: None,
+            snapshot: None,
+            instruments: None,
+            capabilities: Some(entries),
         }
     }
 }
@@ -186,6 +213,35 @@ mod tests {
                 provider: None
             }
         ));
+    }
+
+    #[test]
+    fn ws_capabilities_parses_and_carries_id() {
+        let req: WsRequest = serde_json::from_str(
+            r#"{"id":9,"op":"capabilities","provider":"alpaca","symbols":["AAPL","MSFT"]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &req,
+            WsRequest::Capabilities { id: 9, provider, symbols }
+                if provider == "alpaca" && symbols == &["AAPL", "MSFT"]
+        ));
+        assert_eq!(req.id(), 9);
+    }
+
+    #[test]
+    fn ws_capabilities_reply_round_trips() {
+        use datamancer_core::{AssetClass, Instrument, InstrumentEntry, ProviderId};
+        let entries = vec![InstrumentEntry::bare(Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        ))];
+        let reply = WsReply::capabilities(9, entries.clone());
+        let back: WsReply = serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        assert_eq!(back.capabilities, Some(entries));
+        assert!(back.ok);
+        assert_eq!(back.id, 9);
     }
 
     #[test]

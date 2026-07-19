@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     Adjustment, AssetClass, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
-    HistoryRequest, Instrument, LiveHandle, MarketEvent, Price, Provider, ProviderId, Quantity,
-    Result, Seq, Timestamp, Trade,
+    HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent,
+    OrderType, Price, Provider, ProviderId, Quantity, Result, Seq, TimeInForce, Timestamp, Trade,
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
@@ -61,33 +61,72 @@ fn provider_instrument(symbol: impl Into<String>) -> Instrument {
     )
 }
 
-/// Translate Alpaca's `/v2/assets` rows into the datamancer instrument
-/// catalog. Pure function — no client, no I/O — so it can be exercised
-/// against canned JSON fixtures without credentials.
+/// Order types Alpaca accepts for a fractional equity order (provider policy;
+/// not advertised per-asset — sourced from Alpaca's fractional-trading docs).
+const FRACTIONAL_ORDER_TYPES: [OrderType; 4] = [
+    OrderType::Market,
+    OrderType::Limit,
+    OrderType::Stop,
+    OrderType::StopLimit,
+];
+/// Times-in-force Alpaca accepts for a fractional equity order (`day` only).
+const FRACTIONAL_TIF: [TimeInForce; 1] = [TimeInForce::Day];
+
+/// Build capabilities for one Alpaca equity `Asset`. The notional flag and the
+/// fractional order-type/TIF vocabulary only apply to a *fractional* order —
+/// notional orders **are** fractional dollar orders, and the `allowed_*` fields
+/// describe orders valid fractionally — so a non-fractionable asset reports
+/// `supports_notional_orders: Some(false)` and leaves the fractional `allowed_*`
+/// fields `None` (we don't model whole-share order rules, so unknown is honest).
+fn equity_capabilities(asset: &Asset) -> InstrumentCapabilities {
+    let mut caps = InstrumentCapabilities::default();
+    caps.fractionable = Some(asset.fractionable);
+    caps.supports_notional_orders = Some(asset.fractionable);
+    if asset.fractionable {
+        caps.allowed_order_types = Some(FRACTIONAL_ORDER_TYPES.to_vec());
+        caps.allowed_tif = Some(FRACTIONAL_TIF.to_vec());
+    }
+    // Sizing increments (min_qty/qty_increment/price_increment/min_notional)
+    // stay None: oxidized_alpaca 0.0.10 Asset carries no sizing fields.
+    caps
+}
+
+/// Build a catalog entry for one Alpaca equity `Asset`: the instrument stamped
+/// with the authoritative [`AssetClass::Equity`] plus its capabilities. Shared
+/// by bulk listing and the on-demand `capabilities` lookup so both stamp the
+/// same class (and the on-demand path corrects the daemon's placeholder).
+fn equity_entry(asset: &Asset) -> InstrumentEntry {
+    let instrument = Instrument::new(
+        ProviderId::from_static(PROVIDER_ID),
+        AssetClass::Equity,
+        asset.symbol.clone(),
+    );
+    let mut entry = InstrumentEntry::bare(instrument);
+    entry.capabilities = Some(equity_capabilities(asset));
+    entry
+}
+
+/// Map one Alpaca `Asset` to a catalog entry **iff** it is eligible for this
+/// equities provider: tradable and [`AlpacaAssetClass::UsEquity`]. Everything
+/// else — non-tradable rows, options, crypto-perp, plain crypto (handled by the
+/// dedicated crypto provider) — maps to `None`, so neither bulk listing nor the
+/// on-demand `capabilities` lookup ever stamps an ineligible asset as an
+/// authoritative equity.
 ///
-/// Filters to `tradable = true` and skips asset classes outside our v0
-/// taxonomy. Alpaca returns ETFs under [`AlpacaAssetClass::UsEquity`] with
-/// no explicit ETF flag on the row itself, so for now they land as
-/// [`AssetClass::Equity`]; a future revision can read the `attributes`
-/// vector (e.g. `"etp"`) to promote them to [`AssetClass::Etf`].
-fn assets_to_instruments(assets: &[Asset]) -> Vec<Instrument> {
-    assets
-        .iter()
-        .filter(|a| a.tradable)
-        .filter_map(|a| {
-            let asset_class = match a.class {
-                AlpacaAssetClass::UsEquity => AssetClass::Equity,
-                // Options and crypto-perp aren't part of v0's taxonomy;
-                // the dedicated crypto provider handles plain crypto.
-                _ => return None,
-            };
-            Some(Instrument::new(
-                ProviderId::from_static(PROVIDER_ID),
-                asset_class,
-                a.symbol.clone(),
-            ))
-        })
-        .collect()
+/// Alpaca returns ETFs under [`AlpacaAssetClass::UsEquity`] with no explicit ETF
+/// flag on the row itself, so for now they land as [`AssetClass::Equity`]; a
+/// future revision can read the `attributes` vector (e.g. `"etp"`) to promote
+/// them to [`AssetClass::Etf`].
+fn asset_to_entry(asset: &Asset) -> Option<InstrumentEntry> {
+    (asset.tradable && matches!(asset.class, AlpacaAssetClass::UsEquity))
+        .then(|| equity_entry(asset))
+}
+
+/// Translate Alpaca's `/v2/assets` rows into the datamancer instrument catalog.
+/// Pure function — no client, no I/O — so it can be exercised against canned
+/// JSON fixtures without credentials. Eligibility is per [`asset_to_entry`].
+fn assets_to_entries(assets: &[Asset]) -> Vec<InstrumentEntry> {
+    assets.iter().filter_map(asset_to_entry).collect()
 }
 
 /// Which Alpaca streaming endpoint to use for live data.
@@ -344,7 +383,7 @@ impl Provider for AlpacaProvider {
         Ok(snapshot_to_event(&snap, instrument, kind, wall_clock_ts()))
     }
 
-    async fn list_instruments(&self) -> Result<Vec<Instrument>> {
+    async fn list_instruments(&self) -> Result<Vec<InstrumentEntry>> {
         let trading = self.rest_clients().trading.ok_or_else(|| Error::Provider {
             provider: PROVIDER_ID.to_string(),
             message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
@@ -363,7 +402,25 @@ impl Provider for AlpacaProvider {
                 provider: PROVIDER_ID.to_string(),
                 message: format!("list_assets: {e}"),
             })?;
-        Ok(assets_to_instruments(&assets))
+        Ok(assets_to_entries(&assets))
+    }
+
+    async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
+        let trading = self.rest_clients().trading.ok_or_else(|| Error::Provider {
+            provider: PROVIDER_ID.to_string(),
+            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        })?;
+        let asset = trading
+            .get_asset(instrument.symbol())
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("get_asset({}): {e}", instrument.symbol()),
+            })?;
+        // Same eligibility gate as bulk listing: an ineligible asset (crypto,
+        // option, non-tradable) resolves to `None`, so the caller keeps its
+        // placeholder instrument rather than a mislabeled authoritative equity.
+        Ok(asset_to_entry(&asset))
     }
 }
 
@@ -1421,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn assets_to_instruments_filters_and_maps() {
+    fn assets_to_entries_filters_and_maps() {
         // Fixture mirrors Alpaca's `/v2/assets` JSON, including a row that
         // must be filtered (non-tradable) and an asset class outside v0.
         let json = r#"[
@@ -1451,13 +1508,101 @@ mod tests {
             }
         ]"#;
         let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
-        let instruments = assets_to_instruments(&assets);
+        let entries = assets_to_entries(&assets);
         // AAPL and SPY pass; GE filtered (not tradable); option skipped.
-        let symbols: Vec<&str> = instruments.iter().map(Instrument::symbol).collect();
+        let symbols: Vec<&str> = entries.iter().map(|e| e.instrument.symbol()).collect();
         assert_eq!(symbols, vec!["AAPL", "SPY"]);
-        for i in &instruments {
-            assert_eq!(i.provider().as_str(), PROVIDER_ID);
-            assert_eq!(i.asset_class(), AssetClass::Equity);
+        for e in &entries {
+            assert_eq!(e.instrument.provider().as_str(), PROVIDER_ID);
+            assert_eq!(e.instrument.asset_class(), AssetClass::Equity);
         }
+    }
+
+    #[test]
+    fn assets_to_entries_maps_fractional_flag_and_policy() {
+        let json = r#"[
+            {
+                "id":"1","class":"us_equity","exchange":"NASDAQ","symbol":"AAPL",
+                "name":"Apple Inc.","status":"active","tradable":true,
+                "marginable":true,"shortable":true,"easy_to_borrow":true,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"2","class":"us_equity","exchange":"NYSE","symbol":"GE",
+                "name":"General Electric","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":false,"attributes":[]
+            }
+        ]"#;
+        let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
+        let entries = assets_to_entries(&assets);
+        let frac = entries
+            .iter()
+            .find(|e| e.instrument.symbol() == "AAPL")
+            .unwrap();
+        let caps = frac.capabilities.as_ref().unwrap();
+        assert_eq!(caps.fractionable, Some(true));
+        assert_eq!(caps.supports_notional_orders, Some(true));
+        assert_eq!(
+            caps.allowed_order_types.as_deref(),
+            Some(&FRACTIONAL_ORDER_TYPES[..])
+        );
+        assert_eq!(caps.allowed_tif.as_deref(), Some(&[TimeInForce::Day][..]));
+        assert!(caps.min_qty.is_none()); // not advertised
+
+        let non_frac = entries
+            .iter()
+            .find(|e| e.instrument.symbol() == "GE")
+            .unwrap();
+        let non_frac_caps = non_frac.capabilities.as_ref().unwrap();
+        assert_eq!(non_frac_caps.fractionable, Some(false));
+        // Non-fractionable: no notional support, and the fractional-only
+        // order-type/TIF vocabulary is left unset (unknown, not asserted).
+        assert_eq!(non_frac_caps.supports_notional_orders, Some(false));
+        assert!(non_frac_caps.allowed_order_types.is_none());
+        assert!(non_frac_caps.allowed_tif.is_none());
+    }
+
+    #[test]
+    fn asset_to_entry_rejects_ineligible_assets() {
+        // A crypto, option, or non-tradable asset resolved through the equities
+        // provider must NOT become an authoritative equity entry — the on-demand
+        // `capabilities` lookup relies on this gate to avoid mislabeling.
+        let json = r#"[
+            {
+                "id":"1","class":"crypto","exchange":"CRYPTO","symbol":"BTC/USD",
+                "name":"Bitcoin","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":true,"attributes":[]
+            },
+            {
+                "id":"2","class":"us_option","exchange":"AMEX","symbol":"AAPL250117C00150000",
+                "name":"AAPL 2025 Call","status":"active","tradable":true,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":false,"attributes":[]
+            },
+            {
+                "id":"3","class":"us_equity","exchange":"NYSE","symbol":"GE",
+                "name":"General Electric","status":"active","tradable":false,
+                "marginable":false,"shortable":false,"easy_to_borrow":false,
+                "fractionable":false,"attributes":[]
+            },
+            {
+                "id":"4","class":"us_equity","exchange":"NASDAQ","symbol":"AAPL",
+                "name":"Apple Inc.","status":"active","tradable":true,
+                "marginable":true,"shortable":true,"easy_to_borrow":true,
+                "fractionable":true,"attributes":[]
+            }
+        ]"#;
+        let assets: Vec<Asset> = serde_json::from_str(json).expect("parse fixture");
+        assert!(asset_to_entry(&assets[0]).is_none(), "crypto rejected");
+        assert!(asset_to_entry(&assets[1]).is_none(), "option rejected");
+        assert!(
+            asset_to_entry(&assets[2]).is_none(),
+            "non-tradable rejected"
+        );
+        let ok = asset_to_entry(&assets[3]).expect("eligible equity");
+        assert_eq!(ok.instrument.symbol(), "AAPL");
+        assert_eq!(ok.instrument.asset_class(), AssetClass::Equity);
     }
 }

@@ -25,10 +25,10 @@ metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 ws = ["dep:tokio-tungstenite", "datamancer/transport-ws"]
 
 [dependencies]
-datamancer = { path = "../datamancer", version = "0.6.0", features = ["transport-iceoryx2"] }
-datamancer-client = { path = "../datamancer-client", version = "0.6.0", default-features = false }
-datamancer-core = { path = "../datamancer-core", version = "0.6.0" }
-datamancer-credentials = { path = "../datamancer-credentials", version = "0.6.0" }
+datamancer = { path = "../datamancer", version = "0.7.0", features = ["transport-iceoryx2"] }
+datamancer-client = { path = "../datamancer-client", version = "0.7.0", default-features = false }
+datamancer-core = { path = "../datamancer-core", version = "0.7.0" }
+datamancer-credentials = { path = "../datamancer-credentials", version = "0.7.0" }
 async-trait = "0.1"
 iceoryx2 = "0.9.2"
 tokio = { workspace = true, features = ["signal", "io-util"] }
@@ -64,7 +64,7 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false, feat
 ], optional = true }
 
 [dev-dependencies]
-datamancer-client = { path = "../datamancer-client", version = "0.6.0", features = ["ws", "iceoryx2", "app"] }
+datamancer-client = { path = "../datamancer-client", version = "0.7.0", features = ["ws", "iceoryx2", "app"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 arc-swap = "1"

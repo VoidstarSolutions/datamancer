@@ -26,8 +26,8 @@ use datamancer::transport::{
     Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2HealthPublisher,
 };
 use datamancer::{
-    ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope, Session,
-    TapLog,
+    AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
+    Session, TapLog,
     traits::{EventSink, PublishOutcome},
 };
 use futures::StreamExt as _;
@@ -651,6 +651,14 @@ impl Server {
                     Err(e) => reply_from_library_error(&e),
                 }
             }
+            // Dispatched off-actor in `handle_connection` (a capabilities
+            // request awaits live provider REST and must not stall the
+            // actor). This arm only exists for match exhaustiveness /
+            // defense in depth — it should be unreachable in normal
+            // operation.
+            Request::Capabilities { provider, symbols } => {
+                dispatch_capabilities(&self.dm, &provider, &symbols).await
+            }
             // Dispatched off-actor in `handle_connection` (blocking store I/O
             // behind `spawn_blocking`, peer-cred gated there — the gate needs
             // the connection's peer uid, which never reaches the actor). This
@@ -872,6 +880,24 @@ async fn accept_loop(
     }
 }
 
+/// Look up per-instrument capabilities for a provider's symbols. Ungated
+/// (a read op, like `Instruments`); awaits live provider REST, hence
+/// dispatched off-actor.
+async fn dispatch_capabilities(dm: &Datamancer, provider: &str, symbols: &[String]) -> Reply {
+    let pid = ProviderId::new(provider.to_string());
+    // `capabilities` is keyed on symbol; the asset class here is a placeholder
+    // the provider overwrites with the authoritative class on the returned
+    // entry (see `Provider::capabilities`). Do not treat it as a real class.
+    let instruments: Vec<Instrument> = symbols
+        .iter()
+        .map(|s| Instrument::new(pid.clone(), AssetClass::Equity, s.clone()))
+        .collect();
+    match dm.instrument_capabilities(&pid, &instruments).await {
+        Ok(entries) => Reply::capabilities(entries),
+        Err(e) => reply_from_library_error(&e),
+    }
+}
+
 /// Route an already-gated credential op to the credential hub.
 async fn dispatch_credential_op(request: Request, hub: &CredentialHub) -> Reply {
     match request {
@@ -972,6 +998,8 @@ async fn handle_connection(
                         Ok(catalog) => Reply::instruments(catalog),
                         Err(e) => reply_from_library_error(&e),
                     }
+                } else if let Request::Capabilities { provider, symbols } = &request {
+                    dispatch_capabilities(&dm, provider, symbols).await
                 } else if matches!(
                     &request,
                     Request::SetCredentials { .. }

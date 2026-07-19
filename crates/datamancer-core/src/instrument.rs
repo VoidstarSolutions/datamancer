@@ -147,12 +147,60 @@ impl fmt::Display for Instrument {
 /// (`Provider::list_instruments` + `supports` probed over
 /// [`EventKind::enumerate`]); carried on the daemon's `instruments` control
 /// op.
+///
+/// `#[non_exhaustive]` (like its sibling [`InstrumentEntry`]): construct via
+/// [`InstrumentInfo::new`] and set the public fields you need, so adding a
+/// future row field is a non-breaking change for downstream constructors.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstrumentInfo {
     pub instrument: Instrument,
     /// Kinds this provider serves for this instrument, in
     /// [`EventKind::enumerate`] order.
     pub kinds: Vec<EventKind>,
+    /// Order/fractional capabilities the provider could populate cheaply while
+    /// listing this instrument. `None` = not populated inline (the on-demand
+    /// `Provider::capabilities` path may still supply them). Absence of an
+    /// inner field means unknown, never unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::InstrumentCapabilities>,
+}
+
+impl InstrumentInfo {
+    /// A catalog row for `instrument` serving `kinds`, with no capabilities
+    /// populated. Set the public `capabilities` field afterwards if the
+    /// provider filled them inline.
+    #[must_use]
+    pub fn new(instrument: Instrument, kinds: Vec<EventKind>) -> Self {
+        Self {
+            instrument,
+            kinds,
+            capabilities: None,
+        }
+    }
+}
+
+/// One row of a provider's bulk instrument listing: the instrument plus any
+/// capabilities the provider could populate *cheaply* during the listing.
+/// Reused as the on-demand enrichment result and the `capabilities` control-op
+/// reply element.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentEntry {
+    pub instrument: Instrument,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::InstrumentCapabilities>,
+}
+
+impl InstrumentEntry {
+    /// An entry with no capabilities populated.
+    #[must_use]
+    pub fn bare(instrument: Instrument) -> Self {
+        Self {
+            instrument,
+            capabilities: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -173,9 +221,40 @@ mod tests {
                 EventKind::Quote,
                 EventKind::Bar(BarInterval::OneDay),
             ],
+            capabilities: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: InstrumentInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(info, back);
+    }
+
+    #[test]
+    fn instrument_info_carries_capabilities() {
+        use crate::{InstrumentCapabilities, InstrumentEntry};
+        let inst = Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        );
+        let info = InstrumentInfo {
+            instrument: inst.clone(),
+            kinds: vec![EventKind::Trade],
+            capabilities: Some(InstrumentCapabilities {
+                fractionable: Some(true),
+                ..Default::default()
+            }),
+        };
+        let back: InstrumentInfo =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(info, back);
+
+        // Old-shape JSON (no capabilities key) still deserializes.
+        let legacy = r#"{"instrument":{"provider":"alpaca","asset_class":"Equity","symbol":"AAPL"},"kinds":["Trade"]}"#;
+        let parsed: InstrumentInfo = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.capabilities.is_none());
+
+        // InstrumentEntry::bare has no capabilities.
+        let entry = InstrumentEntry::bare(inst);
+        assert!(entry.capabilities.is_none());
     }
 }

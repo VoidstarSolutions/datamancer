@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use datamancer_core::{
-    HealthView, InstrumentInfo, ProviderCredentials, ProviderId, SystemSnapshot,
+    HealthView, InstrumentEntry, InstrumentInfo, ProviderCredentials, ProviderId, SystemSnapshot,
 };
 
 use crate::Client as _;
@@ -355,6 +355,19 @@ impl AppHandle {
         provider: Option<&ProviderId>,
     ) -> Result<Vec<InstrumentInfo>, ClientError<Iceoryx2ClientError>> {
         self.client.instruments(provider).await
+    }
+
+    /// See [`crate::Client::capabilities`].
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::Client::capabilities`].
+    pub async fn capabilities(
+        &mut self,
+        provider: &ProviderId,
+        symbols: &[String],
+    ) -> Result<Vec<InstrumentEntry>, ClientError<Iceoryx2ClientError>> {
+        self.client.capabilities(provider, symbols).await
     }
 
     /// The raw diagnostics snapshot (prefer [`Self::health`] for rendering).
