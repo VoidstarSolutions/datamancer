@@ -6,14 +6,44 @@ crates.io. Config: `release-plz.toml`. Workflow: `.github/workflows/release-plz.
 
 ## How a release happens
 
-1. You merge normal PRs to `main` using [Conventional Commits]
-   (`fix:` → patch, `feat:` → minor, `feat!:`/`BREAKING CHANGE:` → major).
+1. You merge normal PRs to `main` using [Conventional Commits] — **without
+   touching the version**. See "Never bump the version by hand" below.
 2. The `release-plz PR` job opens/updates a **"chore: release"** PR that bumps
    the single workspace version (`[workspace.package] version` in the root
    `Cargo.toml`) and updates changelogs. It runs through normal CI.
 3. You review and merge that PR.
 4. The `release-plz release` job creates the git tag (`vX.Y.Z`) and a GitHub
    Release with the changelog. Done — no crates.io.
+
+### Never bump the version by hand
+
+The version field belongs to release-plz. The `release` job runs on **every**
+push to `main` and asks one question: is there a tag for the version in
+`Cargo.toml`? If you hand-bump the version in a feature PR, merging that PR
+tags and releases it immediately — ahead of any release PR — and the standing
+`chore: release` PR then rebases onto that surprise tag and proposes a version
+you didn't intend. (This is exactly what produced the stray `v0.6.0`/`v0.7.0`
+tags on feature merges, and the perpetually-wrong PR #39.)
+
+Merge your feature PRs at the *current released version*. The release PR is the
+only thing that edits `[workspace.package] version`.
+
+### How the next version is computed (we're pre-1.0 — this is not plain semver)
+
+While the major version is `0`, release-plz ([`next_version`]) demotes every
+bump one level. Note especially that a plain `feat:` is **not** a minor bump:
+
+| Commit | 0.x.y (today) | ≥1.0.0 (later) |
+| --- | --- | --- |
+| `fix:` / non-conventional | patch (0.7.0 → 0.7.1) | patch |
+| `feat:` | patch (0.7.0 → 0.7.1) | minor |
+| `feat!:` / `BREAKING CHANGE:` | **minor** (0.7.0 → 0.8.0) | major |
+
+So a release cycle only reaches the next minor when it contains a breaking
+change. If you want a minor bump for a non-breaking milestone, say so in the
+release PR — override it there, not in a feature branch.
+
+[`next_version`]: https://docs.rs/next_version/latest/next_version/
 
 All seven crates share one version, so every release re-tags the whole
 workspace together. This keeps `datamancer-client` and `datamancerd` in
