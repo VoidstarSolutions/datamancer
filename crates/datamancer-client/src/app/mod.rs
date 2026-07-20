@@ -126,6 +126,13 @@ pub struct EnsureConfig {
     pub poll_interval: Duration,
     /// Forwarded to the iceoryx2 client (local event buffer bound).
     pub event_buffer: usize,
+    /// Windows hybrid only: the WS-loopback data endpoint (`ws://host:port`)
+    /// the data plane dials. `None` = the loopback default
+    /// (`ws://127.0.0.1:9001`), matching the daemon's `[ws]` scaffold. Ignored
+    /// on unix (the data plane is iceoryx2 shm, which needs no TCP endpoint) —
+    /// the field is `#[cfg(windows)]` so unix `EnsureConfig` is unchanged.
+    #[cfg(windows)]
+    pub ws_data_url: Option<String>,
 }
 
 impl EnsureConfig {
@@ -142,6 +149,8 @@ impl EnsureConfig {
             log_path: None,
             poll_interval: Duration::from_millis(1),
             event_buffer: 8192,
+            #[cfg(windows)]
+            ws_data_url: None,
         }
     }
 }
@@ -226,8 +235,12 @@ impl AppHandle {
         #[cfg(windows)]
         {
             let admin = PipeControlClient::connect(&socket).await?;
+            let url = cfg
+                .ws_data_url
+                .clone()
+                .unwrap_or_else(|| DEFAULT_WS_DATA_ENDPOINT.to_string());
             let (mut data, events) = WsClient::connect(WsConfig {
-                url: DEFAULT_WS_DATA_ENDPOINT.to_string(),
+                url,
                 auth_token: None,
                 event_buffer: cfg.event_buffer,
             })

@@ -1,12 +1,15 @@
 //! The daemon supervisor: process lifecycle, the per-client registry, the
 //! control listener, the diagnostics ticker, and graceful shutdown.
 //!
-//! A single async **actor task** (`run`) owns the client registry and the
-//! iceoryx2 [`Node`]; the control listener and per-connection readers send it
-//! [`ServerCommand`]s over an `mpsc`, so no lock is ever held across an
-//! `.await`. One iceoryx2 node per process; per-client sinks own their service
-//! on it. Startup-session anchors hold authoritative sessions alive across
-//! client presence (`always_on=true` for the whole process lifetime).
+//! A single async **actor task** (`run`) owns the client registry and (on
+//! unix/macOS) the iceoryx2 `Node`; the control listener and per-connection
+//! readers send it [`ServerCommand`]s over an `mpsc`, so no lock is ever held
+//! across an `.await`. One iceoryx2 node per process; per-client sinks own
+//! their service on it. **On Windows there is no node** — iceoryx2 shm cannot
+//! create one at runtime (native-Windows spec §2.5), so the daemon boots
+//! WS-only and the whole iceoryx2 node stack is `#[cfg(not(windows))]`.
+//! Startup-session anchors hold authoritative sessions alive across client
+//! presence (`always_on=true` for the whole process lifetime).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,15 +17,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+// The iceoryx2 node + its sink/publishers are the unix/macOS data-plane
+// transport. On Windows the data plane is WS-loopback (iceoryx2 shm cannot
+// create a node at runtime — native-Windows spec §2.5), so the whole iceoryx2
+// node stack is `#[cfg(not(windows))]` and the daemon boots WS-only there.
+#[cfg(not(windows))]
 use datamancer::transport::{
     Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2HealthPublisher,
 };
 use datamancer::{
     AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
-    Session, TapLog,
-    traits::{EventSink, PublishOutcome},
+    Session, TapLog, traits::EventSink,
 };
+// `PublishOutcome` and the `StreamExt` combinators drive the iceoryx2 per-client
+// pump (`spawn_pump`), which is unix-only (WS has its own pump in `ws/conn.rs`).
+#[cfg(not(windows))]
+use datamancer::traits::PublishOutcome;
+#[cfg(not(windows))]
 use futures::StreamExt as _;
+#[cfg(not(windows))]
 use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 #[cfg(unix)]
@@ -40,6 +53,7 @@ use crate::credentials::privileged_op_permitted;
 use crate::error::{DaemonError, Result};
 use crate::shutdown::{DrainClient, DrainRecorder, drain};
 
+#[cfg(not(windows))]
 type Node = iceoryx2::prelude::Node<ipc_threadsafe::Service>;
 
 /// Reduce a [`datamancer::SystemSnapshot`] into the app-facing
@@ -141,16 +155,31 @@ impl WebHandles {
 /// The daemon supervisor.
 pub struct Server {
     dm: Datamancer,
+    /// The process-wide iceoryx2 node backing the unix data/diagnostics/health
+    /// planes. Absent on Windows (WS-loopback carries the data plane there).
+    #[cfg(not(windows))]
     node: Node,
     tap_log: Option<Arc<dyn TapLog>>,
     /// Startup-session anchors, held for the process lifetime.
     anchors: Vec<Session>,
     clients: HashMap<String, ClientEntry>,
+    /// Monotonic id for the next iceoryx2 data service (`open-client`); unix-only
+    /// since Windows opens no iceoryx2 clients.
+    #[cfg(not(windows))]
     next_client_id: u64,
+    // `service_prefix`/`max_clients` name and bound the per-client iceoryx2
+    // data services; the whole `open-client` flow is unix-only (Windows data
+    // rides WS), so both are `#[cfg(not(windows))]`.
+    #[cfg(not(windows))]
     service_prefix: String,
+    #[cfg(not(windows))]
     max_clients: usize,
     admin_socket: PathBuf,
     shutdown_timeout: Duration,
+    /// Diagnostics/health publish cadence. Read by the unix iceoryx2 diagnostics
+    /// ticker and by the WS health push (`start_ws`); on Windows without `ws`
+    /// neither runs, so it is dead only in that one config.
+    #[cfg_attr(all(windows, not(feature = "ws")), allow(dead_code))]
     diag_interval: Duration,
     /// Optional web-UI settings (Phase 6); `None` (or `enabled=false`) disables
     /// the embedded HTTP introspection surface.
@@ -194,7 +223,9 @@ impl Server {
     /// Propagates config/library/transport errors.
     pub async fn bootstrap(config: Config, config_path: std::path::PathBuf) -> Result<Self> {
         let admin_socket = config.server.admin_socket.clone();
+        #[cfg(not(windows))]
         let service_prefix = config.server.service_prefix.clone();
+        #[cfg(not(windows))]
         let max_clients = config.iceoryx2.max_clients;
         let shutdown_timeout = Duration::from_secs(config.server.shutdown_timeout_secs);
         let diag_interval = Duration::from_millis(config.diagnostics.publish_interval_ms);
@@ -232,6 +263,10 @@ impl Server {
         let dm = built.datamancer;
         let tap_log = built.tap_log;
 
+        // The one process-wide iceoryx2 node. Unix/macOS only — on Windows
+        // `create()` fails at runtime (native-Windows spec §2.5), so the daemon
+        // runs WS-only there with no node.
+        #[cfg(not(windows))]
         let node = NodeBuilder::new()
             .create::<ipc_threadsafe::Service>()
             .map_err(|e| DaemonError::Transport(format!("node create: {e:?}")))?;
@@ -265,12 +300,16 @@ impl Server {
 
         Ok(Self {
             dm,
+            #[cfg(not(windows))]
             node,
             tap_log,
             anchors,
             clients: HashMap::new(),
+            #[cfg(not(windows))]
             next_client_id: 0,
+            #[cfg(not(windows))]
             service_prefix,
+            #[cfg(not(windows))]
             max_clients,
             admin_socket,
             shutdown_timeout,
@@ -290,6 +329,28 @@ impl Server {
         })
     }
 
+    /// Windows only: warn at boot when no WS data plane is serving (built
+    /// without `ws`, or `[ws].enabled=false`) — the daemon then has no data
+    /// plane at all (iceoryx2 is unavailable on Windows), only the admin
+    /// control plane. A warning, not an error: the control-transport CI build
+    /// is intentionally ws-less.
+    #[cfg(windows)]
+    // Without `ws` there is no `self.ws` to read, so `self` is genuinely unused
+    // in that build — the answer is unconditionally "no data plane".
+    #[cfg_attr(not(feature = "ws"), allow(clippy::unused_self))]
+    fn warn_if_no_data_plane(&self) {
+        #[cfg(feature = "ws")]
+        let ws_serving = self.ws.as_ref().is_some_and(|w| w.enabled);
+        #[cfg(not(feature = "ws"))]
+        let ws_serving = false;
+        if !ws_serving {
+            tracing::warn!(
+                "no data plane on Windows (built without `ws` or `[ws]` disabled); \
+                 only the admin control plane is served"
+            );
+        }
+    }
+
     /// Run the daemon until a shutdown signal, then drain gracefully.
     ///
     /// # Errors
@@ -299,17 +360,29 @@ impl Server {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(256);
         let accept = self.spawn_control(cmd_tx.clone())?;
 
-        let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
-            .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
-        let health_publisher = Iceoryx2HealthPublisher::new(&self.node)
-            .map_err(|e| DaemonError::Transport(format!("health publisher: {e:?}")))?;
-        let diagnostics = spawn_diagnostics(
-            self.dm.clone(),
-            publisher,
-            health_publisher,
-            self.credential_backend,
-            self.diag_interval,
-        );
+        // The iceoryx2 diagnostics + health push planes (unix/macOS). On Windows
+        // there is no node: health is pushed over WS (`spawn_health_push`) and
+        // diagnostics are pulled via the WS `snapshot` op, so no ticker runs.
+        #[cfg(not(windows))]
+        let diagnostics = {
+            let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
+                .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
+            let health_publisher = Iceoryx2HealthPublisher::new(&self.node)
+                .map_err(|e| DaemonError::Transport(format!("health publisher: {e:?}")))?;
+            spawn_diagnostics(
+                self.dm.clone(),
+                publisher,
+                health_publisher,
+                self.credential_backend,
+                self.diag_interval,
+            )
+        };
+
+        // Windows has no iceoryx2 data plane; warn if there is also no WS data
+        // plane serving (admin-only). Not a hard error — the control-transport
+        // CI build is intentionally ws-less.
+        #[cfg(windows)]
+        self.warn_if_no_data_plane();
 
         #[cfg(feature = "web-ui")]
         let mut web_handles = self.start_web().await?;
@@ -386,7 +459,11 @@ impl Server {
         let drain_fut = drain(
             &recorder,
             move || accept.abort(),
+            // No diagnostics ticker on Windows (no iceoryx2 planes) — no-op slot.
+            #[cfg(not(windows))]
             move || diagnostics.abort(),
+            #[cfg(windows)]
+            || {},
             clients,
             std::mem::take(&mut self.anchors),
             self.tap_log.clone(),
@@ -752,6 +829,25 @@ impl Server {
         }
     }
 
+    /// Open an iceoryx2 same-host client: create a per-client data service +
+    /// sink and pump the session's stream to it. Unix/macOS only — this is the
+    /// iceoryx2 data flow, which has no node on Windows.
+    #[cfg(windows)]
+    #[allow(clippy::unused_async)] // symmetric with the unix (async) arm the dispatcher awaits
+    async fn open_client(
+        &mut self,
+        _client: String,
+        _subscriptions: Vec<SubscriptionSpec>,
+    ) -> Reply {
+        // On Windows the control plane is the admin surface only; data rides the
+        // WS-loopback transport, so there is no iceoryx2 data service to open.
+        Reply::error(
+            codes::UNSUPPORTED_ON_WINDOWS,
+            "open-client (iceoryx2 data plane) is unavailable on Windows; use the WS data surface",
+        )
+    }
+
+    #[cfg(not(windows))]
     async fn open_client(&mut self, client: String, subscriptions: Vec<SubscriptionSpec>) -> Reply {
         if self.clients.contains_key(&client) {
             return Reply::error(
@@ -896,7 +992,10 @@ fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(),
 
 /// Pump a client's multiplexed stream into its per-client sink, in arrival
 /// order (`(instrument, seq)`; no cross-symbol order is created). A single
-/// sequential pump preserves the stream's existing order.
+/// sequential pump preserves the stream's existing order. Unix/macOS only —
+/// this drives the iceoryx2 `open-client` sink; the WS surface has its own
+/// pump (`ws/conn.rs`).
+#[cfg(not(windows))]
 fn spawn_pump(mut stream: datamancer::EventStream, sink: Arc<dyn EventSink>) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(ev) = stream.next().await {
@@ -1305,7 +1404,9 @@ async fn serve_connection<R, W>(
 /// both — the health view is stamped with the daemon version and credential
 /// backend, same as the `Request::Health` dispatch arm). `snapshot()` is
 /// async (the cache catalog does I/O); awaiting it here keeps the ticker off
-/// the actor's critical path.
+/// the actor's critical path. Unix/macOS only — the ticker publishes on the
+/// iceoryx2 planes, which do not exist on Windows (health rides WS instead).
+#[cfg(not(windows))]
 fn spawn_diagnostics(
     dm: Datamancer,
     publisher: Iceoryx2DiagnosticsPublisher,
