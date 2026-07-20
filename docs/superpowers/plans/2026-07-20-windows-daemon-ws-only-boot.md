@@ -37,10 +37,10 @@
 - [x] Client `EnsureConfig.ws_data_url` default (`ws://127.0.0.1:9001`) matches the daemon `[ws]` scaffold port (9001).
 - Note: the smoke drives the daemon over **raw WS** (proves boot + data + health without an `app` dev-dep in `datamancerd`). An `AppHandle::ensure`-based integration test (Tasks 3–4 already unit-tested in the client crate) is a possible follow-up.
 
-## Task D5 — Phase-4 Task 6 CI (Zach-blessed)
-- [ ] New native-Windows job: build `datamancerd --features ws`, boot it, run the D4 smoke (`--ignored`). Rewrite the `ci.yml:78-87` support-boundary comment to record the lifted scope + Zach's blessing.
-- [ ] Keep the existing `native clippy + control-transport tests` job (control-transport subset) and `ws-portable subset` job.
-- [ ] Commit `ci(windows): run the WS-loopback daemon + app smoke on Windows`.
+## Task D5 — Phase-4 Task 6 CI (Zach-blessed) — ✅ DONE
+> Extended the `windows-native-check` job (rather than a new job — it already has libclang): added `cargo clippy -p datamancerd --features ws --all-targets -- -D warnings` and `cargo test -p datamancerd --features ws --test ws_e2e windows_ws_only_boot_smoke -- --ignored` (boots the daemon WS-only + drives WS data/health). Rewrote both boundary comments (the `windows` ws-portable job and the `windows-native-check` job) to record the lifted scope + Zach's blessing; renamed the job to "native clippy + control-transport + WS-loopback daemon (Windows)".
+- [x] Native-Windows job builds the WS daemon, boots it, runs the D4 smoke.
+- [x] The `ws-portable subset` and control-transport coverage retained.
 
 ---
 

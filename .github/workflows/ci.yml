@@ -81,10 +81,13 @@ jobs:
         run: .github/scripts/semver-checks.sh "origin/${{ github.base_ref }}"
 
   windows:
-    # The support boundary, enforced: Windows gets the ws transport and the
-    # ws-featured client ONLY. The daemon (UDS control socket) and the
-    # iceoryx2 transport are POSIX; do not add them here - that is a porting
-    # decision, not a CI edit (see the open-sourcing design spec).
+    # This job stays the minimal portable subset (transport-ws + ws-featured
+    # client). The native-Windows daemon is NOT built here - it runs in the
+    # `windows-native-check` job below, which boots datamancerd WS-only on
+    # Windows (Phase 4). The original "the daemon is POSIX-only, do not add it"
+    # boundary was lifted once the daemon could run on Windows over WS-loopback
+    # (Zach, Slack 2026-07-19: "once it's possible to run on windows we want the
+    # daemon to run on windows in CI as well"). iceoryx2 shm stays POSIX-only.
     name: ws-portable subset (Windows)
     runs-on: windows-latest
     timeout-minutes: 15
@@ -103,8 +106,11 @@ jobs:
     # would otherwise rot uncaught. This job also carries the *only* CI coverage
     # of the `cfg(windows)` Win32 code (the Linux clippy job never compiles it):
     # clippy lints the ported crates and runs the named-pipe control-transport +
-    # owner-SID auth tests (Phase 3). iceoryx2's bindgen needs libclang.
-    name: native clippy + control-transport tests (Windows)
+    # owner-SID auth tests (Phase 3). Phase 4: it now also builds the WS-featured
+    # daemon and BOOTS it WS-only on Windows (no iceoryx2 node) via the
+    # `windows_ws_only_boot_smoke` e2e - the daemon runs on Windows in CI, per
+    # Zach's blessing (Slack 2026-07-19). iceoryx2's bindgen needs libclang.
+    name: native clippy + control-transport + WS-loopback daemon (Windows)
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -119,7 +125,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install LLVM (libclang for iceoryx2 bindgen)
         run: choco install llvm --no-progress -y
-      - name: clippy + control-transport tests (daemon + client app)
+      - name: clippy + control-transport + WS-loopback daemon (Windows)
         shell: bash
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
@@ -127,12 +133,17 @@ jobs:
           # Lints the Win32 modules (win_control / win_pipe) that no other job sees.
           cargo clippy -p datamancerd --all-targets -- -D warnings
           cargo clippy -p datamancer-client --features app --all-targets -- -D warnings
+          # The WS-featured daemon is the shipped Windows build (its only data
+          # plane); lint it under -D warnings too.
+          cargo clippy -p datamancerd --features ws --all-targets -- -D warnings
           # winsec's cfg(windows) Win32 FFI readers (token/owner SID + integrity)
           # run nowhere else: the Linux job cannot compile them, and the pure
           # classifier it does run covers only the branch logic, not the reads.
           cargo test -p datamancer-winsec
-          # Owner-DACL pipe + client owner-SID check. These create real pipes but
-          # no iceoryx2 node, so they run here (the full daemon needs an iceoryx2
-          # runtime, which is not yet available on Windows — a later phase).
+          # Owner-DACL pipe + client owner-SID check (Phase 3 control transport).
           cargo test -p datamancerd win_control
           cargo test -p datamancer-client --features app win_pipe
+          # Phase 4: BOOT the daemon WS-only on Windows (no iceoryx2 node) and
+          # drive its WS data + health planes end-to-end. This is the proof the
+          # daemon runs on Windows; #[ignore]d (spawns the binary, binds loopback).
+          cargo test -p datamancerd --features ws --test ws_e2e windows_ws_only_boot_smoke -- --ignored
