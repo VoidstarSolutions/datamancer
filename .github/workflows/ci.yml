@@ -143,6 +143,11 @@ jobs:
           # Owner-DACL pipe + client owner-SID check (Phase 3 control transport).
           cargo test -p datamancerd win_control
           cargo test -p datamancer-client --features app win_pipe
+          # Phase 5 / B3: the named-pipe ADMIN plane end-to-end — boot the daemon
+          # (control-plane-only, no `ws` needed) and drive ping / get-config /
+          # configure-provider / shutdown over the pipe. #[ignore]d (spawns the
+          # binary); complements the WS-plane boot smoke in the ws job.
+          cargo test -p datamancerd config_service_boots_disabled_and_shuts_down_cleanly -- --ignored
           # Phase 4: BOOT the daemon WS-only on Windows (no iceoryx2 node) and
           # drive its WS data + health planes end-to-end. This is the proof the
           # daemon runs on Windows; #[ignore]d (spawns the binary, binds loopback).
