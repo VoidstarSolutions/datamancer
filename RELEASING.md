@@ -55,6 +55,15 @@ All seven crates share one version, so every release re-tags the whole
 workspace together. This keeps `datamancer-client` and `datamancerd` in
 lockstep for the ping version gate.
 
+**Known gotcha — the Windows `datamancer-winsec` dep requirement.** `datamancer-winsec`
+is pulled in under `[target.'cfg(windows)'.dependencies]` by `datamancer-client`
+and `datamancerd`. release-plz does **not** reliably bump the `version = "X.Y.Z"`
+requirement inside target-gated dependency tables, so after each workspace bump
+that literal must be **hand-aligned** to the new version in both crates'
+`Cargo.toml` (else the path dep resolves fine locally but the requirement lags,
+and a published build would mismatch). Grep for `datamancer-winsec = {` before
+merging a release PR. (History: commits aligning this to `0.7.0`, then `0.8.0`.)
+
 One version and one tag get **one changelog**: the root `CHANGELOG.md`, owned
 by the `datamancer` package (`changelog_path` + `changelog_include` in
 `release-plz.toml`) exactly as it owns the tag and the Release. The other six

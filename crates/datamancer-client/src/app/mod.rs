@@ -84,9 +84,11 @@ pub type DataError = Iceoryx2ClientError;
 #[cfg(windows)]
 pub type DataError = crate::ws::WsClientError;
 
-/// Default WS-loopback data endpoint for the Windows hybrid (matches the
-/// daemon's `[ws]` loopback default). Task 5 makes this configurable via
-/// `EnsureConfig`; until then the same-host data plane uses the fixed default.
+/// Default WS-loopback data endpoint for the Windows hybrid, used when
+/// [`EnsureConfig::ws_data_url`] is `None`. Must match the daemon's `[ws]`
+/// loopback scaffold in `datamancerd`'s `paths::default_config_toml`
+/// (`bind = "127.0.0.1"`, `port = 9001`) — changing the scaffold port there
+/// requires updating this default (or setting `ws_data_url` explicitly).
 #[cfg(windows)]
 const DEFAULT_WS_DATA_ENDPOINT: &str = "ws://127.0.0.1:9001";
 

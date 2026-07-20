@@ -650,6 +650,15 @@ impl Config {
             // Surface a scope/backfill mismatch at validate time.
             s.resolve_scope()?;
         }
+        // A zero publish interval would panic `tokio::time::interval`, which both
+        // the iceoryx2 diagnostics ticker (unix) and the WS health-push task
+        // (`ws/conn.rs`) construct from it — reject it up front rather than
+        // crashing a task at runtime.
+        if self.diagnostics.publish_interval_ms == 0 {
+            return Err(DaemonError::ConfigInvalid(
+                "[diagnostics].publish_interval_ms must be greater than 0".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -991,6 +1000,24 @@ account_type = "paper"
         config.validate().expect("zero providers must validate");
         let config = Config::parse("").expect("parse empty");
         config.validate().expect("empty config must validate");
+    }
+
+    #[test]
+    fn zero_publish_interval_is_rejected() {
+        // `publish_interval_ms = 0` would panic `tokio::time::interval`, so
+        // validation must reject it rather than let a runtime task crash.
+        let config = Config::parse("[diagnostics]\npublish_interval_ms = 0\n").expect("parse");
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("publish_interval_ms"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid for zero interval, got {other:?}"),
+        }
+        // A positive interval (and the default) validate fine.
+        Config::parse("[diagnostics]\npublish_interval_ms = 1\n")
+            .expect("parse")
+            .validate()
+            .expect("positive interval validates");
     }
 
     #[test]
