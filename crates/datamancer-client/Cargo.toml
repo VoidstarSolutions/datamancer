@@ -23,8 +23,12 @@ iceoryx2 = [
     # "iceoryx2")); pull winsec only when it can actually be used.
     "dep:datamancer-winsec",
 ]
-# App-facing find-or-spawn facade (Task 4+).
-app = ["iceoryx2"]
+# App-facing find-or-spawn facade (Task 4+). Pulls in `ws` because the
+# Windows hybrid `AppHandle` carries its data plane over WS-loopback
+# (iceoryx2 shm is not viable on Windows — Phase 4). On unix `ws` is compiled
+# but unused by the facade (every WS reference is `#[cfg(windows)]`); the
+# iceoryx2 data path and all unix behavior are unchanged.
+app = ["iceoryx2", "ws"]
 
 [dependencies]
 datamancer-core = { path = "../datamancer-core", version = "0.8.0" }

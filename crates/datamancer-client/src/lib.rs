@@ -28,9 +28,11 @@ pub mod spec;
 #[cfg(all(windows, feature = "iceoryx2"))]
 mod win_pipe;
 // Standalone named-pipe control client for the Windows hybrid admin plane
-// (Phase 4): admin ops over the pipe, data over WS.
+// (Phase 4): admin ops over the pipe, data over WS. `pub` so `PipeControlError`
+// (the admin-plane transport error surfaced by the Windows `AppHandle`) is a
+// publicly reachable type; `PipeControlClient` itself stays `pub(crate)`.
 #[cfg(all(windows, feature = "iceoryx2"))]
-mod pipe_control;
+pub mod pipe_control;
 #[cfg(feature = "ws")]
 pub mod ws;
 

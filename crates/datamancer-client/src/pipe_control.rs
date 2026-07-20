@@ -11,12 +11,6 @@
 //! Serial, strict request→reply per line — one in-flight request at a time,
 //! matching the daemon's `serve_connection` contract.
 
-// Standalone control infrastructure — its in-crate consumer is the Windows
-// hybrid `AppHandle` (Phase 4 Task 3). Until that lands the methods are used
-// only by this module's tests, so the plain lib build sees them as dead code;
-// the allow is removed when Task 3 wires the admin plane.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines, ReadHalf, WriteHalf};
@@ -24,9 +18,12 @@ use tokio::net::windows::named_pipe::NamedPipeClient;
 
 use crate::protocol::uds::{Reply, Request};
 
-/// Failure talking to the daemon over the control pipe.
+/// Failure talking to the daemon over the control pipe. Surfaced as the
+/// `AdminError` transport type by the Windows hybrid [`crate::app::AppHandle`]
+/// (`ClientError::Transport(PipeControlError)`); daemon rejections are mapped
+/// to `ClientError::Control` at the facade, not represented here.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PipeControlError {
+pub enum PipeControlError {
     #[error("control pipe I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("control JSON: {0}")]

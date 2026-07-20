@@ -214,10 +214,11 @@ impl WsClient {
     /// Subscribe to the daemon's periodic health push and return the stream of
     /// pushed [`HealthView`]s (the Windows same-host health plane). Sends
     /// `WatchHealth`, awaits the ack, then hands out the health receiver (once
-    /// per client). Consumed by `AppHandle::watch_health` on Windows (Phase 4
-    /// Task 3); the push plumbing (channel + reader arm) is exercised now, this
-    /// accessor lands with its caller.
-    #[allow(dead_code)]
+    /// per client). Consumed by the Windows `AppHandle` (Phase 4), which
+    /// subscribes eagerly at `ensure` so its `watch_health` keeps a `&self`,
+    /// infallible signature. Dead only in builds that never reach that caller
+    /// (non-Windows, or Windows without the `app` facade).
+    #[cfg_attr(not(all(windows, feature = "app")), allow(dead_code))]
     pub(crate) async fn watch_health(
         &mut self,
     ) -> Result<ReceiverStream<HealthView>, ClientError<WsClientError>> {

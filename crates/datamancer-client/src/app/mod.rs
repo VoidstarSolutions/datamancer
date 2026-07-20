@@ -44,13 +44,51 @@ use datamancer_core::{
 
 use crate::Client as _;
 use crate::error::ClientError;
+#[cfg(not(windows))]
 use crate::iceoryx2::{Iceoryx2Client, Iceoryx2ClientError, Iceoryx2Config};
 use crate::protocol::uds::{Reply, Request};
 use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
 
+// Windows hybrid: admin ops ride the owner-DACL named pipe, the data plane
+// rides WS-loopback (iceoryx2 shm is not viable on Windows — Phase 4). Unix is
+// a single `Iceoryx2Client` carrying both.
+#[cfg(windows)]
+use crate::pipe_control::PipeControlClient;
+#[cfg(windows)]
+pub use crate::pipe_control::PipeControlError;
+#[cfg(windows)]
+use crate::ws::{WsClient, WsConfig};
+
 /// The multiplexed event stream (same contract as the underlying
 /// [`crate::Client`] impl: `(instrument, seq)`-ordered, loss never silent).
+#[cfg(not(windows))]
 pub type AppEvents = <Iceoryx2Client as crate::Client>::Events;
+#[cfg(windows)]
+pub type AppEvents = <WsClient as crate::Client>::Events;
+
+/// Transport error surfaced by the admin (control-plane) methods —
+/// `ping`/`health`/credentials/config/`shutdown`. Unix: the iceoryx2 client's
+/// error (control is UDS). Windows: the named-pipe control error (admin stays
+/// on the owner-DACL pipe). Daemon rejections are `ClientError::Control` with a
+/// stable code regardless; this is only the transport-failure type.
+#[cfg(not(windows))]
+pub type AdminError = Iceoryx2ClientError;
+#[cfg(windows)]
+pub type AdminError = PipeControlError;
+
+/// Transport error surfaced by the data-plane methods —
+/// `subscribe`/`unsubscribe`/`snapshot`/`instruments`/`capabilities`/`close`.
+/// Unix: the iceoryx2 client's error. Windows: the WS-loopback client's error.
+#[cfg(not(windows))]
+pub type DataError = Iceoryx2ClientError;
+#[cfg(windows)]
+pub type DataError = crate::ws::WsClientError;
+
+/// Default WS-loopback data endpoint for the Windows hybrid (matches the
+/// daemon's `[ws]` loopback default). Task 5 makes this configurable via
+/// `EnsureConfig`; until then the same-host data plane uses the fixed default.
+#[cfg(windows)]
+const DEFAULT_WS_DATA_ENDPOINT: &str = "ws://127.0.0.1:9001";
 
 /// Gate the connection on the daemon's reported version.
 fn check_version(daemon: &str) -> Result<(), EnsureError> {
@@ -110,10 +148,27 @@ impl EnsureConfig {
 
 /// The app-facing daemon handle: found-or-spawned, connected, versioned.
 ///
-/// Holds the same-host [`Iceoryx2Client`] and adds no protocol semantics —
-/// every method maps to control-surface ops.
+/// Adds no protocol semantics — every method maps to control-surface ops. Unix
+/// holds one same-host [`Iceoryx2Client`] carrying both control and shm data.
+#[cfg(not(windows))]
 pub struct AppHandle {
     client: Iceoryx2Client,
+    daemon_hello: lifecycle::DaemonHello,
+}
+
+/// The app-facing daemon handle (Windows **hybrid**): admin ops ride the
+/// owner-DACL named-pipe control connection (`admin`), the data plane rides
+/// WS-loopback (`data`) since iceoryx2 shm is not viable on Windows. Two
+/// independent connections; still no new protocol semantics.
+#[cfg(windows)]
+pub struct AppHandle {
+    admin: PipeControlClient,
+    data: WsClient,
+    /// The WS health-push stream, subscribed eagerly at [`AppHandle::ensure`]
+    /// and handed out (once) by [`AppHandle::watch_health`]. `None` if the
+    /// eager subscribe failed (health degrades silently, matching the unix
+    /// contract). Behind a `Mutex` so `watch_health` keeps its `&self` signature.
+    health: std::sync::Mutex<Option<HealthStream>>,
     daemon_hello: lifecycle::DaemonHello,
 }
 
@@ -144,26 +199,101 @@ impl AppHandle {
         )
         .await?;
         check_version(&daemon_hello.version)?;
-        let (client, events) = Iceoryx2Client::connect(Iceoryx2Config {
-            control_socket: socket,
-            client_name: cfg.client_name.clone(),
-            poll_interval: cfg.poll_interval,
-            event_buffer: cfg.event_buffer,
-        })
-        .await?;
-        Ok((
-            Self {
-                client,
-                daemon_hello,
-            },
-            events,
-        ))
+
+        #[cfg(not(windows))]
+        {
+            let (client, events) = Iceoryx2Client::connect(Iceoryx2Config {
+                control_socket: socket,
+                client_name: cfg.client_name.clone(),
+                poll_interval: cfg.poll_interval,
+                event_buffer: cfg.event_buffer,
+            })
+            .await?;
+            Ok((
+                Self {
+                    client,
+                    daemon_hello,
+                },
+                events,
+            ))
+        }
+
+        // Windows hybrid: connect the admin plane (owner-verified pipe) and the
+        // data plane (WS-loopback) as two independent connections. The pipe is
+        // re-verified here (owner SID + integrity) even though `ensure_daemon`
+        // already pinged it — `connect_verified` is the security boundary for
+        // every privileged send, not a one-time probe.
+        #[cfg(windows)]
+        {
+            let admin = PipeControlClient::connect(&socket).await?;
+            let (mut data, events) = WsClient::connect(WsConfig {
+                url: DEFAULT_WS_DATA_ENDPOINT.to_string(),
+                auth_token: None,
+                event_buffer: cfg.event_buffer,
+            })
+            .await?;
+            // Eagerly subscribe to the health push so `watch_health` keeps its
+            // `&self`, infallible signature. A subscribe failure degrades to no
+            // health (unix contract: a setup failure just ends the stream), it
+            // does not fail `ensure` — the data/admin planes are already up.
+            let health = std::sync::Mutex::new(data.watch_health().await.ok());
+            Ok((
+                Self {
+                    admin,
+                    data,
+                    health,
+                    daemon_hello,
+                },
+                events,
+            ))
+        }
     }
 
     /// The daemon version reported at connect (`ping`).
     #[must_use]
     pub fn daemon_version(&self) -> &str {
         &self.daemon_hello.version
+    }
+
+    // --- internal plane routing (cfg-split so the public methods above stay
+    // platform-neutral) ---
+
+    /// Route an admin (control-plane) request and map the reply to the
+    /// two-layer error model. Unix: the iceoryx2 client's UDS control. Windows:
+    /// the owner-DACL named pipe — the reject-to-`ClientError::Control` mapping
+    /// (which `Iceoryx2Client::control_request` does on unix) is applied here.
+    #[cfg(not(windows))]
+    async fn admin_request(&mut self, req: &Request) -> Result<Reply, ClientError<AdminError>> {
+        self.client.control_request(req).await
+    }
+
+    #[cfg(windows)]
+    async fn admin_request(&mut self, req: &Request) -> Result<Reply, ClientError<AdminError>> {
+        let reply = self
+            .admin
+            .request(req)
+            .await
+            .map_err(ClientError::Transport)?;
+        if reply.ok {
+            Ok(reply)
+        } else {
+            Err(ClientError::Control {
+                code: reply.code.unwrap_or_default(),
+                message: reply.message.unwrap_or_default(),
+            })
+        }
+    }
+
+    /// The data-plane client. Unix: the shared iceoryx2 client (control + shm).
+    /// Windows: the WS-loopback client.
+    #[cfg(not(windows))]
+    fn data_mut(&mut self) -> &mut Iceoryx2Client {
+        &mut self.client
+    }
+
+    #[cfg(windows)]
+    fn data_mut(&mut self) -> &mut WsClient {
+        &mut self.data
     }
 
     /// The daemon's app-facing health view, reduced and stamped daemon-side
@@ -174,13 +304,11 @@ impl AppHandle {
     /// # Errors
     ///
     /// Propagates the underlying `health` control/transport failure.
-    pub async fn health(&mut self) -> Result<HealthView, ClientError<Iceoryx2ClientError>> {
-        let reply = self.client.control_request(&Request::Health).await?;
-        reply.health.ok_or_else(|| {
-            ClientError::Transport(Iceoryx2ClientError::Protocol(
-                "ok health reply missing health payload".to_string(),
-            ))
-        })
+    pub async fn health(&mut self) -> Result<HealthView, ClientError<AdminError>> {
+        let reply = self.admin_request(&Request::Health).await?;
+        reply
+            .health
+            .ok_or_else(|| admin_protocol_error("ok health reply missing health payload"))
     }
 
     /// Store (create or rotate) provider credentials in the daemon's broker.
@@ -196,14 +324,13 @@ impl AppHandle {
         &mut self,
         provider: &str,
         credentials: ProviderCredentials,
-    ) -> Result<(), ClientError<Iceoryx2ClientError>> {
-        self.client
-            .control_request(&Request::SetCredentials {
-                provider: provider.to_string(),
-                credentials,
-            })
-            .await
-            .map(|_| ())
+    ) -> Result<(), ClientError<AdminError>> {
+        self.admin_request(&Request::SetCredentials {
+            provider: provider.to_string(),
+            credentials,
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Read back stored credentials for `provider`.
@@ -217,17 +344,14 @@ impl AppHandle {
     pub async fn get_credentials(
         &mut self,
         provider: &str,
-    ) -> Result<ProviderCredentials, ClientError<Iceoryx2ClientError>> {
+    ) -> Result<ProviderCredentials, ClientError<AdminError>> {
         let reply = self
-            .client
-            .control_request(&Request::GetCredentials {
+            .admin_request(&Request::GetCredentials {
                 provider: provider.to_string(),
             })
             .await?;
         reply.credentials.ok_or_else(|| {
-            ClientError::Transport(Iceoryx2ClientError::Protocol(
-                "ok get-credentials reply missing credentials payload".to_string(),
-            ))
+            admin_protocol_error("ok get-credentials reply missing credentials payload")
         })
     }
 
@@ -243,13 +367,12 @@ impl AppHandle {
     pub async fn clear_credentials(
         &mut self,
         provider: &str,
-    ) -> Result<(), ClientError<Iceoryx2ClientError>> {
-        self.client
-            .control_request(&Request::ClearCredentials {
-                provider: provider.to_string(),
-            })
-            .await
-            .map(|_| ())
+    ) -> Result<(), ClientError<AdminError>> {
+        self.admin_request(&Request::ClearCredentials {
+            provider: provider.to_string(),
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Fetch the daemon's current config.
@@ -258,8 +381,8 @@ impl AppHandle {
     ///
     /// `ClientError::Control` with stable codes, or a transport failure
     /// (including a malformed ok reply missing the `config` payload).
-    pub async fn get_config(&mut self) -> Result<DaemonConfig, ClientError<Iceoryx2ClientError>> {
-        let reply = self.client.control_request(&Request::GetConfig).await?;
+    pub async fn get_config(&mut self) -> Result<DaemonConfig, ClientError<AdminError>> {
+        let reply = self.admin_request(&Request::GetConfig).await?;
         daemon_config_from(&reply)
     }
 
@@ -276,10 +399,9 @@ impl AppHandle {
         &mut self,
         provider: &str,
         settings: serde_json::Value,
-    ) -> Result<Applied, ClientError<Iceoryx2ClientError>> {
+    ) -> Result<Applied, ClientError<AdminError>> {
         let reply = self
-            .client
-            .control_request(&Request::ConfigureProvider {
+            .admin_request(&Request::ConfigureProvider {
                 provider: provider.to_string(),
                 settings,
             })
@@ -297,10 +419,9 @@ impl AppHandle {
     pub async fn remove_provider(
         &mut self,
         provider: &str,
-    ) -> Result<Applied, ClientError<Iceoryx2ClientError>> {
+    ) -> Result<Applied, ClientError<AdminError>> {
         let reply = self
-            .client
-            .control_request(&Request::RemoveProvider {
+            .admin_request(&Request::RemoveProvider {
                 provider: provider.to_string(),
             })
             .await?;
@@ -314,11 +435,8 @@ impl AppHandle {
     ///
     /// `ClientError::Control` with `permission_denied`, or a transport
     /// failure sending the request.
-    pub async fn shutdown_daemon(mut self) -> Result<(), ClientError<Iceoryx2ClientError>> {
-        self.client
-            .control_request(&Request::Shutdown)
-            .await
-            .map(|_| ())
+    pub async fn shutdown_daemon(mut self) -> Result<(), ClientError<AdminError>> {
+        self.admin_request(&Request::Shutdown).await.map(|_| ())
     }
 
     /// See [`crate::Client::subscribe`].
@@ -329,8 +447,8 @@ impl AppHandle {
     pub async fn subscribe(
         &mut self,
         spec: &SubscriptionSpec,
-    ) -> Result<(), ClientError<Iceoryx2ClientError>> {
-        self.client.subscribe(spec).await
+    ) -> Result<(), ClientError<DataError>> {
+        self.data_mut().subscribe(spec).await
     }
 
     /// See [`crate::Client::unsubscribe`].
@@ -341,8 +459,8 @@ impl AppHandle {
     pub async fn unsubscribe(
         &mut self,
         spec: &UnsubscribeSpec,
-    ) -> Result<(), ClientError<Iceoryx2ClientError>> {
-        self.client.unsubscribe(spec).await
+    ) -> Result<(), ClientError<DataError>> {
+        self.data_mut().unsubscribe(spec).await
     }
 
     /// See [`crate::Client::instruments`].
@@ -353,8 +471,8 @@ impl AppHandle {
     pub async fn instruments(
         &mut self,
         provider: Option<&ProviderId>,
-    ) -> Result<Vec<InstrumentInfo>, ClientError<Iceoryx2ClientError>> {
-        self.client.instruments(provider).await
+    ) -> Result<Vec<InstrumentInfo>, ClientError<DataError>> {
+        self.data_mut().instruments(provider).await
     }
 
     /// See [`crate::Client::capabilities`].
@@ -366,8 +484,8 @@ impl AppHandle {
         &mut self,
         provider: &ProviderId,
         symbols: &[String],
-    ) -> Result<Vec<InstrumentEntry>, ClientError<Iceoryx2ClientError>> {
-        self.client.capabilities(provider, symbols).await
+    ) -> Result<Vec<InstrumentEntry>, ClientError<DataError>> {
+        self.data_mut().capabilities(provider, symbols).await
     }
 
     /// The raw diagnostics snapshot (prefer [`Self::health`] for rendering).
@@ -375,8 +493,8 @@ impl AppHandle {
     /// # Errors
     ///
     /// See [`crate::Client::snapshot`].
-    pub async fn snapshot(&mut self) -> Result<SystemSnapshot, ClientError<Iceoryx2ClientError>> {
-        self.client.snapshot().await
+    pub async fn snapshot(&mut self) -> Result<SystemSnapshot, ClientError<DataError>> {
+        self.data_mut().snapshot().await
     }
 
     /// Graceful close of this client (the daemon keeps running — see
@@ -385,8 +503,21 @@ impl AppHandle {
     /// # Errors
     ///
     /// See [`crate::Client::close`].
-    pub async fn close(self) -> Result<(), ClientError<Iceoryx2ClientError>> {
+    #[cfg(not(windows))]
+    pub async fn close(self) -> Result<(), ClientError<DataError>> {
         self.client.close().await
+    }
+
+    /// Windows hybrid close: the WS `close` sends `CloseClient` to the daemon;
+    /// the admin pipe (`self.admin`) drops here, releasing the control
+    /// connection. The daemon keeps running (see [`Self::shutdown_daemon`]).
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::Client::close`] (the WS data-plane close).
+    #[cfg(windows)]
+    pub async fn close(self) -> Result<(), ClientError<DataError>> {
+        self.data.close().await
     }
 
     /// Subscribe to pushed health views on the `datamancer/health` plane (the
@@ -398,6 +529,7 @@ impl AppHandle {
     /// control connection: it does not consume `self.client` and cannot fail
     /// synchronously — a setup failure (node/service open) ends the returned
     /// stream immediately instead. Drop the stream to stop the poll task.
+    #[cfg(not(windows))]
     #[must_use]
     pub fn watch_health(&self) -> HealthStream {
         let (tx, rx) = tokio::sync::mpsc::channel::<HealthView>(4);
@@ -426,6 +558,44 @@ impl AppHandle {
         });
         tokio_stream::wrappers::ReceiverStream::new(rx)
     }
+
+    /// Windows hybrid health push (WS-loopback, not iceoryx2 shm — Phase 4).
+    /// The subscription is established **eagerly at [`Self::ensure`]** (a
+    /// `watch-health` op over the WS data socket): the daemon then pushes
+    /// daemon-stamped [`HealthView`]s on its diagnostics cadence, demuxed onto
+    /// a dedicated channel by the WS reader task. This method hands out that
+    /// stream.
+    ///
+    /// Two Windows-only nuances vs. the unix iceoryx2 arm, both consequences of
+    /// the push riding the single WS socket (subscribed once) rather than an
+    /// independent shm plane:
+    /// - **Single-shot:** the first call returns the live stream; later calls
+    ///   return an already-ended stream (the unix arm can be called repeatedly,
+    ///   each opening a fresh shm subscriber).
+    /// - **Silent degradation preserved:** if the eager subscribe failed at
+    ///   `ensure` (it does not fail `ensure`), this returns an immediately-ended
+    ///   stream — matching the unix contract that a setup failure just ends the
+    ///   stream. The `&self`, infallible signature is identical across platforms.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn watch_health(&self) -> HealthStream {
+        // A poisoned lock (impossible here — the guard is never held across a
+        // panic-prone section) degrades to an ended stream rather than
+        // panicking, keeping this truly infallible like the unix arm.
+        self.health
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or_else(ended_health_stream)
+    }
+}
+
+/// An immediately-ended [`HealthStream`] (sender dropped): the Windows
+/// `watch_health` fallback when no live health subscription is available.
+#[cfg(windows)]
+fn ended_health_stream() -> HealthStream {
+    let (_tx, rx) = tokio::sync::mpsc::channel::<HealthView>(1);
+    tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
 /// Push stream of daemon-stamped [`HealthView`]s (the `datamancer/health`
@@ -433,21 +603,34 @@ impl AppHandle {
 /// if the subscription fails; drop the stream to stop the poll task.
 pub type HealthStream = tokio_stream::wrappers::ReceiverStream<HealthView>;
 
-/// Idle-poll sleep for [`AppHandle::watch_health`]. Not derived from
+/// Idle-poll sleep for [`AppHandle::watch_health`] (unix iceoryx2 arm only —
+/// the Windows arm consumes a pushed WS channel, no polling). Not derived from
 /// [`EnsureConfig::poll_interval`]: that value lives on the one-shot `ensure`
 /// config and isn't retained on `AppHandle`, and this loop's cadence is
 /// bounded above by the daemon's independent diagnostics publish interval
 /// regardless, so a fixed short poll is simplest.
+#[cfg(not(windows))]
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Construct an admin-plane transport `Protocol` error (a malformed ok reply
+/// from the control plane). The concrete transport type is [`AdminError`],
+/// which differs by platform (iceoryx2 UDS on unix, named pipe on Windows).
+#[cfg(not(windows))]
+fn admin_protocol_error(msg: &str) -> ClientError<AdminError> {
+    ClientError::Transport(Iceoryx2ClientError::Protocol(msg.to_string()))
+}
+#[cfg(windows)]
+fn admin_protocol_error(msg: &str) -> ClientError<AdminError> {
+    ClientError::Transport(PipeControlError::Protocol(msg.to_string()))
+}
 
 /// Map an ok `get-config` reply to [`DaemonConfig`], or a transport error if
 /// the reply is missing its `config` payload.
-fn daemon_config_from(reply: &Reply) -> Result<DaemonConfig, ClientError<Iceoryx2ClientError>> {
-    let config = reply.config.clone().ok_or_else(|| {
-        ClientError::Transport(Iceoryx2ClientError::Protocol(
-            "ok get-config reply missing config payload".to_string(),
-        ))
-    })?;
+fn daemon_config_from(reply: &Reply) -> Result<DaemonConfig, ClientError<AdminError>> {
+    let config = reply
+        .config
+        .clone()
+        .ok_or_else(|| admin_protocol_error("ok get-config reply missing config payload"))?;
     Ok(DaemonConfig {
         config,
         restart_required: reply.restart_required.unwrap_or(false),
@@ -529,10 +712,13 @@ mod tests {
     fn daemon_config_from_missing_config_is_transport_error() {
         let reply = Reply::applied_live();
         match daemon_config_from(&reply) {
-            Err(ClientError::Transport(Iceoryx2ClientError::Protocol(msg))) => {
-                assert!(msg.contains("config"));
+            // The concrete transport type is `AdminError` (platform-specific);
+            // assert on its `Display` so the test holds on both the iceoryx2
+            // (unix) and named-pipe (Windows) admin errors.
+            Err(ClientError::Transport(e)) => {
+                assert!(e.to_string().contains("config"));
             }
-            other => panic!("expected Transport(Protocol(_)), got {other:?}"),
+            other => panic!("expected Transport(_), got {other:?}"),
         }
     }
 }

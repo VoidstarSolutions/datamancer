@@ -373,6 +373,11 @@ impl Iceoryx2Client {
     /// the `Client` trait: credential ops are same-host/UDS-only and must
     /// not appear on the transport-generic trait the WS client also
     /// implements.
+    ///
+    /// `#[cfg(not(windows))]`: the Windows hybrid `AppHandle` routes admin ops
+    /// through `PipeControlClient` (the owner-DACL pipe), not this client, so
+    /// this method has no Windows consumer.
+    #[cfg(not(windows))]
     pub(crate) async fn control_request(
         &mut self,
         req: &Request,
