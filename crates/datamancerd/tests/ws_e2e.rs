@@ -575,11 +575,19 @@ async fn windows_ws_only_boot_smoke() {
     let port = 19097;
     // Windows control endpoint is a named pipe, not a filesystem socket; use a
     // unique pipe so this never collides with a real daemon's default pipe.
+    //
+    // `allow_any_integrity = true`: CI runners (GitHub Actions) execute at
+    // *elevated* (High) integrity, and the Phase-3 control-pipe gate refuses to
+    // boot elevated unless overridden (an elevated daemon's Medium-only pipe
+    // would be unreachable by a Medium client). The test client here runs at the
+    // same integrity as the daemon, so the override is safe and required for the
+    // daemon to boot on CI. Locally (Medium integrity) the daemon boots without it.
     let config = format!(
         r#"
 [server]
 admin_socket = "\\\\.\\pipe\\datamancerd-winboot-smoke"
 service_prefix = "datamancerd-winboot-smoke"
+allow_any_integrity = true
 
 [ws]
 enabled = true
