@@ -9,7 +9,7 @@
 - Every change is `#[cfg(windows)]`-additive; the macOS/Linux build is byte-for-byte unaffected (parent-spec litmus test). iceoryx2 paths untouched.
 - `#![forbid(unsafe_code)]` holds in `datamancer-transport-ws` and `datamancer-client` — WS is pure-safe; Phase 4 introduces no `unsafe`.
 - Toolchain pinned **1.96.1**; Windows builds need `LIBCLANG_PATH=C:/Program Files/LLVM/bin` (iceoryx2 bindgen). Gate `cargo` per crate on **Windows** — `cfg(windows)` code is invisible to the Linux jobs (this has bitten Phase 3 repeatedly).
-- Workspace is **0.7.0**; the WS-vocabulary additions (`WsRequest` variant, `WsReply`/`EventFrame` additions) are breaking-additive → carry a version bump when the branch next bumps. The winsec dep version literal (`datamancer-client`/`datamancerd` Cargo.toml `version = "0.7.0"`) is hand-maintained on every bump.
+- **Versioning (post-#43):** feature PRs **never** touch `[workspace.package] version` — release-plz owns it. A breaking public-API addition (e.g. a new `WsRequest` variant, which cargo-semver-checks flags as `enum_variant_added`) must be **declared** with a Conventional-Commits marker — a `type(scope)!:` subject (e.g. `feat(windows)!:`) or a `BREAKING CHANGE:` footer — so the new `semver-checks.sh` marker gate passes and release-plz sizes the bump. The `[target.'cfg(windows)']` winsec dep version *requirement* still needs hand-alignment to the current workspace version on each bump (a recurring artifact flagged for Zach).
 - Follow Zach's op-add template (`WsRequest::Capabilities` in `protocol/ws.rs`) for the request/reply parts; the **pushed** health frame diverges (§ design decision 4).
 - Per-crate gates after each task: `cargo clippy -p <crate> [--features …] --all-targets -- -D warnings`, `cargo test -p <crate> …`, `cargo fmt --check`.
 - **CI item (worklist 6) is gated on Zach's blessing** — do not merge the `ci.yml` boundary change without it.
@@ -91,6 +91,6 @@
 - [ ] `forbid(unsafe_code)` intact in `datamancer-transport-ws` + `datamancer-client`.
 - [ ] Windows gates green: `cargo clippy -p datamancerd --features ws`, `-p datamancer-client --features app`, `-p datamancer-transport-ws`; `cargo test` for the new tests; `cargo fmt --check`.
 - [ ] `to_wire`/`from_wire` still "one frame = one `MarketEvent`" — the `Health` frame never round-trips through them as a `MarketEvent`.
-- [ ] Version bump + winsec dep literal aligned; `cargo deny check`; `.github/scripts/semver-checks.sh origin/main`.
+- [ ] Breaking changes **declared** via a `type(scope)!:` / `BREAKING CHANGE:` marker (NOT a manual version bump — release-plz owns it, #43); winsec dep requirement aligned to the workspace version; `cargo deny check`; `.github/scripts/semver-checks.sh origin/main` (the marker gate).
 - [ ] Docs updated: `datamancerd/README.md` (WS health op), `datamancer-client/CLAUDE.md` (Windows hybrid stance).
 - [ ] CI boundary change (Task 6) NOT merged without Zach's blessing.
