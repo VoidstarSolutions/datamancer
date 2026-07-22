@@ -46,6 +46,11 @@ pub enum WsRequest {
         #[serde(default)]
         symbols: Vec<String>,
     },
+    /// Subscribe to the daemon's periodic `HealthView` push (the Windows
+    /// same-host health plane — the iceoryx2 health service is not available on
+    /// Windows). The daemon acks with `ok` then pushes `Health` frames on its
+    /// diagnostics cadence until the connection closes.
+    WatchHealth { id: u64 },
 }
 
 impl WsRequest {
@@ -58,7 +63,8 @@ impl WsRequest {
             | Self::Snapshot { id }
             | Self::CloseClient { id }
             | Self::Instruments { id, .. }
-            | Self::Capabilities { id, .. } => *id,
+            | Self::Capabilities { id, .. }
+            | Self::WatchHealth { id } => *id,
         }
     }
 }
@@ -78,6 +84,19 @@ pub struct WsReply {
     pub instruments: Option<Vec<datamancer_core::InstrumentInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<datamancer_core::InstrumentEntry>>,
+}
+
+/// A server-initiated health push (the Windows same-host health plane — the
+/// iceoryx2 health service is unavailable on Windows). Sent unsolicited after a
+/// [`WsRequest::WatchHealth`] subscribe, on the daemon's diagnostics cadence,
+/// until the connection closes. Its shape (`{"view": …}`) is disjoint from
+/// [`WsReply`] (no `id`/`ok`) and the transport crate's `EventFrame` (no
+/// `"type"` tag), so the client's inbound demux is unambiguous — it is **not**
+/// an `EventFrame` (a health push is not a `MarketEvent`, and `transport-ws`
+/// requires all `EventFrame`s to route through `to_wire`/`from_wire`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WsHealthPush {
+    pub view: datamancer_core::HealthView,
 }
 
 impl WsReply {
@@ -149,7 +168,7 @@ impl WsReply {
 
 #[cfg(test)]
 mod tests {
-    use super::{WsReply, WsRequest};
+    use super::{WsHealthPush, WsReply, WsRequest};
     use crate::spec::EventKindCfg;
 
     #[test]
@@ -227,6 +246,28 @@ mod tests {
                 if provider == "alpaca" && symbols == &["AAPL", "MSFT"]
         ));
         assert_eq!(req.id(), 9);
+    }
+
+    #[test]
+    fn ws_watch_health_parses_and_carries_id() {
+        let req: WsRequest = serde_json::from_str(r#"{"id":7,"op":"watch-health"}"#).unwrap();
+        assert!(matches!(&req, WsRequest::WatchHealth { id: 7 }));
+        assert_eq!(req.id(), 7);
+    }
+
+    #[test]
+    fn ws_health_push_round_trips_and_is_disjoint_from_reply() {
+        let view: datamancer_core::HealthView = serde_json::from_str(
+            r#"{"schema_version":2,"daemon":{"version":"1.0.0","credential_backend":null,"captured_at":0},"providers":[],"streams":[]}"#,
+        )
+        .expect("HealthView fixture");
+        let push = WsHealthPush { view: view.clone() };
+        let line = serde_json::to_string(&push).unwrap();
+        let back: WsHealthPush = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.view, view);
+        // No `id`/`ok`, so a health push can never be mistaken for a reply by
+        // the client's inbound demux (locks the disjointness invariant).
+        assert!(serde_json::from_str::<WsReply>(&line).is_err());
     }
 
     #[test]

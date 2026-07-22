@@ -24,7 +24,7 @@ use tokio::net::UnixStream;
 #[cfg(unix)]
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -125,13 +125,14 @@ impl ControlConn {
     }
 
     #[cfg(windows)]
-    // `ClientOptions::open` is synchronous, but `connect` stays `async` to
-    // match the Unix arm the caller awaits.
-    #[allow(clippy::unused_async)]
     async fn connect(path: &Path) -> Result<Self, Iceoryx2ClientError> {
         // The control-socket `Path` carries the pipe name on Windows
-        // (`\\.\pipe\datamancer\control-<user>`; see `crate::paths`).
-        let stream = ClientOptions::new().open(path)?;
+        // (`\\.\pipe\datamancer\<user>\control`; see `crate::paths`).
+        // `connect_verified` retries `ERROR_PIPE_BUSY` and — critically —
+        // rejects the pipe unless its owner SID is this user's (review B1), so
+        // credentials never flow to a foreign-owner endpoint (a pipe owned by
+        // a different user).
+        let stream = crate::win_pipe::connect_verified(path).await?;
         let (read, write) = tokio::io::split(stream);
         Ok(Self {
             lines: BufReader::new(read).lines(),
@@ -372,6 +373,11 @@ impl Iceoryx2Client {
     /// the `Client` trait: credential ops are same-host/UDS-only and must
     /// not appear on the transport-generic trait the WS client also
     /// implements.
+    ///
+    /// `#[cfg(not(windows))]`: the Windows hybrid `AppHandle` routes admin ops
+    /// through `PipeControlClient` (the owner-DACL pipe), not this client, so
+    /// this method has no Windows consumer.
+    #[cfg(not(windows))]
     pub(crate) async fn control_request(
         &mut self,
         req: &Request,

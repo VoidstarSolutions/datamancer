@@ -248,6 +248,10 @@ pub struct ServerConfig {
     pub service_prefix: String,
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
+    /// Windows only: when `true`, the control pipe accepts a daemon or client
+    /// at any integrity level instead of requiring Medium. Ignored off Windows.
+    #[serde(default)]
+    pub allow_any_integrity: bool,
 }
 
 impl Default for ServerConfig {
@@ -256,6 +260,7 @@ impl Default for ServerConfig {
             admin_socket: default_admin_socket(),
             service_prefix: default_service_prefix(),
             shutdown_timeout_secs: default_shutdown_timeout(),
+            allow_any_integrity: false,
         }
     }
 }
@@ -645,6 +650,15 @@ impl Config {
             // Surface a scope/backfill mismatch at validate time.
             s.resolve_scope()?;
         }
+        // A zero publish interval would panic `tokio::time::interval`, which both
+        // the iceoryx2 diagnostics ticker (unix) and the WS health-push task
+        // (`ws/conn.rs`) construct from it — reject it up front rather than
+        // crashing a task at runtime.
+        if self.diagnostics.publish_interval_ms == 0 {
+            return Err(DaemonError::ConfigInvalid(
+                "[diagnostics].publish_interval_ms must be greater than 0".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -989,6 +1003,24 @@ account_type = "paper"
     }
 
     #[test]
+    fn zero_publish_interval_is_rejected() {
+        // `publish_interval_ms = 0` would panic `tokio::time::interval`, so
+        // validation must reject it rather than let a runtime task crash.
+        let config = Config::parse("[diagnostics]\npublish_interval_ms = 0\n").expect("parse");
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("publish_interval_ms"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid for zero interval, got {other:?}"),
+        }
+        // A positive interval (and the default) validate fine.
+        Config::parse("[diagnostics]\npublish_interval_ms = 1\n")
+            .expect("parse")
+            .validate()
+            .expect("positive interval validates");
+    }
+
+    #[test]
     fn compiled_provider_ids_lists_both_alpaca_providers() {
         let ids = compiled_provider_ids();
         assert!(ids.contains(&alpaca::PROVIDER_ID));
@@ -1324,5 +1356,17 @@ always_on = true
         );
         let back = Config::parse(&text).expect("reparse");
         assert_eq!(config, back);
+    }
+
+    #[test]
+    fn server_allow_any_integrity_defaults_false_and_parses() {
+        let defaulted: super::ServerConfig =
+            toml::from_str(r#"admin_socket = "/tmp/x.sock""#).expect("parse");
+        assert!(!defaulted.allow_any_integrity);
+
+        let set: super::ServerConfig =
+            toml::from_str("admin_socket = \"/tmp/x.sock\"\nallow_any_integrity = true")
+                .expect("parse");
+        assert!(set.allow_any_integrity);
     }
 }

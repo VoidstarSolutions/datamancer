@@ -1,0 +1,117 @@
+# Native Windows Phase 4 — WS-loopback data transport — Implementation Plan
+
+> **For agentic workers:** implement task-by-task, TDD (failing test first). Steps use checkbox (`- [ ]`) syntax. Design + locked decisions: `docs/superpowers/specs/2026-07-18-windows-phase4-ws-loopback-design.md`. Parent spec: `docs/superpowers/specs/2026-07-15-native-windows-support-design.md` §5.
+
+**Goal:** Give the Windows same-host consumer path a working data/diagnostics/health transport over **WS-loopback** (iceoryx2 shm is not viable on Windows). **Hybrid**: Windows `AppHandle` uses a named-pipe `PipeControlClient` for admin ops + `WsClient` for the data plane + a new WS health-push stream. Linux/macOS (iceoryx2) is **byte-for-byte unchanged**.
+
+---
+
+## STATUS (2026-07-20) — Phase 4 COMPLETE (Tasks 1–6 landed)
+
+- **Branch `feat/36-windows-3-named-pipe`, PR #37 — all Phase-4 tasks done, CI green.** Tasks 1–4 (client hybrid) landed; **Task 5** (daemon config/spawn: `EnsureConfig.ws_data_url`, Windows `ensure` → `WsConfig`, the Windows `[ws]` scaffold) and **Task 6** (native-Windows CI running the WS daemon) landed **together with the daemon WS-only boot** — that daemon-half work (which this plan under-scoped) has its own design + plan: `docs/superpowers/specs|plans/2026-07-20-windows-daemon-ws-only-boot*`. See also the Phase-5/B3 admin-plane e2e (`…/2026-07-20-windows-config-service-e2e.md`).
+- **Task 3 DONE** — Windows `AppHandle` hybrid. `#[cfg(windows)]` split: `admin: PipeControlClient` + `data: WsClient`. Public methods stay platform-neutral via cfg-split helpers `admin_request`/`data_mut`; error types are cfg-split aliases `AdminError`/`DataError` (both `Iceoryx2ClientError` on unix → unix signatures type-identical; `PipeControlError`/`WsClientError` on Windows). `PipeControlError` now `pub`; `PipeControlClient`'s `#![allow(dead_code)]` removed; `Iceoryx2Client::control_request` gated `#[cfg(not(windows))]`. `EnsureError`: `Connect` cfg-split (iceoryx2/WS), new `#[cfg(windows)] AdminConnect`. **`app = ["iceoryx2", "ws"]`** (CI's `--features app` exercises the hybrid; unix compiles ws but never references it). Verified on Windows: clippy `-D warnings`, 62 tests, fmt; ws-portable subset unaffected.
+- **Task 4 DONE** — `watch_health()` Windows arm. Kept the `&self`-infallible signature by subscribing to the WS health push **eagerly at `ensure`** and stashing the stream in `health: Mutex<Option<HealthStream>>`. Windows arm is single-shot + degrades silently on subscribe failure (documented); unix iceoryx2 arm unchanged. `ws.rs:watch_health` allow scoped to `not(all(windows, feature="app"))`. `datamancer-client/CLAUDE.md` updated.
+- **Branch @ `0d82cc6` baseline, ALL CI GREEN, no rebase debt.** Fresh start with nothing pending from Zach.
+- **Task 1 DONE** (`de93258`): `PipeControlClient` in `crates/datamancer-client/src/pipe_control.rs` (`#[cfg(all(windows, feature = "iceoryx2"))]`, `#![allow(dead_code)]` bridge). `connect(path)` → `win_pipe::connect_verified`; `request(&Request) -> Reply`. Owns `PipeControlError` (thiserror: `Io`/`Serde`/`Protocol`) — **Task 3 reconciles this into `ClientError`**.
+- **Task 2 DONE** (`28ea9b1`, declared `feat(windows)!:` — enum_variant_added break) — **BUILT DIFFERENTLY FROM 2b/2c BELOW.** Health is **not** an `EventFrame::Health`; `transport-ws/wire.rs` is **untouched** (the `to_wire`/`from_wire` "one frame = one MarketEvent" invariant is preserved). As-built:
+  - `protocol/ws.rs`: `WsRequest::WatchHealth { id }` (+ `id()` arm) and a **distinct** `pub struct WsHealthPush { pub view: HealthView }` (JSON `{"view":…}`, disjoint from `WsReply`/`EventFrame`).
+  - `ws.rs`: `WsClient.health_rx: Option<mpsc::Receiver<HealthView>>`; `Inbound::Health(WsHealthPush)` arm in `run_reader`; `pub(crate) async fn watch_health(&mut self) -> Result<ReceiverStream<HealthView>, …>` (`ws.rs:221`) — sends `WatchHealth`, awaits ack, hands out `health_rx` once.
+  - `datamancerd/ws/conn.rs`: `dispatch` `WatchHealth` arm (`WsReply::ok`), `spawn_health_push(...)` (`:378`) ticks on `diag_interval`, pushes `WsHealthPush { view: stamped_health_view(...) }`; `credential_backend`/`diag_interval` already plumbed through `serve`/`start_ws`.
+- **Zach BLESSED the Task 6 CI boundary reversal** (Slack, 2026-07-19): once the daemon runs on Windows, CI should run it on Windows too. Task 6 is **unblocked** (still land it as its own reviewed slice).
+- **`dead_code` bridges to remove in Task 3:** `pipe_control.rs`'s module `#![allow(dead_code)]` and `ws.rs:watch_health`'s allow — both get consumed by the hybrid `AppHandle`.
+- **Open follow-up (non-blocking):** winsec `cfg(windows)` dep-literal hand-alignment on every workspace bump — raise with Zach.
+
+## Global constraints
+
+- Every change is `#[cfg(windows)]`-additive; the macOS/Linux build is byte-for-byte unaffected (parent-spec litmus test). iceoryx2 paths untouched.
+- `#![forbid(unsafe_code)]` holds in `datamancer-transport-ws` and `datamancer-client` — WS is pure-safe; Phase 4 introduces no `unsafe`.
+- Toolchain pinned **1.96.1**; Windows builds need `LIBCLANG_PATH=C:/Program Files/LLVM/bin` (iceoryx2 bindgen). Gate `cargo` per crate on **Windows** — `cfg(windows)` code is invisible to the Linux jobs (this has bitten Phase 3 repeatedly).
+- **Versioning (post-#43):** feature PRs **never** touch `[workspace.package] version` — release-plz owns it. A breaking public-API addition (e.g. a new `WsRequest` variant, which cargo-semver-checks flags as `enum_variant_added`) must be **declared** with a Conventional-Commits marker — a `type(scope)!:` subject (e.g. `feat(windows)!:`) or a `BREAKING CHANGE:` footer — so the new `semver-checks.sh` marker gate passes and release-plz sizes the bump. The `[target.'cfg(windows)']` winsec dep version *requirement* still needs hand-alignment to the current workspace version on each bump (a recurring artifact flagged for Zach).
+- Follow Zach's op-add template (`WsRequest::Capabilities` in `protocol/ws.rs`) for the request/reply parts; the **pushed** health frame diverges (§ design decision 4).
+- Per-crate gates after each task: `cargo clippy -p <crate> [--features …] --all-targets -- -D warnings`, `cargo test -p <crate> …`, `cargo fmt --check`.
+- **CI item (Task 6): Zach has BLESSED the boundary reversal** (Slack, 2026-07-19) — land it as its own reviewed slice; no longer a blocker.
+
+---
+
+## Task 1 — Standalone `PipeControlClient` (Windows admin plane) — ✅ DONE (`de93258`)
+
+> Landed as specified below. `PipeControlClient` lives in `pipe_control.rs`; `ControlConn` left in place in `iceoryx2.rs` (additive extraction). Retained for reference.
+
+**Rationale:** `Iceoryx2Client::connect` fails on Windows (iceoryx2 shm attach), so it can't back the hybrid's admin ops. Factor the named-pipe `Request`/`Reply` control logic (buried in `iceoryx2.rs`'s cfg-split `ControlConn`, lines 104-152) into a small reusable client on `win_pipe::connect_verified`.
+
+**Files:**
+- New: `crates/datamancer-client/src/pipe_control.rs` (`#[cfg(all(windows, feature = "iceoryx2"))]`)
+- Modify: `crates/datamancer-client/src/lib.rs` (module decl, mirroring the `win_pipe` gate at ~line 28)
+
+**Interfaces produced:**
+- `pub(crate) struct PipeControlClient` wrapping the connected pipe halves (`ReadHalf/WriteHalf<NamedPipeClient>` + `Lines` reader), mirroring `ControlConn`'s Windows arm.
+- `PipeControlClient::connect(path: &Path) -> io::Result<Self>` — `win_pipe::connect_verified(path)` then split (see `iceoryx2.rs:127-141`).
+- `async fn request(&mut self, req: &protocol::uds::Request) -> Result<protocol::uds::Reply, ClientError<…>>` — serialize + `\n`, read one reply line, deserialize (mirrors `iceoryx2.rs::ControlConn::request` at ~143-152).
+
+- [ ] **Step 1 — failing test.** In `pipe_control.rs` `#[cfg(test)] mod tests`, stand up a `tokio` named-pipe **server** (via `tokio::net::windows::named_pipe::ServerOptions`), spawn a task that reads one line and replies `{"ok":true}\n`, then assert `PipeControlClient::connect(name).request(&Request::Ping)` returns a reply with `ok == true`. (Same-process, so `connect_verified`'s owner-SID self-check passes — the pipe owner is this token. On an elevated CI runner the default tokio pipe owner is Administrators, which would fail the owner check; create the pipe with an owner-stamped SD or gate the test `#[ignore]` with a note — see Phase 3 `win_control` test `owner_dacl_pipe_round_trips_same_user` for the stamping pattern.)
+- [ ] **Step 2 — run, expect fail** (`cargo test -p datamancer-client --features app pipe_control` on Windows) — `PipeControlClient` unresolved.
+- [ ] **Step 3 — implement** `PipeControlClient` by lifting the `#[cfg(windows)]` `ControlConn` shape from `iceoryx2.rs:110-152` into the new module (fields, `connect`, `request`). Do **not** remove `ControlConn` from `iceoryx2.rs` yet (unix + the iceoryx2 client still use it) — this is an additive extraction. Keep it `pub(crate)`.
+- [ ] **Step 4 — run, expect pass.**
+- [ ] **Step 5 — clippy + fmt** (`-p datamancer-client --features app`, on Windows).
+- [ ] **Step 6 — commit** `feat(windows): standalone PipeControlClient for the hybrid admin plane`.
+
+---
+
+## Task 2 — Health push over WS — ✅ DONE (`28ea9b1`) — BUILT AS `WsHealthPush`, NOT `EventFrame::Health`
+
+> **⚠ As-built diverges from 2a–2d below.** See the STATUS block for the real interfaces. Summary: health rides a **distinct `WsHealthPush` client-protocol message** (`protocol/ws.rs`), NOT a `wire.rs` `EventFrame` — `transport-ws/wire.rs` was deliberately left untouched to preserve the "one frame = one MarketEvent" invariant. `WsClient::watch_health()` returns `ReceiverStream<HealthView>`; the daemon's `spawn_health_push` ticks on `diag_interval`. Steps 2b/2c below (EventFrame::Health, wire.rs edits) are **superseded** — kept only as the original sketch.
+
+**Rationale:** `watch_health()` reads the iceoryx2 health plane, which fails on Windows. Add a WS subscribe op + a server-pushed health frame on a dedicated client channel (design decision 4).
+
+### 2a — WS control vocabulary (`protocol/ws.rs`)
+**Interfaces:** `WsRequest::WatchHealth { id: u64 }`; no new `WsReply` payload field is required (the ack is `WsReply::ok(id)`; the pushed health rides the frame in 2b).
+
+- [ ] **Step 1 — failing test.** Add `ws_watch_health_parses_and_carries_id` (mirror `ws_capabilities_parses_and_carries_id` at `ws.rs:218-230`): parse `{"id":7,"op":"watch-health"}` → `WsRequest::WatchHealth { id: 7 }`, assert `req.id() == 7`.
+- [ ] **Step 2 — run, expect fail.**
+- [ ] **Step 3 — implement:** add the `WatchHealth { id }` variant after `ws.rs:48` (shape like `Snapshot`/`CloseClient` — `id`-only), and add `| Self::WatchHealth { id }` to the `id()` or-pattern (`:56-61`).
+- [ ] **Step 4 — run, expect pass;** Step 5 clippy/fmt; **Step 6 commit** `feat(windows): WsRequest::WatchHealth subscribe op`.
+
+### 2b — Pushed `Health` frame (`transport-ws/wire.rs`)
+**Interfaces:** a health frame carrying `datamancer_core::HealthView`, produced/consumed **outside** `to_wire`/`from_wire` (it is not a `MarketEvent`).
+
+- [ ] **Step 1 — failing test.** In `wire.rs` tests, assert a `Health` frame round-trips: `serde_json::to_string(&EventFrame::Health { view }) → from_str` yields an equal frame, and its `"type"` tag is `"health"`. Use a minimal `HealthView` fixture (schema-2 default).
+- [ ] **Step 2 — run, expect fail.**
+- [ ] **Step 3 — implement:** add `Health { view: datamancer_core::HealthView }` to `EventFrame` (after `:87`), import `HealthView` at `wire.rs:12-15`. **Do not** add it to `to_wire` (it never derives from a `MarketEvent` — leave the `_ => None` at `:133`) or `from_wire` (the client intercepts it before `from_wire`; add an explicit `EventFrame::Health { .. } => …` arm in `from_wire` at `:180` that returns a dedicated error/`None` so a stray health frame can never masquerade as a `MarketEvent`). Document the exception at the enum.
+- [ ] **Step 4 — pass;** Step 5 clippy/fmt (`-p datamancer-transport-ws`); **Step 6 commit** `feat(windows): pushed Health event frame carrying HealthView`.
+
+### 2c — `WsClient` health channel (`client/ws.rs`)
+**Interfaces:** a second inbound sink `mpsc::Sender<HealthView>`; a `WsClient::watch_health()` (or connect-returned `HealthStream`) surfacing it.
+
+- [ ] **Step 1 — failing test.** Drive `run_reader` with a serialized `EventFrame::Health` and assert the `HealthView` arrives on the health channel and **not** on the market-event channel.
+- [ ] **Step 2 — fail;** **Step 3 — implement:** thread a `health_tx: mpsc::Sender<HealthView>` into `run_reader` (alongside `events` at `ws.rs:102`); in the `Inbound::Event` arm (`:113-119`) **intercept** `EventFrame::Health { view }` → `health_tx` **before** calling `from_wire`; everything else → `from_wire` as today. Surface the receiver (return it from `connect`, or an accessor). A `watch_health()` method sends `WsRequest::WatchHealth` via `request()` then returns the health `ReceiverStream`.
+- [ ] **Step 4 — pass;** Step 5 clippy/fmt; **Step 6 commit** `feat(windows): WsClient health-push channel`.
+
+### 2d — Daemon health-push task (`datamancerd/ws/conn.rs` + `server.rs`)
+**Interfaces:** a `WatchHealth` dispatch arm that spawns a periodic push of `stamped_health_view` onto the connection's single-writer `tx`.
+
+- [ ] **Step 1 — failing e2e-ish test.** In `datamancerd/tests/ws_e2e.rs` (`#![cfg(feature="ws")]`) add (behind the existing `#[ignore]`/live gate as appropriate): connect a WS client, send `watch-health`, assert ≥1 `Health` frame arrives within a diagnostics interval carrying a stamped `HealthView` (version populated).
+- [ ] **Step 2 — fail;** **Step 3 — implement:** add a `WatchHealth { id }` arm to `dispatch` (`ws/conn.rs:316`) that returns `WsReply::ok(id)` and spawns a push task (mirror `spawn_pump:325`) which, on `self.diag_interval`, calls `dm.snapshot()` → `stamped_health_view(snapshot, credential_backend)` (reuse `server.rs:53`) and enqueues an `EventFrame::Health` JSON line onto the writer `tx` (the channel cloned into the sink at `conn.rs:55`). **Plumb `credential_backend`** (`&'static str`, `server.rs:1311`) into `handle_connection`/`dispatch` (new param — thread from `start_ws`/`serve` at `server.rs:475-494`). Tie the task's lifetime to the connection (abort on drop / EOF, like the pump).
+- [ ] **Step 4 — pass** (`cargo test -p datamancerd --features ws ws_e2e -- --ignored` where live); Step 5 clippy (`-p datamancerd --features ws`) + fmt; **Step 6 commit** `feat(windows): daemon pushes HealthView over WS on watch-health`.
+
+---
+
+## Tasks 3–6 — outline (detailed against the landed foundation)
+
+> These depend on Tasks 1–2 being implemented; their exact code is finalized once the foundation lands (TDD — no speculative code over unimplemented pieces). Structure + interfaces below.
+
+- [x] **Task 3 — Windows `AppHandle` (hybrid).** ✅ DONE. `#[cfg(windows)]`-split: `admin: PipeControlClient` + `data: WsClient`; public methods stay platform-neutral via cfg-split helpers `admin_request`/`data_mut`; error aliases `AdminError`/`DataError` keep unix signatures type-identical. `PipeControlError` made `pub`; its module `#![allow(dead_code)]` removed; `Iceoryx2Client::control_request` gated `not(windows)`. `EnsureError::Connect` cfg-split + Windows `AdminConnect`. `app` feature now also enables `ws`. The `#[ignore]` same-host smoke moves to Task 6 (needs the ws-built daemon from Task 5).
+- [x] **Task 4 — `watch_health()` Windows arm.** ✅ DONE. `&self`-infallible signature preserved by eager-subscribing to the WS health push at `ensure` and stashing the stream (`health: Mutex<Option<HealthStream>>`); Windows arm single-shot + silent degradation, documented. Unix iceoryx2 arm unchanged. `CLAUDE.md` stances updated.
+- [x] **Task 5 — Spawn/config wiring — ✅ DONE** (config-enablement: **daemon scaffold default on Windows**; landed with the daemon WS-only boot — see `2026-07-20-windows-daemon-ws-only-boot.md`). `EnsureConfig` (`mod.rs:70-91`) gains a WS data endpoint (default `127.0.0.1:9001`, mirroring `config.rs:405-411`); the Windows `ensure` branch feeds it to `WsConfig`. The Windows daemon spawn (`platform_windows.rs::ProcessSpawner`) passes `--features ws`? — **N.B.** features are compile-time, so the *shipped Windows daemon binary must be built with `ws`*; the scaffolded config must set `[ws].enabled=true` on loopback (`config.rs:363-385`, default off). Decide enablement site (scaffold default on Windows vs app-written config). Tests: config round-trip; ensure-config default.
+- [x] **Task 6 — CI — ✅ DONE** (Zach blessed the boundary reversal, Slack 2026-07-19). The `windows-native-check` job now builds the daemon `--features ws` and boots it via `windows_ws_only_boot_smoke`; the `ci.yml` boundary comments were rewritten to record the lifted scope. Landed with the daemon WS-only boot (commits `707e738` + `9330b93`).
+
+---
+
+## Self-review checklist (run before PR)
+
+- [ ] macOS/Linux unaffected: `git diff` shows only `#[cfg(windows)]`-additive changes to shared files; iceoryx2 paths untouched; unix `watch_health`/`AppHandle` byte-identical.
+- [ ] `forbid(unsafe_code)` intact in `datamancer-transport-ws` + `datamancer-client`.
+- [ ] Windows gates green: `cargo clippy -p datamancerd --features ws`, `-p datamancer-client --features app`, `-p datamancer-transport-ws`; `cargo test` for the new tests; `cargo fmt --check`.
+- [ ] `to_wire`/`from_wire` still "one frame = one `MarketEvent`" — the `Health` frame never round-trips through them as a `MarketEvent`.
+- [ ] Breaking changes **declared** via a `type(scope)!:` / `BREAKING CHANGE:` marker (NOT a manual version bump — release-plz owns it, #43); winsec dep requirement aligned to the workspace version; `cargo deny check`; `.github/scripts/semver-checks.sh origin/main` (the marker gate).
+- [ ] Docs updated: `datamancerd/README.md` (WS health op), `datamancer-client/CLAUDE.md` (Windows hybrid stance).
+- [ ] CI boundary change (Task 6) NOT merged without Zach's blessing.

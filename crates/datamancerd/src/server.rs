@@ -1,20 +1,15 @@
 //! The daemon supervisor: process lifecycle, the per-client registry, the
 //! control listener, the diagnostics ticker, and graceful shutdown.
 //!
-//! A single async **actor task** (`run`) owns the client registry and the
-//! iceoryx2 [`Node`]; the control listener and per-connection readers send it
-//! [`ServerCommand`]s over an `mpsc`, so no lock is ever held across an
-//! `.await`. One iceoryx2 node per process; per-client sinks own their service
-//! on it. Startup-session anchors hold authoritative sessions alive across
-//! client presence (`always_on=true` for the whole process lifetime).
-
-// Native Windows port, in progress (#29): this module's control-dispatch
-// machinery (accept loop, per-connection handler, dispatch helpers,
-// `ServerCommand` variants, unix-only fields) is reached only through the Unix
-// control socket, so it is transitionally dead on Windows until the named-pipe
-// transport revives it in Phase 3. Scoped allow — Unix/macOS stay lint-strict;
-// remove when Phase 3 lands.
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
+//! A single async **actor task** (`run`) owns the client registry and (on
+//! unix/macOS) the iceoryx2 `Node`; the control listener and per-connection
+//! readers send it [`ServerCommand`]s over an `mpsc`, so no lock is ever held
+//! across an `.await`. One iceoryx2 node per process; per-client sinks own
+//! their service on it. **On Windows there is no node** — iceoryx2 shm cannot
+//! create one at runtime (native-Windows spec §2.5), so the daemon boots
+//! WS-only and the whole iceoryx2 node stack is `#[cfg(not(windows))]`.
+//! Startup-session anchors hold authoritative sessions alive across client
+//! presence (`always_on=true` for the whole process lifetime).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,15 +17,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+// The iceoryx2 node + its sink/publishers are the unix/macOS data-plane
+// transport. On Windows the data plane is WS-loopback (iceoryx2 shm cannot
+// create a node at runtime — native-Windows spec §2.5), so the whole iceoryx2
+// node stack is `#[cfg(not(windows))]` and the daemon boots WS-only there.
+#[cfg(not(windows))]
 use datamancer::transport::{
     Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2HealthPublisher,
 };
 use datamancer::{
     AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
-    Session, TapLog,
-    traits::{EventSink, PublishOutcome},
+    Session, TapLog, traits::EventSink,
 };
+// `PublishOutcome` and the `StreamExt` combinators drive the iceoryx2 per-client
+// pump (`spawn_pump`), which is unix-only (WS has its own pump in `ws/conn.rs`).
+#[cfg(not(windows))]
+use datamancer::traits::PublishOutcome;
+#[cfg(not(windows))]
 use futures::StreamExt as _;
+#[cfg(not(windows))]
 use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 #[cfg(unix)]
@@ -40,10 +45,15 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::control::{Reply, Request, SubscriptionSpec, codes, reply_from_library_error};
-use crate::credentials::{CredentialHub, privileged_op_permitted};
+use crate::credentials::CredentialHub;
+// Unix gates each privileged op on the peer uid; Windows uses the pipe's
+// owner-only DACL (connect-time), so this helper is Unix-only.
+#[cfg(unix)]
+use crate::credentials::privileged_op_permitted;
 use crate::error::{DaemonError, Result};
 use crate::shutdown::{DrainClient, DrainRecorder, drain};
 
+#[cfg(not(windows))]
 type Node = iceoryx2::prelude::Node<ipc_threadsafe::Service>;
 
 /// Reduce a [`datamancer::SystemSnapshot`] into the app-facing
@@ -145,16 +155,31 @@ impl WebHandles {
 /// The daemon supervisor.
 pub struct Server {
     dm: Datamancer,
+    /// The process-wide iceoryx2 node backing the unix data/diagnostics/health
+    /// planes. Absent on Windows (WS-loopback carries the data plane there).
+    #[cfg(not(windows))]
     node: Node,
     tap_log: Option<Arc<dyn TapLog>>,
     /// Startup-session anchors, held for the process lifetime.
     anchors: Vec<Session>,
     clients: HashMap<String, ClientEntry>,
+    /// Monotonic id for the next iceoryx2 data service (`open-client`); unix-only
+    /// since Windows opens no iceoryx2 clients.
+    #[cfg(not(windows))]
     next_client_id: u64,
+    // `service_prefix`/`max_clients` name and bound the per-client iceoryx2
+    // data services; the whole `open-client` flow is unix-only (Windows data
+    // rides WS), so both are `#[cfg(not(windows))]`.
+    #[cfg(not(windows))]
     service_prefix: String,
+    #[cfg(not(windows))]
     max_clients: usize,
     admin_socket: PathBuf,
     shutdown_timeout: Duration,
+    /// Diagnostics/health publish cadence. Read by the unix iceoryx2 diagnostics
+    /// ticker and by the WS health push (`start_ws`); on Windows without `ws`
+    /// neither runs, so it is dead only in that one config.
+    #[cfg_attr(all(windows, not(feature = "ws")), allow(dead_code))]
     diag_interval: Duration,
     /// Optional web-UI settings (Phase 6); `None` (or `enabled=false`) disables
     /// the embedded HTTP introspection surface.
@@ -179,6 +204,11 @@ pub struct Server {
     /// The active credential-store backend name (for `ping`); threaded in at
     /// bootstrap so the actor never touches the hub.
     credential_backend: &'static str,
+    /// Windows: accept a daemon/client at any integrity level (operator
+    /// override for the Medium-integrity requirement). Read in `spawn_control`
+    /// and `win_accept_loop`.
+    #[cfg(windows)]
+    allow_any_integrity: bool,
     /// `true` once a shutdown signal has been observed; rejects new requests.
     draining: bool,
 }
@@ -193,7 +223,9 @@ impl Server {
     /// Propagates config/library/transport errors.
     pub async fn bootstrap(config: Config, config_path: std::path::PathBuf) -> Result<Self> {
         let admin_socket = config.server.admin_socket.clone();
+        #[cfg(not(windows))]
         let service_prefix = config.server.service_prefix.clone();
+        #[cfg(not(windows))]
         let max_clients = config.iceoryx2.max_clients;
         let shutdown_timeout = Duration::from_secs(config.server.shutdown_timeout_secs);
         let diag_interval = Duration::from_millis(config.diagnostics.publish_interval_ms);
@@ -203,6 +235,10 @@ impl Server {
         let web = config.web_ui.clone();
         #[cfg(feature = "ws")]
         let ws = config.ws.clone();
+        // Read while `config` is still owned here — `build_runtime` below
+        // consumes it by value. `bool` is `Copy`; Windows-only (integrity gate).
+        #[cfg(windows)]
+        let allow_any_integrity = config.server.allow_any_integrity;
         tracing::debug!(
             live_state_ms = config.diagnostics.publish_interval_ms,
             cache_catalog_ms = config.diagnostics.cache_catalog_interval_ms,
@@ -227,6 +263,10 @@ impl Server {
         let dm = built.datamancer;
         let tap_log = built.tap_log;
 
+        // The one process-wide iceoryx2 node. Unix/macOS only — on Windows
+        // `create()` fails at runtime (native-Windows spec §2.5), so the daemon
+        // runs WS-only there with no node.
+        #[cfg(not(windows))]
         let node = NodeBuilder::new()
             .create::<ipc_threadsafe::Service>()
             .map_err(|e| DaemonError::Transport(format!("node create: {e:?}")))?;
@@ -260,12 +300,16 @@ impl Server {
 
         Ok(Self {
             dm,
+            #[cfg(not(windows))]
             node,
             tap_log,
             anchors,
             clients: HashMap::new(),
+            #[cfg(not(windows))]
             next_client_id: 0,
+            #[cfg(not(windows))]
             service_prefix,
+            #[cfg(not(windows))]
             max_clients,
             admin_socket,
             shutdown_timeout,
@@ -279,8 +323,32 @@ impl Server {
             hub,
             config_hub,
             credential_backend,
+            #[cfg(windows)]
+            allow_any_integrity,
             draining: false,
         })
+    }
+
+    /// Windows only: warn at boot when no WS data plane is serving (built
+    /// without `ws`, or `[ws].enabled=false`) — the daemon then has no data
+    /// plane at all (iceoryx2 is unavailable on Windows), only the admin
+    /// control plane. A warning, not an error: the control-transport CI build
+    /// is intentionally ws-less.
+    #[cfg(windows)]
+    // Without `ws` there is no `self.ws` to read, so `self` is genuinely unused
+    // in that build — the answer is unconditionally "no data plane".
+    #[cfg_attr(not(feature = "ws"), allow(clippy::unused_self))]
+    fn warn_if_no_data_plane(&self) {
+        #[cfg(feature = "ws")]
+        let ws_serving = self.ws.as_ref().is_some_and(|w| w.enabled);
+        #[cfg(not(feature = "ws"))]
+        let ws_serving = false;
+        if !ws_serving {
+            tracing::warn!(
+                "no data plane on Windows (built without `ws` or `[ws]` disabled); \
+                 only the admin control plane is served"
+            );
+        }
     }
 
     /// Run the daemon until a shutdown signal, then drain gracefully.
@@ -292,17 +360,29 @@ impl Server {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(256);
         let accept = self.spawn_control(cmd_tx.clone())?;
 
-        let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
-            .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
-        let health_publisher = Iceoryx2HealthPublisher::new(&self.node)
-            .map_err(|e| DaemonError::Transport(format!("health publisher: {e:?}")))?;
-        let diagnostics = spawn_diagnostics(
-            self.dm.clone(),
-            publisher,
-            health_publisher,
-            self.credential_backend,
-            self.diag_interval,
-        );
+        // The iceoryx2 diagnostics + health push planes (unix/macOS). On Windows
+        // there is no node: health is pushed over WS (`spawn_health_push`) and
+        // diagnostics are pulled via the WS `snapshot` op, so no ticker runs.
+        #[cfg(not(windows))]
+        let diagnostics = {
+            let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
+                .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
+            let health_publisher = Iceoryx2HealthPublisher::new(&self.node)
+                .map_err(|e| DaemonError::Transport(format!("health publisher: {e:?}")))?;
+            spawn_diagnostics(
+                self.dm.clone(),
+                publisher,
+                health_publisher,
+                self.credential_backend,
+                self.diag_interval,
+            )
+        };
+
+        // Windows has no iceoryx2 data plane; warn if there is also no WS data
+        // plane serving (admin-only). Not a hard error — the control-transport
+        // CI build is intentionally ws-less.
+        #[cfg(windows)]
+        self.warn_if_no_data_plane();
 
         #[cfg(feature = "web-ui")]
         let mut web_handles = self.start_web().await?;
@@ -313,7 +393,7 @@ impl Server {
         #[cfg(unix)]
         tracing::info!(socket = %self.admin_socket.display(), "datamancerd listening");
         #[cfg(windows)]
-        tracing::info!("datamancerd running; control surface not yet supported on Windows (#29)");
+        tracing::info!(pipe = %self.admin_socket.display(), "datamancerd listening");
 
         // Platform terminate signal, selected on alongside Ctrl-C. Unix:
         // SIGTERM. Windows: console CTRL_SHUTDOWN. Both expose `recv()`.
@@ -379,7 +459,11 @@ impl Server {
         let drain_fut = drain(
             &recorder,
             move || accept.abort(),
+            // No diagnostics ticker on Windows (no iceoryx2 planes) — no-op slot.
+            #[cfg(not(windows))]
             move || diagnostics.abort(),
+            #[cfg(windows)]
+            || {},
             clients,
             std::mem::take(&mut self.anchors),
             self.tap_log.clone(),
@@ -393,6 +477,10 @@ impl Server {
             tracing::error!("shutdown drain exceeded timeout; forcing exit");
         }
         tracing::debug!(phases = ?recorder.entries(), "drain phases");
+        // Unix: unlink the socket file. Windows named pipes are not filesystem
+        // objects — the instances close when their handles drop (accept abort +
+        // task exit), so there is nothing to unlink.
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.admin_socket);
         tracing::info!("datamancerd shutdown complete");
         Ok(())
@@ -473,8 +561,10 @@ impl Server {
         };
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let dm = self.dm.clone();
+        let credential_backend = self.credential_backend;
+        let diag_interval = self.diag_interval;
         let task = tokio::spawn(async move {
-            crate::ws::serve(dm, cfg, async move {
+            crate::ws::serve(dm, cfg, credential_backend, diag_interval, async move {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -508,14 +598,64 @@ impl Server {
         )))
     }
 
+    /// Windows: bind the owner-only-DACL named pipe and spawn its accept loop.
+    ///
+    /// Fail-closed (review B2/S5): resolving the daemon's token SID, building
+    /// the owner-only security descriptor, and minting the first pipe instance
+    /// (with `FILE_FLAG_FIRST_PIPE_INSTANCE`, which fails if the control name
+    /// was squatted) all happen here — any failure aborts startup rather than
+    /// serving an unsecured control surface. See [`crate::win_control`].
     #[cfg(windows)]
-    #[allow(clippy::unnecessary_wraps, clippy::unused_self)] // parity with the Unix arm
-    fn spawn_control(&self, _cmd_tx: mpsc::Sender<ServerCommand>) -> Result<JoinHandle<()>> {
-        tracing::warn!(
-            "control socket not yet supported on Windows; running without a \
-             control surface (native Windows support in progress, #29)"
-        );
-        Ok(tokio::spawn(async {}))
+    fn spawn_control(&self, cmd_tx: mpsc::Sender<ServerCommand>) -> Result<JoinHandle<()>> {
+        let rid = datamancer_winsec::current_process_integrity()?;
+        if !datamancer_winsec::integrity_ok(rid, self.allow_any_integrity) {
+            return Err(DaemonError::from(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "datamancerd is running at {} integrity; the control pipe \
+                     requires Medium integrity so same-user clients can connect. \
+                     Re-launch the daemon at Medium integrity (neither elevated \
+                     nor below-Medium sandboxed), or set \
+                     [server].allow_any_integrity = true to override.",
+                    datamancer_winsec::classify(rid).describe()
+                ),
+            )));
+        }
+        let pipe_name = self.admin_socket.to_str().ok_or_else(|| {
+            DaemonError::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "control pipe name is not valid Unicode: {}",
+                    self.admin_socket.display()
+                ),
+            ))
+        })?;
+        // A non-pipe name here is almost always the Unix-shaped default that
+        // `default_admin_socket` yields when USERNAME is unset (review #1);
+        // surface it clearly instead of letting CreateNamedPipeW fail opaquely
+        // on a `/run/...`-style path.
+        if !(pipe_name.starts_with(r"\\.\pipe\") || pipe_name.starts_with(r"\\?\pipe\")) {
+            return Err(DaemonError::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "control pipe name must be a Windows named pipe \
+                     (\\\\.\\pipe\\...), got {pipe_name:?}; set \
+                     [server].admin_socket, or ensure USERNAME is set so the \
+                     default (\\\\.\\pipe\\datamancer\\<user>\\control) resolves",
+                ),
+            )));
+        }
+        let pipe = crate::win_control::ControlPipe::bind(pipe_name)?;
+        let first = pipe.create_instance(true)?;
+        Ok(tokio::spawn(win_accept_loop(
+            pipe,
+            first,
+            self.allow_any_integrity,
+            cmd_tx,
+            self.dm.clone(),
+            self.hub.clone(),
+            self.config_hub.clone(),
+        )))
     }
 
     #[cfg(unix)]
@@ -689,6 +829,25 @@ impl Server {
         }
     }
 
+    /// Open an iceoryx2 same-host client: create a per-client data service +
+    /// sink and pump the session's stream to it. Unix/macOS only — this is the
+    /// iceoryx2 data flow, which has no node on Windows.
+    #[cfg(windows)]
+    #[allow(clippy::unused_async)] // symmetric with the unix (async) arm the dispatcher awaits
+    async fn open_client(
+        &mut self,
+        _client: String,
+        _subscriptions: Vec<SubscriptionSpec>,
+    ) -> Reply {
+        // On Windows the control plane is the admin surface only; data rides the
+        // WS-loopback transport, so there is no iceoryx2 data service to open.
+        Reply::error(
+            codes::UNSUPPORTED_ON_WINDOWS,
+            "open-client (iceoryx2 data plane) is unavailable on Windows; use the WS data surface",
+        )
+    }
+
+    #[cfg(not(windows))]
     async fn open_client(&mut self, client: String, subscriptions: Vec<SubscriptionSpec>) -> Reply {
         if self.clients.contains_key(&client) {
             return Reply::error(
@@ -833,7 +992,10 @@ fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(),
 
 /// Pump a client's multiplexed stream into its per-client sink, in arrival
 /// order (`(instrument, seq)`; no cross-symbol order is created). A single
-/// sequential pump preserves the stream's existing order.
+/// sequential pump preserves the stream's existing order. Unix/macOS only —
+/// this drives the iceoryx2 `open-client` sink; the WS surface has its own
+/// pump (`ws/conn.rs`).
+#[cfg(not(windows))]
 fn spawn_pump(mut stream: datamancer::EventStream, sink: Arc<dyn EventSink>) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(ev) = stream.next().await {
@@ -898,6 +1060,134 @@ async fn dispatch_capabilities(dm: &Datamancer, provider: &str, symbols: &[Strin
     }
 }
 
+/// Windows control accept loop. Named pipes have no single listener object:
+/// each waiting instance is a separate handle. The pattern is *mint → wait →
+/// pre-mint the next → serve*, so a client can always queue on a fresh instance
+/// while an earlier one is being served. Every accepted connection is the
+/// daemon owner's (the owner-only DACL enforced that at connect), so the shared
+/// dispatch runs with `privileged = true`. See [`crate::win_control`].
+///
+/// The loop is **resilient and never returns on its own** (mirroring the Unix
+/// `accept_loop`, which logs and continues on accept errors): a failure to mint
+/// a pipe instance would otherwise leave the daemon running with no control
+/// surface — no shutdown, config, or credential access — which must not happen
+/// silently. Instead it logs loudly and retries with bounded backoff until it
+/// recovers. The supervisor tears this task down explicitly via `accept.abort()`
+/// during drain.
+#[cfg(windows)]
+async fn win_accept_loop(
+    pipe: crate::win_control::ControlPipe,
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+    allow_any: bool,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+    dm: Datamancer,
+    hub: Arc<CredentialHub>,
+    config_hub: Arc<crate::config_hub::ConfigHub>,
+) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    /// Mint the next pipe instance, retrying indefinitely with bounded backoff
+    /// so a transient failure can't kill the control surface.
+    async fn next_instance(
+        pipe: &crate::win_control::ControlPipe,
+    ) -> tokio::net::windows::named_pipe::NamedPipeServer {
+        const BACKOFF_START: Duration = Duration::from_millis(100);
+        const BACKOFF_MAX: Duration = Duration::from_secs(5);
+        let mut backoff = BACKOFF_START;
+        loop {
+            match pipe.create_instance(false) {
+                Ok(server) => return server,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        backoff_ms = backoff.as_millis(),
+                        "cannot create control pipe instance; retrying (control surface degraded)"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+                }
+            }
+        }
+    }
+
+    let mut server = first;
+    // Backoff for the connect-error path, so a *persistently* failing
+    // `connect()` (instance succeeds to mint but never accepts) can't hot-spin.
+    // Reset on every healthy accept.
+    let mut connect_backoff = Duration::from_millis(100);
+    loop {
+        if let Err(e) = server.connect().await {
+            tracing::warn!(error = %e, backoff_ms = connect_backoff.as_millis(), "control pipe connect failed; recreating instance after backoff");
+            tokio::time::sleep(connect_backoff).await;
+            connect_backoff = (connect_backoff * 2).min(Duration::from_secs(5));
+            server = next_instance(&pipe).await;
+            continue;
+        }
+        connect_backoff = Duration::from_millis(100);
+        // Pre-create the next instance before serving this one, so a new client
+        // can always queue on a fresh instance.
+        let next = next_instance(&pipe).await;
+        let connected = std::mem::replace(&mut server, next);
+        // Read the client's integrity synchronously while we hold the raw handle
+        // (no await between here and the split).
+        let client_rid = datamancer_winsec::client_process_integrity(connected.as_raw_handle());
+        let (read, write) = tokio::io::split(connected);
+        match client_rid {
+            Ok(rid) if datamancer_winsec::integrity_ok(rid, allow_any) => {
+                tokio::spawn(serve_connection(
+                    read,
+                    write,
+                    // The owner-only pipe DACL enforced same-user at connect, so
+                    // the per-op peer-cred gate (Unix) collapses to
+                    // always-permitted here.
+                    true,
+                    cmd_tx.clone(),
+                    dm.clone(),
+                    hub.clone(),
+                    config_hub.clone(),
+                ));
+            }
+            Ok(rid) => {
+                let level = datamancer_winsec::classify(rid).describe();
+                tracing::warn!(level, "rejecting control client at non-Medium integrity");
+                drop(read);
+                tokio::spawn(reject_connection(
+                    write,
+                    format!(
+                        "client is running at {level} integrity; the control \
+                         channel requires Medium integrity. Re-launch the client \
+                         without elevation (or below-Medium sandboxing)."
+                    ),
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot determine control client integrity; rejecting");
+                drop(read);
+                tokio::spawn(reject_connection(
+                    write,
+                    "unable to verify client integrity level".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Write one clear `integrity_rejected` error line to a refused control client,
+/// then close (drop). Runs in its own task so a slow/hostile client cannot stall
+/// the accept loop.
+#[cfg(windows)]
+async fn reject_connection<W>(mut write: W, message: String)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let reply = Reply::error(crate::control::codes::INTEGRITY_REJECTED, message);
+    if let Ok(mut line) = serde_json::to_vec(&reply) {
+        line.push(b'\n');
+        let _ = write.write_all(&line).await;
+        let _ = write.flush().await;
+    }
+}
+
 /// Route an already-gated credential op to the credential hub.
 async fn dispatch_credential_op(request: Request, hub: &CredentialHub) -> Reply {
     match request {
@@ -949,22 +1239,10 @@ async fn dispatch_config_op(
     })
 }
 
-/// One long-lived control connection. Reads newline-delimited JSON requests,
-/// forwards each to the server actor, writes the reply line. On EOF, if this
-/// connection had opened a client, signals an emergency teardown.
-///
-/// `Request::Instruments`, the credential ops, and the config-service ops
-/// are dispatched here, off-actor, rather than forwarded to the actor: the
-/// first awaits a live provider REST call, the credential ops do blocking
-/// credential-store I/O (behind `spawn_blocking`) — neither may stall
-/// unrelated control traffic on the single-actor loop. `get-config` is
-/// ungated — credentials never live in the config, and the one
-/// secret-shaped field, `[ws].auth_token`, is redacted in its reply (see
-/// `ConfigHub::get_config`); the credential ops,
-/// `configure-provider`/`remove-provider`, and `shutdown` are additionally
-/// gated on the peer's uid matching the daemon's own effective uid, captured
-/// per-connection before the stream is split. `shutdown` is forwarded to the
-/// actor (a run-loop decision, not hub state) once the gate passes.
+/// Unix transport arm for one control connection: capture the peer-cred gate
+/// decision (`SO_PEERCRED` vs the daemon's own euid), split the `UnixStream`,
+/// and hand it to the shared [`serve_connection`] dispatch. The full
+/// request-routing and gating contract lives there.
 #[cfg(unix)]
 async fn handle_connection(
     stream: UnixStream,
@@ -975,9 +1253,50 @@ async fn handle_connection(
     own_euid: u32,
 ) {
     // Kernel-reported peer credentials; unreadable peer = privileged ops
-    // denied (never defaulted).
+    // denied (never defaulted). The UDS is world-openable, so the gate is a
+    // per-connection property computed here and passed into the shared
+    // dispatch. (On Windows the owner-only pipe DACL enforces this at connect,
+    // so that arm passes `privileged = true`; see `win_control`.)
     let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
-    let (read, mut write) = stream.into_split();
+    let privileged = privileged_op_permitted(peer_uid, own_euid);
+    let (read, write) = stream.into_split();
+    serve_connection(read, write, privileged, cmd_tx, dm, hub, config_hub).await;
+}
+
+/// Serve one control connection over any byte transport: read newline-JSON
+/// requests, dispatch each, write the reply line. Transport-agnostic — Unix
+/// drives it with the two halves of a `UnixStream`, Windows with the two
+/// halves of a `NamedPipeServer` — so the control vocabulary and its gating
+/// live in exactly one place.
+///
+/// `privileged` is the per-connection authorization decision (whether the peer
+/// is the daemon's owner). It is computed once by the transport arm — Unix from
+/// `SO_PEERCRED`, Windows from the connect-time owner-DACL — because it cannot
+/// change over a connection's life. The credential ops, config-mutation ops,
+/// and `shutdown` require it; every other op is ungated. `get-config` is
+/// ungated because credentials never live in the config and the one
+/// secret-shaped field, `[ws].auth_token`, is redacted in its reply (see
+/// `ConfigHub::get_config`).
+///
+/// `Request::Instruments`, the credential ops, and the config-service ops are
+/// dispatched here, off-actor, rather than forwarded to the actor: the first
+/// awaits a live provider REST call and the credential ops do blocking
+/// credential-store I/O (behind `spawn_blocking`) — neither may stall unrelated
+/// control traffic on the single-actor loop. `shutdown` is forwarded to the
+/// actor (a run-loop decision, not hub state) once the gate passes. On EOF, if
+/// this connection had opened a client, an emergency teardown is signalled.
+async fn serve_connection<R, W>(
+    read: R,
+    mut write: W,
+    privileged: bool,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+    dm: Datamancer,
+    hub: Arc<CredentialHub>,
+    config_hub: Arc<crate::config_hub::ConfigHub>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut lines = BufReader::new(read).lines();
     let mut opened_client: Option<String> = None;
 
@@ -1006,7 +1325,7 @@ async fn handle_connection(
                         | Request::GetCredentials { .. }
                         | Request::ClearCredentials { .. }
                 ) {
-                    if privileged_op_permitted(peer_uid, own_euid) {
+                    if privileged {
                         dispatch_credential_op(request, &hub).await
                     } else {
                         Reply::error(
@@ -1022,7 +1341,7 @@ async fn handle_connection(
                         | Request::RemoveProvider { .. }
                         | Request::Shutdown
                 ) {
-                    if privileged_op_permitted(peer_uid, own_euid) {
+                    if privileged {
                         match dispatch_config_op(request, &config_hub, &cmd_tx).await {
                             Some(reply) => reply,
                             None => break,
@@ -1085,7 +1404,9 @@ async fn handle_connection(
 /// both — the health view is stamped with the daemon version and credential
 /// backend, same as the `Request::Health` dispatch arm). `snapshot()` is
 /// async (the cache catalog does I/O); awaiting it here keeps the ticker off
-/// the actor's critical path.
+/// the actor's critical path. Unix/macOS only — the ticker publishes on the
+/// iceoryx2 planes, which do not exist on Windows (health rides WS instead).
+#[cfg(not(windows))]
 fn spawn_diagnostics(
     dm: Datamancer,
     publisher: Iceoryx2DiagnosticsPublisher,
@@ -1162,6 +1483,8 @@ fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
 mod tests {
     use super::*;
 
+    // The peer-cred gate is Unix-only (Windows uses the pipe owner DACL).
+    #[cfg(unix)]
     #[test]
     fn privileged_gate_requires_exact_uid_match() {
         use crate::credentials::privileged_op_permitted;

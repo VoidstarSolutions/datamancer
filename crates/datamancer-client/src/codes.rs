@@ -52,3 +52,10 @@ pub const RESTART_REQUIRED: &str = "restart_required";
 /// A configure-provider payload carried a field the provider's config
 /// section does not define.
 pub const UNKNOWN_CONFIG_FIELD: &str = "unknown_config_field";
+/// The connected process is not at Medium integrity, so the control channel
+/// refuses it (Windows only).
+pub const INTEGRITY_REJECTED: &str = "integrity_rejected";
+/// The requested op is not available on Windows. Returned for `open-client`
+/// (the iceoryx2 same-host data flow): on Windows the control plane is the
+/// admin surface only and data rides the WS-loopback transport.
+pub const UNSUPPORTED_ON_WINDOWS: &str = "unsupported_on_windows";

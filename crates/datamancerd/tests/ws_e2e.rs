@@ -9,6 +9,11 @@
 //! They exercise wiring (handshake/auth, snapshot reply + id echo, subscribe
 //! reply + id echo, teardown), not live market data. The spawned daemon is the
 //! binary built WITH the `ws` feature, so it runs the ws listener.
+//!
+//! **Windows note:** on Windows the daemon boots **WS-only** (no iceoryx2 node),
+//! so `windows_ws_only_boot_smoke` needs no iceoryx2 runtime — it is the
+//! end-to-end proof that the daemon runs on Windows and serves the WS data +
+//! health planes.
 
 #![cfg(feature = "ws")]
 
@@ -185,6 +190,11 @@ async fn subscribe_reply_echoes_id_and_snapshot_returns() {
 /// (`ws_shutdown` → listener drains `JoinSet` → each `handle_connection` breaks
 /// its read loop → `session.close()` → writer emits the WS Close). All reads are
 /// bounded so a regression FAILS instead of hanging.
+// SIGTERM is a Unix concept; this test drives graceful drain via
+// `libc::kill(SIGTERM)`. The Windows graceful-drain equivalent (CTRL_SHUTDOWN /
+// the `shutdown` control op) is covered separately, so this one is Unix-only —
+// which also keeps the ws_e2e binary compiling on Windows (no `libc::kill`).
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "spawns the binary; needs a live iceoryx2 runtime; run with --ignored"]
 async fn graceful_shutdown_closes_live_connection() {
@@ -541,6 +551,109 @@ async fn slow_consumer_overrun_tears_down_connection() {
         "client never observed teardown after slow-consumer overrun (connection stalled)"
     );
 
+    child.kill().expect("kill");
+    let _ = child.wait();
+}
+
+/// The Windows WS-only boot proof (native-Windows Phase 4 / daemon-boot design).
+/// Unlike the tests above (which need a live iceoryx2 runtime on unix), on
+/// Windows the daemon boots with **no iceoryx2 node** — so this exercises the
+/// full path that was previously impossible: spawn `datamancerd --features ws`,
+/// which now boots WS-only, then over the WS surface (1) `snapshot` returns an
+/// ok reply, and (2) `watch-health` yields at least one pushed `HealthView`
+/// (the `{"view":…}` frame) within a diagnostics interval. No provider is
+/// configured — the point is boot + the data/health planes, not market data.
+///
+/// `#[ignore]`d: it spawns the real binary and binds a loopback port; run with
+///   `cargo test -p datamancerd --features ws --test ws_e2e windows_ws_only_boot_smoke -- --ignored`
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns the binary + binds loopback; run with --ignored"]
+async fn windows_ws_only_boot_smoke() {
+    let _guard = DAEMON_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = 19097;
+    // Windows control endpoint is a named pipe, not a filesystem socket; use a
+    // unique pipe so this never collides with a real daemon's default pipe.
+    //
+    // `allow_any_integrity = true`: CI runners (GitHub Actions) execute at
+    // *elevated* (High) integrity, and the Phase-3 control-pipe gate refuses to
+    // boot elevated unless overridden (an elevated daemon's Medium-only pipe
+    // would be unreachable by a Medium client). The test client here runs at the
+    // same integrity as the daemon, so the override is safe and required for the
+    // daemon to boot on CI. Locally (Medium integrity) the daemon boots without it.
+    let config = format!(
+        r#"
+[server]
+admin_socket = "\\\\.\\pipe\\datamancerd-winboot-smoke"
+service_prefix = "datamancerd-winboot-smoke"
+allow_any_integrity = true
+
+[ws]
+enabled = true
+bind = "127.0.0.1"
+port = {port}
+
+[diagnostics]
+publish_interval_ms = 200
+"#
+    );
+    let config_path = dir.path().join("datamancerd.toml");
+    std::fs::write(&config_path, config).expect("write config");
+    let bin: PathBuf = env!("CARGO_BIN_EXE_datamancerd").into();
+    let mut child = Command::new(bin)
+        .arg("--config")
+        .arg(&config_path)
+        .spawn()
+        .expect("spawn datamancerd (WS-only boot on Windows)");
+
+    let mut ws = connect_when_ready(port).await;
+
+    // (1) Data plane: snapshot returns an ok reply with a snapshot object.
+    ws.send(Message::text(r#"{"id":1,"op":"snapshot"}"#))
+        .await
+        .expect("send snapshot");
+    let snap = read_reply(&mut ws, 1).await;
+    assert_eq!(
+        snap["ok"],
+        serde_json::Value::Bool(true),
+        "snapshot: {snap}"
+    );
+    assert!(snap["snapshot"].is_object(), "expected snapshot object");
+
+    // (2) Health plane: subscribe to the push, then a `{"view":…}` frame must
+    // arrive within a couple of diagnostics intervals.
+    ws.send(Message::text(r#"{"id":2,"op":"watch-health"}"#))
+        .await
+        .expect("send watch-health");
+    let ack = read_reply(&mut ws, 2).await;
+    assert_eq!(
+        ack["ok"],
+        serde_json::Value::Bool(true),
+        "watch-health ack: {ack}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_health = false;
+    while Instant::now() < deadline {
+        let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+        else {
+            break;
+        };
+        if let Message::Text(t) = msg
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
+            && v.get("view").is_some()
+        {
+            saw_health = true;
+            break;
+        }
+    }
+    assert!(
+        saw_health,
+        "no pushed HealthView (`{{\"view\":…}}`) arrived after watch-health"
+    );
+
+    let _ = ws.close(None).await;
     child.kill().expect("kill");
     let _ = child.wait();
 }

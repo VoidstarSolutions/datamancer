@@ -72,13 +72,27 @@ fi
 # A break is fine - it just has to be declared, so release-plz bumps for it.
 # Conventional Commits spells that either `type(scope)!:` or a BREAKING CHANGE
 # footer.
-if git log --format='%s' "${BASELINE_REV}..HEAD" \
-     | grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' \
-   || git log --format='%b' "${BASELINE_REV}..HEAD" \
-     | grep -qE '^BREAKING[ -]CHANGE:'; then
+#
+# Capture the log ONCE into variables and scan with here-strings. Piping
+# `git log` straight into `grep -q` is unsafe under `set -o pipefail`: grep
+# short-circuits on the first match and closes the pipe, `git log` then dies of
+# SIGPIPE (141), and pipefail promotes that to a pipeline failure - a false
+# "undeclared" even though the marker matched. Print the resolved range so this
+# is never debugged blind (on a pull_request the checkout is a detached merge
+# ref; the range still spans the PR commits).
+range="${BASELINE_REV}..HEAD"
+echo "-- marker scan: ${range} = $(git rev-parse --short "${BASELINE_REV}")..$(git rev-parse --short HEAD), $(git rev-list --count "${range}") commits"
+subjects=$(git log --format='%s' "${range}")
+bodies=$(git log --format='%b' "${range}")
+if grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' <<<"${subjects}" \
+   || grep -qE '^BREAKING[ -]CHANGE:' <<<"${bodies}"; then
   echo "-- breaking change in ${breaking[*]}, declared via a breaking commit marker - OK"
   exit 0
 fi
+
+# No marker matched - dump the subjects we scanned so the failure is diagnosable.
+echo "-- no marker in these ${range} subjects:" >&2
+sed 's/^/     | /' >&2 <<<"${subjects}"
 
 cat >&2 <<EOF
 ::error::undeclared breaking change in: ${breaking[*]}

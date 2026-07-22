@@ -62,7 +62,27 @@ pub fn default_data_dir() -> Option<PathBuf> {
 /// `datamancer_client::default_control_socket()`).
 #[must_use]
 pub fn default_config_toml() -> String {
-    r#"# datamancerd configuration.
+    // The same-host data plane on Windows is WS-loopback (iceoryx2 shared
+    // memory is not viable on Windows — see the native-Windows spec §2.5), so
+    // the scaffold enables `[ws]` on loopback by default: it is the *only*
+    // data transport there, so a fresh Windows daemon must serve it out of the
+    // box (the shipped Windows binary is built `--features ws`). On unix the
+    // data plane is iceoryx2 and `[ws]` stays off (omitted here), so the
+    // scaffold is unchanged on unix.
+    #[cfg(windows)]
+    const PLATFORM_DATA_PLANE: &str = r#"
+# Windows same-host data plane: WS over loopback (iceoryx2 shared memory is not
+# viable on Windows). Enabled by default because it is the only data transport
+# on Windows; the app's AppHandle dials ws://127.0.0.1:9001 by convention.
+[ws]
+enabled = true
+bind = "127.0.0.1"
+port = 9001
+"#;
+    #[cfg(not(windows))]
+    const PLATFORM_DATA_PLANE: &str = "";
+
+    let base = r#"# datamancerd configuration.
 #
 # Generated on first run; edit by hand or through the web UI settings page
 # (http://127.0.0.1:8080/config). UI saves rewrite this file and drop comments.
@@ -133,8 +153,8 @@ port = 8080
 # [log]
 # level = "info"
 # format = "text"
-"#
-    .to_string()
+"#;
+    format!("{base}{PLATFORM_DATA_PLANE}")
 }
 
 /// Resolve which config file the daemon should load.

@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use datamancer_core::{InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
+use datamancer_core::{
+    HealthView, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
+};
 use datamancer_transport_ws::{EventFrame, WS_SUBPROTOCOL, from_wire};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt as _, StreamExt as _};
@@ -21,7 +23,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::client::Client;
 use crate::error::ClientError;
-use crate::protocol::ws::{WsReply, WsRequest};
+use crate::protocol::ws::{WsHealthPush, WsReply, WsRequest};
 use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
 
 /// Connection parameters for [`WsClient`].
@@ -79,27 +81,37 @@ struct PendingTable {
 
 type Pending = Arc<Mutex<PendingTable>>;
 
+/// Bound on locally buffered health pushes. Small: health is a periodic
+/// snapshot and only the latest matters, so overrun drops the stale push.
+const HEALTH_CHANNEL_DEPTH: usize = 8;
+
 /// A connected WebSocket client. See [`Client`] for the transport-agnostic
 /// contract.
 pub struct WsClient {
     write: WriteHalf,
     pending: Pending,
     next_id: u64,
+    /// The health-push receiver, created at connect and handed out once by
+    /// [`WsClient::watch_health`]. `None` after it has been taken.
+    health_rx: Option<mpsc::Receiver<HealthView>>,
 }
 
 /// Inbound frame demux: event frames are internally tagged (`"type"`), replies
-/// carry `"id"`/`"ok"` — the untagged union tries in that order.
+/// carry `"id"`/`"ok"`, and a health push carries only `"view"` — the untagged
+/// union tries in that order; the three shapes are disjoint so order is safe.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Inbound {
     Event(EventFrame),
     Reply(WsReply),
+    Health(WsHealthPush),
 }
 
 async fn run_reader(
     mut read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     pending: Pending,
     events: mpsc::Sender<MarketEvent>,
+    health: mpsc::Sender<HealthView>,
 ) {
     // Dropping the event stream must not poison the control plane: the
     // socket is still healthy and replies still need demuxing (the iceoryx2
@@ -126,6 +138,13 @@ async fn run_reader(
                 {
                     let _ = tx.send(reply);
                 }
+            }
+            Ok(Inbound::Health(push)) => {
+                // Best-effort: a full/closed health channel just drops the
+                // push. Health is a periodic snapshot (the next tick refreshes),
+                // and it must never apply backpressure to the socket reader the
+                // way the event stream deliberately does.
+                let _ = health.try_send(push.view);
             }
             // Unknown frame shape: a newer daemon speaking a newer wire.
             // Skipping (rather than erroring) keeps old clients readable.
@@ -191,6 +210,27 @@ impl WsClient {
         self.next_id += 1;
         id
     }
+
+    /// Subscribe to the daemon's periodic health push and return the stream of
+    /// pushed [`HealthView`]s (the Windows same-host health plane). Sends
+    /// `WatchHealth`, awaits the ack, then hands out the health receiver (once
+    /// per client). Consumed by the Windows `AppHandle` (Phase 4), which
+    /// subscribes eagerly at `ensure` so its `watch_health` keeps a `&self`,
+    /// infallible signature. Dead only in builds that never reach that caller
+    /// (non-Windows, or Windows without the `app` facade).
+    #[cfg_attr(not(all(windows, feature = "app")), allow(dead_code))]
+    pub(crate) async fn watch_health(
+        &mut self,
+    ) -> Result<ReceiverStream<HealthView>, ClientError<WsClientError>> {
+        let req = WsRequest::WatchHealth { id: self.next_id() };
+        self.request(&req).await?;
+        let rx = self.health_rx.take().ok_or_else(|| {
+            ClientError::Transport(WsClientError::Protocol(
+                "watch_health already subscribed on this client".to_string(),
+            ))
+        })?;
+        Ok(ReceiverStream::new(rx))
+    }
 }
 
 impl Client for WsClient {
@@ -234,13 +274,15 @@ impl Client for WsClient {
         )?;
         let (write, read) = ws.split();
         let (ev_tx, ev_rx) = mpsc::channel(cfg.event_buffer.max(1));
+        let (health_tx, health_rx) = mpsc::channel(HEALTH_CHANNEL_DEPTH);
         let pending: Pending = Arc::new(Mutex::new(PendingTable::default()));
-        tokio::spawn(run_reader(read, Arc::clone(&pending), ev_tx));
+        tokio::spawn(run_reader(read, Arc::clone(&pending), ev_tx, health_tx));
         Ok((
             WsClient {
                 write,
                 pending,
                 next_id: 1,
+                health_rx: Some(health_rx),
             },
             ReceiverStream::new(ev_rx),
         ))
@@ -626,6 +668,7 @@ mod tests {
             write,
             pending: Arc::clone(&pending),
             next_id: 1,
+            health_rx: None,
         };
         let spec: SubscriptionSpec = serde_json::from_str(
             r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,

@@ -6,6 +6,7 @@ members = [
     "crates/datamancer-credentials",
     "crates/datamancer-transport-iceoryx2",
     "crates/datamancer-transport-ws",
+    "crates/datamancer-winsec",
     "crates/datamancerd",
 ]
 resolver = "3"

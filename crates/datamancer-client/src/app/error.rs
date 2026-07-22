@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::ClientError;
+#[cfg(not(windows))]
 use crate::iceoryx2::Iceoryx2ClientError;
 
 /// Why a spawned daemon never became ready (inside
@@ -71,6 +72,18 @@ pub enum EnsureError {
     },
     #[error("version skew: daemon {daemon} incompatible with client {client}")]
     VersionSkew { daemon: String, client: String },
+    /// The data-plane client failed to connect. On unix this is the iceoryx2
+    /// client (control + shm); on Windows the hybrid's WS-loopback data client.
+    #[cfg(not(windows))]
     #[error(transparent)]
     Connect(#[from] ClientError<Iceoryx2ClientError>),
+    #[cfg(windows)]
+    #[error(transparent)]
+    Connect(#[from] ClientError<crate::ws::WsClientError>),
+    /// The Windows hybrid's admin (named-pipe control) plane failed to connect.
+    /// Distinct from [`Self::Connect`] (the WS data plane) — the two planes are
+    /// independent connections on Windows.
+    #[cfg(windows)]
+    #[error("admin control pipe connect failed: {0}")]
+    AdminConnect(#[from] crate::pipe_control::PipeControlError),
 }

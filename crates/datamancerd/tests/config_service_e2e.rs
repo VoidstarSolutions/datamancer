@@ -19,16 +19,103 @@
 //! cargo test -p datamancerd --test config_service_e2e -- --ignored --nocapture
 //! ```
 
-// Unix-domain control socket + POSIX process management; Windows named-pipe
-// harness port is Phase 5 (#29). Compile on Unix only until then.
-#![cfg(unix)]
+// Cross-platform control-socket + process management: UDS + POSIX on unix, a
+// named pipe (opened as a duplex `std::fs::File`) + `taskkill` on Windows. The
+// newline-JSON round-trip is transport-neutral, so `forbid(unsafe_code)` holds
+// (pure std I/O, no FFI). Phase 5 / B3 (#29).
 #![forbid(unsafe_code)]
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+
+/// The control-socket stream: a UDS socket on unix, a named-pipe file handle on
+/// Windows. Both are duplex `Read + Write`, so the newline-JSON round-trip is
+/// shared across platforms.
+#[cfg(unix)]
+type CtrlStream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type CtrlStream = std::fs::File;
+
+/// Connect to the daemon's control socket (UDS path on unix, `\\.\pipe\…` on
+/// Windows). Retries `ERROR_PIPE_BUSY` on Windows so a briefly-busy pipe server
+/// does not spuriously fail.
+fn connect(socket: &Path) -> std::io::Result<CtrlStream> {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // The daemon reads the connecting client's integrity level by
+        // impersonating it, so the client must grant SECURITY_IMPERSONATION QoS.
+        // tokio's named-pipe client does this; a bare `File` open defaults to
+        // anonymous/identification and the daemon's impersonation-based integrity
+        // read stalls (the connect succeeds but no reply ever comes). 0x0002_0000
+        // = SECURITY_IMPERSONATION; `security_qos_flags` sets SECURITY_SQOS_PRESENT
+        // implicitly. Safe std API — no FFI, `forbid(unsafe_code)` holds.
+        const SECURITY_IMPERSONATION: u32 = 0x0002_0000;
+        // ERROR_PIPE_BUSY: between two round-trips the daemon's accept loop may
+        // not yet have re-created a free pipe instance, so a bare open races and
+        // fails. Retry briefly, as a real pipe client (`WaitNamedPipe`) would.
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .security_qos_flags(SECURITY_IMPERSONATION)
+                .open(socket);
+            match result {
+                Err(e)
+                    if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+/// Wait until the daemon's control socket answers a connect, or the deadline
+/// elapses. Unix exposes the UDS as a filesystem path (`exists()`); a Windows
+/// named pipe is not a filesystem object, so poll `connect()` instead.
+fn wait_ready(socket: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        #[cfg(unix)]
+        let ready = socket.exists();
+        #[cfg(windows)]
+        let ready = connect(socket).is_ok();
+        if ready {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon socket never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The control-socket path: a UDS file on unix, a unique named pipe on Windows.
+fn control_socket_path(dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        dir.join("control.sock")
+    }
+    #[cfg(windows)]
+    {
+        // A named pipe is not under `dir`; a fixed name is safe because the
+        // daemon's global single-instance lock permits only one daemon at a
+        // time (and the pipe closes when that process exits).
+        let _ = dir;
+        PathBuf::from(r"\\.\pipe\datamancerd-config-svc-e2e")
+    }
+}
 
 use datamancer_client::ClientError;
 use datamancer_client::app::{AppHandle, Applied, EnsureConfig};
@@ -39,20 +126,31 @@ use datamancer_core::{ConnectionState, ProviderCredentials};
 /// Write a daemon config with **no** provider sections and return the
 /// config/socket paths.
 fn write_config_no_providers(dir: &std::path::Path) -> (PathBuf, PathBuf) {
-    let socket = dir.join("control.sock");
+    let socket = control_socket_path(dir);
     let config = dir.join("config.toml");
+    // Windows: `admin_socket` is a pipe name full of backslashes, so use a TOML
+    // *literal* string (single quotes — no escape processing) rather than doubling
+    // every `\`. CI runners run elevated, so `allow_any_integrity = true` lets the
+    // control-pipe gate boot there (the test client is same-integrity).
+    #[cfg(windows)]
+    let integrity_line = "allow_any_integrity = true\n";
+    #[cfg(not(windows))]
+    let integrity_line = "";
+    #[cfg(windows)]
+    let admin_socket_toml = format!("'{}'", socket.display());
+    #[cfg(not(windows))]
+    let admin_socket_toml = format!("\"{}\"", socket.display());
     std::fs::write(
         &config,
         format!(
             r#"
 [server]
-admin_socket = "{}"
+admin_socket = {admin_socket_toml}
 service_prefix = "config-service-e2e"
-
+{integrity_line}
 [diagnostics]
 publish_interval_ms = 200
-"#,
-            socket.display()
+"#
         ),
     )
     .unwrap();
@@ -70,7 +168,12 @@ fn stop_daemon() {
     if let Ok(pid) = std::fs::read_to_string(&lock) {
         let pid = pid.trim().to_string();
         if !pid.is_empty() {
+            #[cfg(unix)]
             let _ = std::process::Command::new("kill").arg(&pid).status();
+            #[cfg(windows)]
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid])
+                .status();
             std::thread::sleep(Duration::from_millis(1500));
         }
     }
@@ -79,11 +182,13 @@ fn stop_daemon() {
 /// Send one JSON line and read one JSON reply line (raw UDS round trip, no
 /// facade — same helper shape as `daemon_e2e.rs`).
 fn round_trip(socket: &std::path::Path, request: &str) -> serde_json::Value {
-    let stream = UnixStream::connect(socket).expect("connect socket");
-    let mut writer = stream.try_clone().expect("clone");
-    writer.write_all(request.as_bytes()).expect("write");
-    writer.write_all(b"\n").expect("write nl");
-    writer.flush().expect("flush");
+    // One handle for write-then-read (the pipe/socket is duplex); no `try_clone`
+    // — a cloned Windows pipe handle is a separate client end and complicates the
+    // request→reply exchange the daemon serves on the one connection.
+    let mut stream = connect(socket).expect("connect socket");
+    stream.write_all(request.as_bytes()).expect("write");
+    stream.write_all(b"\n").expect("write nl");
+    stream.flush().expect("flush");
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).expect("read reply");
@@ -109,14 +214,7 @@ fn spawn_daemon(
         .spawn()
         .expect("spawn datamancerd");
 
-    let bind_deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(
-            Instant::now() < bind_deadline,
-            "daemon socket never appeared"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_ready(socket);
     child
 }
 

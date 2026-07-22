@@ -19,9 +19,16 @@ iceoryx2 = [
     "dep:iceoryx2",
     "dep:tokio",
     "dep:tokio-stream",
+    # win_pipe (the only winsec consumer) is cfg(all(windows, feature =
+    # "iceoryx2")); pull winsec only when it can actually be used.
+    "dep:datamancer-winsec",
 ]
-# App-facing find-or-spawn facade (Task 4+).
-app = ["iceoryx2"]
+# App-facing find-or-spawn facade (Task 4+). Pulls in `ws` because the
+# Windows hybrid `AppHandle` carries its data plane over WS-loopback
+# (iceoryx2 shm is not viable on Windows — Phase 4). On unix `ws` is compiled
+# but unused by the facade (every WS reference is `#[cfg(windows)]`); the
+# iceoryx2 data path and all unix behavior are unchanged.
+app = ["iceoryx2", "ws"]
 
 [dependencies]
 datamancer-core = { path = "../datamancer-core", version = "0.8.0" }
@@ -46,6 +53,11 @@ tokio-stream = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
 tempfile = "3"
+
+# Windows client-side server-identity + integrity checks delegate to the shared,
+# audited FFI crate; this crate itself stays forbid(unsafe_code).
+[target.'cfg(windows)'.dependencies]
+datamancer-winsec = { path = "../datamancer-winsec", version = "0.8.0", optional = true }
 
 [lints]
 workspace = true

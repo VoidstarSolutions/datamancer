@@ -26,6 +26,8 @@ use crate::ws::conn::handle_connection;
 pub async fn serve(
     dm: Datamancer,
     cfg: WsConfig,
+    credential_backend: &'static str,
+    diag_interval: Duration,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let addr: SocketAddr = format!("{}:{}", cfg.bind, cfg.port).parse().map_err(|e| {
@@ -93,6 +95,8 @@ pub async fn serve(
                             dm,
                             auth_token,
                             channel_depth,
+                            credential_backend,
+                            diag_interval,
                             conn_shutdown,
                         )
                         .await;

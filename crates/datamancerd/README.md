@@ -9,10 +9,12 @@ Embedders who want zero hops should keep using the library in-process. Reach for
 `datamancerd` when several processes on one machine need to share authoritative
 sessions (and their recording) and read a single multiplexed stream each.
 
-> **Security:** the control surface is a Unix-domain socket guarded by
-> **filesystem permissions only**. There is no authentication and no network
-> transport. This is **not** a network-safe surface; run it same-host,
-> single-operator.
+> **Security:** the control surface is same-host only, guarded by OS access
+> control — a Unix-domain socket with a same-uid peer-cred gate on Unix, or an
+> **owner-only-DACL named pipe** on Windows (only the daemon's own user can
+> open it). There is no network transport. This is **not** a network-safe
+> surface; run it same-host, single-operator. See
+> [Control transport](#control-transport-platform).
 
 > **Ordering:** determinism is **per symbol** only. The daemon computes **no**
 > cross-instrument or global order. Two clients of the same instrument observe
@@ -306,6 +308,59 @@ kind)`, so cardinality is bounded by the number of actively-subscribed units.
 The Prometheus recorder is **process-global and one-shot** — installed exactly
 once at startup.
 
+## Control transport (platform)
+
+The control surface speaks the same newline-JSON vocabulary over a
+platform-native, same-host endpoint. The transport differs; the protocol does
+not.
+
+- **Unix — Unix-domain socket.** Bound at `admin_socket` (default
+  `$XDG_RUNTIME_DIR/datamancer/control.sock`). The socket is world-openable, so
+  the privileged ops (credential ops, `configure-provider`/`remove-provider`,
+  `shutdown`) are gated per-request on the connection's kernel-reported peer uid
+  (`SO_PEERCRED`) matching the daemon's own effective uid.
+
+- **Windows — owner-only-DACL named pipe.** Bound at `admin_socket` (default
+  `\\.\pipe\datamancer\<user>\control`). Access control is the **pipe object's
+  DACL**, not the name: the daemon builds it granting access to exactly one
+  principal — its own process-token user SID (SDDL `O:<sid>D:P(A;;GA;;;<sid>)`;
+  protected, no inherited `Everyone` ACE, no `SYSTEM` ACE; `O:` stamps the owner
+  as the token *user* SID so an elevated daemon's owner isn't the Administrators
+  group, which the client owner-check would otherwise reject). A *different* user
+  therefore cannot open the pipe at all — the OS enforces same-user **at
+  connect time** — so every accepted connection is already privileged (there is
+  no per-op peer-cred check; the DACL is the gate). The first instance is
+  created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so if another process squatted
+  the control name first, the daemon **fails to start** rather than serve an
+  unsecured surface (fail-closed). Any failure to resolve the SID or build the
+  DACL likewise aborts startup.
+
+  - **Client-side identity check (defense in depth).** Before sending anything
+    privileged, `datamancer-client` verifies the connected pipe's **owner SID
+    equals its own token SID**, so a bug that weakened the server DACL cannot
+    silently leak credentials to a foreign or same-user-squatted endpoint.
+  - **Integrity levels — actively enforced, not just advisory.** The DACL keys
+    on the user SID, not the integrity level, so Windows' mandatory
+    "no-write-up" policy is a separate concern the daemon and client both
+    check explicitly: both the daemon and its clients must run at **Medium**
+    integrity. A daemon started elevated (High/System) or sandboxed
+    (Low/Untrusted) refuses to bind its control pipe at startup with a clear
+    error; a client at a non-Medium integrity level refuses to connect with a
+    clear error, and even if it didn't, the daemon independently reads each
+    connecting client's integrity off the raw pipe handle before serving it
+    and rejects a non-Medium client in-band (`integrity_rejected`).
+    Override, when elevation is genuinely required: `[server].allow_any_integrity
+    = true` in the daemon's config, or `DATAMANCER_ALLOW_ANY_INTEGRITY=1` in a
+    client's environment. **Asymmetry:** the client's env override relaxes
+    only that client's own self-check before it dials out — the daemon
+    remains the sole authority over what it accepts, and will still reject a
+    non-Medium client unless the *daemon* has set `allow_any_integrity = true`.
+    Setting the client override without also setting it on the daemon does not
+    let an elevated client through.
+  - **Scope.** The named-pipe *control* surface is native-Windows (#29). The
+    same-host *data* plane (iceoryx2) does not yet run on Windows; a portable
+    WS-loopback data path is a later phase.
+
 ## Control protocol (newline-JSON)
 
 One JSON object per line; one reply line per request.
@@ -430,13 +485,16 @@ Nothing credential-shaped lives in the config file.
   `"secret-service"`, `"credential-manager"`, `"file"`). Setting the `DATAMANCER_CREDENTIALS_FILE`
   env var forces the file backend at that path — a testing/ops escape hatch
   (see `datamancer-credentials/README.md`), not a supported config surface.
-- **UDS-only, same-uid gated.** The three credential ops exist **only** on
-  the Unix-socket control surface — never on the WS surface (its frame
-  vocabulary simply has no such ops). On top of the socket's filesystem
-  permissions, each credential op checks the connection's kernel-reported
-  peer uid (`SO_PEERCRED`/`getpeereid`) against the daemon's own effective
-  uid; a mismatch — or an unreadable peer — gets `permission_denied`. Other
-  control ops are unaffected by the gate.
+- **Local-control-only, same-user gated.** The three credential ops exist
+  **only** on the local control surface (UDS/named pipe) — never on the WS
+  surface (its frame vocabulary simply has no such ops). Same-user enforcement
+  is platform-native: on Unix each credential op checks the connection's
+  kernel-reported peer uid (`SO_PEERCRED`/`getpeereid`) against the daemon's own
+  effective uid, and a mismatch — or an unreadable peer — gets
+  `permission_denied`; on Windows the pipe's owner-only DACL already restricts
+  connect to the daemon's user, so the op runs already-authorized (see
+  [Control transport](#control-transport-platform)). Other control ops are
+  unaffected by the gate.
 - **Hot-apply.** `set-credentials` persists to the store, then applies live:
   the running provider reconnects its stream with the new credentials and
   rebuilds its REST clients on next use. No restart, no resubscribe — the

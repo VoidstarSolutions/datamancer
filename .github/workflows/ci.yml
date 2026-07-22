@@ -25,7 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # Reads rust-toolchain.toml; the @stable ref is the action version,
       # not the toolchain choice.
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +44,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -56,9 +60,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # semver step (next task) diffs against the PR base
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -76,39 +81,74 @@ jobs:
         run: .github/scripts/semver-checks.sh "origin/${{ github.base_ref }}"
 
   windows:
-    # The support boundary, enforced: Windows gets the ws transport and the
-    # ws-featured client ONLY. The daemon (UDS control socket) and the
-    # iceoryx2 transport are POSIX; do not add them here - that is a porting
-    # decision, not a CI edit (see the open-sourcing design spec).
+    # This job stays the minimal portable subset (transport-ws + ws-featured
+    # client). The native-Windows daemon is NOT built here - it runs in the
+    # `windows-native-check` job below, which boots datamancerd WS-only on
+    # Windows (Phase 4). The original "the daemon is POSIX-only, do not add it"
+    # boundary was lifted once the daemon could run on Windows over WS-loopback
+    # (Zach, Slack 2026-07-19: "once it's possible to run on windows we want the
+    # daemon to run on windows in CI as well"). iceoryx2 shm stays POSIX-only.
     name: ws-portable subset (Windows)
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build + test the portable subset
         run: cargo test -p datamancer-transport-ws -p datamancer-client --features datamancer-client/ws
 
   windows-native-check:
-    # Native-Windows compile guard (#29). The ws-portable job above does NOT
-    # build the daemon or the client `app`/`iceoryx2` features, so the
-    # in-progress native-Windows port would otherwise rot uncaught. Type-check
-    # the ported crates on Windows (compile-only; runtime lands with the
-    # named-pipe transport in a later phase). iceoryx2's bindgen needs libclang.
-    name: native compile-check (Windows)
+    # Native-Windows guard (#29). The ws-portable job above does NOT build the
+    # daemon or the client `app`/`iceoryx2` features, so the native-Windows port
+    # would otherwise rot uncaught. This job also carries the *only* CI coverage
+    # of the `cfg(windows)` Win32 code (the Linux clippy job never compiles it):
+    # clippy lints the ported crates and runs the named-pipe control-transport +
+    # owner-SID auth tests (Phase 3). Phase 4: it now also builds the WS-featured
+    # daemon and BOOTS it WS-only on Windows (no iceoryx2 node) via the
+    # `windows_ws_only_boot_smoke` e2e - the daemon runs on Windows in CI, per
+    # Zach's blessing (Slack 2026-07-19). iceoryx2's bindgen needs libclang.
+    name: native clippy + control-transport + WS-loopback daemon (Windows)
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        # cargo build scripts (iceoryx2 bindgen) execute during clippy/test and
+        # could read a persisted checkout token; this job never pushes.
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: install LLVM (libclang for iceoryx2 bindgen)
         run: choco install llvm --no-progress -y
-      - name: cargo check (daemon + client app)
+      - name: clippy + control-transport + WS-loopback daemon (Windows)
         shell: bash
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
         run: |
-          cargo check -p datamancerd
-          cargo check -p datamancer-client --features app
+          # Lints the Win32 modules (win_control / win_pipe) that no other job sees.
+          cargo clippy -p datamancerd --all-targets -- -D warnings
+          cargo clippy -p datamancer-client --features app --all-targets -- -D warnings
+          # The WS-featured daemon is the shipped Windows build (its only data
+          # plane); lint it under -D warnings too.
+          cargo clippy -p datamancerd --features ws --all-targets -- -D warnings
+          # winsec's cfg(windows) Win32 FFI readers (token/owner SID + integrity)
+          # run nowhere else: the Linux job cannot compile them, and the pure
+          # classifier it does run covers only the branch logic, not the reads.
+          cargo test -p datamancer-winsec
+          # Owner-DACL pipe + client owner-SID check (Phase 3 control transport).
+          cargo test -p datamancerd win_control
+          cargo test -p datamancer-client --features app win_pipe
+          # Phase 5 / B3: the named-pipe ADMIN plane end-to-end — boot the daemon
+          # (control-plane-only, no `ws` needed) and drive ping / get-config /
+          # configure-provider / shutdown over the pipe. #[ignore]d (spawns the
+          # binary); complements the WS-plane boot smoke in the ws job.
+          cargo test -p datamancerd config_service_boots_disabled_and_shuts_down_cleanly -- --ignored
+          # Phase 4: BOOT the daemon WS-only on Windows (no iceoryx2 node) and
+          # drive its WS data + health planes end-to-end. This is the proof the
+          # daemon runs on Windows; #[ignore]d (spawns the binary, binds loopback).
+          cargo test -p datamancerd --features ws --test ws_e2e windows_ws_only_boot_smoke -- --ignored

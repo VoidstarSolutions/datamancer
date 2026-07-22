@@ -35,6 +35,9 @@ pub enum DaemonError {
     Library(#[from] datamancer::Error),
 
     /// An iceoryx2 transport-plane setup error (node/service/publisher).
+    /// Unix/macOS only — Windows has no iceoryx2 node to fail (WS-loopback data
+    /// plane), so nothing constructs this variant there.
+    #[cfg(not(windows))]
     #[error("transport: {0}")]
     Transport(String),
 

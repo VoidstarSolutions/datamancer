@@ -565,4 +565,17 @@ mod tests {
         assert!(back.ok);
         assert_eq!(back.health, Some(view));
     }
+
+    #[test]
+    fn integrity_code_is_stable() {
+        assert_eq!(crate::codes::INTEGRITY_REJECTED, "integrity_rejected");
+    }
+
+    #[test]
+    fn unsupported_on_windows_code_is_stable() {
+        assert_eq!(
+            crate::codes::UNSUPPORTED_ON_WINDOWS,
+            "unsupported_on_windows"
+        );
+    }
 }

@@ -6,7 +6,12 @@ Consumer-side surface for datamancerd: the shared control vocabulary
 
 ## Invariants / stance
 
-- **`#![forbid(unsafe_code)]`**, `[lints] workspace = true`.
+- **`#![forbid(unsafe_code)]` on every platform** (no EXT-1 exception): the
+  Windows named-pipe owner-SID + integrity checks before privileged sends
+  (review B1, #36) live in `win_pipe`, but all Win32 FFI is delegated to the
+  shared, audited `datamancer-winsec` crate — this crate itself no longer
+  depends on `windows-sys` and has no `unsafe` of its own. `[lints] workspace
+  = true`.
 - **Depends on `datamancer-core` + the transport crates only — never the
   `datamancer` orchestrator.** The orchestrator re-exports this crate
   (features `client-ws`/`client-iceoryx2`), not the reverse.
@@ -33,19 +38,33 @@ Consumer-side surface for datamancerd: the shared control vocabulary
 
 ## `app` feature (find-or-spawn facade)
 
-- **`app` implies `iceoryx2` and gains no WS lifecycle powers.** `AppHandle`
-  is same-host only, built on `Iceoryx2Client`; it is not a third transport.
+- **`app` implies `iceoryx2` + `ws`; `AppHandle` is same-host only, not a
+  third transport.** On **unix** it is one `Iceoryx2Client` carrying control
+  (UDS) + shm data. On **Windows** (Phase 4) it is a `#[cfg(windows)]`
+  **hybrid**: admin ops ride the owner-DACL named-pipe `PipeControlClient`
+  (same-user secure), the data plane rides a WS-loopback `WsClient` (iceoryx2
+  shm is not viable on Windows). `app` pulls in `ws` for that Windows data
+  plane; on unix the `ws` code compiles but the facade never touches it (every
+  WS reference is `#[cfg(windows)]`), so the iceoryx2 path and all unix
+  behavior are unchanged. The admin/data method error types are the cfg-split
+  aliases `AdminError`/`DataError` (both `Iceoryx2ClientError` on unix; the
+  pipe/WS errors on Windows) — unix public signatures are type-identical.
 - **The facade adds no protocol semantics.** Every `AppHandle` method maps to
   an existing control-surface op (`ping`, `open-client`/`connect`,
   `subscribe`, `unsubscribe`, `snapshot`, `close`, `set-credentials`/
   `get-credentials`/`clear-credentials`, `get-config`/`configure-provider`/
   `remove-provider`, `shutdown`, `health`) — it composes, it does not extend,
   the vocabulary this crate already owns. `watch_health()` is the one
-  exception to "one method, one op": it is a read-only subscription onto the
-  daemon's `datamancer/health` iceoryx2 push plane, not a control-surface op
-  at all — it never touches the control connection `self.client` holds, so it
-  takes `&self` and cannot fail synchronously (a setup failure just ends the
-  returned `HealthStream` immediately).
+  exception to "one method, one op": it is a read-only health-push
+  subscription, not a control-surface op — it never touches the **control**
+  connection, takes `&self`, and cannot fail synchronously (a setup failure
+  just ends the returned `HealthStream` immediately). Its carrier is
+  cfg-split: **unix** subscribes lazily to the daemon's `datamancer/health`
+  iceoryx2 push plane on each call; **Windows** rides the WS data socket —
+  the `watch-health` op is sent **eagerly at `ensure`** (so the method keeps
+  its `&self`, infallible signature), which makes the Windows arm single-shot
+  (the first call hands out the live stream; later calls return an ended one)
+  and, on eager-subscribe failure, degrades silently to an ended stream.
 - **Platform seams are internal traits, not a public abstraction.**
   `ControlEndpoint` and `DaemonSpawner` (`app::lifecycle`) isolate the
   find-or-spawn state machine from the unix-specific `TokioEndpoint` /
@@ -55,6 +74,9 @@ Consumer-side surface for datamancerd: the shared control vocabulary
 - **`EnsureError` variants and the `ping` reply shape are app-facing
   contract.** `NoSocketPath`, `SpawnFailed`, `ReadyTimeout` (with
   `ReadyDiagnosis`), `VersionSkew`, `Connect` are matched by consuming apps;
-  treat additions/removals as breaking. The `ping` reply
+  treat additions/removals as breaking. `Connect` wraps the data-plane connect
+  failure (iceoryx2 on unix; WS on Windows); Windows adds a `#[cfg(windows)]`
+  `AdminConnect` for the named-pipe admin-plane connect failure (the two planes
+  are independent connections). The `ping` reply
   (`{"ok":true,"version":"…"}`) is the daemon's control protocol, documented
   in `datamancerd/README.md` — this crate only consumes it.

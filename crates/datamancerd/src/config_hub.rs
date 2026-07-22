@@ -5,12 +5,6 @@
 //! the running daemon untouched and concurrent writers can never tear the
 //! file or leave the file and the live watches on different values.
 
-// Native Windows port (#29): the config-service ops here are reached only via
-// the Unix control socket, so they are transitionally dead on Windows until the
-// named-pipe transport revives them in Phase 3. Scoped allow — Unix/macOS stay
-// lint-strict; remove when Phase 3 lands.
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
