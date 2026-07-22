@@ -544,8 +544,15 @@ fn parse_rfc3339_nanos(s: &str) -> Option<Timestamp> {
         None => 0,
     };
     let days = days_from_civil(year, month, day)?;
-    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    Some(Timestamp(secs * 1_000_000_000 + nanos_frac))
+    // Checked arithmetic: an absurd but parseable year (a 10-digit year still
+    // fits i64) would otherwise overflow. `days * 86_400` and `secs * 1e9` are
+    // the two products that can exceed i64; the clock terms are bounded above.
+    // Overflow rejects (`None`) rather than wrapping to a bogus instant.
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?;
+    let nanos = secs.checked_mul(1_000_000_000)?.checked_add(nanos_frac)?;
+    Some(Timestamp(nanos))
 }
 
 /// Days since the Unix epoch for a civil (proleptic Gregorian) date. Returns
@@ -658,6 +665,23 @@ impl Config {
             return Err(DaemonError::ConfigInvalid(
                 "[diagnostics].publish_interval_ms must be greater than 0".to_string(),
             ));
+        }
+        // Two WS knobs are runtime-fatal at zero, the same class as the interval
+        // above: `channel_depth = 0` panics `mpsc::channel` (buffer must be > 0)
+        // on the first connection, and `max_connections = 0` builds a
+        // `Semaphore::new(0)` that silently rejects every client. Reject both up
+        // front rather than surfacing them per-connection.
+        if let Some(ws) = &self.ws {
+            if ws.channel_depth == 0 {
+                return Err(DaemonError::ConfigInvalid(
+                    "[ws].channel_depth must be greater than 0".to_string(),
+                ));
+            }
+            if ws.max_connections == 0 {
+                return Err(DaemonError::ConfigInvalid(
+                    "[ws].max_connections must be greater than 0".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1018,6 +1042,50 @@ account_type = "paper"
             .expect("parse")
             .validate()
             .expect("positive interval validates");
+    }
+
+    #[test]
+    fn zero_ws_channel_depth_is_rejected() {
+        // `channel_depth = 0` would panic `mpsc::channel` on the first WS
+        // connection; validation must reject it up front.
+        let config = Config::parse("[ws]\nchannel_depth = 0\n").expect("parse");
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("channel_depth"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid for zero channel_depth, got {other:?}"),
+        }
+        // A positive depth (and the default) validate fine.
+        Config::parse("[ws]\nchannel_depth = 1\n")
+            .expect("parse")
+            .validate()
+            .expect("positive channel_depth validates");
+    }
+
+    #[test]
+    fn zero_ws_max_connections_is_rejected() {
+        // `max_connections = 0` builds a `Semaphore::new(0)` that silently
+        // rejects every client; validation must reject it up front.
+        let config = Config::parse("[ws]\nmax_connections = 0\n").expect("parse");
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("max_connections"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid for zero max_connections, got {other:?}"),
+        }
+        Config::parse("[ws]\nmax_connections = 1\n")
+            .expect("parse")
+            .validate()
+            .expect("positive max_connections validates");
+    }
+
+    #[test]
+    fn rfc3339_absurd_year_does_not_overflow() {
+        // A parseable 10-digit year overflows i64 epoch nanoseconds; checked
+        // arithmetic must reject it (`None`) rather than wrap to a bogus instant.
+        assert!(parse_rfc3339_nanos("9999999999-01-01T00:00:00Z").is_none());
+        // A normal timestamp still parses.
+        assert!(parse_rfc3339_nanos("2026-07-22T00:00:00Z").is_some());
     }
 
     #[test]
