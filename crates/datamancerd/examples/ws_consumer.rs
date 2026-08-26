@@ -79,8 +79,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `type`. See `datamancer-transport-ws::wire::EventFrame`.
         if frame.get("id").is_some() {
             let ok = frame.get("ok").and_then(serde_json::Value::as_bool);
-            eprintln!("[ws_consumer] control reply: ok={ok:?}");
-            continue;
+            if ok == Some(true) {
+                eprintln!("[ws_consumer] subscribe accepted");
+                continue;
+            }
+            // A rejected subscribe (e.g. a disabled/unconfigured provider, or an
+            // unknown symbol/kind) never produces event frames — report it and
+            // exit rather than block forever waiting for data that never comes.
+            let code = frame
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            eprintln!("[ws_consumer] subscribe rejected (code={code}); exiting");
+            std::process::exit(1);
         }
 
         match frame.get("type").and_then(serde_json::Value::as_str) {
