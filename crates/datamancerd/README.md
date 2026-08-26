@@ -650,6 +650,53 @@ server-initiated pings. `tokio-tungstenite` auto-pongs inbound client pings,
 so a client that pings on its own schedule gets working keepalive today;
 server-initiated keepalive is not yet implemented.
 
+#### Live bring-up (WS)
+
+A minimal end-to-end run: the daemon serves real market data to an external
+client over the WS plane. This is the shipped Windows data path (the daemon
+boots WS-only there — no iceoryx2 node — so on Windows this *is* how you consume
+live data). The [`ws_consumer`](examples/ws_consumer.rs) example is the client
+counterpart to `datamancer`'s in-process `crypto_ticker`.
+
+1. Config (`live.toml`) — Alpaca crypto over WS:
+
+   ```toml
+   [provider.alpaca_crypto]
+   account_type = "paper"
+   venue = "us"
+
+   [server]
+   admin_socket = '\\.\pipe\datamancerd-live'   # a UDS path on unix
+   service_prefix = "datamancerd-live"
+
+   [ws]
+   enabled = true
+   bind = "127.0.0.1"
+   port = 9001
+   ```
+
+2. Credentials — provision via the broker (`set-credentials`, the supported
+   path). As a bootstrap shortcut the daemon also reads the **deprecated**
+   `ALPACA_PAPER_API_KEY_ID` / `ALPACA_PAPER_API_SECRET_KEY` env vars for a
+   configured provider when its store entry is empty (it logs a warning).
+
+3. Boot the daemon (built with `ws`), then run the consumer against it:
+
+   ```text
+   # terminal 1
+   cargo run -p datamancerd --features ws -- --config live.toml
+
+   # terminal 2 — subscribe to live BTC/USD trades
+   cargo run -p datamancerd --features ws --example ws_consumer -- \
+       --port 9001 --symbol BTC/USD --kind trade
+   ```
+
+   The consumer prints the subscribe ack, then live `trade`/`quote` frames
+   (prices/sizes unscaled from the `1e9` fixed-point) interleaved with the
+   in-band `subscription_changed` control. On Windows, run at Medium integrity
+   (not elevated) so the control-pipe gate is satisfied without
+   `allow_any_integrity`.
+
 Control frames are JSON, tag field `op`, kebab-case, each carrying a
 correlation `id` that the reply echoes (there is no `client` field — the
 connection identifies the client):
