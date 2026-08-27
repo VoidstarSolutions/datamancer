@@ -89,5 +89,12 @@ http-body-util = "0.1"
 # `ws_e2e` graceful-shutdown test sends SIGTERM to the spawned daemon.
 libc = "0.2"
 
+# Live WS consumer for the data plane (the client counterpart to `datamancer`'s
+# in-process `crypto_ticker`). Needs the `ws` feature for the subprotocol
+# constant + `tokio-tungstenite`.
+[[example]]
+name = "ws_consumer"
+required-features = ["ws"]
+
 [lints]
 workspace = true
