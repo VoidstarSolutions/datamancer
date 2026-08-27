@@ -51,8 +51,12 @@ changelog_include = [
 # whole `release-pr` run hard-fails ("Failed to find package"). A pattern that
 # no existing tag matches makes release-plz treat the crate as an initial
 # release instead. The tag itself is still never created (`git_tag_enable`
-# stays off), so the single-tag convention is unaffected. Safe to leave in
-# place after the first release; new crates need the same entry.
+# stays off), so the single-tag convention is unaffected.
+#
+# REMOVE this entry once the first `vX.Y.Z` tag whose tree contains the crate
+# exists (v0.9.0 for winsec). Because no `datamancer-winsec-v*` tag is ever
+# created, leaving it in place keeps the crate on the initial-release path on
+# every subsequent run. New crates need the same temporary entry.
 [[package]]
 name = "datamancer-winsec"
 git_tag_name = "{{ package }}-v{{ version }}"
