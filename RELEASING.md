@@ -51,7 +51,7 @@ release PR — override it there, not in a feature branch.
 
 [`next_version`]: https://docs.rs/next_version/latest/next_version/
 
-All seven crates share one version, so every release re-tags the whole
+All eight crates share one version, so every release re-tags the whole
 workspace together. This keeps `datamancer-client` and `datamancerd` in
 lockstep for the ping version gate.
 
