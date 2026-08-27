@@ -51,7 +51,7 @@ release PR — override it there, not in a feature branch.
 
 [`next_version`]: https://docs.rs/next_version/latest/next_version/
 
-All seven crates share one version, so every release re-tags the whole
+All eight crates share one version, so every release re-tags the whole
 workspace together. This keeps `datamancer-client` and `datamancerd` in
 lockstep for the ping version gate.
 
@@ -66,7 +66,7 @@ merging a release PR. (History: commits aligning this to `0.7.0`, then `0.8.0`.)
 
 One version and one tag get **one changelog**: the root `CHANGELOG.md`, owned
 by the `datamancer` package (`changelog_path` + `changelog_include` in
-`release-plz.toml`) exactly as it owns the tag and the Release. The other six
+`release-plz.toml`) exactly as it owns the tag and the Release. The other seven
 crates have `changelog_update = false` so there is a single writer — releases
 before `v0.9.0` were backfilled with git-cliff and carry no per-crate history.
 

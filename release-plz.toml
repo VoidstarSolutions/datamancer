@@ -23,7 +23,7 @@ git_release_enable = false         # default off; re-enabled only for the single
 # The changelog follows the same shape: one version and one tag deserve one
 # changelog, so this crate owns the root `CHANGELOG.md` (the path is relative
 # to the root Cargo.toml) and `changelog_include` folds in the commits of the
-# other six crates. Pointing all seven packages at the same file would be the
+# other seven crates. Pointing all eight packages at the same file would be the
 # other way to get one changelog, but multiple writers of one path is
 # undocumented in release-plz and risks interleaved or duplicated sections.
 [[package]]
@@ -37,6 +37,26 @@ changelog_include = [
   "datamancer-credentials",
   "datamancer-transport-iceoryx2",
   "datamancer-transport-ws",
+  "datamancer-winsec",
   "datamancer-client",
   "datamancerd",
 ]
+
+# Crates added after the latest `vX.Y.Z` tag need their own tag pattern until
+# their first release lands. Under `git_only`, release-plz's baseline for each
+# package is "the newest tag matching that package's `git_tag_name`", and the
+# workspace pattern above matches every `vX.Y.Z` tag — so a brand-new crate
+# looks already-released at the current version, release-plz checks that tag
+# out into a worktree to diff against, can't find the crate there, and the
+# whole `release-pr` run hard-fails ("Failed to find package"). A pattern that
+# no existing tag matches makes release-plz treat the crate as an initial
+# release instead. The tag itself is still never created (`git_tag_enable`
+# stays off), so the single-tag convention is unaffected.
+#
+# REMOVE this entry once the first `vX.Y.Z` tag whose tree contains the crate
+# exists (v0.9.0 for winsec). Because no `datamancer-winsec-v*` tag is ever
+# created, leaving it in place keeps the crate on the initial-release path on
+# every subsequent run. New crates need the same temporary entry.
+[[package]]
+name = "datamancer-winsec"
+git_tag_name = "{{ package }}-v{{ version }}"
