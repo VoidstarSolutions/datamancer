@@ -24,7 +24,15 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+/// The daemon takes a host-global single-instance lock, and its diagnostics
+/// plane (`datamancer/diagnostics`) is a single-publisher iceoryx2 service — so
+/// only one daemon may run at a time. Serialize the daemon-spawning tests, the
+/// same as `ws_e2e.rs` / `client_transport_e2e.rs` / `config_service_e2e.rs`
+/// (a `std::sync::Mutex` here, since these tests are sync rather than async).
+static DAEMON_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Spawn the daemon with a memory-backed config and wait for its control
 /// socket to appear. Returns the child and the socket path.
@@ -80,6 +88,10 @@ fn round_trip(socket: &std::path::Path, request: &str) -> serde_json::Value {
 #[test]
 #[ignore = "needs a live iceoryx2 runtime"]
 fn control_round_trip_list_and_snapshot() {
+    // Only one daemon may run at a time (single-instance lock + single-publisher
+    // diagnostics); hold the lock for the whole test. `into_inner` recovers a
+    // poisoned lock so a panicking sibling test can't cascade-fail this one.
+    let _guard = DAEMON_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut child, socket) = spawn_daemon(dir.path());
 
@@ -103,6 +115,8 @@ fn control_round_trip_list_and_snapshot() {
 #[test]
 #[ignore = "needs a live iceoryx2 runtime"]
 fn open_client_creates_a_service_then_closes() {
+    // Serialize against the other daemon-spawning test (see `DAEMON_LOCK`).
+    let _guard = DAEMON_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut child, socket) = spawn_daemon(dir.path());
 
