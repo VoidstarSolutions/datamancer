@@ -1493,6 +1493,107 @@ mod tests {
         assert!(!privileged_op_permitted(None, 501));
     }
 
+    /// The `privileged == false` denial **wiring** (not just the predicate).
+    /// `privileged_gate_requires_exact_uid_match` above proves the decision
+    /// function; this proves `serve_connection` actually *honours* it — a gated
+    /// op from an unprivileged peer is rejected with `PERMISSION_DENIED` and,
+    /// crucially, is never forwarded to the actor. A regression that dispatched
+    /// before checking the gate would pass the predicate test but fail here.
+    /// Cross-platform: the gate is transport-agnostic, so this runs on the Linux
+    /// core job as well as the Windows native job (every daemon e2e connects as
+    /// the daemon's own uid, so this is the only coverage of the deny arm).
+    #[tokio::test]
+    async fn serve_connection_denies_gated_ops_when_unprivileged() {
+        // Minimal deps: on the denial path `serve_connection` returns before
+        // `dm` / `hub` / `config_hub` / `cmd_tx` are ever touched — but the
+        // signature still requires them. A provider-less datamancer is cheap and
+        // never connects to anything.
+        let dm = Datamancer::builder()
+            .build()
+            .expect("build provider-less datamancer");
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(4);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = datamancer_credentials::CredentialStore::with_backend(Box::new(
+            datamancer_credentials::FileBackend::new(dir.path().join("creds.json")),
+        ));
+        let (hub, _sources) = CredentialHub::with_store(store, &["alpaca"]);
+        let (config_hub, _settings) = crate::config_hub::ConfigHub::bootstrap(
+            Config::parse("").expect("empty config parses to defaults"),
+            dir.path().join("config.toml"),
+        );
+
+        // In-memory duplex: the `server` half feeds `serve_connection`; we drive
+        // the `client` half. Bounded reads are unnecessary — `serve_connection`
+        // replies synchronously per line and we close the stream to end it.
+        let (client, server) = tokio::io::duplex(8192);
+        let (s_read, s_write) = tokio::io::split(server);
+        let task = tokio::spawn(serve_connection(
+            s_read,
+            s_write,
+            false, // unprivileged peer
+            cmd_tx,
+            dm,
+            Arc::new(hub),
+            config_hub,
+        ));
+
+        let (c_read, mut c_write) = tokio::io::split(client);
+        let mut replies = BufReader::new(c_read).lines();
+
+        // One op per gate arm: clear-credentials (credential arm) and shutdown
+        // (config/shutdown arm). Serialized via the `Request` enum so the wire
+        // form can never drift out of sync with the dispatcher's `matches!`.
+        let gated = [
+            (
+                "clear-credentials",
+                Request::ClearCredentials {
+                    provider: "alpaca".to_string(),
+                },
+            ),
+            ("shutdown", Request::Shutdown),
+        ];
+        for (_, req) in &gated {
+            let mut line = serde_json::to_string(req).expect("serialize request");
+            line.push('\n');
+            c_write
+                .write_all(line.as_bytes())
+                .await
+                .expect("write request");
+        }
+
+        for (label, _) in &gated {
+            let line = replies
+                .next_line()
+                .await
+                .expect("read reply")
+                .expect("reply line present");
+            let v: serde_json::Value = serde_json::from_str(&line).expect("parse reply");
+            assert_eq!(
+                v["ok"],
+                serde_json::Value::Bool(false),
+                "{label} must be denied for an unprivileged peer: {line}"
+            );
+            assert_eq!(
+                v["code"],
+                serde_json::json!(codes::PERMISSION_DENIED),
+                "{label} must be denied with PERMISSION_DENIED: {line}"
+            );
+        }
+
+        // Close the client so `serve_connection` reads EOF and returns.
+        drop(c_write);
+        drop(replies);
+        task.await.expect("serve_connection task joins");
+
+        // The wiring proof: neither gated op was forwarded to the actor. (Empty
+        // if the gate held; Disconnected once the task dropped `cmd_tx` — either
+        // way, nothing was ever sent.)
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "an unprivileged gated op must never reach the actor command channel"
+        );
+    }
+
     #[test]
     fn reject_unknown_keys_accepts_omitted_settings_on_configure_provider() {
         let line = r#"{"op":"configure-provider","provider":"alpaca"}"#;
