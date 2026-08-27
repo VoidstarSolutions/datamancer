@@ -41,22 +41,3 @@ changelog_include = [
   "datamancer-client",
   "datamancerd",
 ]
-
-# Crates added after the latest `vX.Y.Z` tag need their own tag pattern until
-# their first release lands. Under `git_only`, release-plz's baseline for each
-# package is "the newest tag matching that package's `git_tag_name`", and the
-# workspace pattern above matches every `vX.Y.Z` tag — so a brand-new crate
-# looks already-released at the current version, release-plz checks that tag
-# out into a worktree to diff against, can't find the crate there, and the
-# whole `release-pr` run hard-fails ("Failed to find package"). A pattern that
-# no existing tag matches makes release-plz treat the crate as an initial
-# release instead. The tag itself is still never created (`git_tag_enable`
-# stays off), so the single-tag convention is unaffected.
-#
-# REMOVE this entry once the first `vX.Y.Z` tag whose tree contains the crate
-# exists (v0.9.0 for winsec). Because no `datamancer-winsec-v*` tag is ever
-# created, leaving it in place keeps the crate on the initial-release path on
-# every subsequent run. New crates need the same temporary entry.
-[[package]]
-name = "datamancer-winsec"
-git_tag_name = "{{ package }}-v{{ version }}"
