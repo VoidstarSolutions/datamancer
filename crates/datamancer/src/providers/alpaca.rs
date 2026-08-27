@@ -14,7 +14,6 @@
 //! `ProviderConnected` control pair is emitted in-band so consumers see the
 //! gap window in the event stream.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -346,7 +345,6 @@ impl Provider for AlpacaProvider {
         Ok(Box::new(AlpacaLiveHandle {
             cmd_tx,
             task: Mutex::new(Some(task)),
-            active: Mutex::new(BTreeSet::new()),
         }))
     }
 
@@ -453,11 +451,6 @@ enum LiveCommand {
 struct AlpacaLiveHandle {
     cmd_tx: mpsc::Sender<LiveCommand>,
     task: Mutex<Option<JoinHandle<()>>>,
-    /// Mirror of subscriptions sent through this handle, retained so that
-    /// subscribe-after-reconnect logic in the streaming task can ask us for
-    /// the list to re-apply.
-    #[allow(dead_code)]
-    active: Mutex<BTreeSet<(Instrument, EventKind)>>,
 }
 
 #[async_trait]
@@ -465,27 +458,19 @@ impl LiveHandle for AlpacaLiveHandle {
     async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(LiveCommand::Subscribe(instrument.clone(), kind, tx))
+            .send(LiveCommand::Subscribe(instrument, kind, tx))
             .await
             .map_err(|_| Error::SessionClosed)?;
-        let res = rx.await.map_err(|_| Error::SessionClosed)?;
-        if res.is_ok() {
-            self.active.lock().await.insert((instrument, kind));
-        }
-        res
+        rx.await.map_err(|_| Error::SessionClosed)?
     }
 
     async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(LiveCommand::Unsubscribe(instrument.clone(), kind, tx))
+            .send(LiveCommand::Unsubscribe(instrument, kind, tx))
             .await
             .map_err(|_| Error::SessionClosed)?;
-        let res = rx.await.map_err(|_| Error::SessionClosed)?;
-        if res.is_ok() {
-            self.active.lock().await.remove(&(instrument, kind));
-        }
-        res
+        rx.await.map_err(|_| Error::SessionClosed)?
     }
 
     async fn close(self: Box<Self>) -> Result<()> {
