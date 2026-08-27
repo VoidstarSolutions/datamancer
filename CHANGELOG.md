@@ -6,6 +6,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.8.0...v0.9.0) - 2026-08-27
+
+### Added
+
+- *(winsec)* Windows token/handle identity & integrity readers
+- *(winsec)* new crate with pure integrity-level classifier
+- *(windows)* boot datamancerd WS-only (skip the iceoryx2 node)
+- *(windows)* hybrid AppHandle — WS-loopback data + health plane
+- *(windows)* [**breaking**] health-push over WS (watch-health)
+- *(windows)* standalone PipeControlClient for the hybrid admin plane
+- *(windows)* add integrity_rejected control code
+- *(windows)* named-pipe control transport with owner-DACL same-user auth
+- *(windows)* daemon rejects non-Medium control clients in-band
+- *(windows)* daemon refuses to start at non-Medium integrity
+- *(windows)* [server].allow_any_integrity override flag
+
+### Fixed
+
+- *(winsec)* capture the Win32 error before CloseHandle in token/integrity reads
+- *(winsec)* satisfy pinned clippy on Windows — # Errors docs + ptr-deref allow
+- *(winsec)* guard 0-count integrity SID; gate winsec dep on iceoryx2
+- *(windows)* align winsec dep requirement to workspace 0.8.0
+- *(windows)* align winsec dependency version to workspace 0.7.0 after rebase
+- *(windows)* address PR #37 review — owner SID stamp, resilient accept loop
+- *(datamancerd)* reject zero ws channel_depth/max_connections; checked timestamp math
+- *(windows)* boot the CI smoke daemon at any integrity
+- *(windows)* assert same-process client integrity equals own, not Medium
+- *(windows)* read allow_any_integrity before build_runtime consumes config
+- *(windows)* clear error for a non-pipe control-socket name (review #1)
+- *(windows)* daemon integrity message covers the lowered case too
+
+### Other
+
+- *(windows)* document Medium-integrity enforcement; winsec crate; bump 0.6.0
+- *(windows)* review-readiness — reject zero diag interval; doc hygiene
+- *(windows)* robustify integrity assertions + add winsec/win_pipe CI coverage
+- *(windows)* client win_pipe on datamancer-winsec; restore forbid(unsafe_code)
+- *(windows)* record the Phase 3 EXT-1 unsafe exception in baseline docs
+- Merge branch 'main' into docs/ws-consumer-example
+- *(datamancerd)* cover the unprivileged control-gate deny arm; run the pipe round-trip test in CI
+- *(windows)* config-service admin-plane e2e over the named pipe (Phase 5/B3)
+- *(windows)* daemon win_control sources identity from datamancer-winsec
+
 ## [0.8.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.7.0...v0.8.0) - 2026-07-19
 
 ### Added
