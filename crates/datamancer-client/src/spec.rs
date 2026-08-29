@@ -2,7 +2,7 @@
 //! `Cfg` selectors and the `(instrument, kind)` + scope/persistence spec that
 //! `subscribe`/`unsubscribe` carry.
 
-use datamancer_core::{AssetClass, BarInterval, EventKind, Instrument};
+use datamancer_core::{AssetClass, BarInterval, EventKind, Instrument, Timestamp};
 use serde::{Deserialize, Serialize};
 
 /// The core value has no wire selector: the daemon's control vocabulary is a
