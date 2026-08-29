@@ -35,6 +35,10 @@ jobs:
     name: semi-linear history
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # The repo default for GITHUB_TOKEN is `write`; this job only reads the
+    # commit graph, so drop it to the minimum.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
