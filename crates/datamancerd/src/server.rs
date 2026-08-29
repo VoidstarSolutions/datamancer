@@ -34,6 +34,10 @@ use datamancer::{
 // `unused_imports` on Windows.
 #[cfg(not(windows))]
 use datamancer::Timestamp;
+// `ControlKind` only names the query pump's terminal-event check, which is
+// unix/macOS only (the iceoryx2 data plane has no Windows node).
+#[cfg(not(windows))]
+use datamancer::ControlKind;
 // `QuerySpec` names both `open_query` arms (unix and the Windows stub both take
 // one), so it's imported unconditionally. `QueryId` is a plain `u64` alias
 // (not itself cfg-gated) and now also names the platform-agnostic EOF
@@ -1316,6 +1320,17 @@ fn close_query_session(session: datamancer::Session) {
 /// Reaping happens immediately after the stream drains and flushes — see
 /// `open_query`'s "Attach race" for the known window this leaves for a very
 /// fast query to finish before the client attaches.
+///
+/// # Why this stops at `SessionClosing` rather than reading to `None`
+///
+/// A historical session's controller does **not** close the event channel when
+/// its fetch completes: it emits the terminal `SessionClosing` and then parks
+/// on `tx.closed()`, waiting for the *consumer* to drop the stream before it
+/// shuts down (`Controller::finish_historical`). Reading to `None` therefore
+/// deadlocks — the pump would wait for a close that only the pump's own drop
+/// can trigger — and the entry would never be reaped, permanently consuming a
+/// `max_queries` slot. So the pump publishes the terminal control, breaks, and
+/// drops the stream, which lets the controller finish.
 #[cfg(not(windows))]
 fn spawn_query_pump(
     mut stream: datamancer::EventStream,
@@ -1325,6 +1340,10 @@ fn spawn_query_pump(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(ev) = stream.next().await {
+            let terminal = matches!(
+                &ev,
+                datamancer::MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing
+            );
             match sink.publish(ev).await {
                 PublishOutcome::Delivered => {}
                 PublishOutcome::Rejected(_) => {
@@ -1332,7 +1351,13 @@ fn spawn_query_pump(
                     break;
                 }
             }
+            if terminal {
+                break;
+            }
         }
+        // Drop the stream before reporting: the controller is parked on
+        // `tx.closed()` and only this drop releases it.
+        drop(stream);
         if let Err(e) = sink.flush().await {
             tracing::warn!(query, error = %e, "final query sink flush failed");
         }
