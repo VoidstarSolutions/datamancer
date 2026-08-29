@@ -362,6 +362,31 @@ pub struct Iceoryx2Client {
     /// Bound on locally buffered, not-yet-consumed events for a subscriber
     /// spawned after `connect` (i.e. a query's channel).
     event_buffer: usize,
+    /// Set by [`Client::close`] so [`Drop`] does not fire a second
+    /// `close-client` (which would only answer `unknown_client`).
+    closed: bool,
+}
+
+/// Dropping a client tears its daemon-side session down.
+///
+/// The control connection lives in a task behind a cloneable handle, and a
+/// [`QueryStream`] holds one of those clones without borrowing the client — so
+/// `let (id, s) = client.query(&spec).await?; drop(client);` leaves the socket
+/// open for as long as the query stream is held, and EOF alone would no longer
+/// tell the daemon to tear the client down. This makes the teardown explicit
+/// rather than a side effect of the socket closing: fire-and-forget
+/// `close-client` on the unbounded channel (synchronous, so it is callable
+/// from `Drop`), plus the stop flag for the local poll task.
+impl Drop for Iceoryx2Client {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        self.control.fire(Request::CloseClient {
+            client: self.client_name.clone(),
+        });
+    }
 }
 
 impl Client for Iceoryx2Client {
@@ -408,6 +433,7 @@ impl Client for Iceoryx2Client {
                 stop,
                 poll_interval: cfg.poll_interval,
                 event_buffer: cfg.event_buffer,
+                closed: false,
             },
             events,
         ))
@@ -503,12 +529,16 @@ impl Client for Iceoryx2Client {
     /// and pre-existing; stream-readers on the iceoryx2 transport should not
     /// rely on always observing the `SessionClosing` marker (unlike the WS
     /// transport, which is single-writer and does not have this race).
-    async fn close(self) -> Result<(), ClientError<Self::Error>> {
+    async fn close(mut self) -> Result<(), ClientError<Self::Error>> {
         // `close` consumes the client, so this is the caller's last chance to
         // signal the poll task. Set the stop flag unconditionally *before* the
         // round-trip: a transport failure below must not leave the
         // spawn_blocking loop (and its Node/DataSubscriber) running forever.
         self.stop.store(true, Ordering::Relaxed);
+        // The explicit close owns the teardown from here; `Drop` (which runs
+        // when this call returns, on both the ok and error paths) must not
+        // repeat the `close-client`.
+        self.closed = true;
         let reply = self
             .control
             .request(&Request::CloseClient {
@@ -734,6 +764,7 @@ mod tests {
             stop: Arc::clone(&stop),
             poll_interval: std::time::Duration::from_millis(10),
             event_buffer: 16,
+            closed: false,
         };
         match client.close().await {
             Err(ClientError::Transport(_)) => {}
@@ -878,6 +909,80 @@ mod tests {
         assert!(
             seen.lock().unwrap().is_empty(),
             "observing SessionClosing must suppress the drop-cancel"
+        );
+    }
+
+    #[cfg(unix)]
+    fn client_for_tests(control: ControlHandle, stop: Arc<AtomicBool>) -> super::Iceoryx2Client {
+        super::Iceoryx2Client {
+            control,
+            client_name: "dropped".to_string(),
+            stop,
+            poll_interval: std::time::Duration::from_millis(10),
+            event_buffer: 16,
+            closed: false,
+        }
+    }
+
+    /// The control connection lives in a task now, so dropping the client no
+    /// longer closes the socket while a `QueryStream` holds a handle clone —
+    /// the teardown has to be sent explicitly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_client_without_close_tears_the_session_down() {
+        use std::sync::atomic::Ordering;
+
+        let (path, seen) = fake_uds_recording(vec![]);
+        let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        // A live query stream keeps a clone of the control handle alive past
+        // the client's drop — the case that made the implicit EOF teardown
+        // stop working.
+        let (_query, _tx) = query_stream_for_tests(control.clone(), true);
+
+        drop(client_for_tests(control, Arc::clone(&stop)));
+
+        for _ in 0..50 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let lines = seen.lock().unwrap().clone();
+        let sent: Request = serde_json::from_str(lines.first().expect("a close was sent"))
+            .expect("parse recorded request");
+        assert_eq!(
+            sent,
+            Request::CloseClient {
+                client: "dropped".to_string()
+            }
+        );
+        assert!(
+            stop.load(Ordering::Relaxed),
+            "the drop must also stop the local poll task"
+        );
+    }
+
+    /// `close()` owns the teardown; the `Drop` that runs when it returns must
+    /// not send a second `close-client`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_does_not_also_fire_a_drop_close() {
+        use crate::client::Client as _;
+
+        let (path, seen) = fake_uds_recording(vec![Reply::ok()]);
+        let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let client = client_for_tests(control, stop);
+
+        client.close().await.expect("close");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let lines = seen.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one close-client: {lines:?}"
         );
     }
 }
