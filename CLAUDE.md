@@ -43,6 +43,30 @@ cargo deny check                              # licenses, advisories, sources
 .github/scripts/semver-checks.sh origin/main  # semver vs the PR base (needs cargo-semver-checks)
 ```
 
+## Branch shape — rebase onto main, never merge main in
+
+`main` is **semi-linear**: every PR lands as a merge commit whose branch sits
+*on top of* main, with no merges of its own. Two rules follow, and CI enforces
+both (`.github/scripts/semilinear-check.sh`, required check `semi-linear
+history`):
+
+```bash
+git fetch origin && git rebase origin/main && git push --force-with-lease
+```
+
+- **Rebase, never back-merge.** `git merge main` into your branch leaves a
+  bubble inside the merge and fails the gate. Rebase instead.
+- **Be current at queue time.** GitHub's merge queue uses the `MERGE` method,
+  which preserves merge commits but does **not** rebase for you — and "require
+  branches to be up to date" is not enforced for PRs entering a queue. If main
+  moves while you are queued, the entry is ejected; rebase and re-queue. Queue
+  entries merge one at a time, so this is a rebase per landed PR.
+
+The gate runs twice: as a pre-flight on the PR (advisory — main can still move
+after it goes green) and on the `merge_group` ref, where it inspects the exact
+merge commit the queue is about to fast-forward onto main. The second one is
+authoritative.
+
 ## Versioning — release-plz owns it, never bump by hand
 
 All eight crates share `[workspace.package] version` in the root `Cargo.toml`, which keeps `datamancer-client`/`datamancerd` in lockstep for the ping version gate. **release-plz owns that field**: it bumps it in the `chore: release` PR, and merging that PR is what tags `vX.Y.Z`. Do not edit the version in a feature PR — the `release` job tags whatever version lands on `main`, so a hand-bump self-releases on merge and leaves the standing release PR computing against a surprise tag. Full flow and the pre-1.0 bump table (while major is `0`, release-plz demotes every bump: `feat:` → patch, `feat!:` → minor) live in `RELEASING.md`.
