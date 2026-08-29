@@ -24,7 +24,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::protocol::ws::{WsHealthPush, WsReply, WsRequest};
-use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 /// Connection parameters for [`WsClient`].
 #[derive(Debug, Clone)]
@@ -354,6 +354,30 @@ impl Client for WsClient {
     async fn close(mut self) -> Result<(), ClientError<Self::Error>> {
         let req = WsRequest::CloseClient { id: self.next_id() };
         self.request(&req).await.map(|_| ())
+    }
+
+    /// WS carries events on the same socket as control replies and its
+    /// `EventFrame` has no query id, so queries need a disjoint envelope frame
+    /// that does not exist yet. Until then, queries are iceoryx2-only.
+    type Query = futures::stream::Empty<MarketEvent>;
+
+    async fn query(
+        &mut self,
+        _spec: &QuerySpec,
+    ) -> Result<(QueryId, Self::Query), ClientError<Self::Error>> {
+        Err(ClientError::Control {
+            code: crate::codes::UNSUPPORTED_TRANSPORT.to_string(),
+            message: "historical queries are not available over the WebSocket transport"
+                .to_string(),
+        })
+    }
+
+    async fn cancel_query(&mut self, _query: QueryId) -> Result<(), ClientError<Self::Error>> {
+        Err(ClientError::Control {
+            code: crate::codes::UNSUPPORTED_TRANSPORT.to_string(),
+            message: "historical queries are not available over the WebSocket transport"
+                .to_string(),
+        })
     }
 }
 

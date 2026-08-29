@@ -31,7 +31,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::protocol::uds::{Reply, Request};
-use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 /// Connection parameters for [`Iceoryx2Client`].
 #[derive(Debug, Clone)]
@@ -229,6 +229,78 @@ impl ControlHandle {
     }
 }
 
+/// Attach to the data service for `service_id` and stream its events.
+///
+/// The attach happens on the blocking task (the `Node` must live on the thread
+/// that polls it) and its result is signalled back over a oneshot, so an attach
+/// failure surfaces as a `ClientError::Transport` instead of a silently-ended
+/// stream. Used for both the client's live stream and each query's stream — a
+/// query channel is byte-identical to a client channel, only short-lived.
+///
+/// The poll loop's `Err(_) => return` arm ends the stream on any service
+/// failure, which carries two different meanings depending on the caller: for
+/// a client's live stream it means the daemon dropped the client's services
+/// (a lost connection); for a query it is the **normal** end, reached when the
+/// daemon reaps the finished query's service once it has delivered every
+/// event.
+async fn spawn_subscriber(
+    service_id: u64,
+    poll_interval: Duration,
+    event_buffer: usize,
+    stop: Arc<AtomicBool>,
+) -> Result<ReceiverStream<MarketEvent>, Iceoryx2ClientError> {
+    let (ev_tx, ev_rx) = mpsc::channel(event_buffer.max(1));
+    let (attach_tx, attach_rx) = tokio::sync::oneshot::channel::<Result<(), Iceoryx2ClientError>>();
+    tokio::task::spawn_blocking(move || {
+        let node = match NodeBuilder::new().create::<ipc_threadsafe::Service>() {
+            Ok(node) => node,
+            Err(e) => {
+                let _ = attach_tx.send(Err(Iceoryx2ClientError::Node(e.to_string())));
+                return;
+            }
+        };
+        let mut subscriber = match DataSubscriber::open(&node, service_id) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = attach_tx.send(Err(Iceoryx2ClientError::from(e)));
+                return;
+            }
+        };
+        // Attach succeeded: tell the caller it can return `Ok`, then fall
+        // through into the poll loop on this same thread/Node.
+        if attach_tx.send(Ok(())).is_err() {
+            // The caller gave up waiting (e.g. it was cancelled) — nothing
+            // else can observe this stream, so there is no point in
+            // polling. `subscriber`/`node` drop here, releasing the attach.
+            return;
+        }
+        while !stop.load(Ordering::Relaxed) {
+            match subscriber.poll() {
+                Ok(events) if events.is_empty() => std::thread::sleep(poll_interval),
+                Ok(events) => {
+                    for ev in events {
+                        if ev_tx.blocking_send(ev).is_err() {
+                            return; // consumer dropped the stream
+                        }
+                    }
+                }
+                // Service gone: for a client's live stream the daemon dropped
+                // the client's services; for a query this is the normal end,
+                // reached when the daemon reaps the finished query's service.
+                Err(_) => return,
+            }
+        }
+    });
+
+    match attach_rx.await {
+        Ok(Ok(())) => Ok(ReceiverStream::new(ev_rx)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(Iceoryx2ClientError::Node(
+            "shm-attach task ended without reporting a result".to_string(),
+        )),
+    }
+}
+
 /// A connected same-host client. See [`Client`] for the transport-agnostic
 /// contract; iceoryx2-specific behavior: loss surfaces **in-band** as
 /// `Control::Gap` (the daemon's resume buffer numbers evictions), and the
@@ -237,6 +309,12 @@ pub struct Iceoryx2Client {
     control: ControlHandle,
     client_name: String,
     stop: Arc<AtomicBool>,
+    /// Sleep between empty shm polls; carried past `connect` so a later
+    /// [`Client::query`] can spawn its own subscriber with the same cadence.
+    poll_interval: Duration,
+    /// Bound on locally buffered, not-yet-consumed events for a subscriber
+    /// spawned after `connect` (i.e. a query's channel).
+    event_buffer: usize,
 }
 
 impl Client for Iceoryx2Client {
@@ -263,78 +341,28 @@ impl Client for Iceoryx2Client {
         })?;
         let client_id = parse_client_id(&service).map_err(ClientError::Transport)?;
 
-        let (ev_tx, ev_rx) = mpsc::channel(cfg.event_buffer.max(1));
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = Arc::clone(&stop);
-        let poll_interval = cfg.poll_interval;
         // Shm attach (node create + subscriber open) must surface as a
         // `connect` failure, not an eprintln plus a silently-ended stream —
         // the spec's error contract treats it as a `ClientError::Transport`.
-        // The attach itself has to happen on the blocking task (the `Node`
-        // has to live on the same thread that then polls it), so the result
-        // is signaled back over this oneshot; `connect` awaits it before
-        // returning, and the blocking task falls through into the poll loop
-        // on success without needing a second handoff.
-        let (attach_tx, attach_rx) =
-            tokio::sync::oneshot::channel::<Result<(), Iceoryx2ClientError>>();
-        tokio::task::spawn_blocking(move || {
-            let node = match NodeBuilder::new().create::<ipc_threadsafe::Service>() {
-                Ok(node) => node,
-                Err(e) => {
-                    let _ = attach_tx.send(Err(Iceoryx2ClientError::Node(e.to_string())));
-                    return;
-                }
-            };
-            let mut subscriber = match DataSubscriber::open(&node, client_id) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = attach_tx.send(Err(Iceoryx2ClientError::from(e)));
-                    return;
-                }
-            };
-            // Attach succeeded: tell `connect` it can return `Ok`, then fall
-            // through into the poll loop on this same thread/Node.
-            if attach_tx.send(Ok(())).is_err() {
-                // `connect` gave up waiting (e.g. it was cancelled) — nothing
-                // else can observe this stream, so there is no point in
-                // polling. `subscriber`/`node` drop here, releasing the
-                // attach.
-                return;
-            }
-            while !stop_flag.load(Ordering::Relaxed) {
-                match subscriber.poll() {
-                    Ok(events) if events.is_empty() => std::thread::sleep(poll_interval),
-                    Ok(events) => {
-                        for ev in events {
-                            if ev_tx.blocking_send(ev).is_err() {
-                                return; // consumer dropped the stream
-                            }
-                        }
-                    }
-                    Err(_) => return, // service gone: daemon dropped the client
-                }
-            }
-        });
-
-        match attach_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(ClientError::Transport(e)),
-            Err(_) => {
-                // The blocking task ended (e.g. panicked) without reporting
-                // either outcome.
-                return Err(ClientError::Transport(Iceoryx2ClientError::Node(
-                    "shm-attach task ended without reporting a result".to_string(),
-                )));
-            }
-        }
+        let events = spawn_subscriber(
+            client_id,
+            cfg.poll_interval,
+            cfg.event_buffer,
+            Arc::clone(&stop),
+        )
+        .await
+        .map_err(ClientError::Transport)?;
 
         Ok((
             Iceoryx2Client {
                 control: ControlHandle::spawn(control),
                 client_name: cfg.client_name,
                 stop,
+                poll_interval: cfg.poll_interval,
+                event_buffer: cfg.event_buffer,
             },
-            ReceiverStream::new(ev_rx),
+            events,
         ))
     }
 
@@ -439,6 +467,39 @@ impl Client for Iceoryx2Client {
             .request(&Request::CloseClient {
                 client: self.client_name.clone(),
             })
+            .await
+            .map_err(ClientError::Transport)?;
+        check(reply).map(|_| ())
+    }
+
+    type Query = ReceiverStream<MarketEvent>;
+
+    async fn query(
+        &mut self,
+        spec: &QuerySpec,
+    ) -> Result<(QueryId, Self::Query), ClientError<Self::Error>> {
+        let reply = self
+            .control
+            .request(&Request::OpenQuery { spec: spec.clone() })
+            .await
+            .map_err(ClientError::Transport)?;
+        let reply = check(reply)?;
+        let id = reply.query.ok_or_else(|| {
+            ClientError::Transport(Iceoryx2ClientError::Protocol(
+                "open-query reply missing query id".to_string(),
+            ))
+        })?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let events = spawn_subscriber(id, self.poll_interval, self.event_buffer, Arc::clone(&stop))
+            .await
+            .map_err(ClientError::Transport)?;
+        Ok((id, events))
+    }
+
+    async fn cancel_query(&mut self, query: QueryId) -> Result<(), ClientError<Self::Error>> {
+        let reply = self
+            .control
+            .request(&Request::CancelQuery { query })
             .await
             .map_err(ClientError::Transport)?;
         check(reply).map(|_| ())
@@ -583,6 +644,8 @@ mod tests {
             control: ControlHandle::spawn(control),
             client_name: "doomed".to_string(),
             stop: Arc::clone(&stop),
+            poll_interval: std::time::Duration::from_millis(10),
+            event_buffer: 16,
         };
         match client.close().await {
             Err(ClientError::Transport(_)) => {}
