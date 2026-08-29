@@ -443,8 +443,9 @@ query ops at all, so there is nothing to send. `WsClient::query` /
 `cancel_query` fail locally with `unsupported_transport` without any wire
 traffic — the daemon never sees the request and never emits that code. On
 **Windows**, where the daemon has no iceoryx2 node, the local control surface
-does answer `open-query`/`cancel-query`/`list-queries`, replying
-`unsupported_on_windows`.
+does answer `open-query`/`cancel-query`, replying `unsupported_on_windows`;
+`list-queries` instead answers with an empty list, since there can never be
+an in-flight query to report.
 
 `instruments` enumerates the discoverable catalog and, per entry, the
 `EventKind`s that instrument supports; `provider` is optional and restricts

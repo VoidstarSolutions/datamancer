@@ -1012,13 +1012,11 @@ impl Server {
     ///
     /// The pump starts before this reply is written, so a query that finishes
     /// almost immediately (empty range, fully cached) can reach the end of its
-    /// stream before the client has attached to the named service. To keep
-    /// that from surfacing as an indistinguishable transport error, the pump
-    /// holds the entry — and therefore the service — for
-    /// [`QUERY_REAP_GRACE`] after it drains, giving the client time to open its
-    /// subscriber and observe the (possibly empty) stream and its terminal
-    /// control. A client that is slower than the grace window still sees
-    /// `ClientError::Transport`; the window is a mitigation, not a handshake.
+    /// stream — and have the pump reap the entry and its service — before the
+    /// client has attached to the named service. That surfaces to the client
+    /// as an indistinguishable `ClientError::Transport`, not as an empty
+    /// result. This race is documented and accepted, not mitigated: see
+    /// `Iceoryx2Client::query`'s "Attach race" for the client-side contract.
     #[cfg(not(windows))]
     async fn open_query(&mut self, spec: QuerySpec, cmd_tx: &mpsc::Sender<ServerCommand>) -> Reply {
         // Validate and open the session BEFORE allocating the sink, so every
@@ -1310,21 +1308,14 @@ fn close_query_session(session: datamancer::Session) {
     });
 }
 
-/// How long a drained query pump holds its entry (and so its data service)
-/// before asking the actor to reap it. See `open_query`'s "Attach race": a
-/// query that completes before the client attaches would otherwise take its
-/// service away underneath the pending `DataSubscriber::open`.
-#[cfg(not(windows))]
-const QUERY_REAP_GRACE: Duration = Duration::from_secs(3);
-
 /// Pump a query's bounded stream into its own sink, then tell the actor to reap
 /// the entry. Unlike the client pump, this one **must** report its exit: a
 /// completed query has to release its data service without the consumer having
 /// to call `cancel-query`.
 ///
-/// Reaping waits [`QUERY_REAP_GRACE`] after the stream drains so a fast query
-/// does not drop its service before the client attaches. `cancel-query` and
-/// shutdown both abort this task, so the grace never delays teardown.
+/// Reaping happens immediately after the stream drains and flushes — see
+/// `open_query`'s "Attach race" for the known window this leaves for a very
+/// fast query to finish before the client attaches.
 #[cfg(not(windows))]
 fn spawn_query_pump(
     mut stream: datamancer::EventStream,
@@ -1345,7 +1336,6 @@ fn spawn_query_pump(
         if let Err(e) = sink.flush().await {
             tracing::warn!(query, error = %e, "final query sink flush failed");
         }
-        tokio::time::sleep(QUERY_REAP_GRACE).await;
         let _ = cmd_tx.send(ServerCommand::QueryFinished { query }).await;
     })
 }
