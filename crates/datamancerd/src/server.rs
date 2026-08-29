@@ -1632,6 +1632,62 @@ async fn handle_connection(
     serve_connection(read, write, privileged, cmd_tx, dm, hub, config_hub).await;
 }
 
+/// The EOF-teardown state one request/reply pair may arm or disarm, captured
+/// from the request before it is forwarded to the actor (which consumes it).
+struct TeardownArm {
+    open_client: Option<String>,
+    is_open_query: bool,
+    cancelled_query: Option<QueryId>,
+}
+
+impl TeardownArm {
+    fn of(request: &Request) -> Self {
+        Self {
+            open_client: match request {
+                Request::OpenClient { client, .. } => Some(client.clone()),
+                _ => None,
+            },
+            is_open_query: matches!(request, Request::OpenQuery { .. }),
+            cancelled_query: match request {
+                Request::CancelQuery { query } => Some(*query),
+                _ => None,
+            },
+        }
+    }
+
+    /// Fold this pair's outcome into the connection's teardown state.
+    fn apply(
+        self,
+        reply: &Reply,
+        opened_client: &mut Option<String>,
+        opened_queries: &mut Vec<QueryId>,
+    ) {
+        // Arm teardown only after a *successful* open, so a rejected open
+        // (e.g. duplicate-name) never causes the EOF path to tear down the
+        // existing client/query it did not actually create.
+        if reply.ok {
+            if let Some(name) = self.open_client {
+                *opened_client = Some(name);
+            }
+            if self.is_open_query
+                && let Some(id) = reply.query
+            {
+                opened_queries.push(id);
+            }
+        }
+        // Disarm on a cancel the daemon acted on, so a long-lived connection
+        // issuing many queries does not accumulate every id it ever opened and
+        // then send them all as no-op cancels at EOF. `unknown_query` disarms
+        // too: it means the id is definitively no longer in flight (already
+        // completed, reaped or cancelled).
+        if let Some(id) = self.cancelled_query
+            && (reply.ok || reply.code.as_deref() == Some(codes::UNKNOWN_QUERY))
+        {
+            opened_queries.retain(|open| *open != id);
+        }
+    }
+}
+
 /// Serve one control connection over any byte transport: read newline-JSON
 /// requests, dispatch each, write the reply line. Transport-agnostic — Unix
 /// drives it with the two halves of a `UnixStream`, Windows with the two
@@ -1723,11 +1779,7 @@ async fn serve_connection<R, W>(
                         )
                     }
                 } else {
-                    let open_client_name = match &request {
-                        Request::OpenClient { client, .. } => Some(client.clone()),
-                        _ => None,
-                    };
-                    let is_open_query = matches!(request, Request::OpenQuery { .. });
+                    let teardown = TeardownArm::of(&request);
                     let (tx, rx) = oneshot::channel();
                     if cmd_tx
                         .send(ServerCommand::Request { request, reply: tx })
@@ -1738,18 +1790,7 @@ async fn serve_connection<R, W>(
                     }
                     match rx.await {
                         Ok(reply) => {
-                            // Arm EOF teardown only after a *successful* open, so a
-                            // rejected open (e.g. duplicate-name) never causes the
-                            // EOF path to tear down the existing client/query it
-                            // did not actually create.
-                            if reply.ok {
-                                if let Some(name) = open_client_name {
-                                    opened_client = Some(name);
-                                }
-                                if is_open_query && let Some(id) = reply.query {
-                                    opened_queries.push(id);
-                                }
-                            }
+                            teardown.apply(&reply, &mut opened_client, &mut opened_queries);
                             reply
                         }
                         Err(_) => break,
