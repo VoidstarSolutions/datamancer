@@ -429,7 +429,11 @@ terminal `SessionClosing`, same as any other library error — never a
 control-socket error after the reply. `cancel-query` aborts an in-flight
 query and releases its service early; a stale/finished/unknown id answers
 `unknown_query`. Two things implicitly cancel every query a connection opened:
-**dropping the client's data stream** (the sink observes the disconnect) and
+**dropping the `datamancer-client` `QueryStream`** (its `Drop` sends
+`cancel-query` — a client-library courtesy, not something the daemon detects:
+the iceoryx2 publisher cannot observe a subscriber going away, so a raw
+consumer that just drops its subscriber leaves the query running to
+completion) and
 **dropping the control connection itself** (EOF on the socket — the daemon
 tracks which in-flight queries each control connection opened and aborts them
 on that connection's teardown, the same way `close-client`/EOF tears down an
