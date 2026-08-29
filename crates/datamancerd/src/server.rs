@@ -29,7 +29,19 @@ use datamancer::{
     AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
     Session, TapLog, traits::EventSink,
 };
-use datamancer_client::spec::{QueryId, QuerySpec};
+// `Timestamp` only appears in `validate_query_open`'s signature and its
+// tests, both unix/macOS only — importing it unconditionally would be
+// `unused_imports` on Windows.
+#[cfg(not(windows))]
+use datamancer::Timestamp;
+// `QuerySpec` names both `open_query` arms (unix and the Windows stub both take
+// one), so it's imported unconditionally. `QueryId` only appears in the unix
+// data-plane types (`Server::queries`, `ServerCommand::QueryFinished`,
+// `spawn_query_pump`) — importing it unconditionally would be `unused_imports`
+// on Windows.
+#[cfg(not(windows))]
+use datamancer_client::spec::QueryId;
+use datamancer_client::spec::QuerySpec;
 // `PublishOutcome` and the `StreamExt` combinators drive the iceoryx2 per-client
 // pump (`spawn_pump`), which is unix-only (WS has its own pump in `ws/conn.rs`).
 #[cfg(not(windows))]
@@ -984,20 +996,10 @@ impl Server {
     async fn open_query(&mut self, spec: QuerySpec, cmd_tx: &mpsc::Sender<ServerCommand>) -> Reply {
         // Validate and open the session BEFORE allocating the sink, so every
         // fail-fast path is reachable without an iceoryx2 node.
-        if spec.from > spec.to {
-            return Reply::error(
-                codes::BAD_REQUEST,
-                format!(
-                    "inverted query range: from={:?} > to={:?}",
-                    spec.from, spec.to
-                ),
-            );
-        }
-        if self.queries.len() >= self.max_queries {
-            return Reply::error(
-                codes::SERVICE_CAP_EXCEEDED,
-                format!("query cap {} exceeded", self.max_queries),
-            );
+        if let Some(reply) =
+            validate_query_open(spec.from, spec.to, self.queries.len(), self.max_queries)
+        {
+            return reply;
         }
         let instrument = query_instrument(&spec);
         let scope = Scope::Historical {
@@ -1114,12 +1116,43 @@ fn spec_instrument(spec: &SubscriptionSpec) -> Instrument {
 }
 
 /// The `Instrument` a query names. Mirrors `spec_instrument` for queries.
+/// Unix/macOS only — its sole non-test caller is the unix `open_query`.
+#[cfg(not(windows))]
 fn query_instrument(spec: &QuerySpec) -> Instrument {
     Instrument::new(
         ProviderId::new(spec.provider.clone()),
         spec.asset_class.into(),
         spec.symbol.clone(),
     )
+}
+
+/// Validate an `open-query` request *before* any session or sink is
+/// allocated: the range must not be inverted, and the concurrent-query cap
+/// must not already be met. `Some(reply)` means reject with that reply;
+/// `None` means the caller may proceed. Callers must run this before
+/// `Datamancer::session` and before `Iceoryx2DataSink::new` — that ordering is
+/// what makes both fail-fast paths reachable without a live iceoryx2 node.
+/// Unix/macOS only — its sole non-test caller is the unix `open_query`.
+#[cfg(not(windows))]
+fn validate_query_open(
+    from: Timestamp,
+    to: Timestamp,
+    in_flight: usize,
+    max: usize,
+) -> Option<Reply> {
+    if from > to {
+        return Some(Reply::error(
+            codes::BAD_REQUEST,
+            format!("inverted query range: from={from:?} > to={to:?}"),
+        ));
+    }
+    if in_flight >= max {
+        return Some(Reply::error(
+            codes::SERVICE_CAP_EXCEEDED,
+            format!("query cap {max} exceeded"),
+        ));
+    }
+    None
 }
 
 /// Reject a control request that carries unknown top-level JSON keys. `serde`'s
@@ -1828,6 +1861,9 @@ mod tests {
         );
     }
 
+    // `query_instrument` is unix/macOS only (see its definition); Windows has
+    // no `open_query` arm that calls it.
+    #[cfg(not(windows))]
     #[test]
     fn query_instrument_maps_the_wire_tuple() {
         let spec: QuerySpec = serde_json::from_str(
@@ -1837,5 +1873,32 @@ mod tests {
         let instrument = query_instrument(&spec);
         assert_eq!(instrument.symbol(), "BTC/USD");
         assert_eq!(instrument.provider().as_str(), "alpaca");
+        assert_eq!(instrument.asset_class(), AssetClass::Crypto);
+    }
+
+    // `validate_query_open` is unix/macOS only (see its definition); Windows
+    // has no `open_query` arm that calls it.
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_query_open_rejects_an_inverted_range() {
+        let reply = validate_query_open(Timestamp(2), Timestamp(1), 0, 2)
+            .expect("inverted range must be rejected");
+        assert!(!reply.ok);
+        assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_query_open_rejects_at_the_cap() {
+        let reply =
+            validate_query_open(Timestamp(1), Timestamp(2), 2, 2).expect("at-cap must be rejected");
+        assert!(!reply.ok);
+        assert_eq!(reply.code.as_deref(), Some(codes::SERVICE_CAP_EXCEEDED));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_query_open_allows_a_valid_range_under_cap() {
+        assert!(validate_query_open(Timestamp(1), Timestamp(2), 1, 2).is_none());
     }
 }
