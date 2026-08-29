@@ -527,12 +527,13 @@ impl Client for Iceoryx2Client {
     ///
     /// The daemon starts pumping the query as soon as it replies, so a query
     /// that completes almost immediately (empty range, fully cached) can drain
-    /// before this call attaches. The daemon holds a completed query's service
-    /// open for a short grace period to cover the usual case, but a client that
-    /// is slower than that window sees `ClientError::Transport` for what was a
-    /// legitimately empty result — indistinguishable from a real attach
-    /// failure. Callers that must tell the two apart should treat a transport
-    /// error on a very short/empty range as inconclusive and retry the query.
+    /// — and have the daemon reap its service — before this call attaches.
+    /// That surfaces as `ClientError::Transport` for what was a legitimately
+    /// empty result, indistinguishable from a real attach failure. This race
+    /// is documented and accepted, not mitigated — the daemon does not hold
+    /// the service open to cover it. Callers that must tell the two apart
+    /// should treat a transport error on a very short/empty range as
+    /// inconclusive and retry the query.
     async fn query(
         &mut self,
         spec: &QuerySpec,
