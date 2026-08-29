@@ -198,6 +198,56 @@ impl From<SubscriptionSpec> for UnsubscribeSpec {
     }
 }
 
+/// An opaque handle to an in-flight historical query, minted by the daemon.
+///
+/// A plain alias rather than a newtype: the client only ever echoes it back to
+/// the daemon, so a wrapper would buy no invariant while adding a conversion at
+/// every call site.
+pub type QueryId = u64;
+
+/// One bounded historical query: the `(provider, asset_class, symbol, kind)`
+/// tuple plus a source-time range.
+///
+/// Deliberately carries **no** persistence selector — cache policy for queries
+/// is the daemon's, configured under `[session] query_persistence`. Flattened
+/// into the request frame, so (like [`SubscriptionSpec`]) it cannot use
+/// `deny_unknown_fields`; the daemon enforces unknown-key rejection server-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuerySpec {
+    pub provider: String,
+    pub asset_class: AssetClassCfg,
+    pub symbol: String,
+    pub kind: EventKindCfg,
+    /// Inclusive start of the source-time range.
+    pub from: Timestamp,
+    /// End of the source-time range. Must be `>= from`.
+    pub to: Timestamp,
+}
+
+impl QuerySpec {
+    /// Build a query spec for `(instrument, kind)` over `from..to`.
+    ///
+    /// # Errors
+    ///
+    /// [`UnsupportedAssetClass`] when the instrument's asset class has no wire
+    /// selector (see [`AssetClassCfg`]).
+    pub fn new(
+        instrument: &Instrument,
+        kind: EventKind,
+        from: Timestamp,
+        to: Timestamp,
+    ) -> Result<Self, UnsupportedAssetClass> {
+        Ok(Self {
+            provider: instrument.provider().as_str().to_string(),
+            asset_class: instrument.asset_class().try_into()?,
+            symbol: instrument.symbol().to_string(),
+            kind: kind.into(),
+            from,
+            to,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -247,5 +297,57 @@ mod tests {
 
         let unsub = UnsubscribeSpec::new(&instrument, EventKind::Trade).unwrap();
         assert_eq!(UnsubscribeSpec::from(spec), unsub);
+    }
+
+    mod query_spec_tests {
+        use super::super::{AssetClassCfg, EventKindCfg, QuerySpec};
+        use datamancer_core::{AssetClass, EventKind, Instrument, ProviderId, Timestamp};
+
+        #[test]
+        fn query_spec_round_trips_with_bare_integer_timestamps() {
+            let spec = QuerySpec {
+                provider: "alpaca".to_string(),
+                asset_class: AssetClassCfg::Equity,
+                symbol: "AAPL".to_string(),
+                kind: EventKindCfg::Bar1d,
+                from: Timestamp(1_000),
+                to: Timestamp(2_000),
+            };
+            let json = serde_json::to_string(&spec).expect("serialize");
+            assert_eq!(
+                json,
+                r#"{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1000,"to":2000}"#
+            );
+            let back: QuerySpec = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, spec);
+        }
+
+        #[test]
+        fn new_builds_from_an_instrument_and_kind() {
+            let instrument = Instrument::new(
+                ProviderId::new("alpaca"),
+                AssetClass::Equity,
+                "MSFT".to_string(),
+            );
+            let spec = QuerySpec::new(&instrument, EventKind::Trade, Timestamp(5), Timestamp(9))
+                .expect("equity has a wire selector");
+            assert_eq!(spec.provider, "alpaca");
+            assert_eq!(spec.symbol, "MSFT");
+            assert_eq!(spec.kind, EventKindCfg::Trade);
+            assert_eq!(spec.from, Timestamp(5));
+            assert_eq!(spec.to, Timestamp(9));
+        }
+
+        #[test]
+        fn new_rejects_an_asset_class_with_no_wire_selector() {
+            let instrument = Instrument::new(
+                ProviderId::new("alpaca"),
+                AssetClass::Etf,
+                "SPY".to_string(),
+            );
+            assert!(
+                QuerySpec::new(&instrument, EventKind::Trade, Timestamp(0), Timestamp(1)).is_err()
+            );
+        }
     }
 }
