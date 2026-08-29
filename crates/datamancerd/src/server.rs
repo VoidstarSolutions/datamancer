@@ -129,10 +129,13 @@ impl DrainClient for ClientEntry {
 
 /// One in-flight historical query.
 ///
-/// The `Session` is held here deliberately: dropping it closes the historical
-/// controller's command channel, which aborts the in-flight provider fetch. So
-/// removing this entry from the map *is* the cancellation — it drops the
-/// session, aborts the pump and drops the sink (releasing the service).
+/// The `Session` is held here so cancellation can **close** it. Dropping the
+/// handle is *not* enough: the historical controller holds its own
+/// `Arc<SessionInner>`, so its `cmd_tx` clone stays alive and the in-flight
+/// provider fetch keeps paging into a detached ring. Only
+/// `Session::close()` — which sends `SessionCommand::Close` — reaches the
+/// controller's `fetch_task.abort()`. Removing the entry therefore aborts the
+/// pump, drops the sink (releasing the service) and spawns the session close.
 #[cfg(not(windows))]
 struct QueryEntry {
     session: datamancer::Session,
@@ -1004,6 +1007,18 @@ impl Server {
     /// then allocate its own short-lived iceoryx2 data service and pump the
     /// bounded stream into it. Unix/macOS only — this is the iceoryx2 data
     /// flow, which has no node on Windows.
+    ///
+    /// # Attach race
+    ///
+    /// The pump starts before this reply is written, so a query that finishes
+    /// almost immediately (empty range, fully cached) can reach the end of its
+    /// stream before the client has attached to the named service. To keep
+    /// that from surfacing as an indistinguishable transport error, the pump
+    /// holds the entry — and therefore the service — for
+    /// [`QUERY_REAP_GRACE`] after it drains, giving the client time to open its
+    /// subscriber and observe the (possibly empty) stream and its terminal
+    /// control. A client that is slower than the grace window still sees
+    /// `ClientError::Transport`; the window is a mitigation, not a handshake.
     #[cfg(not(windows))]
     async fn open_query(&mut self, spec: QuerySpec, cmd_tx: &mpsc::Sender<ServerCommand>) -> Reply {
         // Validate and open the session BEFORE allocating the sink, so every
@@ -1067,14 +1082,18 @@ impl Server {
         )
     }
 
-    /// Abort an in-flight query: dropping the entry drops its `Session` (killing
-    /// the provider fetch), aborts the pump and releases the data service.
+    /// Abort an in-flight query: abort the pump, close the `Session` (which is
+    /// what actually kills the provider fetch) and release the data service.
+    ///
+    /// The close is *spawned*, never awaited: `cancel_query` runs on the daemon
+    /// actor, and awaiting a session shutdown there would stall every other
+    /// control op behind it.
     #[cfg(not(windows))]
     fn cancel_query(&mut self, query: QueryId) -> Reply {
         match self.queries.remove(&query) {
             Some(entry) => {
                 entry.pump.abort();
-                drop(entry.session);
+                close_query_session(entry.session);
                 tracing::debug!(query, "query cancelled");
                 Reply::ok()
             }
@@ -1121,6 +1140,7 @@ impl Server {
     fn abort_all_queries(&mut self) {
         for (id, entry) in self.queries.drain() {
             entry.pump.abort();
+            close_query_session(entry.session);
             tracing::debug!(query = id, "aborted in-flight query for shutdown");
         }
     }
@@ -1273,10 +1293,38 @@ fn spawn_pump(mut stream: datamancer::EventStream, sink: Arc<dyn EventSink>) -> 
     })
 }
 
+/// Close a query's `Session` off the actor task.
+///
+/// Dropping a `Session` handle does **not** stop its historical fetch: the
+/// controller owns its own `Arc<SessionInner>`, so the command channel stays
+/// open and the provider keeps paging. `Session::close()` sends
+/// `SessionCommand::Close`, which the controller's `select!` observes and
+/// answers with `fetch_task.abort()` — that is the only path that actually
+/// cancels the fetch. It is spawned rather than awaited because every caller
+/// runs on the daemon actor, where an inline await would block all other
+/// control ops.
+#[cfg(not(windows))]
+fn close_query_session(session: datamancer::Session) {
+    tokio::spawn(async move {
+        let _ = session.close().await;
+    });
+}
+
+/// How long a drained query pump holds its entry (and so its data service)
+/// before asking the actor to reap it. See `open_query`'s "Attach race": a
+/// query that completes before the client attaches would otherwise take its
+/// service away underneath the pending `DataSubscriber::open`.
+#[cfg(not(windows))]
+const QUERY_REAP_GRACE: Duration = Duration::from_secs(3);
+
 /// Pump a query's bounded stream into its own sink, then tell the actor to reap
 /// the entry. Unlike the client pump, this one **must** report its exit: a
 /// completed query has to release its data service without the consumer having
 /// to call `cancel-query`.
+///
+/// Reaping waits [`QUERY_REAP_GRACE`] after the stream drains so a fast query
+/// does not drop its service before the client attaches. `cancel-query` and
+/// shutdown both abort this task, so the grace never delays teardown.
 #[cfg(not(windows))]
 fn spawn_query_pump(
     mut stream: datamancer::EventStream,
@@ -1297,6 +1345,7 @@ fn spawn_query_pump(
         if let Err(e) = sink.flush().await {
             tracing::warn!(query, error = %e, "final query sink flush failed");
         }
+        tokio::time::sleep(QUERY_REAP_GRACE).await;
         let _ = cmd_tx.send(ServerCommand::QueryFinished { query }).await;
     })
 }
