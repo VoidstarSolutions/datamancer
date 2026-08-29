@@ -10,8 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use datamancer_core::{InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
+use datamancer_core::{
+    ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
+};
 use datamancer_transport_iceoryx2::DataSubscriber;
+use futures::Stream;
 // `::` prefix: this module is itself named `iceoryx2`, so the extern crate is
 // named explicitly (bare paths here happen to resolve to the crate today, but
 // only because this module contains no item named `iceoryx2`).
@@ -161,8 +164,7 @@ enum ControlCmd {
         reply: tokio::sync::oneshot::Sender<Result<Reply, Iceoryx2ClientError>>,
     },
     /// Fire-and-forget. Exists so `Drop` — which cannot await — can still send
-    /// a `cancel-query`. First used by `QueryStream::drop` (Task 8).
-    #[allow(dead_code, reason = "first caller lands with QueryStream's Drop impl")]
+    /// a `cancel-query`. Used by `QueryStream::drop`.
     Fire(Request),
 }
 
@@ -221,9 +223,8 @@ impl ControlHandle {
     }
 
     /// Enqueue a request whose reply is discarded. Synchronous and infallible
-    /// while the control task lives — callable from `Drop`. First used by
-    /// `QueryStream::drop` (Task 8).
-    #[allow(dead_code, reason = "first caller lands with QueryStream's Drop impl")]
+    /// while the control task lives — callable from `Drop`. Used by
+    /// `QueryStream::drop`.
     fn fire(&self, request: Request) {
         let _ = self.tx.send(ControlCmd::Fire(request));
     }
@@ -298,6 +299,52 @@ async fn spawn_subscriber(
         Err(_) => Err(Iceoryx2ClientError::Node(
             "shm-attach task ended without reporting a result".to_string(),
         )),
+    }
+}
+
+/// A bounded historical event stream.
+///
+/// **Dropping this stream cancels the query** — an abandoned backtest must not
+/// keep the daemon fetching. Cancellation is a fire-and-forget `cancel-query`
+/// on the control task's unbounded channel, which is why `Drop` can send it
+/// without awaiting. A stream that already observed `SessionClosing` sends
+/// nothing: the daemon has already reaped that query, and asking it to cancel
+/// an id it no longer has would only produce `unknown_query` and log noise.
+pub struct QueryStream {
+    inner: ReceiverStream<MarketEvent>,
+    id: QueryId,
+    control: ControlHandle,
+    stop: Arc<AtomicBool>,
+    finished: bool,
+}
+
+impl Stream for QueryStream {
+    type Item = MarketEvent;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        match &polled {
+            std::task::Poll::Ready(None) => self.finished = true,
+            std::task::Poll::Ready(Some(MarketEvent::Control(control)))
+                if matches!(control.kind, ControlKind::SessionClosing) =>
+            {
+                self.finished = true;
+            }
+            _ => {}
+        }
+        polled
+    }
+}
+
+impl Drop for QueryStream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if !self.finished {
+            self.control.fire(Request::CancelQuery { query: self.id });
+        }
     }
 }
 
@@ -472,7 +519,7 @@ impl Client for Iceoryx2Client {
         check(reply).map(|_| ())
     }
 
-    type Query = ReceiverStream<MarketEvent>;
+    type Query = QueryStream;
 
     async fn query(
         &mut self,
@@ -493,7 +540,16 @@ impl Client for Iceoryx2Client {
         let events = spawn_subscriber(id, self.poll_interval, self.event_buffer, Arc::clone(&stop))
             .await
             .map_err(ClientError::Transport)?;
-        Ok((id, events))
+        Ok((
+            id,
+            QueryStream {
+                inner: events,
+                id,
+                control: self.control.clone(),
+                stop,
+                finished: false,
+            },
+        ))
     }
 
     async fn cancel_query(&mut self, query: QueryId) -> Result<(), ClientError<Self::Error>> {
@@ -534,7 +590,7 @@ impl Iceoryx2Client {
 mod tests {
     use super::parse_client_id;
     #[cfg(unix)]
-    use super::{ControlConn, ControlHandle, Iceoryx2ClientError};
+    use super::{ControlConn, ControlHandle, Iceoryx2ClientError, QueryStream};
     #[cfg(unix)]
     use crate::codes;
     #[cfg(unix)]
@@ -542,9 +598,19 @@ mod tests {
     #[cfg(unix)]
     use crate::protocol::uds::{Reply, Request};
     #[cfg(unix)]
+    use datamancer_core::{Control, ControlKind, MarketEvent, Seq, Timestamp};
+    #[cfg(unix)]
+    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::Mutex;
+    #[cfg(unix)]
+    use std::sync::atomic::AtomicBool;
+    #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
     #[cfg(unix)]
     use tokio::net::UnixListener;
+    #[cfg(unix)]
+    use tokio_stream::wrappers::ReceiverStream;
 
     #[test]
     fn client_id_parses_from_the_service_name() {
@@ -631,8 +697,7 @@ mod tests {
     async fn close_sets_the_stop_flag_even_when_the_transport_fails() {
         use super::Iceoryx2Client;
         use crate::client::Client as _;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::Ordering;
 
         // A fake daemon that accepts and immediately hangs up: the
         // close-client round-trip fails at the transport layer (connection
@@ -670,5 +735,126 @@ mod tests {
 
         // `fire` is synchronous: it must not need an await to enqueue.
         handle.fire(Request::CancelQuery { query: 1 });
+    }
+
+    /// Scripted fake UDS daemon that additionally records every line it
+    /// received into a shared buffer, and keeps reading past the queued
+    /// `replies` so a fire-and-forget request with no queued reply is still
+    /// recorded.
+    #[cfg(unix)]
+    fn fake_uds_recording(replies: Vec<Reply>) -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut replies = replies.into_iter();
+            while let Ok(Some(line)) = lines.next_line().await {
+                recorder.lock().unwrap().push(line);
+                if let Some(reply) = replies.next() {
+                    let mut buf = serde_json::to_vec(&reply).unwrap();
+                    buf.push(b'\n');
+                    if write.write_all(&buf).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        (path, seen)
+    }
+
+    #[cfg(unix)]
+    fn query_stream_for_tests(
+        control: ControlHandle,
+        finished: bool,
+    ) -> (QueryStream, tokio::sync::mpsc::Sender<MarketEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<MarketEvent>(4);
+        let stream = QueryStream {
+            inner: ReceiverStream::new(rx),
+            id: 42,
+            control,
+            stop: Arc::new(AtomicBool::new(false)),
+            finished,
+        };
+        (stream, tx)
+    }
+
+    /// A terminal `MarketEvent::Control(SessionClosing)`, built with the same
+    /// field shape as the crate's other `SessionClosing` construction sites
+    /// (see e.g. `datamancer-transport-iceoryx2/src/payload.rs`).
+    #[cfg(unix)]
+    fn session_closing_event() -> MarketEvent {
+        MarketEvent::Control(Control {
+            source_ts: Timestamp(1),
+            rx_ts: Timestamp(2),
+            seq: Seq::SYNTHETIC,
+            kind: ControlKind::SessionClosing,
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_an_unfinished_query_stream_cancels_it() {
+        let (path, seen) = fake_uds_recording(vec![]);
+        let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
+        let (stream, _tx) = query_stream_for_tests(control, false);
+
+        drop(stream);
+
+        // `fire` enqueues synchronously; let the control task drain and write.
+        for _ in 0..50 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let lines = seen.lock().unwrap().clone();
+        let sent: Request = serde_json::from_str(lines.first().expect("a cancel was sent"))
+            .expect("parse recorded request");
+        assert_eq!(sent, Request::CancelQuery { query: 42 });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finished_query_stream_sends_nothing_on_drop() {
+        let (path, seen) = fake_uds_recording(vec![]);
+        let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
+        let (stream, _tx) = query_stream_for_tests(control, true);
+
+        drop(stream);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a completed query was already reaped; cancelling it would only log noise"
+        );
+    }
+
+    /// The `finished` flag is what suppresses the cancel, and it is set by
+    /// polling a terminal `SessionClosing` through the stream — so exercise
+    /// that path rather than setting the flag by hand.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn polling_session_closing_marks_the_stream_finished() {
+        use futures::StreamExt as _;
+
+        let (path, seen) = fake_uds_recording(vec![]);
+        let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
+        let (mut stream, tx) = query_stream_for_tests(control, false);
+
+        tx.send(session_closing_event()).await.expect("send");
+        let event = stream.next().await.expect("the terminal control");
+        assert!(matches!(event, MarketEvent::Control(_)));
+
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "observing SessionClosing must suppress the drop-cancel"
+        );
     }
 }
