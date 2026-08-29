@@ -151,12 +151,90 @@ impl ControlConn {
     }
 }
 
+/// A command for the control-connection task.
+enum ControlCmd {
+    /// A round trip whose reply the caller awaits.
+    Request {
+        /// The request to send.
+        request: Request,
+        /// Where to deliver the reply (or transport error) once it arrives.
+        reply: tokio::sync::oneshot::Sender<Result<Reply, Iceoryx2ClientError>>,
+    },
+    /// Fire-and-forget. Exists so `Drop` — which cannot await — can still send
+    /// a `cancel-query`. First used by `QueryStream::drop` (Task 8).
+    #[allow(dead_code, reason = "first caller lands with QueryStream's Drop impl")]
+    Fire(Request),
+}
+
+/// A cloneable handle to the task that owns the control connection.
+///
+/// The connection is serially used (strict request→reply per line), so exactly
+/// one task owns it and callers queue commands. The channel is **unbounded**:
+/// that makes [`ControlHandle::fire`] synchronous and infallible while the task
+/// lives, which is what makes drop-cancellation reliable. Volume is bounded in
+/// practice by in-flight queries plus concurrent user calls.
+#[derive(Clone)]
+struct ControlHandle {
+    tx: tokio::sync::mpsc::UnboundedSender<ControlCmd>,
+}
+
+impl ControlHandle {
+    /// Spawn the task that owns `conn` and returns a handle to it.
+    fn spawn(mut conn: ControlConn) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ControlCmd>();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    ControlCmd::Request { request, reply } => {
+                        let result = conn.request(&request).await;
+                        let failed = result.is_err();
+                        let _ = reply.send(result);
+                        if failed {
+                            // The connection is unusable; every later caller
+                            // gets `Protocol` from the closed-channel arm.
+                            break;
+                        }
+                    }
+                    ControlCmd::Fire(request) => {
+                        if conn.request(&request).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    /// Send `request` to the control task and await its reply.
+    async fn request(&self, request: &Request) -> Result<Reply, Iceoryx2ClientError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(ControlCmd::Request {
+                request: request.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| Iceoryx2ClientError::Protocol("control connection closed".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            Iceoryx2ClientError::Protocol("control connection closed mid-request".to_string())
+        })?
+    }
+
+    /// Enqueue a request whose reply is discarded. Synchronous and infallible
+    /// while the control task lives — callable from `Drop`. First used by
+    /// `QueryStream::drop` (Task 8).
+    #[allow(dead_code, reason = "first caller lands with QueryStream's Drop impl")]
+    fn fire(&self, request: Request) {
+        let _ = self.tx.send(ControlCmd::Fire(request));
+    }
+}
+
 /// A connected same-host client. See [`Client`] for the transport-agnostic
 /// contract; iceoryx2-specific behavior: loss surfaces **in-band** as
 /// `Control::Gap` (the daemon's resume buffer numbers evictions), and the
 /// event stream ends when the daemon drops the per-client services.
 pub struct Iceoryx2Client {
-    control: ControlConn,
+    control: ControlHandle,
     client_name: String,
     stop: Arc<AtomicBool>,
 }
@@ -252,7 +330,7 @@ impl Client for Iceoryx2Client {
 
         Ok((
             Iceoryx2Client {
-                control,
+                control: ControlHandle::spawn(control),
                 client_name: cfg.client_name,
                 stop,
             },
@@ -350,7 +428,7 @@ impl Client for Iceoryx2Client {
     /// and pre-existing; stream-readers on the iceoryx2 transport should not
     /// rely on always observing the `SessionClosing` marker (unlike the WS
     /// transport, which is single-writer and does not have this race).
-    async fn close(mut self) -> Result<(), ClientError<Self::Error>> {
+    async fn close(self) -> Result<(), ClientError<Self::Error>> {
         // `close` consumes the client, so this is the caller's last chance to
         // signal the poll task. Set the stop flag unconditionally *before* the
         // round-trip: a transport failure below must not leave the
@@ -395,7 +473,7 @@ impl Iceoryx2Client {
 mod tests {
     use super::parse_client_id;
     #[cfg(unix)]
-    use super::{ControlConn, Iceoryx2ClientError};
+    use super::{ControlConn, ControlHandle, Iceoryx2ClientError};
     #[cfg(unix)]
     use crate::codes;
     #[cfg(unix)]
@@ -502,7 +580,7 @@ mod tests {
         let control = ControlConn::connect(&path).await.unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let client = Iceoryx2Client {
-            control,
+            control: ControlHandle::spawn(control),
             client_name: "doomed".to_string(),
             stop: Arc::clone(&stop),
         };
@@ -515,5 +593,19 @@ mod tests {
             "close() must signal the poll task even when the request fails — \
              it consumes the client, so this is the last chance"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_handle_round_trips_and_fires_without_awaiting() {
+        let path = fake_uds(vec![Reply::ok(), Reply::ok()]);
+        let conn = ControlConn::connect(&path).await.unwrap();
+        let handle = ControlHandle::spawn(conn);
+
+        let reply = handle.request(&Request::ListQueries).await.unwrap();
+        assert!(reply.ok);
+
+        // `fire` is synchronous: it must not need an await to enqueue.
+        handle.fire(Request::CancelQuery { query: 1 });
     }
 }
