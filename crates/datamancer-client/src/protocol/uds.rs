@@ -12,7 +12,7 @@
 use datamancer_core::{HealthView, SystemSnapshot};
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 /// A control request (one per line).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,6 +38,19 @@ pub enum Request {
     },
     /// Tear down a client (graceful).
     CloseClient { client: String },
+    /// Open a bounded historical query. Ungated (a read, like `snapshot`).
+    /// Not a subscription: it needs no prior `open-client`, opens its own
+    /// short-lived data service, and ends with a terminal `SessionClosing`.
+    OpenQuery {
+        #[serde(flatten)]
+        spec: QuerySpec,
+    },
+    /// Abort an in-flight query and release its data service. Answering
+    /// `unknown_query` means the query already finished or was already
+    /// cancelled.
+    CancelQuery { query: QueryId },
+    /// All in-flight query ids, daemon-wide (the `list-clients` analogue).
+    ListQueries,
     /// List currently-connected client names.
     ListClients,
     /// Return the current diagnostics snapshot as JSON.
@@ -105,6 +118,12 @@ pub struct Reply {
     /// Connected client names (on `list-clients`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clients: Option<Vec<String>>,
+    /// The id of a newly opened query (on `open-query`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryId>,
+    /// In-flight query ids (on `list-queries`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queries: Option<Vec<QueryId>>,
     /// The diagnostics snapshot (on `snapshot`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SystemSnapshot>,
@@ -152,6 +171,8 @@ impl Reply {
             ok: true,
             service: None,
             clients: None,
+            query: None,
+            queries: None,
             snapshot: None,
             instruments: None,
             capabilities: None,
@@ -181,6 +202,25 @@ impl Reply {
     pub fn clients(names: Vec<String>) -> Self {
         Self {
             clients: Some(names),
+            ..Self::ok()
+        }
+    }
+
+    /// Success carrying a newly opened query's id and its data-service name.
+    #[must_use]
+    pub fn query(id: QueryId, service: impl Into<String>) -> Self {
+        Self {
+            query: Some(id),
+            service: Some(service.into()),
+            ..Self::ok()
+        }
+    }
+
+    /// Success carrying the in-flight query list.
+    #[must_use]
+    pub fn queries(ids: Vec<QueryId>) -> Self {
+        Self {
+            queries: Some(ids),
             ..Self::ok()
         }
     }
@@ -239,6 +279,8 @@ impl Reply {
             ok: false,
             service: None,
             clients: None,
+            query: None,
+            queries: None,
             snapshot: None,
             instruments: None,
             capabilities: None,
@@ -577,5 +619,55 @@ mod tests {
             crate::codes::UNSUPPORTED_ON_WINDOWS,
             "unsupported_on_windows"
         );
+    }
+
+    #[test]
+    fn open_query_parses_with_flattened_spec_fields() {
+        let line = r#"{"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":100,"to":200}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        match request {
+            Request::OpenQuery { spec } => {
+                assert_eq!(spec.symbol, "AAPL");
+                assert_eq!(spec.from, datamancer_core::Timestamp(100));
+                assert_eq!(spec.to, datamancer_core::Timestamp(200));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_and_list_queries_parse() {
+        let cancel: Request =
+            serde_json::from_str(r#"{"op":"cancel-query","query":7}"#).expect("parse cancel");
+        assert_eq!(cancel, Request::CancelQuery { query: 7 });
+        let list: Request = serde_json::from_str(r#"{"op":"list-queries"}"#).expect("parse list");
+        assert_eq!(list, Request::ListQueries);
+    }
+
+    #[test]
+    fn query_reply_carries_id_and_service_and_omits_absent_fields() {
+        let reply = Reply::query(7, "datamancer/v2/data/7".to_string());
+        let json = serde_json::to_string(&reply).expect("serialize");
+        assert!(json.contains(r#""query":7"#), "got {json}");
+        assert!(
+            json.contains(r#""service":"datamancer/v2/data/7""#),
+            "got {json}"
+        );
+        assert!(
+            !json.contains("queries"),
+            "absent fields must not serialize: {json}"
+        );
+    }
+
+    #[test]
+    fn queries_reply_lists_ids() {
+        let json = serde_json::to_string(&Reply::queries(vec![1, 4])).expect("serialize");
+        assert!(json.contains(r#""queries":[1,4]"#), "got {json}");
+    }
+
+    #[test]
+    fn a_bare_ok_reply_still_omits_the_query_fields() {
+        let json = serde_json::to_string(&Reply::ok()).expect("serialize");
+        assert!(!json.contains("query"), "got {json}");
     }
 }

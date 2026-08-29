@@ -822,6 +822,11 @@ impl Server {
             // `handle` intercepts Shutdown before dispatch; reaching here means the
             // daemon is already draining.
             Request::Shutdown => Reply::error(codes::SHUTTING_DOWN, "daemon is shutting down"),
+            // Placeholders so the daemon keeps building; Tasks 4 and 5 replace
+            // these with the real query implementation.
+            Request::OpenQuery { .. } | Request::CancelQuery { .. } | Request::ListQueries => {
+                Reply::error(codes::INTERNAL, "query ops not implemented yet")
+            }
             Request::Health => {
                 let view = stamped_health_view(&self.dm.snapshot_live(), self.credential_backend);
                 Reply::health(view)
