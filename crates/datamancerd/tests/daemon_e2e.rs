@@ -172,9 +172,13 @@ fn open_client_creates_a_service_then_closes() {
 /// response — 30+ seconds with zero further activity, confirmed by
 /// `RUST_LOG=debug` request tracing. The `bar1m`/month-long request below,
 /// by contrast, paginates and completes in ~1-2 seconds every time it was
-/// run. This looks like a genuine gap in the equity daily-bar historical
-/// path (or an Alpaca-side quirk for that exact short range/holiday-adjacent
-/// window), worth a follow-up outside this task's scope.
+/// run. The cause is **unconfirmed**: this branch's own reading of the fetch
+/// path found it identical for both intervals (only the `TimeFrame` differs),
+/// so the two candidate explanations — an Alpaca-side quirk for that exact
+/// short/holiday-adjacent daily range, or simple rate limiting from repeated
+/// development runs — are both at least as plausible as a defect in our
+/// daily-bar path. Recorded as an observation to reproduce deliberately, not
+/// as a known bug.
 #[test]
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
 fn open_query_streams_bars_then_reaps_its_service() {

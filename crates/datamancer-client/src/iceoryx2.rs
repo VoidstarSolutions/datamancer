@@ -521,6 +521,18 @@ impl Client for Iceoryx2Client {
 
     type Query = QueryStream;
 
+    /// Open a bounded historical query and attach to its data service.
+    ///
+    /// # Attach race
+    ///
+    /// The daemon starts pumping the query as soon as it replies, so a query
+    /// that completes almost immediately (empty range, fully cached) can drain
+    /// before this call attaches. The daemon holds a completed query's service
+    /// open for a short grace period to cover the usual case, but a client that
+    /// is slower than that window sees `ClientError::Transport` for what was a
+    /// legitimately empty result — indistinguishable from a real attach
+    /// failure. Callers that must tell the two apart should treat a transport
+    /// error on a very short/empty range as inconclusive and retry the query.
     async fn query(
         &mut self,
         spec: &QuerySpec,
@@ -537,9 +549,19 @@ impl Client for Iceoryx2Client {
             ))
         })?;
         let stop = Arc::new(AtomicBool::new(false));
-        let events = spawn_subscriber(id, self.poll_interval, self.event_buffer, Arc::clone(&stop))
-            .await
-            .map_err(ClientError::Transport)?;
+        // The query is already open daemon-side. If attaching fails we must
+        // cancel it here, or it holds one of the daemon's few query slots (and
+        // keeps paging the provider) until it finishes on its own.
+        let events =
+            match spawn_subscriber(id, self.poll_interval, self.event_buffer, Arc::clone(&stop))
+                .await
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    self.control.fire(Request::CancelQuery { query: id });
+                    return Err(ClientError::Transport(e));
+                }
+            };
         Ok((
             id,
             QueryStream {

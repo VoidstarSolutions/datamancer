@@ -436,11 +436,15 @@ on that connection's teardown, the same way `close-client`/EOF tears down an
 `open-client` session). `list-queries` returns every currently in-flight query
 id, daemon-wide (not scoped to the caller's connection) — the `list-clients`
 analogue. Concurrency is capped by `[iceoryx2] max_queries`
-(default 2); an `open-query` past the cap answers `service_cap_exceeded`. The
-WebSocket control surface (feature `ws`; see
-[below](#websocket-client-surface-feature-ws)) does not yet carry a query
-envelope, so it answers every `open-query`/`cancel-query`/`list-queries` with
-`unsupported_transport`.
+(default 2); an `open-query` past the cap answers `service_cap_exceeded`.
+Queries are **unavailable over the WebSocket control surface** (feature `ws`;
+see [below](#websocket-client-surface-feature-ws)): the WS protocol has no
+query ops at all, so there is nothing to send. `WsClient::query` /
+`cancel_query` fail locally with `unsupported_transport` without any wire
+traffic — the daemon never sees the request and never emits that code. On
+**Windows**, where the daemon has no iceoryx2 node, the local control surface
+does answer `open-query`/`cancel-query`/`list-queries`, replying
+`unsupported_on_windows`.
 
 `instruments` enumerates the discoverable catalog and, per entry, the
 `EventKind`s that instrument supports; `provider` is optional and restricts
@@ -512,9 +516,8 @@ Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 `service_cap_exceeded`, `bad_request`, `shutting_down`,
 `credentials_missing`, `credential_backend_unavailable`, `permission_denied`,
 `unknown_config_field`, `unknown_query` (`cancel-query` named an id that is
-not in flight), `unsupported_transport` (an op sent over a transport that
-does not carry it — currently `open-query`/`cancel-query`/`list-queries` over
-WS), …). These are an operator contract and are
+not in flight), `unsupported_on_windows` (the query ops on a Windows daemon,
+which has no iceoryx2 node), …). These are an operator contract and are
 regression-guarded. (`restart_required` is not an error code — it is the
 boolean `get-config`/`get`/`PUT /api/config` field and the string value a
 mutating config op's `applied` field carries when a cold-classified change
