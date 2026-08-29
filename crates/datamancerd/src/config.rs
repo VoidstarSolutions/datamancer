@@ -486,7 +486,6 @@ pub fn persistence_options(cfg: PersistenceCfg) -> PersistenceOptions {
 /// every `open-query` fail with `persistence_required`: a cacheless daemon
 /// should still serve queries, straight from the provider.
 #[must_use]
-#[allow(dead_code)]
 pub fn resolve_query_persistence(config: &Config) -> PersistenceOptions {
     let options = persistence_options(config.session.query_persistence);
     if options.uses_cache() && config.cache.is_none() {
