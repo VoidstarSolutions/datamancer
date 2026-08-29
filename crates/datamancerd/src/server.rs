@@ -830,6 +830,13 @@ impl Server {
             ServerCommand::QueryFinished { query } => {
                 if let Some(entry) = self.queries.remove(&query) {
                     tracing::debug!(query, service = %entry.service, "query completed");
+                    // The pump reports here on two paths: a clean drain (the
+                    // controller has already shut itself down, so this close is
+                    // a no-op) and a sink rejection mid-range (the fetch is
+                    // still paging). Only `close()` actually aborts that fetch
+                    // — dropping the handle would leave it burning provider
+                    // rate limit with nobody consuming it.
+                    close_query_session(entry.session);
                 }
             }
             ServerCommand::CancelQueries { queries } => {
@@ -1045,14 +1052,24 @@ impl Server {
         };
 
         let id = self.next_client_id;
+        // Past this point the session is live and its fetch task is running, so
+        // every error path must `close_query_session` — dropping the handle
+        // leaves the controller (and the provider fetch) running with nobody
+        // draining it. See `close_query_session`.
         let sink = match Iceoryx2DataSink::new(&self.node, id) {
             Ok(sink) => Arc::new(sink) as Arc<dyn EventSink>,
-            Err(e) => return Reply::error(codes::INTERNAL, format!("query data sink: {e:?}")),
+            Err(e) => {
+                close_query_session(session);
+                return Reply::error(codes::INTERNAL, format!("query data sink: {e:?}"));
+            }
         };
         let service = format!("{}/data/{id}", self.service_prefix);
         let stream = match session.take_events().await {
             Ok(stream) => stream,
-            Err(e) => return reply_from_library_error(&e),
+            Err(e) => {
+                close_query_session(session);
+                return reply_from_library_error(&e);
+            }
         };
         let pump = spawn_query_pump(stream, sink.clone(), id, cmd_tx.clone());
 
