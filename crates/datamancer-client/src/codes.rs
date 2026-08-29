@@ -59,3 +59,10 @@ pub const INTEGRITY_REJECTED: &str = "integrity_rejected";
 /// (the iceoryx2 same-host data flow): on Windows the control plane is the
 /// admin surface only and data rides the WS-loopback transport.
 pub const UNSUPPORTED_ON_WINDOWS: &str = "unsupported_on_windows";
+/// `cancel-query` named a query id the daemon does not have in flight (already
+/// completed, already cancelled, or never issued).
+pub const UNKNOWN_QUERY: &str = "unknown_query";
+/// The op is not available on this transport. Currently returned by the
+/// WebSocket client for historical queries, which are iceoryx2-only until the
+/// WS query envelope lands.
+pub const UNSUPPORTED_TRANSPORT: &str = "unsupported_transport";
