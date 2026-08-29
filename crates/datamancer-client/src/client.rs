@@ -5,7 +5,7 @@ use datamancer_core::{InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, 
 use futures::Stream;
 
 use crate::error::ClientError;
-use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 /// A connected datamancerd client, generic over transport.
 ///
@@ -80,13 +80,50 @@ pub trait Client: Sized + Send {
     /// Graceful close: the daemon emits a terminal `SessionClosing` on the
     /// event stream and tears the client down.
     fn close(self) -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
+
+    /// A bounded historical event stream. Yields the query's events in source
+    /// order, then ends. A terminal `Control::SessionClosing` marks a clean
+    /// finish; provider failures arrive in-band as `Control::ProviderError` /
+    /// `Control::ProviderDisconnected` before the stream ends.
+    type Query: Stream<Item = MarketEvent> + Send + Unpin + 'static;
+
+    /// Open a bounded historical query. Unlike [`Client::subscribe`], this is
+    /// not part of the multiplexed live stream: the query owns its own channel
+    /// and its own `seq` space.
+    ///
+    /// **Dropping the returned stream cancels the query**, so an abandoned
+    /// backtest does not keep consuming provider rate limit. Call
+    /// [`Client::cancel_query`] to abort one whose stream is still held.
+    ///
+    /// # Errors
+    ///
+    /// - `unknown_provider` / `unsupported_event_kind` — no provider serves the
+    ///   pair on its history surface.
+    /// - `bad_request` — the range is inverted (`from > to`).
+    /// - `service_cap_exceeded` — the daemon's `max_queries` cap is reached.
+    /// - `unsupported_transport` — this transport cannot serve queries (WS).
+    fn query(
+        &mut self,
+        spec: &QuerySpec,
+    ) -> impl Future<Output = Result<(QueryId, Self::Query), ClientError<Self::Error>>> + Send;
+
+    /// Abort an in-flight query. Answering `unknown_query` means it had already
+    /// finished or been cancelled — which is not an error for most callers.
+    ///
+    /// # Errors
+    ///
+    /// `unknown_query` when the daemon has no such query in flight.
+    fn cancel_query(
+        &mut self,
+        query: QueryId,
+    ) -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
 }
 
 #[cfg(test)]
 mod tests {
     use super::Client;
     use crate::error::ClientError;
-    use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
+    use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
     use datamancer_core::{
         InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
     };
@@ -142,6 +179,33 @@ mod tests {
         async fn close(self) -> Result<(), ClientError<Self::Error>> {
             Ok(())
         }
+
+        type Query = Empty<MarketEvent>;
+
+        // `WsClient` has no cheap constructor for a disconnected instance (its
+        // fields all come from a live socket split), so the
+        // `unsupported_transport` regression the WS stub exists to prove is
+        // asserted here instead, against these bodies mirroring `WsClient`'s
+        // (brief-authorized fallback). Every other `FakeClient` method
+        // succeeds; these two deliberately do not, so
+        // `query_reports_unsupported_transport_code` below has something to
+        // assert on.
+        async fn query(
+            &mut self,
+            _spec: &QuerySpec,
+        ) -> Result<(QueryId, Self::Query), ClientError<Self::Error>> {
+            Err(ClientError::Control {
+                code: crate::codes::UNSUPPORTED_TRANSPORT.to_string(),
+                message: "historical queries are not available on this transport".to_string(),
+            })
+        }
+
+        async fn cancel_query(&mut self, _query: QueryId) -> Result<(), ClientError<Self::Error>> {
+            Err(ClientError::Control {
+                code: crate::codes::UNSUPPORTED_TRANSPORT.to_string(),
+                message: "historical queries are not available on this transport".to_string(),
+            })
+        }
     }
 
     /// The generic consumer shape the trait exists to make possible: code
@@ -173,6 +237,31 @@ mod tests {
                 assert_eq!(code, crate::codes::NOT_SUBSCRIBED);
             }
             other => panic!("expected Control error, got {other:?}"),
+        }
+    }
+
+    /// Stand-in for `ws_query_is_unsupported_on_this_transport`: `WsClient`
+    /// has no cheap disconnected constructor, so this asserts the same
+    /// `unsupported_transport` control code against `FakeClient`, whose
+    /// `query`/`cancel_query` bodies mirror `WsClient`'s stubs.
+    #[tokio::test]
+    async fn query_reports_unsupported_transport_code() {
+        let spec: QuerySpec = serde_json::from_str(
+            r#"{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1,"to":2}"#,
+        )
+        .expect("parse");
+        let mut client = FakeClient;
+        match client.query(&spec).await {
+            Err(ClientError::Control { code, .. }) => {
+                assert_eq!(code, crate::codes::UNSUPPORTED_TRANSPORT);
+            }
+            other => panic!("expected an unsupported-transport control error, got {other:?}"),
+        }
+        match client.cancel_query(1).await {
+            Err(ClientError::Control { code, .. }) => {
+                assert_eq!(code, crate::codes::UNSUPPORTED_TRANSPORT);
+            }
+            other => panic!("expected an unsupported-transport control error, got {other:?}"),
         }
     }
 }
