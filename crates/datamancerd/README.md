@@ -105,6 +105,7 @@ path = "/var/lib/datamancerd/taplog.db"  # optional; default: <data dir>/taplog.
 [session]
 resume_buffer_events = 65536
 adjustment = "all"                # raw | split | dividend | spin_off | all
+query_persistence = "cached"      # none | cached | cached_with_tap | read_only | refresh | tap_only
 
 [server]
 # admin_socket defaults to the datamancer-owned well-known path
@@ -124,6 +125,7 @@ cache_catalog_interval_ms = 30000
 
 [iceoryx2]
 max_clients = 64                  # per-client data-plane service cap
+max_queries = 2                   # concurrent in-flight historical-query cap
 
 [web_ui]                          # optional; requires the `web-ui` feature (default on)
 enabled = false                   # off unless explicitly enabled
@@ -156,6 +158,17 @@ restarting). Validation fails fast on the remaining cross-section invariants:
 a startup session using a cache preset requires `[cache]`; one writing the
 tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
 `backfill_from`.
+
+`[session] query_persistence` is the daemon's single cache policy for every
+`open-query` — queries carry no per-request persistence selector on the wire.
+It defaults to `cached`; if the resolved policy needs a cache but no `[cache]`
+is configured, it **degrades to `none` with a logged warning** rather than
+failing every `open-query` with `persistence_required` — a cacheless daemon
+still serves queries, straight from the provider. `[iceoryx2] max_queries`
+bounds concurrent in-flight historical queries (default 2, small on purpose:
+provider rate limit, not daemon capacity, is the binding constraint) — an
+`open-query` past the cap answers `service_cap_exceeded`, same as `max_clients`
+does for `open-client`.
 
 `[log]` configures the tracing subscriber installed at the very start of
 `main` — before the single-instance lock or config-file resolution/scaffolding
@@ -371,6 +384,11 @@ One JSON object per line; one reply line per request.
 {"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
 {"op":"unsubscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
 {"op":"close-client","client":"exec-1"}
+{"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1704067200000000000,"to":1704672000000000000}
+  -> {"ok":true,"query":0,"service":"datamancerd/data/0"}
+{"op":"cancel-query","query":0}
+  -> {"ok":true}
+{"op":"list-queries"}  -> {"ok":true,"queries":[0,1]}
 {"op":"list-clients"}  -> {"ok":true,"clients":["exec-1"]}
 {"op":"snapshot"}      -> {"ok":true,"snapshot":{ /* SystemSnapshot */ }}
 {"op":"instruments","provider":"alpaca-crypto"}
@@ -396,6 +414,33 @@ One JSON object per line; one reply line per request.
 {"op":"health"}
   -> {"ok":true,"health":{ /* HealthView, schema_version 2, daemon-stamped */ }}
 ```
+
+`open-query` opens a **bounded historical query** over
+`from..to` (inclusive `from`, `to >= from` or `bad_request`) — **ungated**,
+like `snapshot`, and, unlike `open-client`/`subscribe`, it needs **no** prior
+`open-client`: the daemon opens its own historical `Session`, allocates its
+own short-lived data service (`{service_prefix}/data/{id}`, the same id space
+as `open-client`'s per-client services), and pumps the bounded stream into it.
+A query that runs to completion ends with a terminal `SessionClosing` control
+on its data stream and the daemon reaps the entry (and the service) on its
+own — no `cancel-query` needed. A provider fetch failure arrives **in-band**
+on the data stream (a `Control` carrying the provider error) followed by the
+terminal `SessionClosing`, same as any other library error — never a
+control-socket error after the reply. `cancel-query` aborts an in-flight
+query and releases its service early; a stale/finished/unknown id answers
+`unknown_query`. Two things implicitly cancel every query a connection opened:
+**dropping the client's data stream** (the sink observes the disconnect) and
+**dropping the control connection itself** (EOF on the socket — the daemon
+tracks which in-flight queries each control connection opened and aborts them
+on that connection's teardown, the same way `close-client`/EOF tears down an
+`open-client` session). `list-queries` returns every currently in-flight query
+id, daemon-wide (not scoped to the caller's connection) — the `list-clients`
+analogue. Concurrency is capped by `[iceoryx2] max_queries`
+(default 2); an `open-query` past the cap answers `service_cap_exceeded`. The
+WebSocket control surface (feature `ws`; see
+[below](#websocket-client-surface-feature-ws)) does not yet carry a query
+envelope, so it answers every `open-query`/`cancel-query`/`list-queries` with
+`unsupported_transport`.
 
 `instruments` enumerates the discoverable catalog and, per entry, the
 `EventKind`s that instrument supports; `provider` is optional and restricts
@@ -466,7 +511,10 @@ Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 `unknown_provider`, `unknown_client`, `duplicate_client`,
 `service_cap_exceeded`, `bad_request`, `shutting_down`,
 `credentials_missing`, `credential_backend_unavailable`, `permission_denied`,
-`unknown_config_field`, …). These are an operator contract and are
+`unknown_config_field`, `unknown_query` (`cancel-query` named an id that is
+not in flight), `unsupported_transport` (an op sent over a transport that
+does not carry it — currently `open-query`/`cancel-query`/`list-queries` over
+WS), …). These are an operator contract and are
 regression-guarded. (`restart_required` is not an error code — it is the
 boolean `get-config`/`get`/`PUT /api/config` field and the string value a
 mutating config op's `applied` field carries when a cold-classified change
@@ -760,8 +808,10 @@ ordering as every other consumer.
 
 SIGTERM/SIGINT triggers a bounded, serialized drain: drain the web server (if
 enabled) → **stop accepting new WS connections and tear down in-flight ones**
-(feature `ws`) → stop accepting control requests → stop the diagnostics ticker
-→ per client close the session and drain its pump (so a terminal
+(feature `ws`) → **abort every in-flight historical query** (its service is
+released; a bounded fetch has no graceful finish worth waiting on, so queries
+are aborted, not drained) → stop accepting control requests → stop the
+diagnostics ticker → per client close the session and drain its pump (so a terminal
 `SessionClosing` reaches the sink instead of being severed) → drop the startup
 anchors → **flush the tap log** (the durable record) → per client flush the
 sink → drop the clients/sinks. The web server (and WS surface) are drained
