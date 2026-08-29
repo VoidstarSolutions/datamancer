@@ -46,9 +46,10 @@ cargo deny check                              # licenses, advisories, sources
 ## Branch shape — rebase onto main, never merge main in
 
 `main` is **semi-linear**: every PR lands as a merge commit whose branch sits
-*on top of* main, with no merges of its own. Two rules follow, and CI enforces
-both (`.github/scripts/semilinear-check.sh`, required check `semi-linear
-history`):
+*on top of* main, with no merges of its own. The `semi-linear history` CI job
+(`.github/scripts/semilinear-check.sh`) checks that shape. It is **advisory
+until it is added to the ruleset's required checks** — until then a red gate
+does not block the merge, but the shape it is complaining about is still wrong.
 
 ```bash
 git fetch origin && git rebase origin/main && git push --force-with-lease
@@ -58,14 +59,20 @@ git fetch origin && git rebase origin/main && git push --force-with-lease
   bubble inside the merge and fails the gate. Rebase instead.
 - **Be current at queue time.** GitHub's merge queue uses the `MERGE` method,
   which preserves merge commits but does **not** rebase for you — and "require
-  branches to be up to date" is not enforced for PRs entering a queue. If main
-  moves while you are queued, the entry is ejected; rebase and re-queue. Queue
-  entries merge one at a time, so this is a rebase per landed PR.
+  branches to be up to date" is not enforced for PRs entering a queue.
 
-The gate runs twice: as a pre-flight on the PR (advisory — main can still move
-after it goes green) and on the `merge_group` ref, where it inspects the exact
-merge commit the queue is about to fast-forward onto main. The second one is
-authoritative.
+The gate runs twice: as a pre-flight on the PR (advisory by nature — main can
+still move after it goes green) and on the `merge_group` ref, where it inspects
+the exact merge commit the queue is about to fast-forward onto main. The second
+one is authoritative.
+
+**One PR in the queue at a time.** A queue entry is built on top of the entries
+ahead of it, not on main, so if you queue behind someone else your entry's first
+parent is *their* merge commit — which your branch is not rebased onto, so the
+gate rejects it. That rejection is correct (merging there would land a bubble),
+but it means concurrent queueing does not work under this rule: land one PR,
+rebase, then queue the next. `max_entries_to_build` is `1`, so a merge group
+never holds more than one PR.
 
 ## Versioning — release-plz owns it, never bump by hand
 

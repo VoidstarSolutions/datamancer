@@ -59,9 +59,12 @@ case "$MODE" in
       echo "queue head ${MERGE_SHA} is not a merge commit; nothing to check"
       exit 0
     fi
-    # More than two parents is an octopus merge: not a shape this repo's
-    # one-PR-per-entry queue can produce, so treat it as a hard error rather
-    # than silently checking only the first two parents.
+    # More than two parents is an octopus merge. The ruleset pins
+    # `merge_queue.max_entries_to_build: 1`, so a group never holds more than
+    # one PR and this cannot happen - but if that setting is ever raised, fail
+    # loudly rather than silently checking only the first two parents.
+    # (`max_entries_to_merge` does NOT batch a group; it only caps how many
+    # already-built groups fast-forward onto the base at once.)
     git rev-parse --verify --quiet "${MERGE_SHA}^3" >/dev/null \
       && fail "queue head ${MERGE_SHA} is an octopus merge; expected one PR per entry"
 

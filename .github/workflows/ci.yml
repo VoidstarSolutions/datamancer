@@ -45,12 +45,21 @@ jobs:
           # `github.sha` covers `merge_group` (the queue head).
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      # `${{ }}` expansions are pasted into the generated shell script before
+      # it runs, so a ref name carrying shell syntax would execute on the
+      # runner. Branch names reach us attacker-influenced (`base_ref` is just
+      # a branch name), so they go through `env` and are quoted at use.
       - name: check merge shape (merge queue)
         if: github.event_name == 'merge_group'
-        run: .github/scripts/semilinear-check.sh merge "${{ github.sha }}"
+        env:
+          MERGE_SHA: ${{ github.sha }}
+        run: .github/scripts/semilinear-check.sh merge "$MERGE_SHA"
       - name: check branch shape (pull request pre-flight)
         if: github.event_name == 'pull_request'
-        run: .github/scripts/semilinear-check.sh branch "origin/${{ github.base_ref }}" "${{ github.event.pull_request.head.sha }}"
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/semilinear-check.sh branch "origin/$BASE_REF" "$HEAD_SHA"
 
   core:
     name: fmt + clippy + tests (Linux)
