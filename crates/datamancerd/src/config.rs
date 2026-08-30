@@ -199,6 +199,11 @@ pub struct SessionConfig {
     pub resume_buffer_events: usize,
     #[serde(default)]
     pub adjustment: AdjustmentCfg,
+    /// Cache policy for daemon-served historical queries. Queries carry no
+    /// per-request persistence selector — this is the daemon's policy for all
+    /// of them.
+    #[serde(default = "default_query_persistence")]
+    pub query_persistence: PersistenceCfg,
 }
 
 impl Default for SessionConfig {
@@ -206,12 +211,17 @@ impl Default for SessionConfig {
         Self {
             resume_buffer_events: default_resume_buffer(),
             adjustment: AdjustmentCfg::default(),
+            query_persistence: default_query_persistence(),
         }
     }
 }
 
 const fn default_resume_buffer() -> usize {
     65_536
+}
+
+const fn default_query_persistence() -> PersistenceCfg {
+    PersistenceCfg::Cached
 }
 
 /// Corporate-action adjustment mode.
@@ -307,24 +317,35 @@ const fn default_catalog_cadence() -> u64 {
 
 /// iceoryx2 transport caps. The per-client data-plane service is fixed-size at
 /// creation; `max_clients` bounds how many per-client services the daemon will
-/// create before rejecting `open-client` with a service-cap error.
+/// create before rejecting `open-client` with a service-cap error. `max_queries`
+/// bounds concurrent in-flight historical queries. Small by default: provider
+/// rate limit, not daemon capacity, is the binding constraint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Iceoryx2Config {
     #[serde(default = "default_max_clients")]
     pub max_clients: usize,
+    /// Bounds concurrent in-flight historical queries. Small by default:
+    /// provider rate limit, not daemon capacity, is the binding constraint.
+    #[serde(default = "default_max_queries")]
+    pub max_queries: usize,
 }
 
 impl Default for Iceoryx2Config {
     fn default() -> Self {
         Self {
             max_clients: default_max_clients(),
+            max_queries: default_max_queries(),
         }
     }
 }
 
 const fn default_max_clients() -> usize {
     64
+}
+
+const fn default_max_queries() -> usize {
+    2
 }
 
 /// Optional web UI (Phase 6).
@@ -456,6 +477,26 @@ pub fn persistence_options(cfg: PersistenceCfg) -> PersistenceOptions {
         PersistenceCfg::Refresh => PersistenceOptions::refresh(),
         PersistenceCfg::TapOnly => PersistenceOptions::none().with_tap_log(true),
     }
+}
+
+/// Resolve the daemon's query cache policy once, at boot.
+///
+/// A configured policy that needs a cache, with no `[cache]` section present,
+/// degrades to [`PersistenceOptions::none`] with a warning rather than making
+/// every `open-query` fail with `persistence_required`: a cacheless daemon
+/// should still serve queries, straight from the provider.
+#[must_use]
+pub fn resolve_query_persistence(config: &Config) -> PersistenceOptions {
+    let options = persistence_options(config.session.query_persistence);
+    if options.uses_cache() && config.cache.is_none() {
+        tracing::warn!(
+            policy = ?config.session.query_persistence,
+            "[session] query_persistence needs a cache but no [cache] is configured; \
+             serving queries straight from the provider"
+        );
+        return PersistenceOptions::none();
+    }
+    options
 }
 
 impl StartupSession {
@@ -1436,5 +1477,35 @@ always_on = true
             toml::from_str("admin_socket = \"/tmp/x.sock\"\nallow_any_integrity = true")
                 .expect("parse");
         assert!(set.allow_any_integrity);
+    }
+
+    #[test]
+    fn max_queries_defaults_to_two() {
+        let config: Config = toml::from_str("").expect("empty config parses");
+        assert_eq!(config.iceoryx2.max_queries, 2);
+    }
+
+    #[test]
+    fn max_queries_is_configurable_under_iceoryx2() {
+        let config: Config = toml::from_str("[iceoryx2]\nmax_queries = 6\n").expect("parse");
+        assert_eq!(config.iceoryx2.max_queries, 6);
+        assert_eq!(config.iceoryx2.max_clients, 64, "unrelated cap untouched");
+    }
+
+    #[test]
+    fn query_persistence_defaults_to_cached_when_a_cache_is_configured() {
+        let config: Config = toml::from_str("[cache]\nbackend = \"memory\"\n").expect("parse");
+        assert_eq!(config.session.query_persistence, PersistenceCfg::Cached);
+        assert!(resolve_query_persistence(&config).read_cache);
+    }
+
+    #[test]
+    fn query_persistence_degrades_to_none_without_a_cache() {
+        let config: Config = toml::from_str("").expect("parse");
+        let options = resolve_query_persistence(&config);
+        assert!(
+            !options.read_cache && !options.write_cache,
+            "a cacheless daemon must still serve queries, straight from the provider"
+        );
     }
 }

@@ -47,7 +47,7 @@ use crate::error::ClientError;
 #[cfg(not(windows))]
 use crate::iceoryx2::{Iceoryx2Client, Iceoryx2ClientError, Iceoryx2Config};
 use crate::protocol::uds::{Reply, Request};
-use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 // Windows hybrid: admin ops ride the owner-DACL named pipe, the data plane
 // rides WS-loopback (iceoryx2 shm is not viable on Windows — Phase 4). Unix is
@@ -83,6 +83,14 @@ pub type AdminError = PipeControlError;
 pub type DataError = Iceoryx2ClientError;
 #[cfg(windows)]
 pub type DataError = crate::ws::WsClientError;
+
+/// The data client's bounded historical stream type. Follows [`DataError`]:
+/// iceoryx2 off Windows, WS on it (where queries answer
+/// `unsupported_transport`).
+#[cfg(not(windows))]
+pub type AppQuery = crate::iceoryx2::QueryStream;
+#[cfg(windows)]
+pub type AppQuery = <crate::ws::WsClient as crate::Client>::Query;
 
 /// Default WS-loopback data endpoint for the Windows hybrid, used when
 /// [`EnsureConfig::ws_data_url`] is `None`. Must match the daemon's `[ws]`
@@ -466,6 +474,27 @@ impl AppHandle {
         self.data_mut().subscribe(spec).await
     }
 
+    /// See [`crate::Client::query`].
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::Client::query`].
+    pub async fn query(
+        &mut self,
+        spec: &QuerySpec,
+    ) -> Result<(QueryId, AppQuery), ClientError<DataError>> {
+        self.data_mut().query(spec).await
+    }
+
+    /// See [`crate::Client::cancel_query`].
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::Client::cancel_query`].
+    pub async fn cancel_query(&mut self, query: QueryId) -> Result<(), ClientError<DataError>> {
+        self.data_mut().cancel_query(query).await
+    }
+
     /// See [`crate::Client::unsubscribe`].
     ///
     /// # Errors
@@ -663,6 +692,17 @@ fn applied_from(reply: &Reply) -> Applied {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_query_alias_matches_the_platform_data_client() {
+        // Compile-time proof that the alias names the data client's own stream
+        // type: on Windows the WS client's, elsewhere the iceoryx2 client's.
+        fn assert_is_market_event_stream<
+            T: futures::Stream<Item = datamancer_core::MarketEvent>,
+        >() {
+        }
+        assert_is_market_event_stream::<AppQuery>();
+    }
 
     #[test]
     fn skew_gate_produces_typed_error() {
