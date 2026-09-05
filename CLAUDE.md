@@ -43,6 +43,37 @@ cargo deny check                              # licenses, advisories, sources
 .github/scripts/semver-checks.sh origin/main  # semver vs the PR base (needs cargo-semver-checks)
 ```
 
+## Branch shape — rebase onto main, never merge main in
+
+`main` is **semi-linear**: every PR lands as a merge commit whose branch sits
+*on top of* main, with no merges of its own. The `semi-linear history` CI job
+(`.github/scripts/semilinear-check.sh`) checks that shape. It is **advisory
+until it is added to the ruleset's required checks** — until then a red gate
+does not block the merge, but the shape it is complaining about is still wrong.
+
+```bash
+git fetch origin && git rebase origin/main && git push --force-with-lease
+```
+
+- **Rebase, never back-merge.** `git merge main` into your branch leaves a
+  bubble inside the merge and fails the gate. Rebase instead.
+- **Be current at queue time.** GitHub's merge queue uses the `MERGE` method,
+  which preserves merge commits but does **not** rebase for you — and "require
+  branches to be up to date" is not enforced for PRs entering a queue.
+
+The gate runs twice: as a pre-flight on the PR (advisory by nature — main can
+still move after it goes green) and on the `merge_group` ref, where it inspects
+the exact merge commit the queue is about to fast-forward onto main. The second
+one is authoritative.
+
+**One PR in the queue at a time.** A queue entry is built on top of the entries
+ahead of it, not on main, so if you queue behind someone else your entry's first
+parent is *their* merge commit — which your branch is not rebased onto, so the
+gate rejects it. That rejection is correct (merging there would land a bubble),
+but it means concurrent queueing does not work under this rule: land one PR,
+rebase, then queue the next. `max_entries_to_build` is `1`, so a merge group
+never holds more than one PR.
+
 ## Versioning — release-plz owns it, never bump by hand
 
 All eight crates share `[workspace.package] version` in the root `Cargo.toml`, which keeps `datamancer-client`/`datamancerd` in lockstep for the ping version gate. **release-plz owns that field**: it bumps it in the `chore: release` PR, and merging that PR is what tags `vX.Y.Z`. Do not edit the version in a feature PR — the `release` job tags whatever version lands on `main`, so a hand-bump self-releases on merge and leaves the standing release PR computing against a surprise tag. Full flow and the pre-1.0 bump table (while major is `0`, release-plz demotes every bump: `feat:` → patch, `feat!:` → minor) live in `RELEASING.md`.

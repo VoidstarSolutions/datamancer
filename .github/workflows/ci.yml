@@ -20,6 +20,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  semilinear:
+    # Semi-linear history gate (see .github/scripts/semilinear-check.sh).
+    # GitHub offers no semi-linear merge mode: the queue's `MERGE` method keeps
+    # merge commits but never rebases the PR head, and "require branches to be
+    # up to date" is not enforced for PRs entering a merge queue. So the shape
+    # has to be asserted here.
+    #
+    # The `merge_group` run is the authoritative one - HEAD there is the exact
+    # merge commit the queue will fast-forward onto main, so a stale entry is
+    # ejected instead of landing a bubble. The `pull_request` run is a
+    # pre-flight: it cannot be authoritative (main can move after it goes
+    # green), but it flags a stale branch in the PR rather than at queue time.
+    name: semi-linear history
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The repo default for GITHUB_TOKEN is `write`; this job only reads the
+    # commit graph, so drop it to the minimum.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The gate reasons about ancestry, so it needs the full graph.
+          fetch-depth: 0
+          # On `pull_request` the default ref is refs/pull/N/merge - a merge of
+          # the head into the base, which is not the branch shape under test.
+          # `github.sha` covers `merge_group` (the queue head).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # `${{ }}` expansions are pasted into the generated shell script before
+      # it runs, so a ref name carrying shell syntax would execute on the
+      # runner. Branch names reach us attacker-influenced (`base_ref` is just
+      # a branch name), so they go through `env` and are quoted at use.
+      - name: check merge shape (merge queue)
+        if: github.event_name == 'merge_group'
+        env:
+          MERGE_SHA: ${{ github.sha }}
+        run: .github/scripts/semilinear-check.sh merge "$MERGE_SHA"
+      - name: check branch shape (pull request pre-flight)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/semilinear-check.sh branch "origin/$BASE_REF" "$HEAD_SHA"
+
   core:
     name: fmt + clippy + tests (Linux)
     runs-on: ubuntu-latest
