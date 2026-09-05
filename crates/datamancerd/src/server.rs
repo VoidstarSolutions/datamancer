@@ -29,6 +29,21 @@ use datamancer::{
     AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
     Session, TapLog, traits::EventSink,
 };
+// `Timestamp` only appears in `validate_query_open`'s signature and its
+// tests, both unix/macOS only — importing it unconditionally would be
+// `unused_imports` on Windows.
+#[cfg(not(windows))]
+use datamancer::Timestamp;
+// `ControlKind` only names the query pump's terminal-event check, which is
+// unix/macOS only (the iceoryx2 data plane has no Windows node).
+#[cfg(not(windows))]
+use datamancer::ControlKind;
+// `QuerySpec` names both `open_query` arms (unix and the Windows stub both take
+// one), so it's imported unconditionally. `QueryId` is a plain `u64` alias
+// (not itself cfg-gated) and now also names the platform-agnostic EOF
+// teardown state (`opened_queries` in `serve_connection`,
+// `ServerCommand::CancelQueries`), so it too is imported unconditionally.
+use datamancer_client::spec::{QueryId, QuerySpec};
 // `PublishOutcome` and the `StreamExt` combinators drive the iceoryx2 per-client
 // pump (`spawn_pump`), which is unix-only (WS has its own pump in `ws/conn.rs`).
 #[cfg(not(windows))]
@@ -116,6 +131,24 @@ impl DrainClient for ClientEntry {
     }
 }
 
+/// One in-flight historical query.
+///
+/// The `Session` is held here so cancellation can **close** it. Dropping the
+/// handle is *not* enough: the historical controller holds its own
+/// `Arc<SessionInner>`, so its `cmd_tx` clone stays alive and the in-flight
+/// provider fetch keeps paging into a detached ring. Only
+/// `Session::close()` — which sends `SessionCommand::Close` — reaches the
+/// controller's `fetch_task.abort()`. Removing the entry therefore aborts the
+/// pump, drops the sink (releasing the service) and spawns the session close.
+#[cfg(not(windows))]
+struct QueryEntry {
+    session: datamancer::Session,
+    #[allow(dead_code)] // held to keep the service alive for the pump's lifetime
+    sink: Arc<dyn EventSink>,
+    pump: JoinHandle<()>,
+    service: String,
+}
+
 /// A command handed to the server actor by a control connection.
 enum ServerCommand {
     /// A parsed control request plus the channel to reply on.
@@ -125,6 +158,15 @@ enum ServerCommand {
     },
     /// A control connection for `client` hit EOF (emergency teardown).
     Disconnect { client: String },
+    /// A query's pump reached the end of its stream; reap the entry.
+    #[cfg(not(windows))]
+    QueryFinished { query: QueryId },
+    /// A control connection hit EOF; abort every query it opened. Unconditional
+    /// (not `#[cfg(not(windows))]`) because `serve_connection` — the shared,
+    /// platform-agnostic connection loop — is what sends it; on Windows
+    /// `open-query` always fails, so `queries` is always empty there in
+    /// practice, but the variant itself must compile on both platforms.
+    CancelQueries { queries: Vec<QueryId> },
 }
 
 /// Live handles to the embedded web server: its `serve` task, a one-shot
@@ -163,6 +205,19 @@ pub struct Server {
     /// Startup-session anchors, held for the process lifetime.
     anchors: Vec<Session>,
     clients: HashMap<String, ClientEntry>,
+    /// In-flight historical queries, keyed by id. Ids share `next_client_id`
+    /// with clients, so a query's data-service name can never collide with a
+    /// client's.
+    #[cfg(not(windows))]
+    queries: HashMap<QueryId, QueryEntry>,
+    /// Bounds concurrent queries (see `[iceoryx2] max_queries`). Unix/macOS
+    /// only — read by `open_query`, which has no Windows arm to read it.
+    #[cfg(not(windows))]
+    max_queries: usize,
+    /// Daemon-wide cache policy for queries, resolved once at boot. Unix/macOS
+    /// only, for the same reason as `max_queries`.
+    #[cfg(not(windows))]
+    query_persistence: datamancer::PersistenceOptions,
     /// Monotonic id for the next iceoryx2 data service (`open-client`); unix-only
     /// since Windows opens no iceoryx2 clients.
     #[cfg(not(windows))]
@@ -227,6 +282,16 @@ impl Server {
         let service_prefix = config.server.service_prefix.clone();
         #[cfg(not(windows))]
         let max_clients = config.iceoryx2.max_clients;
+        let max_queries = config.iceoryx2.max_queries;
+        let query_persistence = crate::config::resolve_query_persistence(&config);
+        // Resolved on every platform (so a config mistake surfaces even where
+        // queries don't run yet), but only stored on unix/macOS: `open-query`
+        // rides the iceoryx2 data plane, which has no Windows node.
+        tracing::debug!(
+            max_queries,
+            ?query_persistence,
+            "resolved historical-query cap and persistence policy"
+        );
         let shutdown_timeout = Duration::from_secs(config.server.shutdown_timeout_secs);
         let diag_interval = Duration::from_millis(config.diagnostics.publish_interval_ms);
         let startup_sessions = config.startup_session.clone();
@@ -306,6 +371,12 @@ impl Server {
             anchors,
             clients: HashMap::new(),
             #[cfg(not(windows))]
+            queries: HashMap::new(),
+            #[cfg(not(windows))]
+            max_queries,
+            #[cfg(not(windows))]
+            query_persistence,
+            #[cfg(not(windows))]
             next_client_id: 0,
             #[cfg(not(windows))]
             service_prefix,
@@ -356,6 +427,11 @@ impl Server {
     /// # Errors
     ///
     /// Propagates control-socket bind errors.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one sequential boot-then-select-loop-then-drain shutdown ordering; \
+                  splitting the drain steps across functions would scatter load-bearing order"
+    )]
     pub async fn run(mut self) -> Result<()> {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(256);
         let accept = self.spawn_control(cmd_tx.clone())?;
@@ -417,7 +493,7 @@ impl Server {
                 maybe = cmd_rx.recv() => {
                     match maybe {
                         Some(cmd) => {
-                            if self.handle(cmd).await.is_break() {
+                            if self.handle(cmd, &cmd_tx).await.is_break() {
                                 break;
                             }
                         }
@@ -449,6 +525,9 @@ impl Server {
                 tracing::warn!("ws surface did not drain within timeout");
             }
         }
+
+        // Abort in-flight queries up front; this also unblocks `cmd_rx` closing below.
+        self.abort_all_queries();
 
         let recorder = DrainRecorder::default();
         let clients: Vec<Box<dyn DrainClient>> = self
@@ -723,7 +802,11 @@ impl Server {
         Ok(())
     }
 
-    async fn handle(&mut self, cmd: ServerCommand) -> std::ops::ControlFlow<()> {
+    async fn handle(
+        &mut self,
+        cmd: ServerCommand,
+        cmd_tx: &mpsc::Sender<ServerCommand>,
+    ) -> std::ops::ControlFlow<()> {
         match cmd {
             ServerCommand::Request { request, reply } => {
                 if matches!(request, Request::Shutdown) && !self.draining {
@@ -737,17 +820,35 @@ impl Server {
                     let _ = reply.send(Reply::ok());
                     return std::ops::ControlFlow::Break(());
                 }
-                let response = self.dispatch(request).await;
+                let response = self.dispatch(request, cmd_tx).await;
                 let _ = reply.send(response);
             }
             ServerCommand::Disconnect { client } => {
                 self.teardown_client(&client).await;
             }
+            #[cfg(not(windows))]
+            ServerCommand::QueryFinished { query } => {
+                if let Some(entry) = self.queries.remove(&query) {
+                    tracing::debug!(query, service = %entry.service, "query completed");
+                    // The pump reports here on two paths: a clean drain (the
+                    // controller has already shut itself down, so this close is
+                    // a no-op) and a sink rejection mid-range (the fetch is
+                    // still paging). Only `close()` actually aborts that fetch
+                    // — dropping the handle would leave it burning provider
+                    // rate limit with nobody consuming it.
+                    close_query_session(entry.session);
+                }
+            }
+            ServerCommand::CancelQueries { queries } => {
+                for query in queries {
+                    let _ = self.cancel_query(query);
+                }
+            }
         }
         std::ops::ControlFlow::Continue(())
     }
 
-    async fn dispatch(&mut self, request: Request) -> Reply {
+    async fn dispatch(&mut self, request: Request, cmd_tx: &mpsc::Sender<ServerCommand>) -> Reply {
         if self.draining {
             return Reply::error(codes::SHUTTING_DOWN, "daemon is shutting down");
         }
@@ -822,6 +923,9 @@ impl Server {
             // `handle` intercepts Shutdown before dispatch; reaching here means the
             // daemon is already draining.
             Request::Shutdown => Reply::error(codes::SHUTTING_DOWN, "daemon is shutting down"),
+            Request::OpenQuery { spec } => self.open_query(spec, cmd_tx).await,
+            Request::CancelQuery { query } => self.cancel_query(query),
+            Request::ListQueries => self.list_queries(),
             Request::Health => {
                 let view = stamped_health_view(&self.dm.snapshot_live(), self.credential_backend);
                 Reply::health(view)
@@ -910,6 +1014,161 @@ impl Server {
         Reply::service(service)
     }
 
+    /// Open a bounded historical query: validate the range, open the session,
+    /// then allocate its own short-lived iceoryx2 data service and pump the
+    /// bounded stream into it. Unix/macOS only — this is the iceoryx2 data
+    /// flow, which has no node on Windows.
+    ///
+    /// # Attach race
+    ///
+    /// The pump starts before this reply is written, so a query that finishes
+    /// almost immediately (empty range, fully cached) can reach the end of its
+    /// stream — and have the pump reap the entry and its service — before the
+    /// client has attached to the named service. That surfaces to the client
+    /// as an indistinguishable `ClientError::Transport`, not as an empty
+    /// result. This race is documented and accepted, not mitigated: see
+    /// `Iceoryx2Client::query`'s "Attach race" for the client-side contract.
+    #[cfg(not(windows))]
+    async fn open_query(&mut self, spec: QuerySpec, cmd_tx: &mpsc::Sender<ServerCommand>) -> Reply {
+        // Validate and open the session BEFORE allocating the sink, so every
+        // fail-fast path is reachable without an iceoryx2 node.
+        if let Some(reply) =
+            validate_query_open(spec.from, spec.to, self.queries.len(), self.max_queries)
+        {
+            return reply;
+        }
+        let instrument = query_instrument(&spec);
+        let scope = Scope::Historical {
+            from: spec.from,
+            to: spec.to,
+        };
+        let session = match self
+            .dm
+            .session(instrument, spec.kind.into(), scope, self.query_persistence)
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => return reply_from_library_error(&e),
+        };
+
+        let id = self.next_client_id;
+        // Past this point the session is live and its fetch task is running, so
+        // every error path must `close_query_session` — dropping the handle
+        // leaves the controller (and the provider fetch) running with nobody
+        // draining it. See `close_query_session`.
+        let sink = match Iceoryx2DataSink::new(&self.node, id) {
+            Ok(sink) => Arc::new(sink) as Arc<dyn EventSink>,
+            Err(e) => {
+                close_query_session(session);
+                return Reply::error(codes::INTERNAL, format!("query data sink: {e:?}"));
+            }
+        };
+        let service = format!("{}/data/{id}", self.service_prefix);
+        let stream = match session.take_events().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                close_query_session(session);
+                return reply_from_library_error(&e);
+            }
+        };
+        let pump = spawn_query_pump(stream, sink.clone(), id, cmd_tx.clone());
+
+        self.next_client_id += 1;
+        self.queries.insert(
+            id,
+            QueryEntry {
+                session,
+                sink,
+                pump,
+                service: service.clone(),
+            },
+        );
+        Reply::query(id, service)
+    }
+
+    /// Windows: historical queries also ride the iceoryx2 data plane, which
+    /// has no node on Windows.
+    #[cfg(windows)]
+    #[allow(clippy::unused_async)] // symmetric with the unix arm the dispatcher awaits
+    async fn open_query(
+        &mut self,
+        _spec: QuerySpec,
+        _cmd_tx: &mpsc::Sender<ServerCommand>,
+    ) -> Reply {
+        Reply::error(
+            codes::UNSUPPORTED_ON_WINDOWS,
+            "historical queries ride the iceoryx2 data plane, which has no Windows node",
+        )
+    }
+
+    /// Abort an in-flight query: abort the pump, close the `Session` (which is
+    /// what actually kills the provider fetch) and release the data service.
+    ///
+    /// The close is *spawned*, never awaited: `cancel_query` runs on the daemon
+    /// actor, and awaiting a session shutdown there would stall every other
+    /// control op behind it.
+    #[cfg(not(windows))]
+    fn cancel_query(&mut self, query: QueryId) -> Reply {
+        match self.queries.remove(&query) {
+            Some(entry) => {
+                entry.pump.abort();
+                close_query_session(entry.session);
+                tracing::debug!(query, "query cancelled");
+                Reply::ok()
+            }
+            None => Reply::error(
+                codes::UNKNOWN_QUERY,
+                format!("no in-flight query {query} (already finished or cancelled)"),
+            ),
+        }
+    }
+
+    /// List in-flight query ids, sorted for a stable reply.
+    #[cfg(not(windows))]
+    fn list_queries(&self) -> Reply {
+        let mut ids: Vec<QueryId> = self.queries.keys().copied().collect();
+        ids.sort_unstable();
+        Reply::queries(ids)
+    }
+
+    /// Windows has no iceoryx2 node, so no query can ever be in flight.
+    #[cfg(windows)]
+    #[allow(clippy::unused_self)] // symmetric with the unix arm's `&mut self`
+    fn cancel_query(&mut self, _query: QueryId) -> Reply {
+        Reply::error(
+            codes::UNSUPPORTED_ON_WINDOWS,
+            "historical queries are unavailable on Windows",
+        )
+    }
+
+    /// Windows has no iceoryx2 node, so the in-flight query list is always empty.
+    #[cfg(windows)]
+    #[allow(clippy::unused_self)] // symmetric with the unix arm's `&self`
+    fn list_queries(&self) -> Reply {
+        Reply::queries(Vec::new())
+    }
+
+    /// Abort every in-flight query on shutdown. In-flight queries are aborted,
+    /// not drained: a bounded fetch has no graceful finish worth waiting on,
+    /// and blocking shutdown on a multi-year bar fetch would be unacceptable.
+    /// This also unblocks `cmd_rx` closing in `run`'s drain: a running query
+    /// pump otherwise holds a `cmd_tx` clone (Task 4 review finding) past the
+    /// supervisor's own `drop(cmd_tx)`, so without this abort the channel
+    /// would stay open until the drain timeout instead of closing promptly.
+    #[cfg(not(windows))]
+    fn abort_all_queries(&mut self) {
+        for (id, entry) in self.queries.drain() {
+            entry.pump.abort();
+            close_query_session(entry.session);
+            tracing::debug!(query = id, "aborted in-flight query for shutdown");
+        }
+    }
+
+    /// Windows has no iceoryx2 node, so there is nothing to abort.
+    #[cfg(windows)]
+    #[allow(clippy::unused_self)] // symmetric with the unix arm's `&mut self`
+    fn abort_all_queries(&mut self) {}
+
     async fn subscribe(&mut self, client: &str, spec: SubscriptionSpec) -> Reply {
         let Some(entry) = self.clients.get(client) else {
             return Reply::error(codes::UNKNOWN_CLIENT, format!("no such client {client:?}"));
@@ -970,6 +1229,46 @@ fn spec_instrument(spec: &SubscriptionSpec) -> Instrument {
     )
 }
 
+/// The `Instrument` a query names. Mirrors `spec_instrument` for queries.
+/// Unix/macOS only — its sole non-test caller is the unix `open_query`.
+#[cfg(not(windows))]
+fn query_instrument(spec: &QuerySpec) -> Instrument {
+    Instrument::new(
+        ProviderId::new(spec.provider.clone()),
+        spec.asset_class.into(),
+        spec.symbol.clone(),
+    )
+}
+
+/// Validate an `open-query` request *before* any session or sink is
+/// allocated: the range must not be inverted, and the concurrent-query cap
+/// must not already be met. `Some(reply)` means reject with that reply;
+/// `None` means the caller may proceed. Callers must run this before
+/// `Datamancer::session` and before `Iceoryx2DataSink::new` — that ordering is
+/// what makes both fail-fast paths reachable without a live iceoryx2 node.
+/// Unix/macOS only — its sole non-test caller is the unix `open_query`.
+#[cfg(not(windows))]
+fn validate_query_open(
+    from: Timestamp,
+    to: Timestamp,
+    in_flight: usize,
+    max: usize,
+) -> Option<Reply> {
+    if from > to {
+        return Some(Reply::error(
+            codes::BAD_REQUEST,
+            format!("inverted query range: from={from:?} > to={to:?}"),
+        ));
+    }
+    if in_flight >= max {
+        return Some(Reply::error(
+            codes::SERVICE_CAP_EXCEEDED,
+            format!("query cap {max} exceeded"),
+        ));
+    }
+    None
+}
+
 /// Reject a control request that carries unknown top-level JSON keys. `serde`'s
 /// `deny_unknown_fields` cannot cover `Request` directly (it is an
 /// internally-tagged enum, and `Subscribe` `#[serde(flatten)]`s its spec — both
@@ -1010,6 +1309,76 @@ fn spawn_pump(mut stream: datamancer::EventStream, sink: Arc<dyn EventSink>) -> 
         if let Err(e) = sink.flush().await {
             tracing::warn!(error = %e, "final sink flush failed");
         }
+    })
+}
+
+/// Close a query's `Session` off the actor task.
+///
+/// Dropping a `Session` handle does **not** stop its historical fetch: the
+/// controller owns its own `Arc<SessionInner>`, so the command channel stays
+/// open and the provider keeps paging. `Session::close()` sends
+/// `SessionCommand::Close`, which the controller's `select!` observes and
+/// answers with `fetch_task.abort()` — that is the only path that actually
+/// cancels the fetch. It is spawned rather than awaited because every caller
+/// runs on the daemon actor, where an inline await would block all other
+/// control ops.
+#[cfg(not(windows))]
+fn close_query_session(session: datamancer::Session) {
+    tokio::spawn(async move {
+        let _ = session.close().await;
+    });
+}
+
+/// Pump a query's bounded stream into its own sink, then tell the actor to reap
+/// the entry. Unlike the client pump, this one **must** report its exit: a
+/// completed query has to release its data service without the consumer having
+/// to call `cancel-query`.
+///
+/// Reaping happens immediately after the stream drains and flushes — see
+/// `open_query`'s "Attach race" for the known window this leaves for a very
+/// fast query to finish before the client attaches.
+///
+/// # Why this stops at `SessionClosing` rather than reading to `None`
+///
+/// A historical session's controller does **not** close the event channel when
+/// its fetch completes: it emits the terminal `SessionClosing` and then parks
+/// on `tx.closed()`, waiting for the *consumer* to drop the stream before it
+/// shuts down (`Controller::finish_historical`). Reading to `None` therefore
+/// deadlocks — the pump would wait for a close that only the pump's own drop
+/// can trigger — and the entry would never be reaped, permanently consuming a
+/// `max_queries` slot. So the pump publishes the terminal control, breaks, and
+/// drops the stream, which lets the controller finish.
+#[cfg(not(windows))]
+fn spawn_query_pump(
+    mut stream: datamancer::EventStream,
+    sink: Arc<dyn EventSink>,
+    query: QueryId,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(ev) = stream.next().await {
+            let terminal = matches!(
+                &ev,
+                datamancer::MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing
+            );
+            match sink.publish(ev).await {
+                PublishOutcome::Delivered => {}
+                PublishOutcome::Rejected(_) => {
+                    tracing::warn!(query, "query sink rejected event; stopping pump");
+                    break;
+                }
+            }
+            if terminal {
+                break;
+            }
+        }
+        // Drop the stream before reporting: the controller is parked on
+        // `tx.closed()` and only this drop releases it.
+        drop(stream);
+        if let Err(e) = sink.flush().await {
+            tracing::warn!(query, error = %e, "final query sink flush failed");
+        }
+        let _ = cmd_tx.send(ServerCommand::QueryFinished { query }).await;
     })
 }
 
@@ -1263,6 +1632,62 @@ async fn handle_connection(
     serve_connection(read, write, privileged, cmd_tx, dm, hub, config_hub).await;
 }
 
+/// The EOF-teardown state one request/reply pair may arm or disarm, captured
+/// from the request before it is forwarded to the actor (which consumes it).
+struct TeardownArm {
+    open_client: Option<String>,
+    is_open_query: bool,
+    cancelled_query: Option<QueryId>,
+}
+
+impl TeardownArm {
+    fn of(request: &Request) -> Self {
+        Self {
+            open_client: match request {
+                Request::OpenClient { client, .. } => Some(client.clone()),
+                _ => None,
+            },
+            is_open_query: matches!(request, Request::OpenQuery { .. }),
+            cancelled_query: match request {
+                Request::CancelQuery { query } => Some(*query),
+                _ => None,
+            },
+        }
+    }
+
+    /// Fold this pair's outcome into the connection's teardown state.
+    fn apply(
+        self,
+        reply: &Reply,
+        opened_client: &mut Option<String>,
+        opened_queries: &mut Vec<QueryId>,
+    ) {
+        // Arm teardown only after a *successful* open, so a rejected open
+        // (e.g. duplicate-name) never causes the EOF path to tear down the
+        // existing client/query it did not actually create.
+        if reply.ok {
+            if let Some(name) = self.open_client {
+                *opened_client = Some(name);
+            }
+            if self.is_open_query
+                && let Some(id) = reply.query
+            {
+                opened_queries.push(id);
+            }
+        }
+        // Disarm on a cancel the daemon acted on, so a long-lived connection
+        // issuing many queries does not accumulate every id it ever opened and
+        // then send them all as no-op cancels at EOF. `unknown_query` disarms
+        // too: it means the id is definitively no longer in flight (already
+        // completed, reaped or cancelled).
+        if let Some(id) = self.cancelled_query
+            && (reply.ok || reply.code.as_deref() == Some(codes::UNKNOWN_QUERY))
+        {
+            opened_queries.retain(|open| *open != id);
+        }
+    }
+}
+
 /// Serve one control connection over any byte transport: read newline-JSON
 /// requests, dispatch each, write the reply line. Transport-agnostic — Unix
 /// drives it with the two halves of a `UnixStream`, Windows with the two
@@ -1299,6 +1724,7 @@ async fn serve_connection<R, W>(
 {
     let mut lines = BufReader::new(read).lines();
     let mut opened_client: Option<String> = None;
+    let mut opened_queries: Vec<QueryId> = Vec::new();
 
     loop {
         let Ok(Some(line)) = lines.next_line().await else {
@@ -1353,10 +1779,7 @@ async fn serve_connection<R, W>(
                         )
                     }
                 } else {
-                    let open_client_name = match &request {
-                        Request::OpenClient { client, .. } => Some(client.clone()),
-                        _ => None,
-                    };
+                    let teardown = TeardownArm::of(&request);
                     let (tx, rx) = oneshot::channel();
                     if cmd_tx
                         .send(ServerCommand::Request { request, reply: tx })
@@ -1367,15 +1790,7 @@ async fn serve_connection<R, W>(
                     }
                     match rx.await {
                         Ok(reply) => {
-                            // Arm EOF teardown only after a *successful* open, so a
-                            // rejected open (e.g. duplicate-name) never causes the
-                            // EOF path to tear down the existing client of that
-                            // name.
-                            if reply.ok
-                                && let Some(name) = open_client_name
-                            {
-                                opened_client = Some(name);
-                            }
+                            teardown.apply(&reply, &mut opened_client, &mut opened_queries);
                             reply
                         }
                         Err(_) => break,
@@ -1393,9 +1808,28 @@ async fn serve_connection<R, W>(
         }
     }
 
-    // Emergency teardown on EOF for a client this connection opened.
+    emergency_teardown(&cmd_tx, opened_client, opened_queries).await;
+}
+
+/// EOF emergency teardown for one control connection: abort whatever this
+/// connection leaves live — its client's stream and any query it opened — so
+/// a dropped connection (e.g. a crashed backtest) never keeps running unread,
+/// burning provider rate limit in the client case or the query cap in the
+/// query case.
+async fn emergency_teardown(
+    cmd_tx: &mpsc::Sender<ServerCommand>,
+    opened_client: Option<String>,
+    opened_queries: Vec<QueryId>,
+) {
     if let Some(client) = opened_client {
         let _ = cmd_tx.send(ServerCommand::Disconnect { client }).await;
+    }
+    if !opened_queries.is_empty() {
+        let _ = cmd_tx
+            .send(ServerCommand::CancelQueries {
+                queries: opened_queries,
+            })
+            .await;
     }
 }
 
@@ -1462,6 +1896,12 @@ async fn drain_servicing_late_requests(
                         ));
                     }
                     Some(ServerCommand::Disconnect { .. }) => {}
+                    #[cfg(not(windows))]
+                    Some(ServerCommand::QueryFinished { .. }) => {}
+                    // Queries were already aborted up front in `run`'s drain
+                    // setup; a late `CancelQueries` from a connection hitting
+                    // EOF during drain has nothing left to cancel.
+                    Some(ServerCommand::CancelQueries { .. }) => {}
                     None => producers_open = false,
                 },
             }
@@ -1611,6 +2051,20 @@ mod tests {
         assert!(reject_unknown_keys(line, &request).is_err());
     }
 
+    #[test]
+    fn cancel_query_and_list_queries_survive_unknown_key_rejection() {
+        for line in [
+            r#"{"op":"cancel-query","query":3}"#,
+            r#"{"op":"list-queries"}"#,
+        ] {
+            let request: Request = serde_json::from_str(line).expect("parse");
+            assert!(reject_unknown_keys(line, &request).is_ok(), "{line}");
+        }
+        let bogus = r#"{"op":"cancel-query","query":3,"client":"x"}"#;
+        let request: Request = serde_json::from_str(bogus).expect("parse");
+        assert!(reject_unknown_keys(bogus, &request).is_err());
+    }
+
     /// `AppHandle::ensure`'s version gate (`datamancer-client`'s
     /// `app::check_version`) requires the daemon's `ping` version
     /// (`env!("CARGO_PKG_VERSION")`, stamped above in `Request::Ping`) to be
@@ -1627,5 +2081,63 @@ mod tests {
             "datamancerd and datamancer-client must be version-bumped together — \
              the ping version gate in AppHandle::ensure compares them"
         );
+    }
+
+    #[test]
+    fn open_query_frame_round_trips_through_unknown_key_rejection() {
+        let line = r#"{"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1,"to":2}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        assert!(reject_unknown_keys(line, &request).is_ok());
+    }
+
+    #[test]
+    fn open_query_rejects_an_unknown_top_level_key() {
+        let line = r#"{"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1,"to":2,"persistence":"cached"}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        assert!(
+            reject_unknown_keys(line, &request).is_err(),
+            "queries carry no persistence selector; it must be rejected, not ignored"
+        );
+    }
+
+    // `query_instrument` is unix/macOS only (see its definition); Windows has
+    // no `open_query` arm that calls it.
+    #[cfg(not(windows))]
+    #[test]
+    fn query_instrument_maps_the_wire_tuple() {
+        let spec: QuerySpec = serde_json::from_str(
+            r#"{"provider":"alpaca","asset_class":"crypto","symbol":"BTC/USD","kind":"bar1d","from":1,"to":2}"#,
+        )
+        .expect("parse");
+        let instrument = query_instrument(&spec);
+        assert_eq!(instrument.symbol(), "BTC/USD");
+        assert_eq!(instrument.provider().as_str(), "alpaca");
+        assert_eq!(instrument.asset_class(), AssetClass::Crypto);
+    }
+
+    // `validate_query_open` is unix/macOS only (see its definition); Windows
+    // has no `open_query` arm that calls it.
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_query_open_rejects_an_inverted_range() {
+        let reply = validate_query_open(Timestamp(2), Timestamp(1), 0, 2)
+            .expect("inverted range must be rejected");
+        assert!(!reply.ok);
+        assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_query_open_rejects_at_the_cap() {
+        let reply =
+            validate_query_open(Timestamp(1), Timestamp(2), 2, 2).expect("at-cap must be rejected");
+        assert!(!reply.ok);
+        assert_eq!(reply.code.as_deref(), Some(codes::SERVICE_CAP_EXCEEDED));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_query_open_allows_a_valid_range_under_cap() {
+        assert!(validate_query_open(Timestamp(1), Timestamp(2), 1, 2).is_none());
     }
 }
