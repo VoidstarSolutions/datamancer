@@ -79,6 +79,21 @@ impl Drop for DaemonHandle {
     }
 }
 
+/// The daemon's control endpoint: a UDS path under the tempdir on unix, a
+/// per-process named pipe on Windows (the daemon's Windows control transport
+/// only accepts `\\.\pipe\` names).
+#[cfg(unix)]
+fn control_endpoint(dir: &std::path::Path) -> PathBuf {
+    dir.join("admin.sock")
+}
+#[cfg(windows)]
+fn control_endpoint(_dir: &std::path::Path) -> PathBuf {
+    PathBuf::from(format!(
+        r"\\.\pipe\datamancerd-ct-e2e-{}",
+        std::process::id()
+    ))
+}
+
 /// Spawn the daemon from a written config file (merges `ws_e2e.rs`'s `[ws]`
 /// generation with `daemon_e2e.rs`'s admin-socket wait) and block until both
 /// surfaces are reachable.
@@ -89,7 +104,7 @@ impl Drop for DaemonHandle {
 /// reply's service name regardless of the configured prefix, so no
 /// particular prefix value is required here.
 async fn spawn_daemon(dir: &std::path::Path, ws_port: u16) -> DaemonHandle {
-    let socket = dir.join("admin.sock");
+    let socket = control_endpoint(dir);
     let config_path = dir.join("datamancerd.toml");
     let config = format!(
         r#"
@@ -98,7 +113,7 @@ account_type = "paper"
 venue = "us"
 
 [server]
-admin_socket = "{socket}"
+admin_socket = '{socket}'
 service_prefix = "datamancerd-ct-e2e"
 
 [diagnostics]
@@ -121,11 +136,16 @@ port = {ws_port}
         .expect("spawn datamancerd");
 
     // Wait for the UDS control socket to appear (ported from
-    // `daemon_e2e.rs::spawn_daemon`).
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(Instant::now() < deadline, "daemon socket never appeared");
-        std::thread::sleep(Duration::from_millis(50));
+    // `daemon_e2e.rs::spawn_daemon`). Unix only: probing a named pipe's
+    // existence can consume a pipe instance, so on Windows the WS readiness
+    // probe below is the boot gate.
+    #[cfg(unix)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(Instant::now() < deadline, "daemon socket never appeared");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     // Wait for the WS listener (ported from `ws_e2e.rs::connect_when_ready`,
