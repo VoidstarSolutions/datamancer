@@ -82,9 +82,14 @@ pub trait Client: Sized + Send {
     fn close(self) -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
 
     /// A bounded historical event stream. Yields the query's events in source
-    /// order, then ends. A terminal `Control::SessionClosing` marks a clean
-    /// finish; provider failures arrive in-band as `Control::ProviderError` /
-    /// `Control::ProviderDisconnected` before the stream ends.
+    /// order, then ends. A terminal `Control::SessionClosing` marks the end of
+    /// the stream — it does NOT distinguish success from provider failure: the
+    /// iceoryx2 data plane suppresses connection-scoped controls
+    /// (`ProviderError`/`ProviderDisconnected`), so a failed fetch is delivered
+    /// as an empty or truncated stream ending in a clean `SessionClosing`.
+    /// Consult the diagnostics plane or daemon log to distinguish a failure
+    /// from a legitimately empty range; per-query error surfacing is a
+    /// follow-up.
     type Query: Stream<Item = MarketEvent> + Send + Unpin + 'static;
 
     /// Open a bounded historical query. Unlike [`Client::subscribe`], this is

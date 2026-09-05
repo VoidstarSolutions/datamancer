@@ -423,10 +423,15 @@ own short-lived data service (`{service_prefix}/data/{id}`, the same id space
 as `open-client`'s per-client services), and pumps the bounded stream into it.
 A query that runs to completion ends with a terminal `SessionClosing` control
 on its data stream and the daemon reaps the entry (and the service) on its
-own — no `cancel-query` needed. A provider fetch failure arrives **in-band**
-on the data stream (a `Control` carrying the provider error) followed by the
-terminal `SessionClosing`, same as any other library error — never a
-control-socket error after the reply. `cancel-query` aborts an in-flight
+own — no `cancel-query` needed. A provider fetch failure is emitted
+in-band by the library, but the iceoryx2 data plane **suppresses
+connection-scoped controls** (`ProviderError`/`ProviderDisconnected`), so
+what a consumer observes is an empty or truncated stream ending in the
+terminal `SessionClosing` — on the data plane alone, indistinguishable
+from a legitimately empty range. Check the daemon log or the diagnostics
+plane to tell them apart (per-query error surfacing is a follow-up); a
+failure is never a control-socket error after the reply. `cancel-query`
+aborts an in-flight
 query and releases its service early; a stale/finished/unknown id answers
 `unknown_query`. Two things implicitly cancel every query a connection opened:
 **dropping the `datamancer-client` `QueryStream`** (its `Drop` sends
