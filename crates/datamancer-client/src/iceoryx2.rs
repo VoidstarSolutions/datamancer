@@ -277,7 +277,18 @@ async fn spawn_subscriber(
         }
         while !stop.load(Ordering::Relaxed) {
             match subscriber.poll() {
-                Ok(events) if events.is_empty() => std::thread::sleep(poll_interval),
+                Ok(events) if events.is_empty() => {
+                    // The consumer can vanish without `close()` running (a
+                    // dropped stream, or a panic unwinding past the client):
+                    // with no events flowing, `blocking_send`'s error can
+                    // never fire, so an idle pass must check for a closed
+                    // channel or this thread never exits — and the tokio
+                    // runtime drop then blocks joining it (#64's wedge).
+                    if ev_tx.is_closed() {
+                        return;
+                    }
+                    std::thread::sleep(poll_interval);
+                }
                 Ok(events) => {
                     for ev in events {
                         if ev_tx.blocking_send(ev).is_err() {
