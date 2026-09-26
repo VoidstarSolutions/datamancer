@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/VoidstarSolutions/datamancer/compare/v0.9.0...v0.9.1) - 2026-09-05
+
+### Added
+
+- *(winsec)* Windows token/handle identity & integrity readers
+- *(winsec)* new crate with pure integrity-level classifier
+
+### Fixed
+
+- *(winsec)* capture the Win32 error before CloseHandle in token/integrity reads
+- *(winsec)* satisfy pinned clippy on Windows — # Errors docs + ptr-deref allow
+- *(winsec)* guard 0-count integrity SID; gate winsec dep on iceoryx2
+
+### Other
+
+- *(windows)* document Medium-integrity enforcement; winsec crate; bump 0.6.0
+- Merge pull request #58 from VoidstarSolutions/release-plz-2026-08-27T01-14-55Z
+
 ## [0.9.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.8.0...v0.9.0) - 2026-08-27
 
 ### Added
