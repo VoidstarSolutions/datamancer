@@ -183,3 +183,19 @@ so this shouldn't happen. If release-plz ever does create multiple Releases
 pointing at the same tag (one per crate), add per-package overrides to
 `release-plz.toml` — a `[[package]]` block with `git_release_enable = false`
 for every crate except the one you want to author the Release.
+
+## Binary artifacts
+
+`release-artifacts.yml` runs on the tag release-plz pushes. Build jobs
+compile `datamancerd` per target, archive it
+(`datamancer-<version>-<target>.tar.gz`), attach a build provenance
+attestation, and hand the archive to a `sign` job. Only the `sign` job can
+read the signing key: `RELEASE_SIGNING_KEY` is a secret of the `release`
+environment, which deploys only from `v*` tags. It signs each archive with
+minisign (`<archive>.minisig`, trusted comment
+`datamancer <version> <target>`), verifies against the `RELEASE_PUBLIC_KEY`
+variable, and attaches both files to the release. Quartermaster trusts the
+key through its root-signed trust list.
+
+A throwaway tag such as `v0.9.0-qm.1` exercises the job without a version
+bump; delete the tag and the release afterwards.

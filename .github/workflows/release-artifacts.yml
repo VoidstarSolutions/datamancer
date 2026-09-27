@@ -1,0 +1,153 @@
+name: release-artifacts
+
+# release-plz creates the tag and the GitHub Release using an App token, so
+# this tag push does trigger workflows (a GITHUB_TOKEN push would not). Build
+# jobs compile datamancerd per target; the sign job signs and attaches.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-artifacts-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: deny
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write      # build provenance attestation
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, 2026-09-03
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Verify tag matches workspace version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${TAG%%-*}"   # throwaway pre-release tags (v0.9.0-qm.1) run against an unbumped tree
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="datamancerd") | .version')"
+          echo "tag=$TAG cargo=$CARGO_VERSION"
+          [ "$TAG" = "$CARGO_VERSION" ] || { echo "::error::tag v$TAG does not match workspace version $CARGO_VERSION"; exit 1; }
+
+      - name: Build datamancerd
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p datamancerd
+
+      - name: Package archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="stage/$TARGET"
+          mkdir -p "$STAGE" dist
+          cp "target/$TARGET/release/datamancerd" "$STAGE/datamancerd"
+          ARCHIVE="dist/datamancer-${VERSION}-${TARGET}.tar.gz"
+          tar -czf "$ARCHIVE" -C "$STAGE" datamancerd
+          shasum -a 256 "$ARCHIVE"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ env.ARCHIVE }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that can read the signing key (release environment, v* tags
+  # only). It never checks out the repository, so no project code, build
+  # script, or dependency runs beside the key.
+  sign:
+    name: sign and attach
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+    env:
+      PRODUCT: datamancer
+      EXPECTED_ARCHIVES: 2
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install rsign2
+        run: cargo install --locked rsign2@0.6.7
+
+      - name: Sign and verify
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${RELEASE_SIGNING_KEY:-}" ] || { echo "::error::RELEASE_SIGNING_KEY is empty; this job must run in the release environment from a v* tag"; exit 1; }
+          [ -n "${RELEASE_PUBLIC_KEY:-}" ] || { echo "::error::RELEASE_PUBLIC_KEY variable is not set"; exit 1; }
+          VERSION="${GITHUB_REF_NAME#v}"
+          shopt -s nullglob
+          archives=(dist/"$PRODUCT-$VERSION-"*.tar.gz)
+          if [ "${#archives[@]}" -ne "$EXPECTED_ARCHIVES" ]; then
+            echo "::error::expected $EXPECTED_ARCHIVES archives, found ${#archives[@]}"
+            exit 1
+          fi
+          KEY="$RUNNER_TEMP/release.key"
+          trap 'rm -f "$KEY"' EXIT
+          install -m 600 /dev/null "$KEY"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$KEY"
+          for ARCHIVE in "${archives[@]}"; do
+            TARGET="$(basename "$ARCHIVE" .tar.gz)"
+            TARGET="${TARGET#"$PRODUCT-$VERSION-"}"
+            rsign sign -s "$KEY" -x "$ARCHIVE.minisig" -t "$PRODUCT $VERSION $TARGET" "$ARCHIVE"
+            rsign verify -P "$RELEASE_PUBLIC_KEY" -x "$ARCHIVE.minisig" "$ARCHIVE"
+          done
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # release-plz has already created the release for this tag.
+          # --clobber makes a re-run idempotent.
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.minisig \
+            --repo "$GITHUB_REPOSITORY" --clobber
