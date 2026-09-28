@@ -147,14 +147,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # release-plz has already created the release for a vX.Y.Z tag. A
-          # hand-pushed throwaway tag (v0.9.0-qm.1) has none, so it gets a
-          # pre-release here; a plain tag never does, so this cannot race
-          # release-plz. --clobber makes a re-run idempotent.
-          if [[ "$GITHUB_REF_NAME" == *-* ]] \
-            && ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-              --prerelease --title "$GITHUB_REF_NAME" --notes "Throwaway pre-release; delete after use."
+          # release-plz creates the release for a vX.Y.Z tag right after
+          # pushing it; deny + build leave it ample time, but wait rather than
+          # assume. A hand-pushed throwaway tag (v0.9.0-qm.1) has no release,
+          # so it gets a draft pre-release here, published once its assets are
+          # attached; a plain tag never does, so this cannot race release-plz.
+          # --clobber makes a re-run idempotent.
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+                --draft --prerelease --title "$GITHUB_REF_NAME" --notes "Throwaway pre-release; delete after use."
+            fi
+          else
+            for _ in $(seq 60); do
+              gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
+              sleep 10
+            done
+            gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null \
+              || { echo "::error::no release for $GITHUB_REF_NAME after 10 minutes"; exit 1; }
           fi
           gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.minisig \
             --repo "$GITHUB_REPOSITORY" --clobber
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          fi

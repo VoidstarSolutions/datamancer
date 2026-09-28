@@ -192,10 +192,35 @@ compile `datamancerd` per target, archive it
 attestation, and hand the archive to a `sign` job. Only the `sign` job can
 read the signing key: `RELEASE_SIGNING_KEY` is a secret of the `release`
 environment, which deploys only from `v*` tags. It signs each archive with
-minisign (`<archive>.minisig`, trusted comment
-`datamancer <version> <target>`), verifies against the `RELEASE_PUBLIC_KEY`
-variable, and attaches both files to the release. Quartermaster trusts the
-key through its root-signed trust list.
+`rsign2` (the `rsign` command), producing a Minisign-format
+`<archive>.minisig` with the trusted comment `datamancer <version> <target>`,
+verifies each signature against the `RELEASE_PUBLIC_KEY` variable, and
+attaches both files to the release. Quartermaster trusts the key through its
+root-signed trust list.
+
+### Signing key
+
+The `sign` job has no TTY and supplies no passphrase, so the key **must be
+unencrypted** — `rsign2` encrypts by default, and a protected key makes the
+step fail. Generate (or rotate) a pair offline with:
+
+```bash
+cargo install --locked rsign2@0.6.7
+rsign generate -W -p release.pub -s release.key
+```
+
+- `RELEASE_SIGNING_KEY` (secret, `release` environment): the full contents of
+  `release.key`.
+- `RELEASE_PUBLIC_KEY` (repository variable): the base64 key line of
+  `release.pub` (the second line, not the `untrusted comment:` line).
+
+To rotate, generate a new pair, replace both values, add the new public key to
+Quartermaster's trust list before the next release, then destroy
+`release.key`.
+
+### Testing the job
 
 A throwaway tag such as `v0.9.0-qm.1` exercises the job without a version
-bump; delete the tag and the release afterwards.
+bump. release-plz makes no release for it, so the `sign` job creates a draft
+pre-release, attaches the assets, and publishes it. Delete the tag and the
+release afterwards.
