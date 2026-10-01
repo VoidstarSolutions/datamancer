@@ -33,15 +33,49 @@ Every implementation upholds the same contract (from the doc comment on
 
 `connect` returns a split `(handle, events)` pair, so a consumer can issue
 control calls (`subscribe`, `unsubscribe`, `snapshot`, `instruments`,
-`close`) while draining the event stream on another task without contention.
+`capabilities`, `query`, `close`) while draining the event stream on another
+task without contention.
+
+## Bounded historical queries
+
+`query(&QuerySpec)` opens a **bounded** historical range and returns
+`(QueryId, Self::Query)` — a second, query-scoped stream that is independent of
+the client's subscription stream. It needs no prior subscription: the daemon
+opens its own historical session, allocates a dedicated data service for it, and
+pumps the bounded range into it. A query that runs to completion ends with a
+terminal `SessionClosing` control. `cancel_query(QueryId)` aborts one in flight;
+`unknown_query` back means it had already finished, which is not an error for
+most callers.
+
+**Availability is not uniform, and this is deliberate rather than incidental:**
+
+| Transport / platform | `query` |
+| --- | --- |
+| iceoryx2 on macOS / Linux | ✅ supported |
+| WebSocket (any platform) | ❌ fails locally with `unsupported_transport` — the WS protocol has no query ops, so no wire traffic is generated and the daemon never sees the request |
+| Any transport against a Windows daemon | ❌ the daemon answers `unsupported_on_windows` — there is no iceoryx2 node to carry a query's result plane |
+
+Because the `app` facade uses WS for its data plane on Windows, an `AppHandle`
+on Windows cannot run historical queries at all. Consumers that need history on
+Windows must currently go through an in-process `datamancer` session rather than
+the daemon.
 
 ## Stable codes
 
-Control rejections carry one of the strings in `codes` (`duplicate_subscription`,
-`not_subscribed`, `unknown_provider`, `session_closed`, `duplicate_client`,
-`unsupported_event_kind`, `shutting_down`, `internal`, …) — identical across
-both transports and regression-guarded by tests. Treat these as an operator
-contract: match on the string, not on transport-specific error text.
+Control rejections carry one of the strings in `codes` — identical across both
+transports and regression-guarded by tests. Treat these as an operator contract:
+**match on the string, not on transport-specific error text.**
+
+| Group | Codes |
+| --- | --- |
+| Subscription | `duplicate_subscription`, `not_subscribed`, `unsupported_event_kind`, `unsupported_client_scope`, `live_session_conflict` |
+| Session / client | `session_closed`, `unknown_client`, `duplicate_client`, `events_already_taken`, `service_cap_exceeded` |
+| Queries | `unknown_query`, `unsupported_transport`, `unsupported_on_windows`, `persistence_required` |
+| Credentials / config | `credentials_missing`, `credential_backend_unavailable`, `unknown_config_field`, `restart_required` |
+| Access control | `permission_denied`, `integrity_rejected` |
+| Generic | `unknown_provider`, `bad_request`, `storage`, `config`, `provider`, `shutting_down`, `internal` |
+
+`codes.rs` is authoritative; adding or removing one is a breaking change.
 
 ## Loss contract
 
