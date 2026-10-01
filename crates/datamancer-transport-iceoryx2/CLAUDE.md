@@ -19,7 +19,7 @@ Same-host, zero-copy iceoryx2 transport for datamancer. Two planes:
   `unsafe impl ZeroCopySend`, relax *only this crate* to `#![deny(unsafe_code)]`
   + one scoped `#[allow(unsafe_code)]` with a `// SAFETY:` proof — never the
   core crates.
-- **Pinned iceoryx2 version: `0.9.2`.** All builder/port method names are
+- **Pinned iceoryx2 version: `0.10.0`.** All builder/port method names are
   verify-against-this-version. Note 0.9.x renamed `FixedSizeByteString` →
   `StaticString` and uses `BackpressureStrategy` (no `UnableToDeliverStrategy`).
   Ports are created on `ipc_threadsafe::Service` (the default `ipc::Service` is
