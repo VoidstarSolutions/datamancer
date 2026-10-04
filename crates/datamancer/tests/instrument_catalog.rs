@@ -227,3 +227,129 @@ async fn catalog_carries_capabilities_and_enrichment_works() {
     assert_eq!(enriched[1].instrument.asset_class(), AssetClass::Equity);
     assert!(enriched[1].capabilities.is_none());
 }
+
+/// Fake that is parked (`enabled() == false`, like a daemon provider with
+/// `Watch(None)` settings — the #64 Bug A shape) and/or cannot answer
+/// `list_instruments` (like an enabled provider with no credentials).
+struct GatedFake {
+    id: &'static str,
+    enabled: bool,
+    fails: bool,
+}
+
+#[async_trait]
+impl Provider for GatedFake {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
+        false
+    }
+
+    async fn start_live(
+        &self,
+        _sink: mpsc::Sender<MarketEvent>,
+    ) -> datamancer::Result<Box<dyn LiveHandle>> {
+        Err(Error::Provider {
+            provider: self.id.to_string(),
+            message: "not live-capable".to_string(),
+        })
+    }
+
+    async fn fetch_history(
+        &self,
+        _request: HistoryRequest,
+        _sink: mpsc::Sender<MarketEvent>,
+    ) -> datamancer::Result<()> {
+        Ok(())
+    }
+
+    async fn list_instruments(&self) -> datamancer::Result<Vec<InstrumentEntry>> {
+        if self.fails {
+            return Err(Error::Provider {
+                provider: self.id.to_string(),
+                message: "Trading client not initialized".to_string(),
+            });
+        }
+        Ok(vec![InstrumentEntry::bare(Instrument::new(
+            ProviderId::from_static(self.id),
+            AssetClass::Crypto,
+            "GATED",
+        ))])
+    }
+}
+
+fn dm_with(gated: GatedFake) -> Datamancer {
+    Datamancer::builder()
+        .provider(Box::new(VaryingFake { id: "fake-a" }))
+        .provider(Box::new(gated))
+        .build()
+        .expect("build")
+}
+
+#[tokio::test]
+async fn unfiltered_catalog_omits_disabled_providers() {
+    let catalog = dm_with(GatedFake {
+        id: "parked",
+        enabled: false,
+        fails: false,
+    })
+    .instrument_catalog(None)
+    .await
+    .expect("catalog");
+    assert_eq!(catalog.len(), 2);
+    assert!(
+        catalog
+            .iter()
+            .all(|i| i.instrument.provider().as_str() == "fake-a")
+    );
+}
+
+#[tokio::test]
+async fn unfiltered_catalog_propagates_an_enabled_providers_error() {
+    // Only parked providers are omitted. An enabled provider that cannot
+    // answer (e.g. no credentials) still fails the op, per the daemon's
+    // documented "fail provider-unavailable" contract.
+    let err = dm_with(GatedFake {
+        id: "broken",
+        enabled: true,
+        fails: true,
+    })
+    .instrument_catalog(None)
+    .await
+    .expect_err("an enabled provider's error must not be swallowed");
+    assert!(matches!(err, Error::Provider { provider, .. } if provider == "broken"));
+}
+
+#[tokio::test]
+async fn filtered_catalog_still_asks_a_disabled_provider() {
+    // The caller named it, so the enabled() filter does not apply.
+    let catalog = dm_with(GatedFake {
+        id: "parked",
+        enabled: false,
+        fails: false,
+    })
+    .instrument_catalog(Some(&ProviderId::from_static("parked")))
+    .await
+    .expect("catalog");
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].instrument.provider().as_str(), "parked");
+}
+
+#[tokio::test]
+async fn filtered_catalog_propagates_the_named_providers_error() {
+    let err = dm_with(GatedFake {
+        id: "broken",
+        enabled: true,
+        fails: true,
+    })
+    .instrument_catalog(Some(&ProviderId::from_static("broken")))
+    .await
+    .expect_err("the caller named the failing provider");
+    assert!(matches!(err, Error::Provider { provider, .. } if provider == "broken"));
+}
