@@ -6,9 +6,9 @@ A unified subscription and replay layer for financial market data. Datamancer ta
 
 Datamancer is an early-stage open-source library. The public API is still co-evolving with its first real consumers, and breaking changes should be expected until that surface stabilizes.
 
-The workspace currently holds two crates — `datamancer-core` (types and trait surface) and `datamancer` (the session orchestrator, plus provider and storage backends behind cargo features). Provider integrations and persistence backends are expected to split into their own sibling crates once the boundaries are obvious from working code; until that split is motivated by real coupling pain, they live in `datamancer` behind features and grow organically. Consumers bring in `datamancer` plus the providers and persistence backends they actually need.
+The workspace holds eight crates. `datamancer-core` carries the types and trait surface; `datamancer` is the session orchestrator, with provider and storage backends behind cargo features. The transports (`datamancer-transport-iceoryx2`, `datamancer-transport-ws`), the consumer-side client (`datamancer-client`), credential storage (`datamancer-credentials`), the Windows security primitives (`datamancer-winsec`), and the server binary (`datamancerd`) have each split out into their own crate as the boundary became obvious from working code. Provider integrations and storage backends have **not** split yet — they still live in `datamancer` behind features, and will move when real coupling pain motivates it. Consumers bring in `datamancer` plus the providers and persistence backends they actually need; separate consumer *processes* depend on `datamancer-client` instead and never link the orchestrator.
 
-The first supported provider is Alpaca. Provider integration is meant to be additive: adding a second provider should not require changing any consumer code.
+The supported providers are Alpaca equities and Alpaca crypto. Provider integration is additive: adding a provider does not require changing any consumer code. An IBKR provider is reserved in the core wire types (`ProviderCredentials::Gateway`, `ProviderState::{CompanionUnreachable, Unauthenticated}`) but is **not implemented**.
 
 ## What Datamancer Does
 
@@ -31,12 +31,22 @@ The first supported provider is Alpaca. Provider integration is meant to be addi
 
 ## Event Model
 
-Datamancer's public output is a stream of `MarketEvent`. Variants currently planned:
+Datamancer's public output is a stream of `MarketEvent` (`#[non_exhaustive]`):
 
 - `Trade { instrument, source_ts, rx_ts, seq, price, size }`
 - `Bar { instrument, interval, source_ts, rx_ts, seq, open, high, low, close, volume }`
-- `Quote { instrument, source_ts, rx_ts, seq, bid, ask, ... }`
-- `Control(SessionEvent)` — connectivity, subscription state, gap notifications
+- `Quote { instrument, source_ts, rx_ts, seq, bid, ask, … }`
+- `Control(Control)` — connectivity, subscription state, gap notifications, session close
+
+`EventKind` is the subscription selector and maps 1:1 onto the data variants: `Trade`,
+`Quote`, and `Bar(BarInterval)` over the six intervals (`OneSecond`, `OneMinute`,
+`FiveMinute`, `FifteenMinute`, `OneHour`, `OneDay`). `EventKind::enumerate()` walks the
+whole finite kind space, which is what makes per-instrument capability discovery possible.
+
+> `EventKind`, `BarInterval`, and `Surface` are deliberately **not** `#[non_exhaustive]`,
+> so adding an interval or a kind is a declared breaking change that every provider must
+> consciously answer. Prices and sizes are fixed-point (`Price`, `Quantity`) — `1e-9`
+> scaled `i64`/`u64` on the wire, not floats.
 
 Every data variant carries three timestamp/identifier fields, with distinct roles that should not be conflated:
 
@@ -48,55 +58,137 @@ Every data variant carries three timestamp/identifier fields, with distinct role
 
 ## Sessions
 
-A session is the unit of consumption. Three constructors, all returning the same `Session` type:
+There are two consumption handles, both fed by the same authoritative machinery.
+
+**`Session`** is the single-pair case — one `(instrument, kind)`. It is opened from a built
+`Datamancer`, and what would once have been three separate constructors is one call whose
+`Scope` argument selects the shape:
 
 ```rust
-let live = datamancer.live(LiveConfig { providers, credentials, ... })?;
-let backtest = datamancer.replay(ReplayConfig { source, instruments, range })?;
-let warm_start = datamancer.stitched(StitchConfig { backfill_from, ... })?;
+let dm = Datamancer::builder().provider_arc(provider).build()?;
+
+// bounded replay: the stream completes when `to` is reached
+let backtest = dm.session(instrument.clone(), kind, Scope::Historical { from, to },
+                          PersistenceOptions::cached()).await?;
+
+// pure live, from "now"
+let live = dm.session(instrument.clone(), kind, Scope::Live { backfill_from: None },
+                      PersistenceOptions::cached_with_tap()).await?;
+
+// stitched: backfill from `t` to the live edge, then seam into the live tail
+let warm_start = dm.session(instrument, kind, Scope::Live { backfill_from: Some(t) },
+                            PersistenceOptions::cached()).await?;
 ```
 
-A `Session` exposes:
+Opening is **eager** — the live subscription or historical fetch begins before the call
+returns. A second live open for the same pair *shares* the authoritative session rather
+than conflicting with it.
 
-- `events()` — the single output stream (`Stream<Item = MarketEvent>`).
-- `subscribe(Subscription)` / `unsubscribe(Subscription)` — mutate the active subscription set. Live and stitched sessions accept these throughout their lifetime; replay sessions fix the subscription set at construction (the subscription set is part of what defines a reproducible analysis).
+**`ClientSession`** (`dm.client_session()`) is the primary consumer handle: it holds a
+mutable `(instrument, kind)` subscription set and presents one multiplexed stream over all
+of it. `Session`'s live path is a referrer onto the same shared authoritative sessions that
+back `ClientSession`.
+
+Both expose:
+
+- `events()` — the output stream (`Stream<Item = MarketEvent>`). Multi-shot: dropping and
+  re-taking it is the resume primitive, and events missed in between surface as a
+  `Control::Gap` rather than vanishing.
 - `close()` — explicit shutdown.
+
+`ClientSession` additionally exposes `subscribe` / `unsubscribe` to mutate its set at
+runtime without tearing down the underlying connection.
 
 The choice of explicit `close` over reference-counted lifetime keeps subscription teardown visible in code, which matters once persistence is wired up and shutdown order affects whether buffered events make it to disk.
 
+## The `Provider` trait
+
+`Provider` is the extension point; adding a source is purely additive at the consumer
+layer. Dynamic dispatch lives at the **cold** boundary (start, subscribe, history fetch) —
+a provider's per-message decode loop stays monomorphic behind its own concrete
+`mpsc::Sender<MarketEvent>`.
+
+| Method | Role |
+| --- | --- |
+| `id()` | stable provider id, used in config, control events, and storage keys |
+| `supports(instrument, kind, surface)` | capability predicate, answered **per `Surface`** |
+| `start_live(sink)` | open a streaming subscription, returning a `LiveHandle` |
+| `fetch_history(request, sink)` | serve a bounded range in source-timestamp order |
+| `list_instruments()` | bulk catalog for the instrument picker (default: empty) |
+| `capabilities(instrument)` | on-demand per-contract lookup (default: `None`) |
+| `latest(instrument, kind)` | one-shot most-recent value, to seed a live subscription (default: `None`) |
+| `metrics()` | optional byte / rate-limit counters from inside the decode loop |
+| `enabled()` | whether a runtime settings source has this provider parked |
+
+`Surface::{Live, History}` is the axis that keeps the two data paths honest. They genuinely
+differ and neither contains the other — Alpaca's equity websocket streams only minute and
+daily bars while its REST endpoint serves five intervals. Collapsing them into one
+predicate makes a provider either over-promise a backfill it cannot serve or reject a
+request it could have served; datamancer shipped both bugs before this axis existed.
+
+Capability answers are **best-effort and may be partial**: an absent field means
+*unknown*, never *unsupported*.
+
 ## Subscriptions
 
-A subscription is `(instrument, set-of-event-kinds)`:
+A subscription is one `(instrument, kind)` pair, added to a `ClientSession`'s set:
 
 ```rust
-session.subscribe(Subscription {
-    instrument: Instrument::from("AAPL"),
-    kinds: [EventKind::Trade, EventKind::Quote].into(),
-}).await?;
+let aapl = Instrument::new("alpaca", AssetClass::Equity, "AAPL");
+
+let mut client = dm.client_session();
+client.subscribe(aapl.clone(), EventKind::Trade, scope, options).await?;
+client.subscribe(aapl, EventKind::Quote, scope, options).await?;
 ```
 
 Subscriptions accumulate; the client session's multiplexed stream **interleaves** everything that has been requested — per-symbol deterministic (`(instrument, seq)`, source-stamped within each instrument), arrival-order across symbols, never globally merge-sorted. Each `(instrument, kind)` pair is backed by a refcounted shared **authoritative session**, so two consumers of the same pair observe identical `(seq, source_ts)`. Adding the same instrument with a new event kind extends the subscription set rather than duplicating it.
 
 ## Configuration
 
-A `LiveConfig` covers:
+There is no monolithic session config. What a session needs is split across three places:
 
-- Provider selection and credentials. Each provider config carries a `CredentialsSource` (`Env` — deprecated legacy `ALPACA_*` variables; `Static`; or `Watch`, a hot-reloadable channel) rather than the builder itself gaining a credential-source API; `datamancerd` wires `Watch` to its own credential broker (`datamancer-credentials`: OS keychain/secret-service with a file fallback, provisioned over the control socket).
-- Per-instrument provider mapping, once more than one provider is supported.
-- Reconnect and retry policy.
-- Buffer sizes and backpressure behavior.
+**The builder** (`DatamancerBuilder`) registers providers, the optional `HistoricalCache`
+and `TapLog`, and process-wide knobs such as the per-client resume-buffer size.
 
-A `ReplayConfig` covers:
+**Per-session arguments** — `Scope` and `PersistenceOptions` — are passed at `session()` /
+`subscribe()` time, so one `Datamancer` serves bounded-replay, pure-live, and stitched
+consumers simultaneously. Datamancer owns the backfill→live seam and reports any gap or
+overlap at it as a `Control` event.
 
-- The replay source (historical fetch from a provider, a local tap log, or a local fetch cache once persistence lands).
-- The instrument set and event-kind selection.
-- The date range.
+**Per-provider configuration** is the provider's own struct, carrying two hot-reloadable
+sources rather than being fixed at build time:
 
-A `StitchConfig` is essentially a `ReplayConfig` for the backfill window plus a `LiveConfig` for the tail, with datamancer responsible for handling the seam (and reporting any gap or overlap as a `Control` event).
+- `SettingsSource<T>` — `Static(T)` or `Watch(rx)`. `Watch(None)` parks a compiled-in
+  provider *disabled* without tearing it down, so enabling or disabling it is a settings
+  hot-apply rather than a restart. This is what `datamancerd`'s `configure-provider` /
+  `remove-provider` ops drive.
+- `CredentialsSource` — `Env` (the deprecated legacy `ALPACA_*` variables), `Static`, or
+  `Watch`. `datamancerd` wires `Watch` to its credential broker (`datamancer-credentials`:
+  OS keychain / secret-service with a locked-down file fallback), so `set-credentials`
+  hot-applies to a running provider.
+
+Keeping these on the provider rather than on the builder is deliberate: the orchestrator
+never gains a credential-source API, and a provider crate stays depending on
+`datamancer-core` alone.
 
 ## Instrument Identity
 
-`Instrument` is an opaque newtype wrapping a symbol string for now. Asset class, exchange, contract specification, and other structured fields will be added when there is a real cross-provider or non-equity use case driving them. Keeping the type opaque from day one means callers won't need to be revised when that growth happens.
+`Instrument` is the qualifying tuple `(provider, asset_class, symbol)`. The triple is what
+makes the id unique across the union of all sources: the same ticker can name an equity and
+an ETF, and the same crypto pair trades on several venues. Symbol *grammar* stays
+provider-specific (`"AAPL"` on Alpaca equities, `"BTC/USD"` on Alpaca crypto), and engine
+code holding an `Instrument` can round-trip back to the right provider with no external
+lookup.
+
+Beyond that triple the type stays **opaque**. Exchange, contract specification, expiry,
+multiplier, and the like are not fields — a provider that needs them resolves
+symbol→contract *inside itself*, which is what keeps output source-agnostic. `AssetClass`
+is `#[non_exhaustive]` (`Equity`, `Etf`, `Crypto` today) so new classes are additive.
+
+This is a live constraint rather than a settled one: a structured-contract provider such as
+IBKR is the use case most likely to force the question, and the recorded position is that
+`Instrument` stays opaque until a real cross-provider collision forces it, with a
+provider-qualified instrument namespace as the likely eventual shape.
 
 ## Persistence — Historical Cache
 
@@ -242,6 +334,20 @@ ride one logical client connection:
 
 The POD payload preserves the timestamp triple end-to-end — `rx_ts` stays
 **observability-only** and is never reconstructed/synthesized by the subscriber.
+
+### WebSocket transport
+
+The optional `transport-ws` feature (`datamancer::transport_ws`, the
+`datamancer-transport-ws` crate) is the second worked example of the same seam: a
+network-reachable transport where one connection is one client, carrying JSON control and
+event frames. It does **no** symbol interning — the `Instrument` rides inline on every
+frame — and it is not zero-copy. Prices and sizes stay fixed-point `i64`/`u64` on the wire,
+so a consumer that parses them as IEEE doubles silently corrupts values.
+
+It exists for two reasons: remote consumers, and Windows, where iceoryx2's shared memory is
+not viable and WS-over-loopback carries the data plane instead. Between them, the two
+transports are the input to a future unified client-transport trait; `datamancer-client`
+already presents both behind one generic `Client`.
 
 ### Standalone server
 
