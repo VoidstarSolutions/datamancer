@@ -393,7 +393,7 @@ One JSON object per line; one reply line per request.
 {"op":"snapshot"}      -> {"ok":true,"snapshot":{ /* SystemSnapshot */ }}
 {"op":"instruments","provider":"alpaca-crypto"}
   -> {"ok":true,"instruments":[{"instrument":{ /* Instrument */ },"live_kinds":["trade"],"history_kinds":[]}]}
-{"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across all providers */ ]}
+{"op":"instruments"}  -> {"ok":true,"instruments":[ /* full catalog across enabled providers */ ]}
 {"op":"capabilities","provider":"alpaca","symbols":["AAPL","MSFT"]}
   -> {"ok":true,"capabilities":[{"instrument":{ /* Instrument */ },"capabilities":{ /* InstrumentCapabilities, optional */ }}]}
 {"op":"ping"}          -> {"ok":true,"version":"0.8.0","credential_backend":"keychain"}
@@ -459,7 +459,10 @@ an in-flight query to report.
 `instruments` enumerates the discoverable catalog and, per entry, the
 `EventKind`s that instrument supports; `provider` is optional and restricts
 the catalog to one provider (a full equities catalog is ~10k rows — prefer
-the filter when you know the provider). Because it awaits a live provider
+the filter when you know the provider). Without the filter, the catalog
+covers **enabled** providers only: a disabled provider (no `[provider.*]`
+section, or removed with `remove-provider`) is absent rather than failing the
+op. Because it awaits a live provider
 REST call, it is dispatched off the single-actor control loop (in the
 per-connection task) so it cannot stall unrelated `open-client`/`subscribe`/
 etc. traffic on other connections.

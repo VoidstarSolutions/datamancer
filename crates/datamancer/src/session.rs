@@ -614,6 +614,11 @@ impl Datamancer {
     /// there is no combined field. Pass `provider` to
     /// restrict the catalog (a full equities list is ~10k rows).
     ///
+    /// Unfiltered (`provider: None`), the catalog covers only providers whose
+    /// [`Provider::enabled`] is `true`: a parked provider is absent rather than
+    /// failing the call. A named `provider` is asked whether or not it is
+    /// enabled.
+    ///
     /// Freshness is pass-through: every call hits the provider's
     /// reference-data path live. Requests are startup/operator-time, not
     /// hot-path.
@@ -621,7 +626,7 @@ impl Datamancer {
     /// # Errors
     ///
     /// - [`Error::UnknownProvider`] — `provider` names no registered provider.
-    /// - Any error surfaced by the provider's `list_instruments` call.
+    /// - Any error surfaced by an asked provider's `list_instruments` call.
     pub async fn instrument_catalog(
         &self,
         provider: Option<&ProviderId>,
@@ -636,7 +641,13 @@ impl Datamancer {
                     .ok_or_else(|| Error::UnknownProvider(id.as_str().to_string()))?;
                 vec![found]
             }
-            None => self.inner.providers.iter().collect(),
+            // Unfiltered: a parked provider is absent, never poisoning.
+            None => self
+                .inner
+                .providers
+                .iter()
+                .filter(|p| p.enabled())
+                .collect(),
         };
         let mut catalog = Vec::new();
         for p in providers {
