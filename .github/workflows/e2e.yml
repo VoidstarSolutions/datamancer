@@ -50,6 +50,10 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Untimed: a cold cache (any lockfile change) must not spend a timed
+      # step's budget on compilation.
+      - name: build e2e suites
+        run: cargo test -p datamancerd --all-features --test daemon_e2e --test client_transport_e2e --no-run
       # `--nocapture` on both suites: a test that wedges during panic unwind
       # (issue #64 — the tokio runtime drop can block joining a still-running
       # spawn_blocking thread) never reaches libtest's final failure report,
