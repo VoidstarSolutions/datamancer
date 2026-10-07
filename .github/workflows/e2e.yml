@@ -50,7 +50,20 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Untimed: a cold cache (any lockfile change) must not spend a timed
+      # step's budget on compilation.
+      - name: build e2e suites
+        run: cargo test -p datamancerd --all-features --test daemon_e2e --test client_transport_e2e --no-run
+      # `--nocapture` on both suites: a test that wedges during panic unwind
+      # (issue #64 — the tokio runtime drop can block joining a still-running
+      # spawn_blocking thread) never reaches libtest's final failure report,
+      # which is the only place captured panic output is printed. Streaming
+      # output is the difference between a diagnosable log and a silent
+      # 30-minute timeout. Step-level timeouts keep a recurrence from eating
+      # the whole job budget.
       - name: daemon e2e
-        run: cargo test -p datamancerd --all-features --test daemon_e2e -- --ignored
+        timeout-minutes: 10
+        run: cargo test -p datamancerd --all-features --test daemon_e2e -- --ignored --nocapture
       - name: client transport e2e
-        run: cargo test -p datamancerd --all-features --test client_transport_e2e -- --ignored
+        timeout-minutes: 10
+        run: cargo test -p datamancerd --all-features --test client_transport_e2e -- --ignored --nocapture
