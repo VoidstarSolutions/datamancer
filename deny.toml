@@ -28,10 +28,10 @@ allow = [
 ]
 
 [licenses.private]
-# The three unpublished workspace binaries/libs (publish = false) don't carry
-# a license field yet; workspace licensing lands in a separate sub-project.
-# Skip license enforcement for local, unpublished workspace members only -
-# this does not affect any third-party dependency.
+# Every workspace crate declares MIT OR Apache-2.0, and the texts ship at the
+# repository root (LICENSE-MIT, LICENSE-APACHE). Skip license enforcement for
+# local, unpublished workspace members only - this does not affect any
+# third-party dependency.
 ignore = true
 
 [advisories]
