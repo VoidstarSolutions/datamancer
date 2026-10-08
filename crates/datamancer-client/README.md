@@ -217,15 +217,25 @@ while let Some(event) = events.next().await {
   does it spawn `cfg.daemon_binary` (detached, stdio to
   `cfg.log_path` or the platform default) and poll `ping` until ready or
   `cfg.ready_timeout` elapses.
+- **Attach-only.** `EnsureConfig::attach_only(name)` leaves `daemon_binary`
+  unset: `ensure` only connects, never spawns, and needs no log path. If no
+  daemon answers it returns `EnsureError::NoDaemon { socket,
+  last_ping_failure }`.
 - **A lost spawn race is success.** If another process wins the
   single-instance daemon and this app's spawned child exits first, that's
   fine as long as a subsequent `ping` on the socket answers — `ensure`
   returns `Ok` either way.
 - **Spawn-don't-supervise.** Once connected, the daemon is not monitored;
   when the event stream ends (daemon died, connection dropped), the app's
-  recovery is to call `ensure` again, not to restart a handle in place.
+  recovery is to call `ensure` again (attach-only; see "Spawn at most once"
+  below), not to restart a handle in place.
   Deliberately stopping a daemon this app spawned is out of scope for this
   cycle (`AppHandle::close` closes this client only, not the daemon).
+- **Spawn at most once.** The recommended client shape: spawn on the first
+  attempt only (`EnsureConfig::new` with the bundled binary) and reconnect
+  with `EnsureConfig::attach_only` on every later attempt. Re-running
+  `ensure` with a binary would bring back a daemon that someone stopped on
+  purpose; supervising the daemon is the host's job, not an app's.
 - **Version-gated.** `ensure` rejects with `EnsureError::VersionSkew` unless
   the daemon's `ping`-reported version is compatible with this crate's own
   (`CARGO_PKG_VERSION`): equal major version, and — while major is `0` —

@@ -72,10 +72,13 @@ Consumer-side surface for datamancerd: the shared control vocabulary
   module (named pipe + `CreateProcess`) implementing the same seams — never a
   widened state machine in `lifecycle.rs`.
 - **`EnsureError` variants and the `ping` reply shape are app-facing
-  contract.** `NoSocketPath`, `SpawnFailed`, `ReadyTimeout` (with
-  `ReadyDiagnosis`), `VersionSkew`, `Connect` are matched by consuming apps;
-  treat additions/removals as breaking. `Connect` wraps the data-plane connect
-  failure (iceoryx2 on unix; WS on Windows); Windows adds a `#[cfg(windows)]`
+  contract.** `NoSocketPath`, `SpawnFailed`, `NoDaemon` (attach-only, no
+  answering daemon), `ReadyTimeout` (with `ReadyDiagnosis`), `VersionSkew`,
+  `Connect` are matched by consuming apps. `EnsureError`, `ReadyDiagnosis` and
+  `EnsureConfig` are `#[non_exhaustive]`, so a new variant or config field is
+  additive; removing or reshaping one is breaking. `Connect` wraps the
+  data-plane connect failure (iceoryx2 on unix; WS on Windows); Windows adds a
+  `#[cfg(windows)]`
   `AdminConnect` for the named-pipe admin-plane connect failure (the two planes
   are independent connections). The `ping` reply
   (`{"ok":true,"version":"…"}`) is the daemon's control protocol, documented

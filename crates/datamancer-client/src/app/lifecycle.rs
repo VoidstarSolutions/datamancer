@@ -3,7 +3,7 @@
 //! [`ControlEndpoint`] (UDS today, named pipe later) and a [`DaemonSpawner`]
 //! (detached unix spawn today, `CreateProcess` later).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -58,8 +58,43 @@ pub(crate) trait DaemonSpawner {
     fn spawn(&self, binary: &Path, config: Option<&Path>) -> std::io::Result<Self::Proc>;
 }
 
-/// Find a ready daemon on `socket` or spawn one and await readiness.
-/// Returns the daemon's hello (from `ping`).
+/// What a spawning config spawns: the binary and the log its stdio goes to.
+/// `None` from [`spawn_plan`] means attach only.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SpawnPlan<'a> {
+    pub binary: &'a Path,
+    pub log_path: PathBuf,
+}
+
+/// Resolve what `cfg` would spawn. Attach-only (`daemon_binary: None`)
+/// resolves nothing, so it never fails on a log path it would not use; a
+/// spawning config with no explicit `log_path` needs `default_log` (the
+/// platform default) and fails [`EnsureError::NoSocketPath`] without it.
+pub(crate) fn spawn_plan(
+    cfg: &EnsureConfig,
+    default_log: impl FnOnce() -> Option<PathBuf>,
+) -> Result<Option<SpawnPlan<'_>>, EnsureError> {
+    let Some(binary) = cfg.daemon_binary.as_deref() else {
+        return Ok(None);
+    };
+    let log_path = cfg
+        .log_path
+        .clone()
+        .or_else(default_log)
+        .ok_or(EnsureError::NoSocketPath)?;
+    Ok(Some(SpawnPlan { binary, log_path }))
+}
+
+/// The spawn side of [`ensure_daemon`]: a spawner and the binary it runs,
+/// together. `None` in its place means attach only.
+pub(crate) struct Spawn<'a, S> {
+    pub spawner: &'a S,
+    pub binary: &'a Path,
+}
+
+/// Find a ready daemon on `socket` or, given a [`Spawn`], spawn one and await
+/// readiness. Returns the daemon's hello (from `ping`). Without a `Spawn`
+/// (attach only) a failed first probe is [`EnsureError::NoDaemon`].
 ///
 /// A spawned process exiting is **not** failure while the deadline holds:
 /// losing the single-instance race to another app's daemon that then answers
@@ -67,17 +102,24 @@ pub(crate) trait DaemonSpawner {
 /// answers.
 pub(crate) async fn ensure_daemon<E: ControlEndpoint, S: DaemonSpawner>(
     endpoint: &E,
-    spawner: &S,
+    spawn: Option<Spawn<'_, S>>,
     cfg: &EnsureConfig,
     socket: &Path,
 ) -> Result<DaemonHello, EnsureError> {
-    if let Ok(hello) = endpoint.ping(socket, PROBE_TIMEOUT).await {
-        return Ok(hello);
-    }
+    let first_failure = match endpoint.ping(socket, PROBE_TIMEOUT).await {
+        Ok(hello) => return Ok(hello),
+        Err(failure) => failure,
+    };
+    let Some(Spawn { spawner, binary }) = spawn else {
+        return Err(EnsureError::NoDaemon {
+            socket: socket.to_path_buf(),
+            last_ping_failure: Some(first_failure.0),
+        });
+    };
     let mut proc_ = spawner
-        .spawn(&cfg.daemon_binary, cfg.config_path.as_deref())
+        .spawn(binary, cfg.config_path.as_deref())
         .map_err(|source| EnsureError::SpawnFailed {
-            binary: cfg.daemon_binary.clone(),
+            binary: binary.to_path_buf(),
             source,
         })?;
     let deadline = Instant::now() + cfg.ready_timeout;
@@ -221,17 +263,27 @@ mod tests {
     fn fail() -> Result<DaemonHello, PingFailure> {
         Err(PingFailure("connection refused".to_string()))
     }
+    const BIN: &str = "/bundle/datamancerd";
+
     fn cfg() -> EnsureConfig {
-        let mut c = EnsureConfig::new("/bundle/datamancerd", "test-app");
+        let mut c = EnsureConfig::new(BIN, "test-app");
         c.ready_timeout = Duration::from_millis(300);
         c
+    }
+
+    /// The spawn side `AppHandle::ensure` builds for [`cfg`].
+    fn spawning(sp: &ScriptedSpawner) -> Spawn<'_, ScriptedSpawner> {
+        Spawn {
+            spawner: sp,
+            binary: Path::new(BIN),
+        }
     }
 
     #[tokio::test]
     async fn already_running_daemon_is_used_without_spawning() {
         let ep = ScriptedEndpoint::new(vec![Ok(hello("0.1.0"))]);
         let sp = ScriptedSpawner::unreachable();
-        let v = ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock"))
+        let v = ensure_daemon(&ep, Some(spawning(&sp)), &cfg(), Path::new("/tmp/x.sock"))
             .await
             .unwrap();
         assert_eq!(v.version, "0.1.0");
@@ -245,7 +297,7 @@ mod tests {
             alive_polls: usize::MAX,
             exit: None,
         });
-        let v = ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock"))
+        let v = ensure_daemon(&ep, Some(spawning(&sp)), &cfg(), Path::new("/tmp/x.sock"))
             .await
             .unwrap();
         assert_eq!(v.version, "0.1.0");
@@ -264,7 +316,7 @@ mod tests {
                 stderr_tail: "already running".into(),
             }),
         });
-        let v = ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock"))
+        let v = ensure_daemon(&ep, Some(spawning(&sp)), &cfg(), Path::new("/tmp/x.sock"))
             .await
             .unwrap();
         assert_eq!(v.version, "0.1.0");
@@ -280,7 +332,7 @@ mod tests {
                 stderr_tail: "bad config".into(),
             }),
         });
-        match ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock")).await {
+        match ensure_daemon(&ep, Some(spawning(&sp)), &cfg(), Path::new("/tmp/x.sock")).await {
             Err(EnsureError::ReadyTimeout {
                 diagnosis:
                     ReadyDiagnosis::DaemonExited {
@@ -300,7 +352,7 @@ mod tests {
             alive_polls: usize::MAX,
             exit: None,
         });
-        match ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock")).await {
+        match ensure_daemon(&ep, Some(spawning(&sp)), &cfg(), Path::new("/tmp/x.sock")).await {
             Err(EnsureError::ReadyTimeout {
                 diagnosis: ReadyDiagnosis::Unresponsive { .. },
                 ..
@@ -318,7 +370,7 @@ mod tests {
             alive_polls: usize::MAX,
             exit: None,
         });
-        let err = ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock"))
+        let err = ensure_daemon(&ep, Some(spawning(&sp)), &cfg(), Path::new("/tmp/x.sock"))
             .await
             .unwrap_err();
         // The rendered error message (the surface apps actually log) must
@@ -340,12 +392,96 @@ mod tests {
     async fn spawn_io_failure_is_spawn_failed() {
         let ep = ScriptedEndpoint::new(vec![fail()]);
         let sp = ScriptedSpawner::fails();
-        match ensure_daemon(&ep, &sp, &cfg(), Path::new("/tmp/x.sock")).await {
+        match ensure_daemon(&ep, Some(spawning(&sp)), &cfg(), Path::new("/tmp/x.sock")).await {
             Err(EnsureError::SpawnFailed { binary, .. }) => {
                 assert_eq!(binary, Path::new("/bundle/datamancerd"));
             }
             other => panic!("expected SpawnFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn attach_only_with_no_daemon_is_no_daemon_without_spawning() {
+        let ep = ScriptedEndpoint::new(vec![Err(PingFailure("connect refused (test)".into()))]);
+        let cfg = EnsureConfig::attach_only("test-app");
+        // `AppHandle::ensure` passes no spawn side for this config.
+        assert_eq!(spawn_plan(&cfg, || None).unwrap(), None);
+        let err = ensure_daemon(
+            &ep,
+            None::<Spawn<'_, ScriptedSpawner>>,
+            &cfg,
+            Path::new("/tmp/x.sock"),
+        )
+        .await
+        .unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("/tmp/x.sock") && rendered.contains("connect refused (test)"),
+            "rendered error should name the socket and the reason: {rendered}"
+        );
+        match err {
+            EnsureError::NoDaemon {
+                socket,
+                last_ping_failure,
+            } => {
+                assert_eq!(socket, Path::new("/tmp/x.sock"));
+                assert_eq!(last_ping_failure.as_deref(), Some("connect refused (test)"));
+            }
+            other => panic!("expected NoDaemon, got {other:?}"),
+        }
+        assert_eq!(ep.calls.load(Ordering::SeqCst), 1, "one probe, no retry");
+    }
+
+    #[tokio::test]
+    async fn attach_only_uses_a_running_daemon() {
+        let ep = ScriptedEndpoint::new(vec![Ok(hello("0.1.0"))]);
+        let cfg = EnsureConfig::attach_only("test-app");
+        let v = ensure_daemon(
+            &ep,
+            None::<Spawn<'_, ScriptedSpawner>>,
+            &cfg,
+            Path::new("/tmp/x.sock"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v.version, "0.1.0");
+    }
+
+    #[test]
+    fn spawn_plan_needs_a_log_path_only_when_spawning() {
+        // Attach-only: no plan, and the default resolver is never consulted.
+        let attach = EnsureConfig::attach_only("test-app");
+        assert_eq!(
+            spawn_plan(&attach, || panic!("must not resolve")).unwrap(),
+            None
+        );
+
+        // Spawning, no explicit log, no platform default: NoSocketPath, as
+        // before attach-only existed.
+        assert!(matches!(
+            spawn_plan(&cfg(), || None),
+            Err(EnsureError::NoSocketPath)
+        ));
+
+        // Spawning with the platform default.
+        assert_eq!(
+            spawn_plan(&cfg(), || Some(PathBuf::from("/var/log/d.log"))).unwrap(),
+            Some(SpawnPlan {
+                binary: Path::new(BIN),
+                log_path: PathBuf::from("/var/log/d.log"),
+            })
+        );
+
+        // An explicit log path wins and the default is never consulted.
+        let mut explicit = cfg();
+        explicit.log_path = Some(PathBuf::from("/explicit.log"));
+        assert_eq!(
+            spawn_plan(&explicit, || panic!("must not resolve")).unwrap(),
+            Some(SpawnPlan {
+                binary: Path::new(BIN),
+                log_path: PathBuf::from("/explicit.log"),
+            })
+        );
     }
 
     #[test]

@@ -6,6 +6,12 @@
 //! the daemon is a shared host service that outlives the app that spawned it;
 //! if it dies, the event stream ends and the app calls [`AppHandle::ensure`]
 //! again (reconnect-by-recreate).
+//!
+//! **Spawn at most once.** The recommended client shape spawns on its first
+//! attempt only ([`EnsureConfig::new`] with the bundled binary) and attaches on
+//! every later one ([`EnsureConfig::attach_only`]), so a daemon someone stopped
+//! on purpose is never brought back by a client: supervising the daemon is the
+//! host's job, not an app's.
 
 mod error;
 mod lifecycle;
@@ -114,12 +120,19 @@ fn check_version(daemon: &str) -> Result<(), EnsureError> {
 }
 
 /// Parameters for `AppHandle::ensure` (`AppHandle` lands with the facade).
+///
+/// `#[non_exhaustive]`: build with [`EnsureConfig::new`] or
+/// [`EnsureConfig::attach_only`], then set fields; a new field is an additive
+/// change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EnsureConfig {
     /// The datamancerd binary to spawn if none is running. Explicit — no
     /// `PATH` search (a bundling app knows its sidecar's location; guessing
-    /// invites version skew and PATH hijack).
-    pub daemon_binary: PathBuf,
+    /// invites version skew and PATH hijack). `None` = attach only: `ensure`
+    /// never spawns and returns [`EnsureError::NoDaemon`] when no daemon
+    /// answers.
+    pub daemon_binary: Option<PathBuf>,
     /// Daemon config file. `None` = the daemon's platform default (which
     /// self-scaffolds on first run).
     pub config_path: Option<PathBuf>,
@@ -130,7 +143,8 @@ pub struct EnsureConfig {
     /// Bound on spawn-to-ready. Default 10 s.
     pub ready_timeout: Duration,
     /// Spawned daemon's stdout/stderr destination. `None` = the platform
-    /// default (`crate::paths::default_daemon_log()`, Task 5).
+    /// default (`crate::paths::default_daemon_log()`, Task 5). Unused, and not
+    /// resolved, when attach-only.
     pub log_path: Option<PathBuf>,
     /// Forwarded to the iceoryx2 client (idle poll sleep).
     pub poll_interval: Duration,
@@ -146,15 +160,28 @@ pub struct EnsureConfig {
 }
 
 impl EnsureConfig {
+    /// Connect to a running daemon, or spawn `daemon_binary` if none answers.
     /// Defaults: 10 s ready timeout, 1 ms poll, 8192-event buffer, platform
     /// socket/config/log paths.
     #[must_use]
     pub fn new(daemon_binary: impl Into<PathBuf>, client_name: impl Into<String>) -> Self {
+        Self::with_binary(Some(daemon_binary.into()), client_name.into())
+    }
+
+    /// Connect to a running daemon only; never spawn one. Same defaults as
+    /// [`new`](Self::new). The shape for every attempt after a client's first
+    /// (see the module docs, "Spawn at most once").
+    #[must_use]
+    pub fn attach_only(client_name: impl Into<String>) -> Self {
+        Self::with_binary(None, client_name.into())
+    }
+
+    fn with_binary(daemon_binary: Option<PathBuf>, client_name: String) -> Self {
         Self {
-            daemon_binary: daemon_binary.into(),
+            daemon_binary,
             config_path: None,
             control_socket: None,
-            client_name: client_name.into(),
+            client_name,
             ready_timeout: Duration::from_secs(10),
             log_path: None,
             poll_interval: Duration::from_millis(1),
@@ -193,8 +220,11 @@ pub struct AppHandle {
 
 impl AppHandle {
     /// Find a running daemon at the (default or configured) control socket,
-    /// or spawn `cfg.daemon_binary` detached and await readiness; then
-    /// connect. Losing a spawn race to another app's daemon is success.
+    /// or — when `cfg.daemon_binary` is set — spawn it detached and await
+    /// readiness; then connect. Losing a spawn race to another app's daemon is
+    /// success. An attach-only config never spawns: no answering daemon is
+    /// [`EnsureError::NoDaemon`]. Spawn at most once (module docs): after a
+    /// client's first attempt, call this with [`EnsureConfig::attach_only`].
     ///
     /// # Errors
     ///
@@ -205,18 +235,20 @@ impl AppHandle {
             .clone()
             .or_else(crate::default_control_socket)
             .ok_or(EnsureError::NoSocketPath)?;
-        let log_path = cfg
-            .log_path
-            .clone()
-            .or_else(crate::paths::default_daemon_log)
-            .ok_or(EnsureError::NoSocketPath)?;
-        let daemon_hello = lifecycle::ensure_daemon(
-            &platform::TokioEndpoint,
-            &platform::ProcessSpawner::new(log_path),
-            &cfg,
-            &socket,
-        )
-        .await?;
+        // Only a spawning config resolves a daemon log path.
+        let spawner;
+        let spawn = match lifecycle::spawn_plan(&cfg, crate::paths::default_daemon_log)? {
+            Some(plan) => {
+                spawner = platform::ProcessSpawner::new(plan.log_path);
+                Some(lifecycle::Spawn {
+                    spawner: &spawner,
+                    binary: plan.binary,
+                })
+            }
+            None => None,
+        };
+        let daemon_hello =
+            lifecycle::ensure_daemon(&platform::TokioEndpoint, spawn, &cfg, &socket).await?;
         check_version(&daemon_hello.version)?;
 
         #[cfg(not(windows))]

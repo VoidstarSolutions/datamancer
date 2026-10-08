@@ -7,7 +7,11 @@ use crate::iceoryx2::Iceoryx2ClientError;
 
 /// Why a spawned daemon never became ready (inside
 /// [`EnsureError::ReadyTimeout`]).
+///
+/// `#[non_exhaustive]`: match with a wildcard arm; a new diagnosis is an
+/// additive change.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ReadyDiagnosis {
     /// The spawned process exited before the socket answered — and a
     /// subsequent connect never succeeded either (a lost spawn race whose
@@ -49,11 +53,16 @@ impl std::fmt::Display for ReadyDiagnosis {
 }
 
 /// Failure to find-or-spawn-and-connect a daemon.
+///
+/// `#[non_exhaustive]`: match with a wildcard arm; a new variant is an
+/// additive change.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EnsureError {
-    /// Also returned when the daemon-log path can't be resolved
-    /// (`EnsureConfig::log_path` unset and `paths::default_daemon_log`
-    /// fails) — both stem from the same no-home-dir condition.
+    /// Also returned, when spawning is configured, if the daemon-log path
+    /// can't be resolved (`EnsureConfig::log_path` unset and
+    /// `paths::default_daemon_log` fails) — both stem from the same
+    /// no-home-dir condition. An attach-only config never needs the log path.
     #[error(
         "no control-socket (or daemon-log) path: no platform default derivable \
          (no home/runtime dir); set EnsureConfig::control_socket/log_path explicitly"
@@ -64,6 +73,21 @@ pub enum EnsureError {
         binary: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    /// No daemon answered on the control socket and the config is attach-only
+    /// ([`EnsureConfig::attach_only`](crate::app::EnsureConfig::attach_only)),
+    /// so none was spawned.
+    #[error(
+        "no datamancerd answered at {socket} and spawning is disabled (attach-only): {reason}",
+        socket = socket.display(),
+        reason = last_ping_failure.as_deref().unwrap_or("no probe completed")
+    )]
+    NoDaemon {
+        /// The control socket that was probed.
+        socket: PathBuf,
+        /// The probe's diagnostic reason (connect refused, absent or stale
+        /// socket, bad reply…), as in [`ReadyDiagnosis::Unresponsive`].
+        last_ping_failure: Option<String>,
     },
     #[error("daemon not ready within {timeout:?}: {diagnosis}")]
     ReadyTimeout {
