@@ -2075,7 +2075,16 @@ impl Controller {
     /// Release the upstream provider subscription and flush the tap log. No
     /// `SessionClosing` is emitted: by teardown the fan-out is empty (each
     /// referrer emits its own `SessionClosing` on `close`).
+    ///
+    /// A substream torn down while connected releases its share of the
+    /// provider's connection count first: no `ProviderDisconnected` follows a
+    /// teardown, so without this the count leaks and the provider reads
+    /// `Connected` after its last live substream has dropped.
     async fn teardown_upstream(&mut self, live: &Arc<Mutex<Option<Box<dyn LiveHandle>>>>) {
+        if self.connection_up {
+            self.connection_up = false;
+            self.accounting.record_connection_down();
+        }
         if let Some(h) = live.lock().await.take() {
             self.accounting.record_unsubscribe();
             let _ = h

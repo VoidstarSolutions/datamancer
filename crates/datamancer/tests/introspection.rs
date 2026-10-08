@@ -321,6 +321,12 @@ impl LiveCtrl {
             sink.send(ev).await.expect("live sink closed");
         }
     }
+
+    /// Whether `symbol` is still subscribed upstream (removed by `unsubscribe`
+    /// during the authoritative controller's teardown).
+    async fn has_sink(&self, symbol: &str) -> bool {
+        self.shared.lock().await.sinks.contains_key(symbol)
+    }
 }
 
 impl LiveProvider {
@@ -546,6 +552,64 @@ async fn provider_accounting_reconnects_and_last_error_from_control() {
     assert_eq!(p.connection_state, datamancer::ConnectionState::Connected);
     assert_eq!(p.reconnects, 1);
     assert_eq!(p.last_error.as_deref(), Some("boom"));
+}
+
+#[tokio::test]
+async fn tearing_down_a_connected_session_releases_its_connection() {
+    let (provider, ctrl) = LiveProvider::new("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    // AAPL connects (start_live emits ProviderConnected), then closes while
+    // still connected: its teardown must release its share of the provider's
+    // connection count.
+    let aapl = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut aapl_stream = aapl.take_events().await.unwrap();
+    ctrl.push("AAPL", trade("AAPL", 1, 1)).await;
+    drain_until_marker(&mut aapl_stream, 1).await;
+    drop(aapl_stream);
+    aapl.close().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while ctrl.has_sink("AAPL").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("AAPL teardown never unsubscribed upstream");
+
+    // MSFT connects, then its connection drops. It is the provider's only live
+    // substream, so the provider must read Disconnected — a count leaked by the
+    // AAPL teardown would keep it Connected.
+    let msft = dm
+        .session(
+            inst("MSFT"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut msft_stream = msft.take_events().await.unwrap();
+    ctrl.push("MSFT", disconnected("fake")).await;
+    ctrl.push("MSFT", trade("MSFT", 2, 2)).await;
+    drain_until_marker(&mut msft_stream, 2).await;
+
+    let snap = dm.snapshot().await.unwrap();
+    let p = provider_snap(&snap, "fake");
+    assert_eq!(
+        p.connection_state,
+        datamancer::ConnectionState::Disconnected
+    );
 }
 
 #[tokio::test]
