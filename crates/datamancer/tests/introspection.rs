@@ -13,8 +13,9 @@ use datamancer::Surface;
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, DisconnectCause, EventKind,
-    GapSpan, Instrument, LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId,
-    ProviderSnapshot, Result, Scope, Seq, Timestamp, Trade,
+    GapSpan, HealthView, Instrument, LiveHandle, Liveness, MarketEvent, PersistenceOptions, Price,
+    Provider, ProviderId, ProviderSnapshot, ProviderState, Result, Scope, Seq, StreamConnection,
+    Timestamp, Trade,
 };
 use datamancer_core::{AuthoritativeSessionSnapshot, HistoryRequest};
 use futures::StreamExt;
@@ -610,6 +611,103 @@ async fn tearing_down_a_connected_session_releases_its_connection() {
         p.connection_state,
         datamancer::ConnectionState::Disconnected
     );
+}
+
+/// Stamp a control with a wall-clock receipt time.
+fn received_at(ev: MarketEvent, rx: i64) -> MarketEvent {
+    match ev {
+        MarketEvent::Control(mut c) => {
+            c.rx_ts = Timestamp(rx);
+            MarketEvent::Control(c)
+        }
+        other => other,
+    }
+}
+
+#[tokio::test]
+async fn snapshot_carries_stream_connection_evidence_and_active_subscriptions() {
+    let (provider, ctrl) = LiveProvider::new("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let health = |snap: &datamancer::SystemSnapshot| {
+        HealthView::from_snapshot(snap, HealthView::DEFAULT_STALE_AFTER_NS)
+    };
+
+    // Nothing requested: Idle, whatever the (never-connected) aggregate says.
+    let snap = dm.snapshot().await.unwrap();
+    assert_eq!(provider_snap(&snap, "fake").active_subscriptions, 0);
+    assert_eq!(health(&snap).providers[0].state, ProviderState::Idle);
+
+    // One live substream, connected by start_live (its control has rx_ts 0).
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+    ctrl.push("AAPL", trade("AAPL", 1, 1)).await;
+    drain_until_marker(&mut stream, 1).await;
+    let snap = dm.snapshot().await.unwrap();
+    assert_eq!(provider_snap(&snap, "fake").active_subscriptions, 1);
+    let a = auth_snap(&snap, "AAPL");
+    assert_eq!(
+        a.connection,
+        StreamConnection::Up {
+            since: Timestamp(0)
+        }
+    );
+    assert_eq!(a.last_error_rx_ts, None);
+
+    // An error, then the substream's connection drops: each is recorded with
+    // its own receipt time, and the stream reads Stale since the drop.
+    ctrl.push("AAPL", received_at(provider_error("fake", "boom"), 40))
+        .await;
+    ctrl.push("AAPL", received_at(disconnected("fake"), 50))
+        .await;
+    ctrl.push("AAPL", trade("AAPL", 2, 2)).await;
+    drain_until_marker(&mut stream, 2).await;
+    let snap = dm.snapshot().await.unwrap();
+    let a = auth_snap(&snap, "AAPL");
+    assert_eq!(
+        a.connection,
+        StreamConnection::Down {
+            since: Timestamp(50),
+            cause: DisconnectCause::Error,
+        }
+    );
+    assert_eq!(a.last_error_rx_ts, Some(Timestamp(40)));
+    let view = health(&snap);
+    assert_eq!(view.providers[0].state, ProviderState::Disconnected);
+    assert_eq!(
+        view.streams[0].liveness,
+        Liveness::Stale {
+            since: Timestamp(50)
+        }
+    );
+
+    // Last subscriber leaves: nothing requested again, so Idle (not the
+    // Disconnected the aggregate still reports).
+    drop(stream);
+    session.close().await.unwrap();
+    let snap = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snap = dm.snapshot().await.unwrap();
+            if snap.authoritative_sessions.is_empty() {
+                return snap;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("authoritative session never left the registry");
+    assert_eq!(provider_snap(&snap, "fake").active_subscriptions, 0);
+    assert_eq!(health(&snap).providers[0].state, ProviderState::Idle);
 }
 
 #[tokio::test]

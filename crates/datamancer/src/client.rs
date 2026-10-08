@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 
 use datamancer_core::{
     ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, MarketEvent,
-    Result, Seq, SubscriptionRef, Timestamp,
+    Result, Seq, StreamConnection, SubscriptionRef, Timestamp,
 };
 use futures::StreamExt as _;
 use tokio::sync::{mpsc, oneshot};
@@ -241,6 +241,11 @@ pub(crate) struct LiveStats {
     /// from the registry `Arc` strong count, which over-counts (a single
     /// referrer holds several strong `Arc<AuthoritativeSession>`).
     subscribers: AtomicU64,
+    /// This substream's connection phase from its in-band connect/disconnect
+    /// controls (cold mutex, written only on those controls).
+    connection: std::sync::Mutex<StreamConnection>,
+    has_error_rx: AtomicBool,
+    last_error_rx_ts: AtomicI64,
 }
 
 /// Bounded per-symbol recent-gap detail (oldest evicted).
@@ -260,6 +265,9 @@ impl LiveStats {
             last_gap_rx_ts: AtomicI64::new(0),
             backfilling: AtomicBool::new(false),
             subscribers: AtomicU64::new(0),
+            connection: std::sync::Mutex::new(StreamConnection::Pending),
+            has_error_rx: AtomicBool::new(false),
+            last_error_rx_ts: AtomicI64::new(0),
         }
     }
 
@@ -286,8 +294,8 @@ impl LiveStats {
                     self.has_ts.store(true, Ordering::Relaxed);
                 }
             }
-            MarketEvent::Control(c) => {
-                if let ControlKind::Gap { span, .. } = &c.kind {
+            MarketEvent::Control(c) => match &c.kind {
+                ControlKind::Gap { span, .. } => {
                     self.gap_count.fetch_add(1, Ordering::Relaxed);
                     self.last_gap_rx_ts.store(c.rx_ts.0, Ordering::Relaxed);
                     self.has_gap_rx.store(true, Ordering::Relaxed);
@@ -298,7 +306,21 @@ impl LiveStats {
                         ring.push_back(span.clone());
                     }
                 }
-            }
+                ControlKind::ProviderConnected { .. } => {
+                    self.set_connection(StreamConnection::Up { since: c.rx_ts });
+                }
+                ControlKind::ProviderDisconnected { cause, .. } => {
+                    self.set_connection(StreamConnection::Down {
+                        since: c.rx_ts,
+                        cause: *cause,
+                    });
+                }
+                ControlKind::ProviderError { .. } => {
+                    self.last_error_rx_ts.store(c.rx_ts.0, Ordering::Relaxed);
+                    self.has_error_rx.store(true, Ordering::Relaxed);
+                }
+                ControlKind::SubscriptionChanged { .. } | ControlKind::SessionClosing => {}
+            },
             _ => {}
         }
     }
@@ -369,6 +391,26 @@ impl LiveStats {
     /// flush and on every backfill exit path).
     pub(crate) fn set_backfilling(&self, active: bool) {
         self.backfilling.store(active, Ordering::Relaxed);
+    }
+
+    fn set_connection(&self, phase: StreamConnection) {
+        if let Ok(mut slot) = self.connection.lock() {
+            *slot = phase;
+        }
+    }
+
+    /// This substream's connection phase (`Pending` before any connect).
+    pub(crate) fn connection(&self) -> StreamConnection {
+        self.connection
+            .lock()
+            .map_or(StreamConnection::Pending, |slot| *slot)
+    }
+
+    /// Receipt of the last `ProviderError` on this substream, or `None`.
+    pub(crate) fn last_error_rx_ts(&self) -> Option<Timestamp> {
+        self.has_error_rx
+            .load(Ordering::Relaxed)
+            .then(|| Timestamp(self.last_error_rx_ts.load(Ordering::Relaxed)))
     }
 }
 

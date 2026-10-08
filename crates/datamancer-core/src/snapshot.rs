@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    event::{EventKind, GapSpan, Seq, Timestamp},
+    event::{DisconnectCause, EventKind, GapSpan, Seq, Timestamp},
     instrument::{Instrument, ProviderId},
     traits::storage::CacheCatalogEntry,
 };
@@ -112,6 +112,12 @@ pub struct ProviderSnapshot {
     /// from enabled-but-not-yet-connected.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Live `(instrument, kind)` substreams currently requested from this
+    /// provider: its authoritative sessions in the registry at assembly. An
+    /// active count, unlike the `subscribes`/`unsubscribes` call counts. `0`
+    /// on frames that predate the field.
+    #[serde(default)]
+    pub active_subscriptions: u32,
 }
 
 /// Old-frame default for [`ProviderSnapshot::enabled`]: pre-cycle-4 frames
@@ -164,6 +170,36 @@ pub struct AuthoritativeSessionSnapshot {
     /// Whether a historical→live backfill is currently in progress.
     #[serde(default)]
     pub backfilling: bool,
+    /// This substream's own upstream connection phase, from the in-band
+    /// connect/disconnect controls it received. `Pending` on frames that
+    /// predate the field.
+    #[serde(default)]
+    pub connection: StreamConnection,
+    /// Wall-clock receipt of the most recent `Control::ProviderError` this
+    /// substream received (observability).
+    #[serde(default)]
+    pub last_error_rx_ts: Option<Timestamp>,
+}
+
+/// One substream's upstream connection phase, judged from the in-band
+/// `ProviderConnected`/`ProviderDisconnected` controls it received. `since` is
+/// the wall-clock receipt (`rx_ts`) of the control that entered the phase.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamConnection {
+    /// No connect control received yet.
+    #[default]
+    Pending,
+    Up {
+        since: Timestamp,
+    },
+    /// Down after a `ProviderDisconnected`; a reconnect is scheduled or in
+    /// flight. `cause` is the control's classification.
+    Down {
+        since: Timestamp,
+        cause: DisconnectCause,
+    },
 }
 
 /// One client session's per-client resume buffer occupancy.
@@ -253,7 +289,16 @@ impl ProviderSnapshot {
             gaps_emitted,
             last_error,
             enabled: true,
+            active_subscriptions: 0,
         }
+    }
+
+    /// Set the number of live substreams currently requested from this
+    /// provider.
+    #[must_use]
+    pub fn with_active_subscriptions(mut self, active: u32) -> Self {
+        self.active_subscriptions = active;
+        self
     }
 
     /// Set the provider-reported rate-limit-hit count.
@@ -311,7 +356,21 @@ impl AuthoritativeSessionSnapshot {
             recent_gaps: Vec::new(),
             last_gap_rx_ts: None,
             backfilling: false,
+            connection: StreamConnection::Pending,
+            last_error_rx_ts: None,
         }
+    }
+
+    /// Set this substream's connection phase and last provider-error receipt.
+    #[must_use]
+    pub fn with_connection(
+        mut self,
+        connection: StreamConnection,
+        last_error_rx_ts: Option<Timestamp>,
+    ) -> Self {
+        self.connection = connection;
+        self.last_error_rx_ts = last_error_rx_ts;
+        self
     }
 
     /// Set the last-assigned per-symbol source `seq`.
@@ -387,11 +446,12 @@ impl ClientSessionSnapshot {
 mod tests {
     use super::{
         AuthoritativeSessionSnapshot, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
-        ConnectionState, ProviderSnapshot, ResumeBufferSnapshot, SubscriptionRef, SystemSnapshot,
+        ConnectionState, ProviderSnapshot, ResumeBufferSnapshot, StreamConnection, SubscriptionRef,
+        SystemSnapshot,
     };
     use crate::{
-        Adjustment, AssetClass, BarInterval, CacheCatalogEntry, EventKind, GapSpan, Instrument,
-        ProviderId, Seq, Timestamp,
+        Adjustment, AssetClass, BarInterval, CacheCatalogEntry, DisconnectCause, EventKind,
+        GapSpan, Instrument, ProviderId, Seq, Timestamp,
     };
 
     #[test]
@@ -457,6 +517,7 @@ mod tests {
                 gaps_emitted: 2,
                 last_error: Some("boom".to_string()),
                 enabled: false,
+                active_subscriptions: 3,
             }],
             cache: CacheSnapshot {
                 entries: vec![
@@ -491,6 +552,11 @@ mod tests {
                 }],
                 last_gap_rx_ts: Some(Timestamp(9)),
                 backfilling: true,
+                connection: StreamConnection::Down {
+                    since: Timestamp(11),
+                    cause: DisconnectCause::Unauthenticated,
+                },
+                last_error_rx_ts: Some(Timestamp(10)),
             }],
             client_sessions: vec![ClientSessionSnapshot {
                 id: ClientSessionId(42),

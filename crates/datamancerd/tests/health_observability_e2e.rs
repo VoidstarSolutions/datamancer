@@ -130,12 +130,12 @@ async fn health_reflects_disabled_enabled_and_pushes() {
         .await
         .expect("ensure must find the already-running daemon");
 
-    // 2. health(): schema_version == 2, daemon.version == daemon crate
+    // 2. health(): schema_version == 3, daemon.version == daemon crate
     // version, credential_backend set, every provider Disabled.
     let health = handle.health().await.expect("health");
     assert_eq!(
-        health.schema_version, 2,
-        "schema_version must be pinned to 2"
+        health.schema_version, 3,
+        "schema_version must be pinned to 3"
     );
     // This test binary IS the datamancerd crate, so its CARGO_PKG_VERSION
     // is the daemon crate version — assert against the constant directly
@@ -184,10 +184,11 @@ async fn health_reflects_disabled_enabled_and_pushes() {
         .find(|p| p.provider.as_str() == "alpaca-crypto")
         .expect("alpaca-crypto must be enumerated")
         .state;
-    assert_ne!(
+    assert_eq!(
         alpaca_crypto_state,
-        ProviderState::Disabled,
-        "alpaca-crypto must leave Disabled once configured, even without credentials"
+        ProviderState::Idle,
+        "alpaca-crypto must leave Disabled once configured, even without credentials, \
+         and read Idle (enabled, nothing subscribed) rather than Connecting"
     );
     let alpaca_state = health_after_configure
         .providers
@@ -228,7 +229,7 @@ async fn health_reflects_disabled_enabled_and_pushes() {
         "no pushed health view showed alpaca-crypto off Disabled within 3s \
          (publish cadence 200ms) — push plane stale or hot-apply not reflected",
     );
-    assert_eq!(pushed.schema_version, 2, "pushed view must carry schema 2");
+    assert_eq!(pushed.schema_version, 3, "pushed view must carry schema 3");
     assert_eq!(pushed.schema_version, health_after_configure.schema_version);
     let pushed_alpaca_state = pushed
         .providers

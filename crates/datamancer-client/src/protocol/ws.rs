@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn ws_health_push_round_trips_and_is_disjoint_from_reply() {
         let view: datamancer_core::HealthView = serde_json::from_str(
-            r#"{"schema_version":2,"daemon":{"version":"1.0.0","credential_backend":null,"captured_at":0},"providers":[],"streams":[]}"#,
+            r#"{"schema_version":3,"daemon":{"version":"1.0.0","credential_backend":null,"captured_at":0},"providers":[{"provider":"alpaca","state":"idle","detail":null}],"streams":[]}"#,
         )
         .expect("HealthView fixture");
         let push = WsHealthPush { view: view.clone() };
