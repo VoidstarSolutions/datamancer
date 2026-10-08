@@ -93,7 +93,8 @@ pub struct StreamHealth {
     pub instrument: Instrument,
     pub kind: EventKind,
     pub liveness: Liveness,
-    /// Provider-reported market time of the last event.
+    /// Provider-reported market time of the last live data event (a
+    /// latest-value seed is not one).
     pub last_event_source_ts: Option<Timestamp>,
     /// Cumulative per-symbol `Control::Gap` count.
     pub gap_count: u64,
@@ -114,7 +115,8 @@ pub struct StreamHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Liveness {
-    /// Subscribed, no data event observed yet.
+    /// Subscribed, no live data event observed yet (a latest-value seed does
+    /// not count).
     Idle,
     Live,
     /// No event within the staleness threshold; `since` is the last receipt.

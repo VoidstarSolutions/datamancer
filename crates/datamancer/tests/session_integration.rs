@@ -1207,3 +1207,141 @@ async fn seed_is_teed_to_tap_log() {
     }
     assert_eq!(tss, vec![5], "seed must be persisted to the tap log");
 }
+
+/// A trade whose `rx_ts` differs from its `source_ts`, so latency is visible.
+fn trade_rx(symbol: &str, source_ts: i64, rx_ts: i64, price: f64) -> MarketEvent {
+    MarketEvent::Trade(Trade {
+        instrument: inst(symbol),
+        source_ts: Timestamp(source_ts),
+        rx_ts: Timestamp(rx_ts),
+        seq: Seq(0),
+        price: Price::from_f64_round(price),
+        size: datamancer::Quantity::from_units(1),
+    })
+}
+
+fn auth_snap(
+    snap: &datamancer_core::SystemSnapshot,
+    symbol: &str,
+) -> datamancer_core::AuthoritativeSessionSnapshot {
+    snap.authoritative_sessions
+        .iter()
+        .find(|a| a.instrument.symbol() == symbol)
+        .cloned()
+        .unwrap_or_else(|| panic!("no authoritative snapshot for {symbol}"))
+}
+
+fn provider_messages(snap: &datamancer_core::SystemSnapshot, id: &str) -> u64 {
+    snap.providers
+        .iter()
+        .find(|p| p.provider.as_str() == id)
+        .unwrap_or_else(|| panic!("no provider snapshot for {id}"))
+        .messages
+}
+
+/// The seed is delivered and takes a `seq`, but it is a `Provider::latest`
+/// snapshot, not a live arrival: no timestamps, no latency, no live
+/// `messages`, and the stream's health reads `Idle`. The seed below is a
+/// trade from source time 5 fetched at 1,000,000, which as a live arrival
+/// would read as a latency of 999,995.
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn seed_is_not_recorded_as_a_live_arrival() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade_rx("AAPL", 5, 1_000_000, 999.0)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.expect("take events");
+
+    // Stats are recorded before fan-out, so once the seed is read they are set.
+    let first = stream.next().await.expect("seed event");
+    assert_eq!(trade_price(&first), 999.0);
+    assert_eq!(first.seq(), Some(Seq(0)));
+
+    let snap = dm.snapshot().await.unwrap();
+    let a = auth_snap(&snap, "AAPL");
+    assert_eq!(a.seq_position, Some(Seq(0)), "the seed takes a seq");
+    assert_eq!(a.last_source_ts, None);
+    assert_eq!(a.last_rx_ts, None);
+    assert_eq!(a.latency_ns, None);
+    assert_eq!(provider_messages(&snap, "fake"), 0);
+
+    let health = datamancer::HealthView::from_snapshot(
+        &snap,
+        datamancer::HealthView::DEFAULT_STALE_AFTER_NS,
+    );
+    let stream_health = health
+        .streams
+        .iter()
+        .find(|s| s.instrument.symbol() == "AAPL")
+        .expect("AAPL stream health");
+    assert!(
+        matches!(stream_health.liveness, datamancer::Liveness::Idle),
+        "a seed-only stream is idle, got {:?}",
+        stream_health.liveness
+    );
+    assert_eq!(stream_health.latency, None);
+    assert_eq!(stream_health.last_event_source_ts, None);
+}
+
+/// After the seed, the first live event sets the stats from itself alone.
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn first_live_event_after_seed_sets_live_stats() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade_rx("AAPL", 5, 1_000_000, 999.0)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.expect("take events");
+
+    let seed = stream.next().await.expect("seed event");
+    assert_eq!(trade_price(&seed), 999.0);
+
+    ctrl.push_live(trade_rx("AAPL", 2_000_000, 2_000_007, 10.0))
+        .await;
+    let live = stream.next().await.expect("live event");
+    assert_eq!(trade_price(&live), 10.0);
+    assert_eq!(live.seq(), Some(Seq(1)));
+
+    let snap = dm.snapshot().await.unwrap();
+    let a = auth_snap(&snap, "AAPL");
+    assert_eq!(a.seq_position, Some(Seq(1)));
+    assert_eq!(a.last_source_ts, Some(Timestamp(2_000_000)));
+    assert_eq!(a.last_rx_ts, Some(Timestamp(2_000_007)));
+    assert_eq!(a.latency_ns, Some(7));
+    assert_eq!(provider_messages(&snap, "fake"), 1, "only the live trade");
+}

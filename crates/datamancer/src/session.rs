@@ -1292,6 +1292,18 @@ enum Sink {
     Detached(EventRing),
 }
 
+/// How a forwarded event reached the controller. Only stats and accounting
+/// read it: every arrival is stamped, teed and delivered the same way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arrival {
+    /// From the provider's live stream.
+    Live,
+    /// The pure-live latest-value seed, a `Provider::latest` snapshot. It
+    /// records its `seq` position but no timestamps (so no latency, and the
+    /// stream reads idle until its first live event) and no live `messages`.
+    Seed,
+}
+
 /// In-process [`EventSink`]: wraps the consumer-facing channel. `publish`
 /// hands back a rejected event (consumer dropped its stream) so the controller
 /// can divert it to the resume buffer. `flush` is a no-op — the channel has no
@@ -2022,8 +2034,10 @@ impl Controller {
                         // connect control, though this unbiased select! does not
                         // guarantee seed-vs-control order — both keep seq
                         // monotonic), tee to the tap log, and fan out. `forward`
-                        // sets data_forwarded so nothing else can seed.
-                        self.forward(seed).await;
+                        // sets data_forwarded so nothing else can seed. The seed
+                        // is not a live arrival, so stats and accounting see it
+                        // as `Arrival::Seed`.
+                        self.forward_with(seed, Arrival::Seed).await;
                     }
                     // else: a live data event already won, or
                     // Err(RecvError) / Ok(None) — nothing to seed.
@@ -2103,11 +2117,20 @@ impl Controller {
     /// no other producer into the outbound order, so push order == canonical
     /// delivery order.
     async fn deliver(&mut self, ev: MarketEvent) {
+        self.deliver_with(ev, Arrival::Live).await;
+    }
+
+    /// [`deliver`](Self::deliver), with the event's [`Arrival`]: a seed records
+    /// only its `seq` position in the per-symbol stats.
+    async fn deliver_with(&mut self, ev: MarketEvent, arrival: Arrival) {
         // Live authoritative session: fan the stamped event out to every
         // referrer. Each referrer owns its per-client resume buffer, so there is
         // no core-side ring here.
         if self.fanout.is_some() {
-            self.stats.record_event(&ev);
+            match arrival {
+                Arrival::Live => self.stats.record_event(&ev),
+                Arrival::Seed => self.stats.record_seed(&ev),
+            }
             if let Some(fanout) = self.fanout.as_mut() {
                 fanout.fanout(&ev);
             }
@@ -2144,6 +2167,13 @@ impl Controller {
     /// must not come through here — `stream_segments` emits it directly, so only
     /// the live tail lands in the log (backfill data belongs to the cache).
     async fn forward(&mut self, ev: MarketEvent) {
+        self.forward_with(ev, Arrival::Live).await;
+    }
+
+    /// [`forward`](Self::forward), with the event's [`Arrival`]. A seed is
+    /// stamped, teed and delivered exactly like live data; only the stats and
+    /// the provider's live `messages` count leave it out.
+    async fn forward_with(&mut self, ev: MarketEvent, arrival: Arrival) {
         let ev = self.stamp(ev);
         if matches!(
             ev,
@@ -2172,9 +2202,11 @@ impl Controller {
         // Stream-derived provider accounting: messages count as live-data
         // throughput only on the authoritative live path (fan-out present);
         // gap/error state is derived from in-band Control regardless of scope.
-        self.accounting.record_forwarded(&ev, self.fanout.is_some());
+        // The seed is a `Provider::latest` snapshot, not provider traffic.
+        self.accounting
+            .record_forwarded(&ev, self.fanout.is_some() && arrival == Arrival::Live);
         self.tee(&ev).await;
-        self.deliver(ev).await;
+        self.deliver_with(ev, arrival).await;
     }
 
     /// Backfill seam: a live arrival during the backfill is buffered in arrival
