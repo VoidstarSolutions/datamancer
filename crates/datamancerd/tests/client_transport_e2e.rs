@@ -40,6 +40,7 @@
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use datamancer_client::spec::{SubscriptionSpec, UnsubscribeSpec};
@@ -98,14 +99,22 @@ fn control_endpoint(_dir: &std::path::Path) -> PathBuf {
 /// generation with `daemon_e2e.rs`'s admin-socket wait) and block until both
 /// surfaces are reachable.
 ///
-/// `service_prefix` uses this file's own distinct value (as the other e2e
-/// files each do); `datamancer_client::iceoryx2::parse_client_id` extracts the
-/// client id from the trailing `/data/{id}` segments of the `open-client`
-/// reply's service name regardless of the configured prefix, so no
-/// particular prefix value is required here.
+/// `service_prefix` is unique per daemon (`<pid>-<n>`): iceoryx2 reports
+/// `SystemInFlux` when a service name is created and removed in quick
+/// succession (#72), which a fixed prefix plus client ids restarting at 0
+/// did on every respawn. `datamancer_client::iceoryx2::parse_client_id`
+/// extracts the client id from the trailing `/data/{id}` segments of the
+/// `open-client` reply's service name regardless of the configured prefix,
+/// so no particular prefix value is required here.
 async fn spawn_daemon(dir: &std::path::Path, ws_port: u16) -> DaemonHandle {
+    static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
     let socket = control_endpoint(dir);
     let config_path = dir.join("datamancerd.toml");
+    let service_prefix = format!(
+        "datamancerd-ct-e2e-{}-{}",
+        std::process::id(),
+        PREFIX_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let config = format!(
         r#"
 [provider.alpaca_crypto]
@@ -114,7 +123,7 @@ venue = "us"
 
 [server]
 admin_socket = '{socket}'
-service_prefix = "datamancerd-ct-e2e"
+service_prefix = "{service_prefix}"
 
 [diagnostics]
 publish_interval_ms = 200

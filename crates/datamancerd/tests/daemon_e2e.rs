@@ -24,7 +24,15 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+/// Makes every daemon's `service_prefix` unique (`<pid>-<n>`). iceoryx2
+/// reports `SystemInFlux` when a service name is created and removed in quick
+/// succession (#72); with a fixed prefix and client ids restarting at 0, each
+/// test's daemon re-created the previous one's service names seconds after
+/// its kill. Distinct names per daemon remove the trigger entirely.
+static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Serializes the whole suite: `datamancerd` takes a **global** single-instance
 /// lock (`<data dir>/datamancerd.lock`, one per user per host), so two daemons
@@ -43,6 +51,9 @@ struct Daemon {
     // the next test races the dying daemon for the single-instance lock.
     child: Child,
     _lock: std::sync::MutexGuard<'static, ()>,
+    /// The `[server].service_prefix` this daemon was started with, for tests
+    /// that assert on a reply's full service name.
+    service_prefix: String,
 }
 
 impl Drop for Daemon {
@@ -62,6 +73,11 @@ fn spawn_daemon(dir: &std::path::Path) -> (Daemon, PathBuf) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let socket = dir.join("admin.sock");
     let config_path = dir.join("datamancerd.toml");
+    let service_prefix = format!(
+        "datamancerd-e2e-{}-{}",
+        std::process::id(),
+        PREFIX_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let config = format!(
         r#"
 [provider.alpaca]
@@ -73,7 +89,7 @@ venue = "us"
 
 [server]
 admin_socket = "{}"
-service_prefix = "datamancerd-e2e"
+service_prefix = "{service_prefix}"
 
 [diagnostics]
 publish_interval_ms = 200
@@ -89,7 +105,11 @@ publish_interval_ms = 200
         .spawn()
         .expect("spawn datamancerd");
 
-    let daemon = Daemon { child, _lock: lock };
+    let daemon = Daemon {
+        child,
+        _lock: lock,
+        service_prefix,
+    };
 
     // Wait for the socket to appear (daemon bound).
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -137,7 +157,7 @@ fn control_round_trip_list_and_snapshot() {
 #[ignore = "needs a live iceoryx2 runtime"]
 fn open_client_creates_a_service_then_closes() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (_daemon, socket) = spawn_daemon(dir.path());
+    let (daemon, socket) = spawn_daemon(dir.path());
 
     // open-client over its own long-lived connection.
     let stream = UnixStream::connect(&socket).expect("connect");
@@ -153,10 +173,11 @@ fn open_client_creates_a_service_then_closes() {
     reader.read_line(&mut line).expect("read");
     let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
     assert_eq!(reply["ok"], serde_json::Value::Bool(true));
+    let expected_prefix = format!("{}/data/", daemon.service_prefix);
     assert!(
         reply["service"]
             .as_str()
-            .is_some_and(|s| s.contains("datamancerd-e2e/data/"))
+            .is_some_and(|s| s.contains(&expected_prefix))
     );
 
     // The client appears in list-clients (separate connection).
@@ -210,7 +231,7 @@ fn open_client_creates_a_service_then_closes() {
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
 fn open_query_streams_bars_then_reaps_its_service() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (_daemon, socket) = spawn_daemon(dir.path());
+    let (daemon, socket) = spawn_daemon(dir.path());
 
     let stream = UnixStream::connect(&socket).expect("connect");
     let mut writer = stream.try_clone().expect("clone");
@@ -228,9 +249,12 @@ fn open_query_streams_bars_then_reaps_its_service() {
     let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
     assert_eq!(reply["ok"], true, "open-query rejected: {reply}");
     let id = reply["query"].as_u64().expect("query id");
-    // `service_prefix` is "datamancerd-e2e" in `spawn_daemon`'s config above,
+    // The service name carries `spawn_daemon`'s per-daemon `service_prefix`,
     // not the daemon's own out-of-the-box default ("datamancerd").
-    assert_eq!(reply["service"], format!("datamancerd-e2e/data/{id}"));
+    assert_eq!(
+        reply["service"],
+        format!("{}/data/{id}", daemon.service_prefix)
+    );
 
     // The query is in flight immediately after the reply. `list-queries` owns
     // nothing, so checking it over a fresh `round_trip` connection cannot
