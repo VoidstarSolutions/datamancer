@@ -15,8 +15,8 @@ lifecycle, and a control surface — **no** new ordering, transport, or event se
 
 > **Status:** early-stage (`0.9.x`). The public API is co-evolving with its first
 > consumers; expect breaking changes until it stabilizes. Pre-1.0, a `feat!:` bump is a
-> *minor* release, so **every minor is potentially breaking**. A license has not yet been
-> selected — see [Licensing](#licensing).
+> *minor* release, so **every minor is potentially breaking**. Dual-licensed
+> `MIT OR Apache-2.0` — see [Licensing](#licensing).
 
 ## Core design rule: per-symbol determinism
 
@@ -266,7 +266,6 @@ need any of those build them on top.
 
 ## Licensing
 
-**No license has been selected yet** and no `LICENSE` file exists, so the source is
-currently "all rights reserved" by default. The recorded intent is a `MIT OR Apache-2.0`
-dual license, but that decision is **unexecuted**. Downstream projects should not describe a stack built
-on Datamancer as open-source-based until the file lands.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Every crate in the workspace declares
+`MIT OR Apache-2.0`.
