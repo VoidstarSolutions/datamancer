@@ -142,13 +142,17 @@ pub enum Liveness {
     Idle,
     Live,
     /// Soft error, needs diagnosing: the substream is disconnected on a fault
-    /// (a reconnect is scheduled or in flight), or it reported a provider
-    /// error after its last data event and its last connect. `since` is when
-    /// that evidence was received, not the last data receipt. A drop because
-    /// the provider was deliberately disabled (`DisconnectCause::Disabled`)
-    /// is not a fault: the provider reads `Disabled` and the stream is judged
-    /// on its data alone.
+    /// (a reconnect is scheduled or in flight). Judged on the stream's own
+    /// connection only — provider errors are connection-scoped and surface on
+    /// the provider's `detail`, and a failed backfill fetch is reported
+    /// in-band as a `Gap` — so one stream never reads `Stale` for another's
+    /// trouble. A drop because the provider was deliberately disabled
+    /// (`DisconnectCause::Disabled`) is not a fault: the provider reads
+    /// `Disabled` and the stream is judged on its data alone.
     Stale {
+        /// Wall-clock receipt (`rx_ts`) of the `ProviderDisconnected` that
+        /// started the outage the stream is still in — not the last data
+        /// receipt.
         since: Timestamp,
     },
     /// Healthy and listening, nothing received within the threshold (an
@@ -269,26 +273,23 @@ fn liveness(
 }
 
 /// When this substream's fault evidence was received, if it has any: the
-/// disconnect while it is down, or a provider error received after both its
-/// last data event and its last connect (either clears an earlier error). A
-/// drop whose cause is `Disabled` is deliberate, not a fault: the provider
-/// reads `Disabled`, and the stream is judged on its data alone.
+/// disconnect it is currently down on. Only the stream's **own** connection
+/// counts. A `ProviderError` is connection-scoped — Alpaca's error frames
+/// name no symbol, and the crypto hub fans every one out to all of its
+/// streams — so it surfaces on the provider (`detail`), never as one stream's
+/// `Stale`; a stream's own failed backfill fetch is already reported in-band
+/// as a `Gap`. A drop whose cause is `Disabled` is deliberate, not a fault:
+/// the provider reads `Disabled`, and the stream is judged on its data alone.
 fn fault_since(s: &AuthoritativeSessionSnapshot) -> Option<Timestamp> {
-    let connected_at = match s.connection {
+    match s.connection {
         StreamConnection::Down {
             cause: DisconnectCause::Disabled,
             ..
         }
-        | StreamConnection::Pending => None,
-        StreamConnection::Down { since, .. } => return Some(since),
-        StreamConnection::Up { since } => Some(since),
-    };
-    let error_at = s.last_error_rx_ts?;
-    let cleared = [connected_at, s.last_rx_ts]
-        .into_iter()
-        .flatten()
-        .any(|t| t.0 >= error_at.0);
-    (!cleared).then_some(error_at)
+        | StreamConnection::Pending
+        | StreamConnection::Up { .. } => None,
+        StreamConnection::Down { since, .. } => Some(since),
+    }
 }
 
 #[cfg(test)]
@@ -576,9 +577,8 @@ mod tests {
     fn stream_with(
         last_rx_ns: Option<i64>,
         connection: StreamConnection,
-        last_error_rx_ns: Option<i64>,
     ) -> AuthoritativeSessionSnapshot {
-        stream_snapshot(last_rx_ns).with_connection(connection, last_error_rx_ns.map(Timestamp))
+        stream_snapshot(last_rx_ns).with_connection(connection)
     }
 
     fn liveness_of(sessions: Vec<AuthoritativeSessionSnapshot>) -> Vec<Liveness> {
@@ -655,10 +655,10 @@ mod tests {
         assert_eq!(
             liveness_of(vec![
                 // Data before the drop: Stale, not Live (data is 3s old).
-                stream_with(Some(NOW - 3 * SEC), down(DisconnectCause::Error), None),
+                stream_with(Some(NOW - 3 * SEC), down(DisconnectCause::Error)),
                 // Never received anything: Stale, not Idle.
-                stream_with(None, down(DisconnectCause::Error), None),
-                stream_with(None, down(DisconnectCause::Unauthenticated), None),
+                stream_with(None, down(DisconnectCause::Error)),
+                stream_with(None, down(DisconnectCause::Unauthenticated)),
             ]),
             vec![stale.clone(), stale.clone(), stale]
         );
@@ -675,9 +675,9 @@ mod tests {
         };
         assert_eq!(
             liveness_of(vec![
-                stream_with(Some(NOW - 3 * SEC), disabled, None),
-                stream_with(Some(NOW - 10 * SEC), disabled, None),
-                stream_with(None, disabled, None),
+                stream_with(Some(NOW - 3 * SEC), disabled),
+                stream_with(Some(NOW - 10 * SEC), disabled),
+                stream_with(None, disabled),
             ]),
             vec![
                 Liveness::Live,
@@ -690,44 +690,29 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_after_last_event_and_connect_is_stale() {
+    fn provider_error_surfaces_on_the_provider_not_as_stale() {
+        // A ProviderError is connection-scoped (it names no stream, and a
+        // shared connection fans it out to every stream), so it is the
+        // provider's detail; a stream reads Stale only on its own disconnect.
         let up = StreamConnection::Up {
             since: Timestamp(NOW - 10 * SEC),
         };
-        assert_eq!(
-            liveness_of(vec![
-                stream_with(Some(NOW - 3 * SEC), up, Some(NOW - SEC)),
-                stream_with(None, StreamConnection::Pending, Some(NOW - SEC)),
-            ]),
+        let snap = snapshot(
+            vec![provider_snapshot(ConnectionState::Connected, Some("boom"))],
             vec![
-                Liveness::Stale {
-                    since: Timestamp(NOW - SEC)
-                },
-                Liveness::Stale {
-                    since: Timestamp(NOW - SEC)
-                },
-            ]
+                stream_with(Some(NOW - 3 * SEC), up),
+                stream_with(None, up),
+                stream_with(None, StreamConnection::Pending),
+            ],
+            NOW,
         );
-    }
-
-    #[test]
-    fn later_data_or_reconnect_clears_a_provider_error() {
-        let up_long_ago = StreamConnection::Up {
-            since: Timestamp(NOW - 10 * SEC),
-        };
-        let reconnected = StreamConnection::Up {
-            since: Timestamp(NOW - SEC),
-        };
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert_eq!(view.providers[0].state, ProviderState::Connected);
+        assert_eq!(view.providers[0].detail.as_deref(), Some("boom"));
+        let liveness: Vec<_> = view.streams.into_iter().map(|s| s.liveness).collect();
         assert_eq!(
-            liveness_of(vec![
-                // Data after the error.
-                stream_with(Some(NOW - SEC), up_long_ago, Some(NOW - 3 * SEC)),
-                // Reconnect after the error, nothing received since.
-                stream_with(None, reconnected, Some(NOW - 3 * SEC)),
-                // Data received in the same instant as the error: not newer.
-                stream_with(Some(NOW - SEC), up_long_ago, Some(NOW - SEC)),
-            ]),
-            vec![Liveness::Live, Liveness::Idle, Liveness::Live]
+            liveness,
+            vec![Liveness::Live, Liveness::Idle, Liveness::Idle]
         );
     }
 
@@ -738,7 +723,7 @@ mod tests {
             cause: DisconnectCause::Error,
         };
         assert_eq!(
-            liveness_of(vec![stream_with(None, down, None).with_backfilling(true)]),
+            liveness_of(vec![stream_with(None, down).with_backfilling(true)]),
             vec![Liveness::Backfilling]
         );
     }
@@ -781,8 +766,8 @@ mod tests {
 
     #[test]
     fn frames_without_the_schema_3_fields_still_parse() {
-        // A snapshot frame from before schema 3 has no `active_subscriptions`,
-        // `connection` or `last_error_rx_ts`; they default.
+        // A snapshot frame from before schema 3 has no `active_subscriptions`
+        // or `connection`; they default.
         let mut provider =
             serde_json::to_value(provider_snapshot(ConnectionState::Connected, None)).unwrap();
         provider
@@ -797,14 +782,10 @@ mod tests {
             StreamConnection::Up {
                 since: Timestamp(1),
             },
-            Some(1),
         ))
         .unwrap();
-        let fields = session.as_object_mut().unwrap();
-        fields.remove("connection");
-        fields.remove("last_error_rx_ts");
+        session.as_object_mut().unwrap().remove("connection");
         let session: AuthoritativeSessionSnapshot = serde_json::from_value(session).unwrap();
         assert_eq!(session.connection, StreamConnection::Pending);
-        assert_eq!(session.last_error_rx_ts, None);
     }
 }

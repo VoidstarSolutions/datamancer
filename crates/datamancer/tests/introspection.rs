@@ -1107,26 +1107,44 @@ async fn snapshot_carries_stream_connection_evidence_and_active_subscriptions() 
             since: Timestamp(0)
         }
     );
-    assert_eq!(a.last_error_rx_ts, None);
 
-    // An error, then the substream's connection drops: each is recorded with
-    // its own receipt time, and the stream reads Stale since the drop.
+    // A provider error is connection-scoped (a shared connection fans it out
+    // to every stream): it lands on the provider as detail and leaves the
+    // stream's own evidence alone, so the stream is judged on its data.
     ctrl.push("AAPL", received_at(provider_error("fake", "boom"), 40))
-        .await;
-    ctrl.push("AAPL", received_at(disconnected("fake"), 50))
         .await;
     ctrl.push("AAPL", trade("AAPL", 2, 2)).await;
     drain_until_marker(&mut stream, 2).await;
     let snap = dm.snapshot().await.unwrap();
-    let a = auth_snap(&snap, "AAPL");
     assert_eq!(
-        a.connection,
+        auth_snap(&snap, "AAPL").connection,
+        StreamConnection::Up {
+            since: Timestamp(0)
+        }
+    );
+    let view = health(&snap);
+    assert_eq!(view.providers[0].state, ProviderState::Connected);
+    assert_eq!(view.providers[0].detail.as_deref(), Some("boom"));
+    assert_eq!(
+        view.streams[0].liveness,
+        Liveness::Quiet {
+            since: Timestamp(2)
+        }
+    );
+
+    // The substream's own connection drops: Stale since the drop.
+    ctrl.push("AAPL", received_at(disconnected("fake"), 50))
+        .await;
+    ctrl.push("AAPL", trade("AAPL", 3, 3)).await;
+    drain_until_marker(&mut stream, 3).await;
+    let snap = dm.snapshot().await.unwrap();
+    assert_eq!(
+        auth_snap(&snap, "AAPL").connection,
         StreamConnection::Down {
             since: Timestamp(50),
             cause: DisconnectCause::Error,
         }
     );
-    assert_eq!(a.last_error_rx_ts, Some(Timestamp(40)));
     let view = health(&snap);
     assert_eq!(view.providers[0].state, ProviderState::Disconnected);
     assert_eq!(

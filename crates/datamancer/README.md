@@ -306,7 +306,8 @@ transport or daemon. It composes three things:
   (subscriber refcount, last source/rx timestamps, `latency_ns =
   rx_ts − source_ts`, per-symbol gap count, seq position, the substream's own
   `connection` phase — `pending`/`up`/`down`, each with the receipt time of the
-  control that entered it — and `last_error_rx_ts`) and per-client
+  control that entered it; a `ProviderError` is connection-scoped and lands in
+  the provider's `last_error`, not here) and per-client
   `ClientSessionSnapshot` (subscriptions + resume-buffer occupancy/drops).
   The timestamps, `latency_ns` and the provider's `messages` describe live
   arrivals only: the pure-live latest-value seed is delivered, teed and takes

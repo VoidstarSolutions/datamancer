@@ -244,8 +244,6 @@ pub(crate) struct LiveStats {
     /// This substream's connection phase from its in-band connect/disconnect
     /// controls (cold mutex, written only on those controls).
     connection: std::sync::Mutex<StreamConnection>,
-    has_error_rx: AtomicBool,
-    last_error_rx_ts: AtomicI64,
 }
 
 /// Bounded per-symbol recent-gap detail (oldest evicted).
@@ -280,8 +278,6 @@ impl LiveStats {
             backfilling: AtomicBool::new(false),
             subscribers: AtomicU64::new(0),
             connection: std::sync::Mutex::new(StreamConnection::Pending),
-            has_error_rx: AtomicBool::new(false),
-            last_error_rx_ts: AtomicI64::new(0),
         }
     }
 
@@ -320,16 +316,14 @@ impl LiveStats {
                         ring.push_back(span.clone());
                     }
                 }
-                ControlKind::ProviderError { .. } => {
-                    self.last_error_rx_ts.store(c.rx_ts.0, Ordering::Relaxed);
-                    self.has_error_rx.store(true, Ordering::Relaxed);
-                }
                 // The connection phase is recorded at receipt
                 // (`record_connection`), not at delivery: a control held in the
                 // backfill ring must still count, and one the ring evicts must
-                // not be lost.
+                // not be lost. A `ProviderError` is connection-scoped and is the
+                // provider's `last_error`, not per-stream evidence.
                 ControlKind::ProviderConnected { .. }
                 | ControlKind::ProviderDisconnected { .. }
+                | ControlKind::ProviderError { .. }
                 | ControlKind::SubscriptionChanged { .. }
                 | ControlKind::SessionClosing => {}
             },
@@ -457,13 +451,6 @@ impl LiveStats {
         self.connection
             .lock()
             .map_or(StreamConnection::Pending, |slot| *slot)
-    }
-
-    /// Receipt of the last `ProviderError` on this substream, or `None`.
-    pub(crate) fn last_error_rx_ts(&self) -> Option<Timestamp> {
-        self.has_error_rx
-            .load(Ordering::Relaxed)
-            .then(|| Timestamp(self.last_error_rx_ts.load(Ordering::Relaxed)))
     }
 }
 

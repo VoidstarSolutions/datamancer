@@ -187,10 +187,6 @@ pub struct AuthoritativeSessionSnapshot {
     /// predate the field.
     #[serde(default)]
     pub connection: StreamConnection,
-    /// Wall-clock receipt of the most recent `Control::ProviderError` this
-    /// substream received (observability).
-    #[serde(default)]
-    pub last_error_rx_ts: Option<Timestamp>,
 }
 
 /// One substream's upstream connection phase, judged from the in-band
@@ -384,19 +380,13 @@ impl AuthoritativeSessionSnapshot {
             last_gap_rx_ts: None,
             backfilling: false,
             connection: StreamConnection::Pending,
-            last_error_rx_ts: None,
         }
     }
 
-    /// Set this substream's connection phase and last provider-error receipt.
+    /// Set this substream's connection phase.
     #[must_use]
-    pub fn with_connection(
-        mut self,
-        connection: StreamConnection,
-        last_error_rx_ts: Option<Timestamp>,
-    ) -> Self {
+    pub fn with_connection(mut self, connection: StreamConnection) -> Self {
         self.connection = connection;
-        self.last_error_rx_ts = last_error_rx_ts;
         self
     }
 
@@ -583,7 +573,6 @@ mod tests {
                     since: Timestamp(11),
                     cause: DisconnectCause::Unauthenticated,
                 },
-                last_error_rx_ts: Some(Timestamp(10)),
             }],
             client_sessions: vec![ClientSessionSnapshot {
                 id: ClientSessionId(42),

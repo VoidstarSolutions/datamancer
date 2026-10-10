@@ -811,7 +811,7 @@ impl Datamancer {
                     .with_timestamps(stats.last_source_ts(), stats.last_rx_ts())
                     .with_gaps(stats.recent_gaps(), stats.last_gap_rx_ts())
                     .with_backfilling(stats.backfilling())
-                    .with_connection(stats.connection(), stats.last_error_rx_ts())
+                    .with_connection(stats.connection())
             })
             .collect();
 
