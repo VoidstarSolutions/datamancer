@@ -277,10 +277,7 @@ impl LiveStats {
     /// Record one fan-out event: advance the last-`seq`/timestamps and bump the
     /// gap counter on a `Control::Gap`.
     pub(crate) fn record_event(&self, ev: &MarketEvent) {
-        if let Some(seq) = ev.seq() {
-            self.last_seq.store(seq.0, Ordering::Relaxed);
-            self.has_seq.store(true, Ordering::Relaxed);
-        }
+        self.record_seq(ev);
         match ev {
             MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_) => {
                 if let (Some(source), Some(rx)) = (data_source_ts(ev), data_rx_ts(ev)) {
@@ -306,6 +303,21 @@ impl LiveStats {
         }
     }
 
+    /// Record the pure-live latest-value seed: its `seq` position only. The
+    /// seed is a `Provider::latest` snapshot, not a live arrival, so it leaves
+    /// the last timestamps (and the latency derived from them) unset until the
+    /// first live data event.
+    pub(crate) fn record_seed(&self, ev: &MarketEvent) {
+        self.record_seq(ev);
+    }
+
+    fn record_seq(&self, ev: &MarketEvent) {
+        if let Some(seq) = ev.seq() {
+            self.last_seq.store(seq.0, Ordering::Relaxed);
+            self.has_seq.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Last source-stamped `seq` seen, or `None` before any event.
     pub(crate) fn seq_position(&self) -> Option<Seq> {
         self.has_seq
@@ -313,14 +325,15 @@ impl LiveStats {
             .then(|| Seq(self.last_seq.load(Ordering::Relaxed)))
     }
 
-    /// Last data-event `source_ts`, or `None` before any data event.
+    /// Last live data-event `source_ts`, or `None` before any live data event
+    /// (the latest-value seed is not one; see [`Self::record_seed`]).
     pub(crate) fn last_source_ts(&self) -> Option<Timestamp> {
         self.has_ts
             .load(Ordering::Relaxed)
             .then(|| Timestamp(self.last_source_ts.load(Ordering::Relaxed)))
     }
 
-    /// Last data-event `rx_ts`, or `None` before any data event.
+    /// Last live data-event `rx_ts`, or `None` before any live data event.
     pub(crate) fn last_rx_ts(&self) -> Option<Timestamp> {
         self.has_ts
             .load(Ordering::Relaxed)

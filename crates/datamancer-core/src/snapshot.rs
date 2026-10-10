@@ -140,12 +140,17 @@ pub struct AuthoritativeSessionSnapshot {
     pub subscriber_refcount: u32,
     /// Last-assigned per-symbol source `seq`, or `None` before any event.
     pub seq_position: Option<Seq>,
+    /// `source_ts` of the last live data event, or `None` before any. The
+    /// pure-live latest-value seed counts toward `seq_position` but not here.
     pub last_source_ts: Option<Timestamp>,
+    /// `rx_ts` of the last live data event, or `None` before any (the seed is
+    /// excluded, as for `last_source_ts`).
     pub last_rx_ts: Option<Timestamp>,
-    /// Last `rx_ts - source_ts` (observability only). It straddles two clocks —
-    /// the provider's `source_ts` and our wall-clock `rx_ts` — so it is **signed
-    /// and may be negative** when the local clock lags the provider's (clock
-    /// skew). It is not a pure network latency and must never feed engine logic.
+    /// Last live `rx_ts - source_ts` (observability only). It straddles two
+    /// clocks — the provider's `source_ts` and our wall-clock `rx_ts` — so it is
+    /// **signed and may be negative** when the local clock lags the provider's
+    /// (clock skew). It is not a pure network latency and must never feed engine
+    /// logic.
     pub latency_ns: Option<i64>,
     /// Per-symbol provider/source `Control::Gap` count. Per-client resume-buffer
     /// drops live on [`ClientSessionSnapshot`] instead.

@@ -299,6 +299,11 @@ transport or daemon. It composes three things:
   (subscriber refcount, last source/rx timestamps, `latency_ns =
   rx_ts − source_ts`, per-symbol gap count, seq position) and per-client
   `ClientSessionSnapshot` (subscriptions + resume-buffer occupancy/drops).
+  The timestamps, `latency_ns` and the provider's `messages` describe live
+  arrivals only: the pure-live latest-value seed is delivered, teed and takes
+  a `seq` (so it moves the seq position), but it is a `Provider::latest`
+  snapshot, not live traffic, so a stream that has seen only its seed has no
+  timestamps or latency yet and its health reads `Idle`.
 
 The snapshot is **sampled, not transactional**: per-symbol fields are read from
 `Relaxed` atomics and the session registry lock is held only to clone handles
