@@ -77,13 +77,13 @@ type Node = iceoryx2::prelude::Node<ipc_threadsafe::Service>;
 /// ritual happens, shared by the UDS `Request::Health` reply, the
 /// diagnostics-plane health publisher, and (when `web-ui` is enabled) the
 /// `/api/health` HTTP handler. Byte-identical behavior everywhere: same
-/// [`HealthView::DEFAULT_STALE_AFTER_NS`], same `CARGO_PKG_VERSION` (all call
+/// [`HealthView::DEFAULT_QUIET_AFTER_NS`], same `CARGO_PKG_VERSION` (all call
 /// sites live in this crate, so the version constant is identical).
 pub(crate) fn stamped_health_view(
     snapshot: &datamancer::SystemSnapshot,
     credential_backend: &str,
 ) -> HealthView {
-    let mut view = HealthView::from_snapshot(snapshot, HealthView::DEFAULT_STALE_AFTER_NS);
+    let mut view = HealthView::from_snapshot(snapshot, HealthView::DEFAULT_QUIET_AFTER_NS);
     view.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
     view.daemon.credential_backend = Some(credential_backend.to_string());
     view

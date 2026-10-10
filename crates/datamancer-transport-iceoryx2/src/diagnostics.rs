@@ -408,7 +408,7 @@ mod tests {
         let snap = sample_snapshot(1);
         let view = datamancer_core::HealthView::from_snapshot(
             &snap,
-            datamancer_core::HealthView::DEFAULT_STALE_AFTER_NS,
+            datamancer_core::HealthView::DEFAULT_QUIET_AFTER_NS,
         );
         let bytes = encode_health(&view).unwrap();
         assert!(bytes.len() <= DIAGNOSTICS_PAYLOAD_CAPACITY);

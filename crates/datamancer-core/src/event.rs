@@ -230,10 +230,17 @@ pub struct Control {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisconnectCause {
+    /// A transport or provider fault; a reconnect is scheduled or in flight.
     #[default]
     Error,
+    /// Credentials rejected or an auth session lapsed; retrying without new
+    /// credentials cannot help.
     Unauthenticated,
+    /// A required companion process is unreachable (reserved; nothing emits
+    /// it yet).
     CompanionUnreachable,
+    /// The provider was deliberately disabled; not a fault, and no reconnect
+    /// is coming until it is enabled again.
     Disabled,
 }
 

@@ -713,7 +713,7 @@ async fn connection_phase_is_visible_while_a_backfill_holds_the_control() {
     let p = provider_snap(&snap, "fake");
     assert_eq!(p.active_subscriptions, 1);
     assert_eq!(p.connection_state, datamancer::ConnectionState::Connected);
-    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
     assert_eq!(view.providers[0].state, ProviderState::Connected);
     assert_eq!(view.streams[0].liveness, Liveness::Backfilling);
     gate.release.send(true).unwrap();
@@ -771,7 +771,7 @@ async fn connection_phase_survives_backfill_ring_eviction() {
     let p = provider_snap(&snap, "fake");
     assert_eq!(p.connection_state, datamancer::ConnectionState::Connected);
     assert_eq!(p.reconnects, 0);
-    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
     assert_eq!(view.providers[0].state, ProviderState::Connected);
 }
 
@@ -865,7 +865,7 @@ async fn rejected_credentials_outlive_the_last_subscription() {
     ctrl.push("AAPL", trade("AAPL", 1, 1)).await;
     drain_until_marker(&mut stream, 1).await;
     let snap = dm.snapshot().await.unwrap();
-    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
     assert_eq!(view.providers[0].state, ProviderState::Unauthenticated);
 
     drop(stream);
@@ -881,7 +881,7 @@ async fn rejected_credentials_outlive_the_last_subscription() {
         datamancer::ConnectionState::Unauthenticated
     );
     assert_eq!(p.last_error.as_deref(), Some("auth rejected"));
-    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
     assert_eq!(view.providers[0].state, ProviderState::Unauthenticated);
     assert_eq!(view.providers[0].detail.as_deref(), Some("auth rejected"));
 }
@@ -926,7 +926,7 @@ async fn disabled_drop_leaves_the_stream_quiet_not_stale() {
             cause: DisconnectCause::Disabled,
         }
     );
-    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
     assert_eq!(
         view.streams[0].liveness,
         Liveness::Quiet {
@@ -940,7 +940,7 @@ async fn disabled_drop_leaves_the_stream_quiet_not_stale() {
     ctrl.push("AAPL", trade("AAPL", 3, 3)).await;
     drain_until_marker(&mut stream, 3).await;
     let snap = dm.snapshot().await.unwrap();
-    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
     assert_eq!(
         view.streams[0].liveness,
         Liveness::Stale {
@@ -1031,7 +1031,7 @@ async fn open_refused_for_want_of_credentials_reads_unauthenticated() {
         p.last_error.as_deref(),
         Some("provider fake: unauthenticated: waiting for credentials")
     );
-    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
     assert_eq!(view.providers[0].state, ProviderState::Unauthenticated);
 }
 
@@ -1050,7 +1050,7 @@ async fn open_refused_for_another_reason_reads_idle_with_detail() {
         p.last_error.as_deref(),
         Some("provider fake: provider disabled")
     );
-    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
     assert_eq!(view.providers[0].state, ProviderState::Idle);
     assert_eq!(
         view.providers[0].detail.as_deref(),
@@ -1077,7 +1077,7 @@ async fn snapshot_carries_stream_connection_evidence_and_active_subscriptions() 
         .build()
         .unwrap();
     let health = |snap: &datamancer::SystemSnapshot| {
-        HealthView::from_snapshot(snap, HealthView::DEFAULT_STALE_AFTER_NS)
+        HealthView::from_snapshot(snap, HealthView::DEFAULT_QUIET_AFTER_NS)
     };
 
     // Nothing requested: Idle, whatever the (never-connected) aggregate says.

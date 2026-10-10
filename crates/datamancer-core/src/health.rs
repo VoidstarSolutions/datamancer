@@ -7,12 +7,14 @@
 //! engine logic.
 //!
 //! Schema 3 judges health on evidence, not silence. `Stale` is a soft error
-//! (the substream is disconnected, or reported a provider error after its last
-//! event); `Quiet` is healthy and listening with nothing arriving; provider
-//! `Idle` is enabled with nothing requested.
+//! (the substream is down on a fault — its own disconnect, not a deliberate
+//! disable and not a provider-wide error, which is the provider's `detail`);
+//! `Quiet` is healthy and listening with nothing arriving; `AwaitingData` is
+//! subscribed with no first event yet; provider `Idle` is enabled with nothing
+//! requested, except that a known fault (`Unauthenticated`) wins over it.
 //!
 //! Quiet boundary: the check is **strictly greater than** the threshold
-//! (`captured_at - last_rx_ts > stale_after_ns`), so exact-threshold age
+//! (`captured_at - last_rx_ts > quiet_after_ns`), so exact-threshold age
 //! counts as `Live`, not `Quiet` (a cycle-1 triage residual, locked in by a
 //! boundary test rather than "fixed").
 //!
@@ -128,18 +130,21 @@ pub struct StreamHealth {
 ///
 /// Precedence when multiple conditions could apply: `Backfilling` wins over
 /// everything (judgment is suspended mid-seam); otherwise evidence of a
-/// fault is `Stale`; otherwise no `last_rx_ts` is `Idle`; otherwise data older
-/// than the threshold is `Quiet` (the boundary is **strict**: exact-threshold
-/// age is *not* quiet — a cycle-1 triage residual, locked in); otherwise a
-/// `Control::Gap` received within the threshold window is `Gapped`;
-/// otherwise `Live`.
+/// fault is `Stale`; otherwise no `last_rx_ts` is `AwaitingData`; otherwise
+/// data older than the threshold is `Quiet` (the boundary is **strict**:
+/// exact-threshold age is *not* quiet — a cycle-1 triage residual, locked in);
+/// otherwise a `Control::Gap` received within the threshold window is
+/// `Gapped`; otherwise `Live`.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Liveness {
     /// Subscribed, no live data event observed yet (a latest-value seed does
-    /// not count).
-    Idle,
+    /// not count). Named apart from [`ProviderState::Idle`] ("nothing
+    /// requested"), which is a different state: here something *is*
+    /// requested and the first event has not arrived.
+    AwaitingData,
+    /// Data received within the threshold, no fault, no recent gap.
     Live,
     /// Soft error, needs diagnosing: the substream is disconnected on a fault
     /// (a reconnect is scheduled or in flight). Judged on the stream's own
@@ -156,14 +161,17 @@ pub enum Liveness {
         since: Timestamp,
     },
     /// Healthy and listening, nothing received within the threshold (an
-    /// illiquid instrument, a closed session). Not an error. `since` is the
-    /// last receipt.
+    /// illiquid instrument, a closed session). Not an error.
     Quiet {
+        /// Wall-clock receipt (`rx_ts`) of the last live data event — how
+        /// long the stream has been silent.
         since: Timestamp,
     },
-    /// A `Control::Gap` was received within the staleness window; data is
-    /// otherwise flowing. `spans` is the bounded recent-gap detail.
+    /// A `Control::Gap` was received within the threshold window; data is
+    /// otherwise flowing.
     Gapped {
+        /// The stream's most recent gap spans, oldest first (bounded detail
+        /// behind `StreamHealth::gap_count`).
         spans: Vec<GapSpan>,
     },
     /// A historical→live backfill is in progress; staleness judgment is
@@ -183,15 +191,16 @@ pub struct LatencySummary {
 impl HealthView {
     /// Shape version of the current reduction.
     pub const SCHEMA_VERSION: u32 = 3;
-    /// Default threshold: 5 seconds without a received event reads `Quiet`.
-    /// (Named for its schema-2 role, when silence read `Stale`.)
-    pub const DEFAULT_STALE_AFTER_NS: i64 = 5_000_000_000;
+    /// Default threshold: 5 seconds without a received event reads `Quiet`
+    /// (and a `Control::Gap` older than this no longer reads `Gapped`). It
+    /// does not affect `Stale`, which is judged on fault evidence alone.
+    pub const DEFAULT_QUIET_AFTER_NS: i64 = 5_000_000_000;
 
     /// Reduce a [`SystemSnapshot`] to the app-facing view. Pure: no clock is
     /// read — `Quiet` compares `last_rx_ts` to the snapshot's own
-    /// `captured_at` against `stale_after_ns`.
+    /// `captured_at` against `quiet_after_ns`.
     #[must_use]
-    pub fn from_snapshot(snapshot: &SystemSnapshot, stale_after_ns: i64) -> Self {
+    pub fn from_snapshot(snapshot: &SystemSnapshot, quiet_after_ns: i64) -> Self {
         let providers = snapshot
             .providers
             .iter()
@@ -207,7 +216,7 @@ impl HealthView {
             .map(|s| StreamHealth {
                 instrument: s.instrument.clone(),
                 kind: s.kind,
-                liveness: liveness(s, snapshot.captured_at, stale_after_ns),
+                liveness: liveness(s, snapshot.captured_at, quiet_after_ns),
                 last_event_source_ts: s.last_source_ts,
                 gap_count: s.gap_count,
                 latency: s.latency_ns.map(|last_ns| LatencySummary { last_ns }),
@@ -252,7 +261,7 @@ fn provider_state(p: &ProviderSnapshot) -> ProviderState {
 fn liveness(
     s: &AuthoritativeSessionSnapshot,
     captured_at: Timestamp,
-    stale_after_ns: i64,
+    quiet_after_ns: i64,
 ) -> Liveness {
     if s.backfilling {
         return Liveness::Backfilling;
@@ -261,10 +270,10 @@ fn liveness(
         return Liveness::Stale { since };
     }
     match s.last_rx_ts {
-        None => Liveness::Idle,
-        Some(rx) if captured_at.0 - rx.0 > stale_after_ns => Liveness::Quiet { since: rx },
+        None => Liveness::AwaitingData,
+        Some(rx) if captured_at.0 - rx.0 > quiet_after_ns => Liveness::Quiet { since: rx },
         Some(_) => match s.last_gap_rx_ts {
-            Some(gap_rx) if captured_at.0 - gap_rx.0 <= stale_after_ns => Liveness::Gapped {
+            Some(gap_rx) if captured_at.0 - gap_rx.0 <= quiet_after_ns => Liveness::Gapped {
                 spans: s.recent_gaps.clone(),
             },
             _ => Liveness::Live,
@@ -357,7 +366,7 @@ mod tests {
             vec![],
             1_000,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert_eq!(view.schema_version, HealthView::SCHEMA_VERSION);
         assert_eq!(view.daemon.version, None); // filled by the caller, not the reduction
         assert_eq!(view.daemon.credential_backend, None); // filled by the caller, not the reduction
@@ -386,9 +395,9 @@ mod tests {
             ],
             now,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert_eq!(view.streams.len(), 3); // one entry per (instrument, kind); never aggregated
-        assert_eq!(view.streams[0].liveness, Liveness::Idle);
+        assert_eq!(view.streams[0].liveness, Liveness::AwaitingData);
         assert!(view.streams[0].latency.is_none());
         assert_eq!(view.streams[1].liveness, Liveness::Live);
         assert_eq!(view.streams[1].latency.map(|l| l.last_ns), Some(7));
@@ -408,7 +417,7 @@ mod tests {
             vec![],
             1_000,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert_eq!(view.providers[0].state, ProviderState::Disabled);
     }
 
@@ -422,7 +431,7 @@ mod tests {
             vec![],
             1_000,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert_eq!(view.providers[0].state, ProviderState::Unauthenticated);
     }
 
@@ -430,13 +439,13 @@ mod tests {
     fn quiet_boundary_is_strictly_greater() {
         // Exact-threshold age counts Live (cycle-1 triage residual, locked in).
         let now = 100_000_000_000_i64;
-        let exactly = now - HealthView::DEFAULT_STALE_AFTER_NS;
+        let exactly = now - HealthView::DEFAULT_QUIET_AFTER_NS;
         let snap = snapshot(
             vec![provider_snapshot(ConnectionState::Connected, None)],
             vec![stream_snapshot(Some(exactly))],
             now,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert_eq!(view.streams[0].liveness, Liveness::Live);
     }
 
@@ -454,7 +463,7 @@ mod tests {
             vec![s],
             now,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert_eq!(
             view.streams[0].liveness,
             Liveness::Gapped { spans: vec![span] }
@@ -478,7 +487,7 @@ mod tests {
             vec![quiet, backfilling],
             now,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert!(matches!(view.streams[0].liveness, Liveness::Quiet { .. }));
         assert_eq!(view.streams[1].liveness, Liveness::Backfilling);
     }
@@ -501,14 +510,14 @@ mod tests {
             vec![quiet_with_recent_gap],
             now,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert!(matches!(view.streams[0].liveness, Liveness::Quiet { .. }));
     }
 
     #[test]
     fn schema_version_is_3() {
         let snap = snapshot(vec![], vec![], 0);
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert_eq!(view.schema_version, 3);
     }
 
@@ -565,7 +574,7 @@ mod tests {
             vec![stream_snapshot(Some(50))],
             1_000,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         let json = serde_json::to_string(&view).unwrap();
         let back: HealthView = serde_json::from_str(&json).unwrap();
         assert_eq!(view, back);
@@ -587,7 +596,7 @@ mod tests {
             sessions,
             NOW,
         );
-        HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS)
+        HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS)
             .streams
             .into_iter()
             .map(|s| s.liveness)
@@ -614,7 +623,7 @@ mod tests {
             vec![],
             1_000,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         let states: Vec<_> = view.providers.iter().map(|p| p.state).collect();
         assert_eq!(
             states,
@@ -639,7 +648,7 @@ mod tests {
             vec![],
             1_000,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert_eq!(view.providers[0].state, ProviderState::Disabled);
     }
 
@@ -684,7 +693,7 @@ mod tests {
                 Liveness::Quiet {
                     since: Timestamp(NOW - 10 * SEC)
                 },
-                Liveness::Idle,
+                Liveness::AwaitingData,
             ]
         );
     }
@@ -706,13 +715,17 @@ mod tests {
             ],
             NOW,
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         assert_eq!(view.providers[0].state, ProviderState::Connected);
         assert_eq!(view.providers[0].detail.as_deref(), Some("boom"));
         let liveness: Vec<_> = view.streams.into_iter().map(|s| s.liveness).collect();
         assert_eq!(
             liveness,
-            vec![Liveness::Live, Liveness::Idle, Liveness::Idle]
+            vec![
+                Liveness::Live,
+                Liveness::AwaitingData,
+                Liveness::AwaitingData
+            ]
         );
     }
 
@@ -747,9 +760,19 @@ mod tests {
                 },
                 r#"{"stale":{"since":6}}"#,
             ),
+            (Liveness::AwaitingData, r#""awaiting_data""#),
+            (Liveness::Live, r#""live""#),
         ] {
             assert_eq!(serde_json::to_string(&liveness).unwrap(), wire);
         }
+        assert_eq!(
+            serde_json::to_string(&StreamConnection::Down {
+                since: Timestamp(8),
+                cause: DisconnectCause::Disabled,
+            })
+            .unwrap(),
+            r#"{"down":{"since":8,"cause":"disabled"}}"#
+        );
         assert_eq!(
             serde_json::to_string(&StreamConnection::Pending).unwrap(),
             r#""pending""#

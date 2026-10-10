@@ -89,7 +89,13 @@ pub enum Error {
     /// when it fails a live open, so a provider that never connected still
     /// reports why.
     #[error("provider {provider}: unauthenticated: {message}")]
-    Unauthenticated { provider: String, message: String },
+    Unauthenticated {
+        /// The provider id.
+        provider: String,
+        /// Provider-defined detail: which credentials are missing or why
+        /// they were rejected.
+        message: String,
+    },
 
     /// Storage-layer error.
     #[error("storage: {0}")]

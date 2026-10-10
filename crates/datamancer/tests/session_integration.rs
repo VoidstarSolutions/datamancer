@@ -1285,7 +1285,7 @@ async fn seed_is_not_recorded_as_a_live_arrival() {
 
     let health = datamancer::HealthView::from_snapshot(
         &snap,
-        datamancer::HealthView::DEFAULT_STALE_AFTER_NS,
+        datamancer::HealthView::DEFAULT_QUIET_AFTER_NS,
     );
     let stream_health = health
         .streams
@@ -1293,7 +1293,7 @@ async fn seed_is_not_recorded_as_a_live_arrival() {
         .find(|s| s.instrument.symbol() == "AAPL")
         .expect("AAPL stream health");
     assert!(
-        matches!(stream_health.liveness, datamancer::Liveness::Idle),
+        matches!(stream_health.liveness, datamancer::Liveness::AwaitingData),
         "a seed-only stream is idle, got {:?}",
         stream_health.liveness
     );

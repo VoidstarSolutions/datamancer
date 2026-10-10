@@ -607,7 +607,7 @@ impl Datamancer {
     #[must_use]
     pub fn health(&self) -> HealthView {
         let mut view =
-            HealthView::from_snapshot(&self.snapshot_live(), HealthView::DEFAULT_STALE_AFTER_NS);
+            HealthView::from_snapshot(&self.snapshot_live(), HealthView::DEFAULT_QUIET_AFTER_NS);
         view.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
         view
     }

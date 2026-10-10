@@ -313,7 +313,7 @@ transport or daemon. It composes three things:
   arrivals only: the pure-live latest-value seed is delivered, teed and takes
   a `seq` (so it moves the seq position), but it is a `Provider::latest`
   snapshot, not live traffic, so a stream that has seen only its seed has no
-  timestamps or latency yet and its health reads `Idle`.
+  timestamps or latency yet and its health reads `AwaitingData`.
 
 The snapshot is **sampled, not transactional**: per-symbol fields are read from
 `Relaxed` atomics and the session registry lock is held only to clone handles
