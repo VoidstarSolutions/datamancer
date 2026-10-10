@@ -874,7 +874,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "datamancer"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-client"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "datamancer-core",
  "datamancer-transport-iceoryx2",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-credentials"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "apple-native-keyring-store",
  "datamancer-core",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-transport-iceoryx2"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "datamancer-core",
@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "datamancer-transport-ws"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "datamancer-core",
@@ -971,14 +971,14 @@ dependencies = [
 
 [[package]]
 name = "datamancer-winsec"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "datamancerd"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "async-trait",
