@@ -6,6 +6,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.9.0...v0.10.0) - 2026-10-10
+
+### Added
+
+- *(client)* expose queries on the AppHandle facade
+- *(client)* cancel the daemon-side fetch when a query stream drops
+- *(client)* add Client::query and cancel_query with a WS stub
+- [**breaking**] add open-query, cancel-query and list-queries control frames
+- *(client)* add QuerySpec, QueryId and query error codes
+- *(daemon)* cancel, list and reap historical queries
+- *(daemon)* serve open-query on its own data-plane channel
+- *(daemon)* add max_queries and query_persistence config
+
+### Fixed
+
+- *(datamancer)* keep the latest-value seed out of live stats
+- *(datamancer)* unfiltered instrument catalog skips disabled providers
+- *(deps)* iceoryx2 0.10 for RUSTSEC-2026-0294
+- *(client)* exit the shm poll thread when the consumer is gone
+- *(client)* tear the daemon session down when a client is dropped
+- *(daemon)* drop QUERY_REAP_GRACE, it starves the 2-query cap
+- *(daemon)* close query sessions so cancellation aborts the provider fetch
+- *(daemon)* close the query session on every path that abandons it
+- *(daemon)* stop the query pump at SessionClosing so queries self-reap
+- *(daemon)* gate Windows-unused query imports/fns, extract and test open-query validation
+- *(datamancerd)* ws_consumer exits on a rejected subscribe instead of hanging
+
+### Other
+
+- correct the README set against the shipped surface
+- *(alpaca)* remove the dead AlpacaLiveHandle.active mirror
+- *(claude)* track the iceoryx2 0.10.0 pin in the two lockstep notes
+- *(client,daemon)* correct the query-failure contract to match the iceoryx2 data plane
+- *(client)* own the control connection in a task behind an unbounded channel
+- apply preflight rulings R1-R3 to the historical-query plan
+- ship license texts for the declared MIT OR Apache-2.0
+- *(datamancerd)* unique service_prefix per spawned e2e daemon
+- *(datamancerd)* make client_transport_e2e bootable on Windows
+- *(daemon)* correct the query cancellation contract
+- *(daemon)* serialize the e2e suite and kill the daemon on panic
+- *(daemon)* prune cancelled ids from a connection's teardown state
+- *(daemon)* end-to-end historical query coverage and operator docs
+- Merge pull request #58 from VoidstarSolutions/release-plz-2026-08-27T01-14-55Z
+- Merge branch 'main' into docs/ws-consumer-example
+- *(datamancerd)* ws_consumer example Windows live-bring-up walkthrough
+
 ## [0.9.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.8.0...v0.9.0) - 2026-08-27
 
 ### Added
