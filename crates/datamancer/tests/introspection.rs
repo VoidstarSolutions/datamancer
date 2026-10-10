@@ -309,10 +309,20 @@ struct LiveProvider {
     id: String,
     shared: Arc<Mutex<Shared>>,
     live_starts: Arc<AtomicUsize>,
+    /// When set, `fetch_history` parks until released, so a creation-time
+    /// backfill can be held open while the test observes the snapshot.
+    fetch_gate: Option<watch::Receiver<bool>>,
+    fetch_started: Arc<tokio::sync::Notify>,
 }
 
 struct LiveCtrl {
     shared: Arc<Mutex<Shared>>,
+}
+
+/// Test-side handle on a gated provider's backfill fetch.
+struct FetchGate {
+    started: Arc<tokio::sync::Notify>,
+    release: watch::Sender<bool>,
 }
 
 impl LiveCtrl {
@@ -338,8 +348,29 @@ impl LiveProvider {
                 id: id.to_string(),
                 shared: shared.clone(),
                 live_starts: Arc::new(AtomicUsize::new(0)),
+                fetch_gate: None,
+                fetch_started: Arc::new(tokio::sync::Notify::new()),
             }),
             LiveCtrl { shared },
+        )
+    }
+
+    /// A provider whose backfill fetch parks until `FetchGate::release` sends
+    /// `true`; `FetchGate::started` fires once the fetch is parked.
+    fn gated(id: &str) -> (Arc<Self>, LiveCtrl, FetchGate) {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release, gate) = watch::channel(false);
+        (
+            Arc::new(Self {
+                id: id.to_string(),
+                shared: shared.clone(),
+                live_starts: Arc::new(AtomicUsize::new(0)),
+                fetch_gate: Some(gate),
+                fetch_started: started.clone(),
+            }),
+            LiveCtrl { shared },
+            FetchGate { started, release },
         )
     }
 }
@@ -374,6 +405,13 @@ impl Provider for LiveProvider {
         _request: HistoryRequest,
         _sink: mpsc::Sender<MarketEvent>,
     ) -> Result<()> {
+        if let Some(gate) = &self.fetch_gate {
+            self.fetch_started.notify_one();
+            let mut rx = gate.clone();
+            while !*rx.borrow() {
+                rx.changed().await.ok();
+            }
+        }
         Ok(())
     }
 }
@@ -611,6 +649,180 @@ async fn tearing_down_a_connected_session_releases_its_connection() {
         p.connection_state,
         datamancer::ConnectionState::Disconnected
     );
+}
+
+/// Poll `dm.snapshot()` until `pred` holds, bounded at two seconds.
+async fn snapshot_until(
+    dm: &Datamancer,
+    what: &str,
+    pred: impl Fn(&datamancer_core::SystemSnapshot) -> bool,
+) -> datamancer_core::SystemSnapshot {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snap = dm.snapshot().await.unwrap();
+            if pred(&snap) {
+                return snap;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("snapshot never showed: {what}"))
+}
+
+fn backfilled() -> Scope {
+    Scope::Live {
+        backfill_from: Some(Timestamp(0)),
+    }
+}
+
+#[tokio::test]
+async fn connection_phase_is_visible_while_a_backfill_holds_the_control() {
+    // The ProviderConnected from start_live arrives while the creation-time
+    // backfill is parked, so it sits in the backfill ring until the seam. The
+    // phase must still be recorded at receipt: the socket IS up.
+    let (provider, _ctrl, gate) = LiveProvider::gated("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            backfilled(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let _stream = session.take_events().await.unwrap();
+    gate.started.notified().await;
+
+    let snap = snapshot_until(&dm, "AAPL Up mid-backfill", |s| {
+        matches!(auth_snap(s, "AAPL").connection, StreamConnection::Up { .. })
+    })
+    .await;
+    let a = auth_snap(&snap, "AAPL");
+    assert!(a.backfilling, "the observation must be mid-backfill");
+    assert_eq!(
+        a.connection,
+        StreamConnection::Up {
+            since: Timestamp(0)
+        }
+    );
+    let p = provider_snap(&snap, "fake");
+    assert_eq!(p.active_subscriptions, 1);
+    assert_eq!(p.connection_state, datamancer::ConnectionState::Connected);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    assert_eq!(view.providers[0].state, ProviderState::Connected);
+    assert_eq!(view.streams[0].liveness, Liveness::Backfilling);
+    gate.release.send(true).unwrap();
+}
+
+#[tokio::test]
+async fn connection_phase_survives_backfill_ring_eviction() {
+    // Ring capacity 2, four live arrivals during the parked backfill
+    // (ProviderConnected + three trades): the ring evicts oldest-first, so the
+    // connect control is dropped at the seam and reported as a Gap. The phase
+    // was recorded at receipt, so the stream still reads Up afterwards.
+    let (provider, ctrl, gate) = LiveProvider::gated("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(2)
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            backfilled(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+    gate.started.notified().await;
+    for n in 1..=3 {
+        ctrl.push("AAPL", trade("AAPL", n, n)).await;
+    }
+    gate.release.send(true).unwrap();
+
+    // Drain to the last trade, confirming the seam reported the eviction.
+    let mut evicted = false;
+    loop {
+        match next_ev(&mut stream).await {
+            MarketEvent::Control(Control {
+                kind: ControlKind::Gap { .. },
+                ..
+            }) => evicted = true,
+            MarketEvent::Trade(t) if t.source_ts.0 == 3 => break,
+            _ => {}
+        }
+    }
+    assert!(evicted, "the ring must have evicted (a Gap at the seam)");
+
+    let snap = dm.snapshot().await.unwrap();
+    assert_eq!(
+        auth_snap(&snap, "AAPL").connection,
+        StreamConnection::Up {
+            since: Timestamp(0)
+        }
+    );
+    let p = provider_snap(&snap, "fake");
+    assert_eq!(p.connection_state, datamancer::ConnectionState::Connected);
+    assert_eq!(p.reconnects, 0);
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    assert_eq!(view.providers[0].state, ProviderState::Connected);
+}
+
+#[tokio::test]
+async fn duplicate_connect_is_not_a_transition() {
+    let (provider, ctrl) = LiveProvider::new("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+
+    // A second ProviderConnected while already Up (start_live's was at rx 0):
+    // no phase change, `since` keeps the original connect, no reconnect.
+    ctrl.push("AAPL", received_at(connected("fake"), 50)).await;
+    ctrl.push("AAPL", trade("AAPL", 1, 1)).await;
+    drain_until_marker(&mut stream, 1).await;
+    let snap = dm.snapshot().await.unwrap();
+    assert_eq!(
+        auth_snap(&snap, "AAPL").connection,
+        StreamConnection::Up {
+            since: Timestamp(0)
+        }
+    );
+    assert_eq!(provider_snap(&snap, "fake").reconnects, 0);
+
+    // A real drop and reconnect is one transition each.
+    ctrl.push("AAPL", received_at(disconnected("fake"), 60))
+        .await;
+    ctrl.push("AAPL", received_at(connected("fake"), 70)).await;
+    ctrl.push("AAPL", trade("AAPL", 2, 2)).await;
+    drain_until_marker(&mut stream, 2).await;
+    let snap = dm.snapshot().await.unwrap();
+    assert_eq!(
+        auth_snap(&snap, "AAPL").connection,
+        StreamConnection::Up {
+            since: Timestamp(70)
+        }
+    );
+    let p = provider_snap(&snap, "fake");
+    assert_eq!(p.reconnects, 1);
+    assert_eq!(p.connection_state, datamancer::ConnectionState::Connected);
 }
 
 /// Stamp a control with a wall-clock receipt time.

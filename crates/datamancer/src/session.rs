@@ -306,8 +306,6 @@ impl Datamancer {
                     fanout: None,
                     stats: Arc::new(LiveStats::new()),
                     accounting,
-                    connection_up: false,
-                    connection_seen: false,
                     data_forwarded: false,
                 };
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
@@ -476,8 +474,6 @@ impl Datamancer {
             fanout: Some(fanout),
             stats,
             accounting: accounting.clone(),
-            connection_up: false,
-            connection_seen: false,
             data_forwarded: false,
         };
         let backfill_from = match scope {
@@ -760,13 +756,19 @@ impl Datamancer {
                     (Some(m.bytes()), Some(m.rate_limit_hits()))
                 });
                 let enabled = provider.is_none_or(|p| p.enabled());
-                let active = auth_handles
+                // This provider's active substreams, from the same sample: their
+                // count is `active_subscriptions`, and their connection phases
+                // decide the provider's connection state — derived, so it can
+                // never disagree with the streams reported beside it.
+                let own = auth_handles
                     .iter()
-                    .filter(|(provider_id, ..)| provider_id.as_str() == id.as_str())
-                    .count();
+                    .filter(|(provider_id, ..)| provider_id.as_str() == id.as_str());
+                let active = own.clone().count();
+                let connection_state =
+                    acc.connection_state(own.map(|(.., stats)| stats.connection()));
                 ProviderSnapshot::new(
                     id.clone(),
-                    acc.connection_state(),
+                    connection_state,
                     acc.history_fetches(),
                     acc.history_fetch_coalesced(),
                     acc.live_starts(),
@@ -1364,14 +1366,6 @@ struct Controller {
     /// Shared (cloned `Arc`) with `DatamancerInner` and every other controller
     /// for the same provider.
     accounting: Arc<ProviderAccounting>,
-    /// This controller's own connection phase, used to drive provider-level
-    /// connection accounting correctly across substreams. `true` once a
-    /// `ProviderConnected` is seen without an intervening `ProviderDisconnected`.
-    connection_up: bool,
-    /// Whether this controller has ever been connected, so a later
-    /// `ProviderConnected` is classified as a reconnect rather than a first
-    /// connect.
-    connection_seen: bool,
     /// True once any data event (Trade/Quote/Bar) has been delivered on this
     /// authoritative session. Gates the pure-live "latest value" seed: once a
     /// real live value has been delivered, a late-arriving seed is discarded.
@@ -1561,6 +1555,9 @@ impl Controller {
     /// ends with no data, indistinguishable from an empty range. Stamped at an
     /// in-range `source_ts` so it stays ordered within the source-time stream.
     async fn emit_provider_error(&mut self, source_ts: Timestamp, message: String) {
+        // Controller-originated, so it never passes `note_provider_arrival`:
+        // record the provider's last error here.
+        self.accounting.record_error(&message);
         self.forward(MarketEvent::Control(Control {
             source_ts,
             rx_ts: source_ts,
@@ -1650,6 +1647,9 @@ impl Controller {
                                 }
                             }
                             ev = recv_live(&mut live_rx) => {
+                                if let Some(ev) = &ev {
+                                    self.note_provider_arrival(ev);
+                                }
                                 Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
                             }
                             ev = stream.next() => {
@@ -1698,6 +1698,9 @@ impl Controller {
                                 }
                             }
                             ev = recv_live(&mut live_rx) => {
+                                if let Some(ev) = &ev {
+                                    self.note_provider_arrival(ev);
+                                }
                                 Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
                             }
                             ev = rx.recv() => {
@@ -2025,6 +2028,7 @@ impl Controller {
                     let Some(ev) = ev else {
                         break; // provider task exited
                     };
+                    self.note_provider_arrival(&ev);
                     self.forward(ev).await;
                 }
                 res = async {
@@ -2087,15 +2091,10 @@ impl Controller {
     /// `SessionClosing` is emitted: by teardown the fan-out is empty (each
     /// referrer emits its own `SessionClosing` on `close`).
     ///
-    /// A substream torn down while connected releases its share of the
-    /// provider's connection count first: no `ProviderDisconnected` follows a
-    /// teardown, so without this the count leaks and the provider reads
-    /// `Connected` after its last live substream has dropped.
+    /// Nothing to release on the provider's connection state: it is derived at
+    /// snapshot time from the substreams still in the live registry, and this
+    /// one leaves the registry when its `AuthoritativeSession` drops.
     async fn teardown_upstream(&mut self, live: &Arc<Mutex<Option<Box<dyn LiveHandle>>>>) {
-        if self.connection_up {
-            self.connection_up = false;
-            self.accounting.record_connection_down();
-        }
         if let Some(h) = live.lock().await.take() {
             self.accounting.record_unsubscribe();
             let _ = h
@@ -2201,32 +2200,28 @@ impl Controller {
         ) {
             self.data_forwarded = true;
         }
-        // Drive per-provider connection accounting from this controller's own
-        // up/down phase, so one substream's drop never marks the whole provider
-        // down and a second substream's first connect is never a reconnect.
-        if let MarketEvent::Control(c) = &ev {
-            match &c.kind {
-                ControlKind::ProviderConnected { .. } if !self.connection_up => {
-                    let reconnect = self.connection_seen;
-                    self.connection_up = true;
-                    self.connection_seen = true;
-                    self.accounting.record_connection_up(reconnect);
-                }
-                ControlKind::ProviderDisconnected { .. } if self.connection_up => {
-                    self.connection_up = false;
-                    self.accounting.record_connection_down();
-                }
-                _ => {}
-            }
-        }
-        // Stream-derived provider accounting: messages count as live-data
-        // throughput only on the authoritative live path (fan-out present);
-        // gap/error state is derived from in-band Control regardless of scope.
-        // The seed is a `Provider::latest` snapshot, not provider traffic.
+        // Throughput accounting: messages count as live-data throughput only on
+        // the authoritative live path (fan-out present); gaps count regardless
+        // of scope. Connection/error state from provider controls was folded at
+        // receipt (`note_provider_arrival`), not here. The seed is a
+        // `Provider::latest` snapshot, not provider traffic.
         self.accounting
             .record_forwarded(&ev, self.fanout.is_some() && arrival == Arrival::Live);
         self.tee(&ev).await;
         self.deliver_with(ev, arrival).await;
+    }
+
+    /// Fold a control **received from the provider** into this substream's
+    /// connection phase and the provider's accounting, at receipt. Runs on
+    /// every provider arrival — the live loop and the backfill buffer alike —
+    /// so a connect held in the backfill ring is visible while the backfill
+    /// runs, and one the ring evicts is still counted. Data events carry no
+    /// provider-level state and pass through untouched.
+    fn note_provider_arrival(&self, ev: &MarketEvent) {
+        if let MarketEvent::Control(c) = ev {
+            let change = self.stats.record_connection(c);
+            self.accounting.record_provider_control(&c.kind, change);
+        }
     }
 
     /// Backfill seam: a live arrival during the backfill is buffered in arrival

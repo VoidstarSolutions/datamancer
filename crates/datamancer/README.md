@@ -285,7 +285,12 @@ transport or daemon. It composes three things:
   (call counts, **not** active-subscription deltas — stock subscribe is a
   full-snapshot and reconnect re-applies the full list), `active_subscriptions`
   (the live substreams currently requested: this provider's authoritative
-  sessions in the registry at assembly), `reconnects`, `connection_state`,
+  sessions in the registry at assembly), `connection_state` (**derived** at
+  assembly from those same substreams' `connection` phases — `Connected` while
+  any is up, else `Unauthenticated`/`Disconnected` from their disconnect
+  causes, else `Unknown`; with none active, the provider's history decides —
+  so it can never disagree with the streams reported beside it), `reconnects`
+  (substream down→up transitions; a duplicate connect is not one),
   `gaps_emitted`, `last_error`, and `messages` (live data forwarded to
   consumers only — cache-replay/backfill is not provider traffic). `bytes` and
   `rate_limit_hits` are `Option` and stay `None` until a provider implements

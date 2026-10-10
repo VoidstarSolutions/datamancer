@@ -251,6 +251,20 @@ pub(crate) struct LiveStats {
 /// Bounded per-symbol recent-gap detail (oldest evicted).
 const RECENT_GAPS_CAP: usize = 8;
 
+/// What a connect/disconnect control did to a substream's phase
+/// ([`LiveStats::record_connection`]); the controller folds the provider-level
+/// consequences (`ever_connected`, `reconnects`) from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionChange {
+    /// No transition: a duplicate connect, a repeated disconnect, or a control
+    /// that is not connection evidence.
+    None,
+    /// `Pending`/`Down` → `Up`; `reconnect` when it was `Down`.
+    Connected { reconnect: bool },
+    /// `Pending`/`Up` → `Down`.
+    Disconnected,
+}
+
 impl LiveStats {
     pub(crate) fn new() -> Self {
         Self {
@@ -306,20 +320,18 @@ impl LiveStats {
                         ring.push_back(span.clone());
                     }
                 }
-                ControlKind::ProviderConnected { .. } => {
-                    self.set_connection(StreamConnection::Up { since: c.rx_ts });
-                }
-                ControlKind::ProviderDisconnected { cause, .. } => {
-                    self.set_connection(StreamConnection::Down {
-                        since: c.rx_ts,
-                        cause: *cause,
-                    });
-                }
                 ControlKind::ProviderError { .. } => {
                     self.last_error_rx_ts.store(c.rx_ts.0, Ordering::Relaxed);
                     self.has_error_rx.store(true, Ordering::Relaxed);
                 }
-                ControlKind::SubscriptionChanged { .. } | ControlKind::SessionClosing => {}
+                // The connection phase is recorded at receipt
+                // (`record_connection`), not at delivery: a control held in the
+                // backfill ring must still count, and one the ring evicts must
+                // not be lost.
+                ControlKind::ProviderConnected { .. }
+                | ControlKind::ProviderDisconnected { .. }
+                | ControlKind::SubscriptionChanged { .. }
+                | ControlKind::SessionClosing => {}
             },
             _ => {}
         }
@@ -393,9 +405,50 @@ impl LiveStats {
         self.backfilling.store(active, Ordering::Relaxed);
     }
 
-    fn set_connection(&self, phase: StreamConnection) {
-        if let Ok(mut slot) = self.connection.lock() {
-            *slot = phase;
+    /// Record a provider connect/disconnect control **at receipt** and report
+    /// the phase transition it caused. This is the one record of the
+    /// substream's connection; the provider's state is derived from it at
+    /// snapshot time, so there is no parallel counter to drift.
+    ///
+    /// Transitions: `Pending`/`Down` → `Up` on a connect (a reconnect when it
+    /// was `Down`); `Pending`/`Up` → `Down` on a disconnect. A connect while
+    /// already `Up` is a duplicate and changes nothing. A disconnect while
+    /// already `Down` keeps `since` (the outage start) and adopts the newer
+    /// `cause`, so a connect failure reclassified as an auth rejection shows
+    /// as one without restarting the clock. Other controls are not connection
+    /// evidence and return [`ConnectionChange::None`].
+    pub(crate) fn record_connection(&self, c: &Control) -> ConnectionChange {
+        let Ok(mut slot) = self.connection.lock() else {
+            return ConnectionChange::None;
+        };
+        match (&c.kind, *slot) {
+            (ControlKind::ProviderConnected { .. }, StreamConnection::Up { .. }) => {
+                ConnectionChange::None
+            }
+            (ControlKind::ProviderConnected { .. }, previous) => {
+                *slot = StreamConnection::Up { since: c.rx_ts };
+                ConnectionChange::Connected {
+                    reconnect: matches!(previous, StreamConnection::Down { .. }),
+                }
+            }
+            (
+                ControlKind::ProviderDisconnected { cause, .. },
+                StreamConnection::Down { since, .. },
+            ) => {
+                *slot = StreamConnection::Down {
+                    since,
+                    cause: *cause,
+                };
+                ConnectionChange::None
+            }
+            (ControlKind::ProviderDisconnected { cause, .. }, _) => {
+                *slot = StreamConnection::Down {
+                    since: c.rx_ts,
+                    cause: *cause,
+                };
+                ConnectionChange::Disconnected
+            }
+            _ => ConnectionChange::None,
         }
     }
 

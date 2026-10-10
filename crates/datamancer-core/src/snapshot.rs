@@ -94,12 +94,24 @@ pub struct SystemSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSnapshot {
     pub provider: ProviderId,
+    /// Derived at assembly from the [`StreamConnection`] phases of this
+    /// provider's active substreams (the `authoritative_sessions` reported
+    /// beside it): `Connected` while any is `Up`; otherwise `Unauthenticated`
+    /// if any is down on an auth rejection; otherwise `Disconnected` if any is
+    /// down; otherwise `Unknown` (a connect in flight). With no active
+    /// substream, the provider's history decides: the last rejection
+    /// (`Unauthenticated`), ever having connected (`Disconnected`), else
+    /// `Unknown`. Never a separately kept counter, so it cannot disagree with
+    /// the streams.
     pub connection_state: ConnectionState,
     pub history_fetches: u64,
     pub history_fetch_coalesced: u64,
     pub live_starts: u64,
     pub subscribes: u64,
     pub unsubscribes: u64,
+    /// Substream `Down` → `Up` transitions, summed over this provider's
+    /// substreams. A substream's first connect is not one; a duplicate connect
+    /// while already up is not one.
     pub reconnects: u64,
     pub rate_limit_hits: Option<u64>,
     pub messages: u64,
@@ -182,22 +194,37 @@ pub struct AuthoritativeSessionSnapshot {
 }
 
 /// One substream's upstream connection phase, judged from the in-band
-/// `ProviderConnected`/`ProviderDisconnected` controls it received. `since` is
-/// the wall-clock receipt (`rx_ts`) of the control that entered the phase.
+/// `ProviderConnected`/`ProviderDisconnected` controls it received. Recorded
+/// **at receipt**, before any buffering or delivery, so a control held in a
+/// backfill buffer (or evicted from one) still counts. This is the one record
+/// of the connection: the provider's [`ConnectionState`] is derived from its
+/// active substreams' phases at snapshot time, never kept separately.
+///
+/// A connect while already `Up` is a duplicate and changes nothing. A
+/// disconnect while already `Down` keeps `since` and adopts the newer `cause`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamConnection {
-    /// No connect control received yet.
+    /// No connect or disconnect control received yet: the first connect is in
+    /// flight.
     #[default]
     Pending,
+    /// Connected.
     Up {
+        /// Wall-clock receipt (`rx_ts`) of the `ProviderConnected` that
+        /// brought the substream up.
         since: Timestamp,
     },
     /// Down after a `ProviderDisconnected`; a reconnect is scheduled or in
-    /// flight. `cause` is the control's classification.
+    /// flight.
     Down {
+        /// Wall-clock receipt (`rx_ts`) of the `ProviderDisconnected` that
+        /// started the current outage; repeated disconnects while down do not
+        /// move it.
         since: Timestamp,
+        /// The latest disconnect's classification (a connect failure
+        /// reclassified as an auth rejection shows as one here).
         cause: DisconnectCause,
     },
 }
