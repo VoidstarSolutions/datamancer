@@ -8,7 +8,7 @@ Datamancer is an early-stage open-source library. The public API is still co-evo
 
 The workspace holds eight crates. `datamancer-core` carries the types and trait surface; `datamancer` is the session orchestrator, with provider and storage backends behind cargo features. The transports (`datamancer-transport-iceoryx2`, `datamancer-transport-ws`), the consumer-side client (`datamancer-client`), credential storage (`datamancer-credentials`), the Windows security primitives (`datamancer-winsec`), and the server binary (`datamancerd`) have each split out into their own crate as the boundary became obvious from working code. Provider integrations and storage backends have **not** split yet — they still live in `datamancer` behind features, and will move when real coupling pain motivates it. Consumers bring in `datamancer` plus the providers and persistence backends they actually need; separate consumer *processes* depend on `datamancer-client` instead and never link the orchestrator.
 
-The supported providers are Alpaca equities and Alpaca crypto. Provider integration is additive: adding a provider does not require changing any consumer code. An IBKR provider is reserved in the core wire types (`ProviderCredentials::Gateway`, `ProviderState::{CompanionUnreachable, Unauthenticated}`) but is **not implemented**.
+The supported providers are Alpaca equities and Alpaca crypto. Provider integration is additive: adding a provider does not require changing any consumer code. An IBKR provider is reserved in the core wire types (`ProviderCredentials::Gateway`, `ProviderState::CompanionUnreachable`, `DisconnectCause::CompanionUnreachable`) but is **not implemented**.
 
 ## What Datamancer Does
 
@@ -283,11 +283,18 @@ transport or daemon. It composes three things:
   `history_fetch_coalesced` (single-flight dedups; backfill bypasses the
   coalescer and never counts here), `live_starts`, `subscribes`/`unsubscribes`
   (call counts, **not** active-subscription deltas — stock subscribe is a
-  full-snapshot and reconnect re-applies the full list), `reconnects`,
-  `connection_state`, `gaps_emitted`, `last_error`, and `messages` (live data
-  forwarded to consumers only — cache-replay/backfill is not provider traffic).
-  `bytes` and `rate_limit_hits` are `Option` and stay `None` until a provider
-  implements the optional `Provider::metrics()` hook.
+  full-snapshot and reconnect re-applies the full list), `active_subscriptions`
+  (the live substreams currently requested: this provider's authoritative
+  sessions in the registry at assembly), `connection_state` (**derived** at
+  assembly from those same substreams' `connection` phases — `Connected` while
+  any is up, else `Unauthenticated`/`Disconnected` from their disconnect
+  causes, else `Unknown`; with none active, the provider's history decides —
+  so it can never disagree with the streams reported beside it), `reconnects`
+  (substream down→up transitions; a duplicate connect is not one),
+  `gaps_emitted`, `last_error`, and `messages` (live data forwarded to
+  consumers only — cache-replay/backfill is not provider traffic). `bytes` and
+  `rate_limit_hits` are `Option` and stay `None` until a provider implements
+  the optional `Provider::metrics()` hook.
 - **Cache catalog** (`CacheSnapshot.entries`, via `HistoricalCache::catalog()`)
   — every stored `(provider, symbol, kind, adjustment)` key with its actual
   covered segments and a *logical* volume estimate (`event_count ×
@@ -297,13 +304,16 @@ transport or daemon. It composes three things:
   per-symbol property, not a cache property).
 - **Live state** — per-`(instrument, kind)` `AuthoritativeSessionSnapshot`
   (subscriber refcount, last source/rx timestamps, `latency_ns =
-  rx_ts − source_ts`, per-symbol gap count, seq position) and per-client
+  rx_ts − source_ts`, per-symbol gap count, seq position, the substream's own
+  `connection` phase — `pending`/`up`/`down`, each with the receipt time of the
+  control that entered it; a `ProviderError` is connection-scoped and lands in
+  the provider's `last_error`, not here) and per-client
   `ClientSessionSnapshot` (subscriptions + resume-buffer occupancy/drops).
   The timestamps, `latency_ns` and the provider's `messages` describe live
   arrivals only: the pure-live latest-value seed is delivered, teed and takes
   a `seq` (so it moves the seq position), but it is a `Provider::latest`
   snapshot, not live traffic, so a stream that has seen only its seed has no
-  timestamps or latency yet and its health reads `Idle`.
+  timestamps or latency yet and its health reads `AwaitingData`.
 
 The snapshot is **sampled, not transactional**: per-symbol fields are read from
 `Relaxed` atomics and the session registry lock is held only to clone handles

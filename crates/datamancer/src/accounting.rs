@@ -22,7 +22,11 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use datamancer_core::{ConnectionState, ControlKind, DisconnectCause, MarketEvent};
+use datamancer_core::{
+    ConnectionState, Control, ControlKind, DisconnectCause, Error, MarketEvent, StreamConnection,
+};
+
+use crate::client_session::ConnectionChange;
 
 /// Lock-free per-provider call/throughput counters.
 #[derive(Debug)]
@@ -35,21 +39,18 @@ pub(crate) struct ProviderAccounting {
     reconnects: AtomicU64,
     messages: AtomicU64,
     gaps_emitted: AtomicU64,
-    /// Number of this provider's authoritative `(instrument, kind)` connections
-    /// currently up. The provider is `Connected` while any are up; one
-    /// substream dropping must not mark the whole provider down while others are
-    /// still live. Each controller tracks its own up/down phase and notes
-    /// transitions here, so per-substream churn aggregates correctly.
-    active_connections: AtomicU64,
-    /// Whether any connection has ever come up (so `active == 0` reads as
-    /// `Disconnected`, not `Unknown`).
+    /// Whether any of this provider's substreams has ever connected. The live
+    /// connection state itself is **not** kept here: it is derived at snapshot
+    /// time from the active substreams' own phases
+    /// ([`Self::connection_state`]), so a parallel counter cannot drift from
+    /// them. This flag only decides how a provider with no active substream
+    /// reads (`Disconnected`, not `Unknown`).
     ever_connected: std::sync::atomic::AtomicBool,
     /// Last `ProviderError` message, behind a mutex (cold, set rarely).
     last_error: std::sync::Mutex<Option<String>>,
-    /// Set when the most recent disconnect carried `DisconnectCause::Unauthenticated`;
-    /// cleared on the next successful connect. Folded from `record_forwarded`
-    /// because only the in-band `Control` carries the classification — the
-    /// owning controller's up/down calls don't see it.
+    /// Set when a disconnect carried `DisconnectCause::Unauthenticated`;
+    /// cleared on the next successful connect. Sticky so a provider whose last
+    /// substream has gone keeps reporting the rejection.
     auth_failed: std::sync::atomic::AtomicBool,
 }
 
@@ -64,7 +65,6 @@ impl Default for ProviderAccounting {
             reconnects: AtomicU64::new(0),
             messages: AtomicU64::new(0),
             gaps_emitted: AtomicU64::new(0),
-            active_connections: AtomicU64::new(0),
             ever_connected: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
             auth_failed: std::sync::atomic::AtomicBool::new(false),
@@ -101,10 +101,12 @@ impl ProviderAccounting {
         self.unsubscribes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Fold one forwarded event into the stream-derived counters. `live` is true
+    /// Fold one forwarded event into the throughput counters. `live` is true
     /// for an authoritative live session (fan-out present); only then does a data
-    /// event count as a `message` (live-data throughput). Control-derived state
-    /// (connection, reconnect, gap, error) is recorded regardless.
+    /// event count as a `message` (live-data throughput). A `Gap` the controller
+    /// emits is counted here too. Provider-originated controls are folded at
+    /// receipt instead ([`Self::record_provider_control`]), so a control held in
+    /// a backfill ring, or evicted from it, is never missed.
     pub(crate) fn record_forwarded(&self, ev: &MarketEvent, live: bool) {
         match ev {
             MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_) => {
@@ -112,60 +114,60 @@ impl ProviderAccounting {
                     self.messages.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            MarketEvent::Control(c) => match &c.kind {
-                ControlKind::ProviderError { message, .. } => {
-                    if let Ok(mut slot) = self.last_error.lock() {
-                        *slot = Some(message.clone());
-                    }
-                }
-                ControlKind::Gap { .. } => {
-                    self.gaps_emitted.fetch_add(1, Ordering::Relaxed);
-                }
-                // Connection up/down is recorded by the owning controller via
-                // `record_connection_up`/`record_connection_down`, which know the
-                // per-substream phase needed to aggregate correctly (folding it
-                // here off a single shared flag mis-attributed reconnects and let
-                // one substream's drop mark the whole provider down). The
-                // remaining controls carry no provider-level counter.
-                ControlKind::ProviderDisconnected { reason, cause, .. } => {
-                    // Up/down accounting stays with the owning controller
-                    // (see comment below); only the *classification* is
-                    // folded here, because the controller cannot see it.
-                    if *cause == DisconnectCause::Unauthenticated {
-                        self.auth_failed.store(true, Ordering::Relaxed);
-                        if let Ok(mut slot) = self.last_error.lock() {
-                            *slot = Some(reason.clone());
-                        }
-                    }
-                }
-                ControlKind::ProviderConnected { .. }
-                | ControlKind::SubscriptionChanged { .. }
-                | ControlKind::SessionClosing => {}
-            },
+            MarketEvent::Control(Control {
+                kind: ControlKind::Gap { .. },
+                ..
+            }) => {
+                self.gaps_emitted.fetch_add(1, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
 
-    /// One authoritative connection for this provider came up. `reconnect` is
-    /// true when the owning controller was previously disconnected (a genuine
-    /// reconnect), false on its first connect. Call once per up transition.
-    pub(crate) fn record_connection_up(&self, reconnect: bool) {
-        self.active_connections.fetch_add(1, Ordering::Relaxed);
-        self.ever_connected.store(true, Ordering::Relaxed);
-        self.auth_failed.store(false, Ordering::Relaxed);
-        if reconnect {
-            self.reconnects.fetch_add(1, Ordering::Relaxed);
+    /// Fold one control **received from the provider** (before any buffering
+    /// or delivery), together with the phase transition the owning substream
+    /// recorded for it. Connect/disconnect counters move only on a real
+    /// transition — a duplicate connect is `ConnectionChange::None` and counts
+    /// nothing — while the auth classification and the error text are taken
+    /// from every control that carries them.
+    pub(crate) fn record_provider_control(&self, kind: &ControlKind, change: ConnectionChange) {
+        if let ConnectionChange::Connected { reconnect } = change {
+            self.ever_connected.store(true, Ordering::Relaxed);
+            self.auth_failed.store(false, Ordering::Relaxed);
+            if reconnect {
+                self.reconnects.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        match kind {
+            ControlKind::ProviderDisconnected { reason, cause, .. }
+                if *cause == DisconnectCause::Unauthenticated =>
+            {
+                self.auth_failed.store(true, Ordering::Relaxed);
+                self.record_error(reason);
+            }
+            ControlKind::ProviderError { message, .. } => self.record_error(message),
+            _ => {}
         }
     }
 
-    /// One authoritative connection for this provider went down. Call once per
-    /// down transition (saturating, so a stray disconnect never underflows).
-    pub(crate) fn record_connection_down(&self) {
-        let _ = self
-            .active_connections
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
-            });
+    /// Record the provider's last error text (a `ProviderError`, an auth
+    /// rejection's reason, or a failed fetch the controller surfaced itself).
+    pub(crate) fn record_error(&self, message: &str) {
+        if let Ok(mut slot) = self.last_error.lock() {
+            *slot = Some(message.to_string());
+        }
+    }
+
+    /// Record a failed live open (`start_live`/`subscribe` returned `Err`, so
+    /// no controller and no substream exist to carry the evidence). The error
+    /// text becomes `last_error`; an [`Error::Unauthenticated`] also sets the
+    /// sticky auth-rejection flag, so a provider that never connected because
+    /// it has no usable credentials reads `Unauthenticated`, not `Unknown`.
+    pub(crate) fn record_open_failure(&self, error: &Error) {
+        if let Error::Unauthenticated { .. } = error {
+            self.auth_failed.store(true, Ordering::Relaxed);
+        }
+        self.record_error(&error.to_string());
     }
 }
 
@@ -203,15 +205,37 @@ impl ProviderAccounting {
         self.gaps_emitted.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn connection_state(&self) -> ConnectionState {
-        // Aggregate across the provider's substreams: Connected while any are
-        // up; Disconnected once all are down having been up; Unknown until the
-        // first connect.
-        if self.active_connections.load(Ordering::Relaxed) > 0 {
+    /// The provider's connection state, derived from the phases of its active
+    /// substreams sampled in the same snapshot (`streams`), so it can never
+    /// disagree with them: `Connected` while any is `Up`; otherwise
+    /// `Unauthenticated` if any is down on an auth rejection; otherwise
+    /// `Disconnected` if any is down; otherwise (all still `Pending`) `Unknown`,
+    /// a connect in flight. With no active substream the sticky facts decide:
+    /// the last rejection (`Unauthenticated`), ever having connected
+    /// (`Disconnected`), else `Unknown`.
+    pub(crate) fn connection_state(
+        &self,
+        streams: impl IntoIterator<Item = StreamConnection>,
+    ) -> ConnectionState {
+        let (mut any, mut up, mut down, mut unauthenticated) = (false, false, false, false);
+        for phase in streams {
+            any = true;
+            match phase {
+                StreamConnection::Up { .. } => up = true,
+                StreamConnection::Down { cause, .. } => {
+                    down = true;
+                    unauthenticated |= cause == DisconnectCause::Unauthenticated;
+                }
+                // `Pending`, and any phase a future core adds (`non_exhaustive`):
+                // not evidence either way.
+                _ => {}
+            }
+        }
+        if up {
             ConnectionState::Connected
-        } else if self.auth_failed.load(Ordering::Relaxed) {
+        } else if unauthenticated || (!any && self.auth_failed.load(Ordering::Relaxed)) {
             ConnectionState::Unauthenticated
-        } else if self.ever_connected.load(Ordering::Relaxed) {
+        } else if down || (!any && self.ever_connected.load(Ordering::Relaxed)) {
             ConnectionState::Disconnected
         } else {
             ConnectionState::Unknown
@@ -225,10 +249,10 @@ impl ProviderAccounting {
 
 #[cfg(test)]
 mod tests {
-    use super::ProviderAccounting;
+    use super::{ConnectionChange, ProviderAccounting};
     use datamancer_core::{
         AssetClass, ConnectionState, Control, ControlKind, DisconnectCause, GapSpan, Instrument,
-        MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
+        MarketEvent, Price, ProviderId, Seq, StreamConnection, Timestamp, Trade,
     };
 
     fn trade() -> MarketEvent {
@@ -275,69 +299,117 @@ mod tests {
         assert_eq!(a.messages(), 1);
     }
 
+    fn up() -> StreamConnection {
+        StreamConnection::Up {
+            since: Timestamp(1),
+        }
+    }
+
+    fn down(cause: DisconnectCause) -> StreamConnection {
+        StreamConnection::Down {
+            since: Timestamp(2),
+            cause,
+        }
+    }
+
+    fn connected() -> ControlKind {
+        ControlKind::ProviderConnected {
+            provider: "p".to_string(),
+        }
+    }
+
+    fn disconnected(reason: &str, cause: DisconnectCause) -> ControlKind {
+        ControlKind::ProviderDisconnected {
+            provider: "p".to_string(),
+            reason: reason.to_string(),
+            cause,
+        }
+    }
+
     #[test]
-    fn connection_and_reconnect_from_transitions() {
+    fn connection_state_is_derived_from_the_active_substreams() {
         let a = ProviderAccounting::default();
-        assert_eq!(a.connection_state(), ConnectionState::Unknown);
-        a.record_connection_up(false); // first connect
-        assert_eq!(a.connection_state(), ConnectionState::Connected);
-        assert_eq!(a.reconnects(), 0); // first connect is not a reconnect
-        a.record_connection_down();
-        assert_eq!(a.connection_state(), ConnectionState::Disconnected);
-        a.record_connection_up(true); // reconnect
-        assert_eq!(a.connection_state(), ConnectionState::Connected);
+        // Nothing active, never connected: Unknown.
+        assert_eq!(a.connection_state([]), ConnectionState::Unknown);
+        // A connect in flight: still Unknown (Connecting), not Disconnected.
+        assert_eq!(
+            a.connection_state([StreamConnection::Pending]),
+            ConnectionState::Unknown
+        );
+        // Any Up wins, whatever the others are doing.
+        assert_eq!(
+            a.connection_state([
+                down(DisconnectCause::Error),
+                up(),
+                StreamConnection::Pending
+            ]),
+            ConnectionState::Connected
+        );
+        // All down: Disconnected; an auth rejection among them wins.
+        assert_eq!(
+            a.connection_state([down(DisconnectCause::Error), StreamConnection::Pending]),
+            ConnectionState::Disconnected
+        );
+        assert_eq!(
+            a.connection_state([
+                down(DisconnectCause::Error),
+                down(DisconnectCause::Unauthenticated),
+            ]),
+            ConnectionState::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn reconnects_count_transitions_only() {
+        let a = ProviderAccounting::default();
+        a.record_provider_control(
+            &connected(),
+            ConnectionChange::Connected { reconnect: false },
+        );
+        assert_eq!(a.reconnects(), 0, "a first connect is not a reconnect");
+        // A duplicate connect while already up is no transition: nothing moves.
+        a.record_provider_control(&connected(), ConnectionChange::None);
+        assert_eq!(a.reconnects(), 0);
+        a.record_provider_control(
+            &disconnected("ws closed", DisconnectCause::Error),
+            ConnectionChange::Disconnected,
+        );
+        a.record_provider_control(
+            &connected(),
+            ConnectionChange::Connected { reconnect: true },
+        );
         assert_eq!(a.reconnects(), 1);
     }
 
     #[test]
-    fn one_substream_drop_does_not_mark_provider_down() {
-        // Two substreams of the same provider; one dropping must not flip the
-        // whole provider to Disconnected, and a second substream's first connect
-        // is not a reconnect.
+    fn sticky_facts_decide_with_no_active_substream() {
         let a = ProviderAccounting::default();
-        a.record_connection_up(false); // substream A first connect
-        a.record_connection_up(false); // substream B first connect
-        assert_eq!(a.reconnects(), 0);
-        assert_eq!(a.connection_state(), ConnectionState::Connected);
-        a.record_connection_down(); // A drops; B still up
-        assert_eq!(a.connection_state(), ConnectionState::Connected);
-        a.record_connection_down(); // B drops; now all down
-        assert_eq!(a.connection_state(), ConnectionState::Disconnected);
-        assert_eq!(a.reconnects(), 0);
-    }
-
-    #[test]
-    fn unauthenticated_disconnect_derives_state_until_next_connect() {
-        let a = ProviderAccounting::default();
-        a.record_forwarded(
-            &control(ControlKind::ProviderDisconnected {
-                provider: "p".to_string(),
-                reason: "auth rejected".to_string(),
-                cause: DisconnectCause::Unauthenticated,
-            }),
-            true,
+        // Rejected credentials, then the substream is gone: still Unauthenticated.
+        a.record_provider_control(
+            &disconnected("auth rejected", DisconnectCause::Unauthenticated),
+            ConnectionChange::Disconnected,
         );
-        assert_eq!(a.connection_state(), ConnectionState::Unauthenticated);
+        assert_eq!(a.connection_state([]), ConnectionState::Unauthenticated);
         assert_eq!(a.last_error(), Some("auth rejected".to_string()));
-        // A successful (re)connect clears the flag.
-        a.record_connection_up(false);
-        assert_eq!(a.connection_state(), ConnectionState::Connected);
-        a.record_connection_down();
-        assert_eq!(a.connection_state(), ConnectionState::Disconnected);
+        // A successful connect clears the rejection; once that substream is
+        // gone too the provider reads Disconnected (it has connected before).
+        a.record_provider_control(
+            &connected(),
+            ConnectionChange::Connected { reconnect: true },
+        );
+        assert_eq!(a.connection_state([up()]), ConnectionState::Connected);
+        assert_eq!(a.connection_state([]), ConnectionState::Disconnected);
     }
 
     #[test]
     fn plain_disconnect_does_not_mark_unauthenticated() {
         let a = ProviderAccounting::default();
-        a.record_forwarded(
-            &control(ControlKind::ProviderDisconnected {
-                provider: "p".to_string(),
-                reason: "ws closed".to_string(),
-                cause: DisconnectCause::Error,
-            }),
-            true,
+        a.record_provider_control(
+            &disconnected("ws closed", DisconnectCause::Error),
+            ConnectionChange::Disconnected,
         );
-        assert_eq!(a.connection_state(), ConnectionState::Unknown);
+        assert_eq!(a.connection_state([]), ConnectionState::Unknown);
+        assert_eq!(a.last_error(), None);
     }
 
     #[test]
@@ -356,12 +428,12 @@ mod tests {
         );
         assert_eq!(a.gaps_emitted(), 1);
         assert_eq!(a.last_error(), None);
-        a.record_forwarded(
-            &control(ControlKind::ProviderError {
+        a.record_provider_control(
+            &ControlKind::ProviderError {
                 provider: "p".to_string(),
                 message: "boom".to_string(),
-            }),
-            true,
+            },
+            ConnectionChange::None,
         );
         assert_eq!(a.last_error(), Some("boom".to_string()));
     }

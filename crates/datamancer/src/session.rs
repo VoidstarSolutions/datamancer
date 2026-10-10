@@ -306,8 +306,6 @@ impl Datamancer {
                     fanout: None,
                     stats: Arc::new(LiveStats::new()),
                     accounting,
-                    connection_up: false,
-                    connection_seen: false,
                     data_forwarded: false,
                 };
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
@@ -476,8 +474,6 @@ impl Datamancer {
             fanout: Some(fanout),
             stats,
             accounting: accounting.clone(),
-            connection_up: false,
-            connection_seen: false,
             data_forwarded: false,
         };
         let backfill_from = match scope {
@@ -491,10 +487,23 @@ impl Datamancer {
         // first value, so they skip this.
         let seed_rx = (backfill_from.is_none())
             .then(|| Self::spawn_latest_seed(provider.clone(), instrument.clone(), kind));
+        // A failed open leaves no controller and no substream behind, so its
+        // evidence is recorded on the provider here (`last_error`, and the
+        // auth-rejection flag for `Error::Unauthenticated`); otherwise a
+        // provider that never connects would have nothing to report.
         accounting.record_live_start();
-        let live = provider.start_live(provider_tx).await?;
+        let live = match provider.start_live(provider_tx).await {
+            Ok(live) => live,
+            Err(e) => {
+                accounting.record_open_failure(&e);
+                return Err(e);
+            }
+        };
         accounting.record_subscribe();
-        live.subscribe(instrument, kind).await?;
+        if let Err(e) = live.subscribe(instrument, kind).await {
+            accounting.record_open_failure(&e);
+            return Err(e);
+        }
         tokio::spawn(controller.run_live(
             live,
             backfill_from,
@@ -598,7 +607,7 @@ impl Datamancer {
     #[must_use]
     pub fn health(&self) -> HealthView {
         let mut view =
-            HealthView::from_snapshot(&self.snapshot_live(), HealthView::DEFAULT_STALE_AFTER_NS);
+            HealthView::from_snapshot(&self.snapshot_live(), HealthView::DEFAULT_QUIET_AFTER_NS);
         view.daemon.version = Some(env!("CARGO_PKG_VERSION").to_string());
         view
     }
@@ -717,43 +726,11 @@ impl Datamancer {
     fn assemble_snapshot(&self, cache: CacheSnapshot) -> SystemSnapshot {
         let captured_at = wall_clock_ts();
 
-        // 1. Provider accounting, folding in the optional metrics hook.
-        let providers = self
-            .inner
-            .provider_accounting
-            .iter()
-            .map(|(id, acc)| {
-                let provider = self.inner.providers.iter().find(|p| p.id() == id.as_str());
-                let metrics = provider.and_then(|p| p.metrics());
-                let (bytes, rate_limit_hits) = metrics.map_or((None, None), |m| {
-                    (Some(m.bytes()), Some(m.rate_limit_hits()))
-                });
-                let enabled = provider.is_none_or(|p| p.enabled());
-                ProviderSnapshot::new(
-                    id.clone(),
-                    acc.connection_state(),
-                    acc.history_fetches(),
-                    acc.history_fetch_coalesced(),
-                    acc.live_starts(),
-                    acc.subscribes(),
-                    acc.unsubscribes(),
-                    acc.reconnects(),
-                    acc.messages(),
-                    acc.gaps_emitted(),
-                    acc.last_error(),
-                )
-                .with_bytes(bytes)
-                .with_rate_limit_hits(rate_limit_hits)
-                .with_enabled(enabled)
-            })
-            .collect();
-
-        // 2. Cache catalog is supplied by the caller (already computed, or empty
-        // for `snapshot_live`).
-
-        // 3. Authoritative sessions: take the registry lock only to upgrade each
-        // Weak, read the referrer refcount, and clone the LiveStats handle; drop
-        // the lock before reading atomics (and never hold it across an await).
+        // Authoritative sessions first (step 3 below): take the registry lock
+        // only to upgrade each Weak, read the referrer refcount, and clone the
+        // LiveStats handle; drop the lock before reading atomics (and never
+        // hold it across an await). Provider accounting counts its active
+        // substreams from this same sample.
         let auth_handles: Vec<_> = {
             let map = self
                 .inner
@@ -769,6 +746,7 @@ impl Datamancer {
                         let refcount =
                             u32::try_from(auth.stats.subscriber_count()).unwrap_or(u32::MAX);
                         (
+                            auth.provider_id.clone(),
                             auth.instrument.clone(),
                             auth.kind,
                             refcount,
@@ -778,14 +756,62 @@ impl Datamancer {
                 })
                 .collect()
         };
+
+        // 1. Provider accounting, folding in the optional metrics hook.
+        let providers = self
+            .inner
+            .provider_accounting
+            .iter()
+            .map(|(id, acc)| {
+                let provider = self.inner.providers.iter().find(|p| p.id() == id.as_str());
+                let metrics = provider.and_then(|p| p.metrics());
+                let (bytes, rate_limit_hits) = metrics.map_or((None, None), |m| {
+                    (Some(m.bytes()), Some(m.rate_limit_hits()))
+                });
+                let enabled = provider.is_none_or(|p| p.enabled());
+                // This provider's active substreams, from the same sample: their
+                // count is `active_subscriptions`, and their connection phases
+                // decide the provider's connection state — derived, so it can
+                // never disagree with the streams reported beside it.
+                let own = auth_handles
+                    .iter()
+                    .filter(|(provider_id, ..)| provider_id.as_str() == id.as_str());
+                let active = own.clone().count();
+                let connection_state =
+                    acc.connection_state(own.map(|(.., stats)| stats.connection()));
+                ProviderSnapshot::new(
+                    id.clone(),
+                    connection_state,
+                    acc.history_fetches(),
+                    acc.history_fetch_coalesced(),
+                    acc.live_starts(),
+                    acc.subscribes(),
+                    acc.unsubscribes(),
+                    acc.reconnects(),
+                    acc.messages(),
+                    acc.gaps_emitted(),
+                    acc.last_error(),
+                )
+                .with_bytes(bytes)
+                .with_rate_limit_hits(rate_limit_hits)
+                .with_enabled(enabled)
+                .with_active_subscriptions(u32::try_from(active).unwrap_or(u32::MAX))
+            })
+            .collect();
+
+        // 2. Cache catalog is supplied by the caller (already computed, or empty
+        // for `snapshot_live`).
+
+        // 3. Authoritative sessions, from the handles sampled above.
         let authoritative_sessions = auth_handles
             .into_iter()
-            .map(|(instrument, kind, refcount, stats)| {
+            .map(|(_, instrument, kind, refcount, stats)| {
                 AuthoritativeSessionSnapshot::new(instrument, kind, refcount, stats.gap_count())
                     .with_seq_position(stats.seq_position())
                     .with_timestamps(stats.last_source_ts(), stats.last_rx_ts())
                     .with_gaps(stats.recent_gaps(), stats.last_gap_rx_ts())
                     .with_backfilling(stats.backfilling())
+                    .with_connection(stats.connection())
             })
             .collect();
 
@@ -1353,14 +1379,6 @@ struct Controller {
     /// Shared (cloned `Arc`) with `DatamancerInner` and every other controller
     /// for the same provider.
     accounting: Arc<ProviderAccounting>,
-    /// This controller's own connection phase, used to drive provider-level
-    /// connection accounting correctly across substreams. `true` once a
-    /// `ProviderConnected` is seen without an intervening `ProviderDisconnected`.
-    connection_up: bool,
-    /// Whether this controller has ever been connected, so a later
-    /// `ProviderConnected` is classified as a reconnect rather than a first
-    /// connect.
-    connection_seen: bool,
     /// True once any data event (Trade/Quote/Bar) has been delivered on this
     /// authoritative session. Gates the pure-live "latest value" seed: once a
     /// real live value has been delivered, a late-arriving seed is discarded.
@@ -1550,6 +1568,9 @@ impl Controller {
     /// ends with no data, indistinguishable from an empty range. Stamped at an
     /// in-range `source_ts` so it stays ordered within the source-time stream.
     async fn emit_provider_error(&mut self, source_ts: Timestamp, message: String) {
+        // Controller-originated, so it never passes `note_provider_arrival`:
+        // record the provider's last error here.
+        self.accounting.record_error(&message);
         self.forward(MarketEvent::Control(Control {
             source_ts,
             rx_ts: source_ts,
@@ -1639,6 +1660,9 @@ impl Controller {
                                 }
                             }
                             ev = recv_live(&mut live_rx) => {
+                                if let Some(ev) = &ev {
+                                    self.note_provider_arrival(ev);
+                                }
                                 Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
                             }
                             ev = stream.next() => {
@@ -1687,6 +1711,9 @@ impl Controller {
                                 }
                             }
                             ev = recv_live(&mut live_rx) => {
+                                if let Some(ev) = &ev {
+                                    self.note_provider_arrival(ev);
+                                }
                                 Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
                             }
                             ev = rx.recv() => {
@@ -2014,6 +2041,7 @@ impl Controller {
                     let Some(ev) = ev else {
                         break; // provider task exited
                     };
+                    self.note_provider_arrival(&ev);
                     self.forward(ev).await;
                 }
                 res = async {
@@ -2075,6 +2103,10 @@ impl Controller {
     /// Release the upstream provider subscription and flush the tap log. No
     /// `SessionClosing` is emitted: by teardown the fan-out is empty (each
     /// referrer emits its own `SessionClosing` on `close`).
+    ///
+    /// Nothing to release on the provider's connection state: it is derived at
+    /// snapshot time from the substreams still in the live registry, and this
+    /// one leaves the registry when its `AuthoritativeSession` drops.
     async fn teardown_upstream(&mut self, live: &Arc<Mutex<Option<Box<dyn LiveHandle>>>>) {
         if let Some(h) = live.lock().await.take() {
             self.accounting.record_unsubscribe();
@@ -2181,32 +2213,28 @@ impl Controller {
         ) {
             self.data_forwarded = true;
         }
-        // Drive per-provider connection accounting from this controller's own
-        // up/down phase, so one substream's drop never marks the whole provider
-        // down and a second substream's first connect is never a reconnect.
-        if let MarketEvent::Control(c) = &ev {
-            match &c.kind {
-                ControlKind::ProviderConnected { .. } if !self.connection_up => {
-                    let reconnect = self.connection_seen;
-                    self.connection_up = true;
-                    self.connection_seen = true;
-                    self.accounting.record_connection_up(reconnect);
-                }
-                ControlKind::ProviderDisconnected { .. } if self.connection_up => {
-                    self.connection_up = false;
-                    self.accounting.record_connection_down();
-                }
-                _ => {}
-            }
-        }
-        // Stream-derived provider accounting: messages count as live-data
-        // throughput only on the authoritative live path (fan-out present);
-        // gap/error state is derived from in-band Control regardless of scope.
-        // The seed is a `Provider::latest` snapshot, not provider traffic.
+        // Throughput accounting: messages count as live-data throughput only on
+        // the authoritative live path (fan-out present); gaps count regardless
+        // of scope. Connection/error state from provider controls was folded at
+        // receipt (`note_provider_arrival`), not here. The seed is a
+        // `Provider::latest` snapshot, not provider traffic.
         self.accounting
             .record_forwarded(&ev, self.fanout.is_some() && arrival == Arrival::Live);
         self.tee(&ev).await;
         self.deliver_with(ev, arrival).await;
+    }
+
+    /// Fold a control **received from the provider** into this substream's
+    /// connection phase and the provider's accounting, at receipt. Runs on
+    /// every provider arrival — the live loop and the backfill buffer alike —
+    /// so a connect held in the backfill ring is visible while the backfill
+    /// runs, and one the ring evicts is still counted. Data events carry no
+    /// provider-level state and pass through untouched.
+    fn note_provider_arrival(&self, ev: &MarketEvent) {
+        if let MarketEvent::Control(c) = ev {
+            let change = self.stats.record_connection(c);
+            self.accounting.record_provider_control(&c.kind, change);
+        }
     }
 
     /// Backfill seam: a live arrival during the backfill is buffered in arrival
@@ -2554,6 +2582,7 @@ fn data_source_ts(ev: &MarketEvent) -> Option<Timestamp> {
 fn provider_error_message(e: &Error) -> String {
     match e {
         Error::Provider { message, .. } => message.clone(),
+        Error::Unauthenticated { message, .. } => format!("unauthenticated: {message}"),
         other => other.to_string(),
     }
 }

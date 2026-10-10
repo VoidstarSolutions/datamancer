@@ -601,7 +601,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
         let line = serde_json::to_string(&Reply::health(view.clone())).unwrap();
         let back: Reply = serde_json::from_str(&line).unwrap();
         assert!(back.ok);

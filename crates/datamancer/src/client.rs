@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 
 use datamancer_core::{
     ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, MarketEvent,
-    Result, Seq, SubscriptionRef, Timestamp,
+    Result, Seq, StreamConnection, SubscriptionRef, Timestamp,
 };
 use futures::StreamExt as _;
 use tokio::sync::{mpsc, oneshot};
@@ -241,10 +241,27 @@ pub(crate) struct LiveStats {
     /// from the registry `Arc` strong count, which over-counts (a single
     /// referrer holds several strong `Arc<AuthoritativeSession>`).
     subscribers: AtomicU64,
+    /// This substream's connection phase from its in-band connect/disconnect
+    /// controls (cold mutex, written only on those controls).
+    connection: std::sync::Mutex<StreamConnection>,
 }
 
 /// Bounded per-symbol recent-gap detail (oldest evicted).
 const RECENT_GAPS_CAP: usize = 8;
+
+/// What a connect/disconnect control did to a substream's phase
+/// ([`LiveStats::record_connection`]); the controller folds the provider-level
+/// consequences (`ever_connected`, `reconnects`) from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionChange {
+    /// No transition: a duplicate connect, a repeated disconnect, or a control
+    /// that is not connection evidence.
+    None,
+    /// `Pending`/`Down` → `Up`; `reconnect` when it was `Down`.
+    Connected { reconnect: bool },
+    /// `Pending`/`Up` → `Down`.
+    Disconnected,
+}
 
 impl LiveStats {
     pub(crate) fn new() -> Self {
@@ -260,6 +277,7 @@ impl LiveStats {
             last_gap_rx_ts: AtomicI64::new(0),
             backfilling: AtomicBool::new(false),
             subscribers: AtomicU64::new(0),
+            connection: std::sync::Mutex::new(StreamConnection::Pending),
         }
     }
 
@@ -286,8 +304,8 @@ impl LiveStats {
                     self.has_ts.store(true, Ordering::Relaxed);
                 }
             }
-            MarketEvent::Control(c) => {
-                if let ControlKind::Gap { span, .. } = &c.kind {
+            MarketEvent::Control(c) => match &c.kind {
+                ControlKind::Gap { span, .. } => {
                     self.gap_count.fetch_add(1, Ordering::Relaxed);
                     self.last_gap_rx_ts.store(c.rx_ts.0, Ordering::Relaxed);
                     self.has_gap_rx.store(true, Ordering::Relaxed);
@@ -298,7 +316,17 @@ impl LiveStats {
                         ring.push_back(span.clone());
                     }
                 }
-            }
+                // The connection phase is recorded at receipt
+                // (`record_connection`), not at delivery: a control held in the
+                // backfill ring must still count, and one the ring evicts must
+                // not be lost. A `ProviderError` is connection-scoped and is the
+                // provider's `last_error`, not per-stream evidence.
+                ControlKind::ProviderConnected { .. }
+                | ControlKind::ProviderDisconnected { .. }
+                | ControlKind::ProviderError { .. }
+                | ControlKind::SubscriptionChanged { .. }
+                | ControlKind::SessionClosing => {}
+            },
             _ => {}
         }
     }
@@ -369,6 +397,60 @@ impl LiveStats {
     /// flush and on every backfill exit path).
     pub(crate) fn set_backfilling(&self, active: bool) {
         self.backfilling.store(active, Ordering::Relaxed);
+    }
+
+    /// Record a provider connect/disconnect control **at receipt** and report
+    /// the phase transition it caused. This is the one record of the
+    /// substream's connection; the provider's state is derived from it at
+    /// snapshot time, so there is no parallel counter to drift.
+    ///
+    /// Transitions: `Pending`/`Down` → `Up` on a connect (a reconnect when it
+    /// was `Down`); `Pending`/`Up` → `Down` on a disconnect. A connect while
+    /// already `Up` is a duplicate and changes nothing. A disconnect while
+    /// already `Down` keeps `since` (the outage start) and adopts the newer
+    /// `cause`, so a connect failure reclassified as an auth rejection shows
+    /// as one without restarting the clock. Other controls are not connection
+    /// evidence and return [`ConnectionChange::None`].
+    pub(crate) fn record_connection(&self, c: &Control) -> ConnectionChange {
+        let Ok(mut slot) = self.connection.lock() else {
+            return ConnectionChange::None;
+        };
+        match (&c.kind, *slot) {
+            (ControlKind::ProviderConnected { .. }, StreamConnection::Up { .. }) => {
+                ConnectionChange::None
+            }
+            (ControlKind::ProviderConnected { .. }, previous) => {
+                *slot = StreamConnection::Up { since: c.rx_ts };
+                ConnectionChange::Connected {
+                    reconnect: matches!(previous, StreamConnection::Down { .. }),
+                }
+            }
+            (
+                ControlKind::ProviderDisconnected { cause, .. },
+                StreamConnection::Down { since, .. },
+            ) => {
+                *slot = StreamConnection::Down {
+                    since,
+                    cause: *cause,
+                };
+                ConnectionChange::None
+            }
+            (ControlKind::ProviderDisconnected { cause, .. }, _) => {
+                *slot = StreamConnection::Down {
+                    since: c.rx_ts,
+                    cause: *cause,
+                };
+                ConnectionChange::Disconnected
+            }
+            _ => ConnectionChange::None,
+        }
+    }
+
+    /// This substream's connection phase (`Pending` before any connect).
+    pub(crate) fn connection(&self) -> StreamConnection {
+        self.connection
+            .lock()
+            .map_or(StreamConnection::Pending, |slot| *slot)
     }
 }
 

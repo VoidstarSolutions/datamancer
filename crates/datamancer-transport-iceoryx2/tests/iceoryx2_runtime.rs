@@ -245,7 +245,7 @@ async fn health_subscriber_reconstructs_view() {
         vec![],
         vec![],
     );
-    let mut view = HealthView::from_snapshot(&snapshot, HealthView::DEFAULT_STALE_AFTER_NS);
+    let mut view = HealthView::from_snapshot(&snapshot, HealthView::DEFAULT_QUIET_AFTER_NS);
     view.daemon.version = Some("0.4.0".to_string());
     view.daemon.credential_backend = Some("keychain".to_string());
     publisher.publish(&view).expect("publish health view");
