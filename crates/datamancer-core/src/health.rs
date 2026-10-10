@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    event::{EventKind, GapSpan, Timestamp},
+    event::{DisconnectCause, EventKind, GapSpan, Timestamp},
     instrument::{Instrument, ProviderId},
     snapshot::{
         AuthoritativeSessionSnapshot, ConnectionState, ProviderSnapshot, StreamConnection,
@@ -141,10 +141,13 @@ pub enum Liveness {
     /// not count).
     Idle,
     Live,
-    /// Soft error, needs diagnosing: the substream is disconnected (a
-    /// reconnect is scheduled or in flight), or it reported a provider error
-    /// after its last data event and its last connect. `since` is when that
-    /// evidence was received, not the last data receipt.
+    /// Soft error, needs diagnosing: the substream is disconnected on a fault
+    /// (a reconnect is scheduled or in flight), or it reported a provider
+    /// error after its last data event and its last connect. `since` is when
+    /// that evidence was received, not the last data receipt. A drop because
+    /// the provider was deliberately disabled (`DisconnectCause::Disabled`)
+    /// is not a fault: the provider reads `Disabled` and the stream is judged
+    /// on its data alone.
     Stale {
         since: Timestamp,
     },
@@ -267,12 +270,18 @@ fn liveness(
 
 /// When this substream's fault evidence was received, if it has any: the
 /// disconnect while it is down, or a provider error received after both its
-/// last data event and its last connect (either clears an earlier error).
+/// last data event and its last connect (either clears an earlier error). A
+/// drop whose cause is `Disabled` is deliberate, not a fault: the provider
+/// reads `Disabled`, and the stream is judged on its data alone.
 fn fault_since(s: &AuthoritativeSessionSnapshot) -> Option<Timestamp> {
     let connected_at = match s.connection {
+        StreamConnection::Down {
+            cause: DisconnectCause::Disabled,
+            ..
+        }
+        | StreamConnection::Pending => None,
         StreamConnection::Down { since, .. } => return Some(since),
         StreamConnection::Up { since } => Some(since),
-        StreamConnection::Pending => None,
     };
     let error_at = s.last_error_rx_ts?;
     let cleared = [connected_at, s.last_rx_ts]
@@ -652,6 +661,31 @@ mod tests {
                 stream_with(None, down(DisconnectCause::Unauthenticated), None),
             ]),
             vec![stale.clone(), stale.clone(), stale]
+        );
+    }
+
+    #[test]
+    fn disabled_drop_is_not_a_fault() {
+        // A deliberate disable drops the stream with cause Disabled: the
+        // provider reads Disabled, and the stream is judged on its data alone
+        // (Live / Quiet / Idle), never Stale.
+        let disabled = StreamConnection::Down {
+            since: Timestamp(NOW - 2 * SEC),
+            cause: DisconnectCause::Disabled,
+        };
+        assert_eq!(
+            liveness_of(vec![
+                stream_with(Some(NOW - 3 * SEC), disabled, None),
+                stream_with(Some(NOW - 10 * SEC), disabled, None),
+                stream_with(None, disabled, None),
+            ]),
+            vec![
+                Liveness::Live,
+                Liveness::Quiet {
+                    since: Timestamp(NOW - 10 * SEC)
+                },
+                Liveness::Idle,
+            ]
         );
     }
 

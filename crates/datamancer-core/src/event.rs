@@ -221,8 +221,11 @@ pub struct Control {
 
 /// Why a provider connection is down — app-renderable classification.
 /// `Unauthenticated`: credentials rejected or an auth session lapsed;
-/// retrying without new credentials cannot help. `CompanionUnreachable` is
-/// reserved (spec appendix: IBKR's local gateway) — nothing emits it yet.
+/// retrying without new credentials cannot help. `Disabled`: the provider
+/// was deliberately disabled (its settings were removed), so the drop is
+/// not a fault and no reconnect is coming until it is enabled again.
+/// `CompanionUnreachable` is reserved (spec appendix: IBKR's local gateway)
+/// — nothing emits it yet.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +234,7 @@ pub enum DisconnectCause {
     Error,
     Unauthenticated,
     CompanionUnreachable,
+    Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -300,6 +304,7 @@ mod serde_tests {
                 DisconnectCause::CompanionUnreachable,
                 "\"companion_unreachable\"",
             ),
+            (DisconnectCause::Disabled, "\"disabled\""),
         ] {
             let json = serde_json::to_string(&cause).unwrap();
             assert_eq!(json, wire);

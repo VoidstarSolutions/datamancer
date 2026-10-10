@@ -886,6 +886,69 @@ async fn rejected_credentials_outlive_the_last_subscription() {
     assert_eq!(view.providers[0].detail.as_deref(), Some("auth rejected"));
 }
 
+#[tokio::test]
+async fn disabled_drop_leaves_the_stream_quiet_not_stale() {
+    // The provider is disabled under an open stream: the drop arrives with
+    // cause Disabled. Not a fault — the stream is judged on its data (Quiet
+    // here: its last receipt is far older than the threshold), never Stale.
+    let (provider, ctrl) = LiveProvider::new("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+    ctrl.push("AAPL", trade("AAPL", 1, 1)).await;
+    ctrl.push(
+        "AAPL",
+        received_at(
+            disconnected_with("fake", DisconnectCause::Disabled, "provider disabled"),
+            50,
+        ),
+    )
+    .await;
+    ctrl.push("AAPL", trade("AAPL", 2, 2)).await;
+    drain_until_marker(&mut stream, 2).await;
+
+    let snap = dm.snapshot().await.unwrap();
+    assert_eq!(
+        auth_snap(&snap, "AAPL").connection,
+        StreamConnection::Down {
+            since: Timestamp(50),
+            cause: DisconnectCause::Disabled,
+        }
+    );
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    assert_eq!(
+        view.streams[0].liveness,
+        Liveness::Quiet {
+            since: Timestamp(2)
+        }
+    );
+    // The same drop with cause Error is the fault it looks like.
+    ctrl.push("AAPL", received_at(connected("fake"), 60)).await;
+    ctrl.push("AAPL", received_at(disconnected("fake"), 70))
+        .await;
+    ctrl.push("AAPL", trade("AAPL", 3, 3)).await;
+    drain_until_marker(&mut stream, 3).await;
+    let snap = dm.snapshot().await.unwrap();
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    assert_eq!(
+        view.streams[0].liveness,
+        Liveness::Stale {
+            since: Timestamp(70)
+        }
+    );
+}
+
 /// A provider whose live handle refuses every subscribe with `error()`, the
 /// shape of a streaming task parked for want of credentials (or disabled):
 /// the open fails before any controller exists.

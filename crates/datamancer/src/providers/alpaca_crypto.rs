@@ -843,10 +843,12 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                     }
                 }, if settings_rx.is_some() => {
                     if changed.is_ok() {
-                        let reason = if cfg.settings.current().is_none() {
-                            "provider disabled"
+                        // A disable is deliberate, not a fault: classify it so
+                        // health does not read the dropped streams as Stale.
+                        let (reason, cause) = if cfg.settings.current().is_none() {
+                            ("provider disabled", DisconnectCause::Disabled)
                         } else {
-                            "settings changed"
+                            ("settings changed", DisconnectCause::Error)
                         };
                         tracing::info!(provider = PROVIDER_ID, reason, "settings changed; reconnecting");
                         broadcast_control(
@@ -854,7 +856,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                             ControlKind::ProviderDisconnected {
                                 provider: PROVIDER_ID.to_string(),
                                 reason: reason.to_string(),
-                                cause: DisconnectCause::Error,
+                                cause,
                             },
                         )
                         .await;
