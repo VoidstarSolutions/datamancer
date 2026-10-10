@@ -6,17 +6,29 @@
 //! (`captured_at`, `last_rx_ts`, `latency_ns`) — observability only, never
 //! engine logic.
 //!
-//! Staleness boundary: the check is **strictly greater than** the threshold
+//! Schema 3 judges health on evidence, not silence. `Stale` is a soft error
+//! (the substream is disconnected, or reported a provider error after its last
+//! event); `Quiet` is healthy and listening with nothing arriving; provider
+//! `Idle` is enabled with nothing requested.
+//!
+//! Quiet boundary: the check is **strictly greater than** the threshold
 //! (`captured_at - last_rx_ts > stale_after_ns`), so exact-threshold age
-//! counts as `Live`, not `Stale` (a cycle-1 triage residual, locked in by a
+//! counts as `Live`, not `Quiet` (a cycle-1 triage residual, locked in by a
 //! boundary test rather than "fixed").
+//!
+//! Known blind spot: a socket that stays open and goes silent produces no
+//! disconnect control, so it reads `Quiet`, not `Stale`, until the provider
+//! detects it (no liveness probe exists at the provider boundary yet).
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     event::{EventKind, GapSpan, Timestamp},
     instrument::{Instrument, ProviderId},
-    snapshot::{ConnectionState, SystemSnapshot},
+    snapshot::{
+        AuthoritativeSessionSnapshot, ConnectionState, ProviderSnapshot, StreamConnection,
+        SystemSnapshot,
+    },
 };
 
 /// A typed, versioned, app-renderable reduction of [`SystemSnapshot`]:
@@ -65,25 +77,31 @@ pub struct ProviderHealth {
 
 /// Provider connection state, app-facing.
 ///
-/// `Unauthenticated` and `CompanionUnreachable` are **reserved** (spec
-/// appendix: IBKR attaches to a local TWS/IB Gateway that can be down or
-/// needing re-auth); nothing produces them in cycle 1, but they exist now so
-/// shipped consumers already parse them.
+/// `CompanionUnreachable` is **reserved** (spec appendix: IBKR attaches to a
+/// local TWS/IB Gateway that can be down); nothing produces it yet, but it
+/// exists so shipped consumers already parse it.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderState {
     Connected,
-    /// Not yet observed connected (initial / connecting / reconnecting).
+    /// A requested substream has not connected yet: a connect is in flight.
     Connecting,
     Disconnected,
-    /// Credentials rejected or an auth session lapsed (reserved).
+    /// Credentials rejected or an auth session lapsed (an Alpaca auth
+    /// rejection produces it); reconnecting without new credentials cannot
+    /// help.
     Unauthenticated,
     /// A required companion process (e.g. IB Gateway) is unreachable (reserved).
     CompanionUnreachable,
     /// Compiled in but deliberately disabled (parked settings watch). Not an
     /// error: enable via the daemon config service.
     Disabled,
+    /// Enabled, with no live substream requested. Not an error: the provider
+    /// connects when something subscribes. Wins over the connection state, so
+    /// a provider whose last subscription ended reads `Idle`, not
+    /// `Disconnected`.
+    Idle,
 }
 
 /// Per-`(instrument, kind)` stream health. Per-symbol only.
@@ -102,15 +120,16 @@ pub struct StreamHealth {
     pub latency: Option<LatencySummary>,
 }
 
-/// Stream liveness, judged on wall-clock receipt (`rx_ts` vs the snapshot's
-/// `captured_at`) — observability only.
+/// Stream liveness, judged on the substream's own evidence and on wall-clock
+/// receipt (`rx_ts` vs the snapshot's `captured_at`) — observability only.
 ///
 /// Precedence when multiple conditions could apply: `Backfilling` wins over
-/// everything (staleness judgment is suspended mid-seam); otherwise no
-/// `last_rx_ts` is `Idle`; otherwise data older than the staleness threshold
-/// is `Stale` (the boundary is **strict**: exact-threshold age is *not*
-/// stale — a cycle-1 triage residual, locked in); otherwise a `Control::Gap`
-/// received within the staleness window is `Gapped`; otherwise `Live`.
+/// everything (judgment is suspended mid-seam); otherwise evidence of a
+/// fault is `Stale`; otherwise no `last_rx_ts` is `Idle`; otherwise data older
+/// than the threshold is `Quiet` (the boundary is **strict**: exact-threshold
+/// age is *not* quiet — a cycle-1 triage residual, locked in); otherwise a
+/// `Control::Gap` received within the threshold window is `Gapped`;
+/// otherwise `Live`.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,8 +138,17 @@ pub enum Liveness {
     /// not count).
     Idle,
     Live,
-    /// No event within the staleness threshold; `since` is the last receipt.
+    /// Soft error, needs diagnosing: the substream is disconnected (a
+    /// reconnect is scheduled or in flight), or it reported a provider error
+    /// after its last data event and its last connect. `since` is when that
+    /// evidence was received, not the last data receipt.
     Stale {
+        since: Timestamp,
+    },
+    /// Healthy and listening, nothing received within the threshold (an
+    /// illiquid instrument, a closed session). Not an error. `since` is the
+    /// last receipt.
+    Quiet {
         since: Timestamp,
     },
     /// A `Control::Gap` was received within the staleness window; data is
@@ -144,12 +172,13 @@ pub struct LatencySummary {
 
 impl HealthView {
     /// Shape version of the current reduction.
-    pub const SCHEMA_VERSION: u32 = 2;
-    /// Default staleness threshold: 5 seconds without a received event.
+    pub const SCHEMA_VERSION: u32 = 3;
+    /// Default threshold: 5 seconds without a received event reads `Quiet`.
+    /// (Named for its schema-2 role, when silence read `Stale`.)
     pub const DEFAULT_STALE_AFTER_NS: i64 = 5_000_000_000;
 
     /// Reduce a [`SystemSnapshot`] to the app-facing view. Pure: no clock is
-    /// read — staleness compares `last_rx_ts` to the snapshot's own
+    /// read — `Quiet` compares `last_rx_ts` to the snapshot's own
     /// `captured_at` against `stale_after_ns`.
     #[must_use]
     pub fn from_snapshot(snapshot: &SystemSnapshot, stale_after_ns: i64) -> Self {
@@ -158,16 +187,7 @@ impl HealthView {
             .iter()
             .map(|p| ProviderHealth {
                 provider: p.provider.clone(),
-                state: if p.enabled {
-                    match p.connection_state {
-                        ConnectionState::Connected => ProviderState::Connected,
-                        ConnectionState::Disconnected => ProviderState::Disconnected,
-                        ConnectionState::Unauthenticated => ProviderState::Unauthenticated,
-                        ConnectionState::Unknown => ProviderState::Connecting,
-                    }
-                } else {
-                    ProviderState::Disabled
-                },
+                state: provider_state(p),
                 detail: p.last_error.clone(),
             })
             .collect();
@@ -177,24 +197,7 @@ impl HealthView {
             .map(|s| StreamHealth {
                 instrument: s.instrument.clone(),
                 kind: s.kind,
-                liveness: if s.backfilling {
-                    Liveness::Backfilling
-                } else {
-                    match s.last_rx_ts {
-                        None => Liveness::Idle,
-                        Some(rx) if snapshot.captured_at.0 - rx.0 > stale_after_ns => {
-                            Liveness::Stale { since: rx }
-                        }
-                        Some(_) => match s.last_gap_rx_ts {
-                            Some(gap_rx) if snapshot.captured_at.0 - gap_rx.0 <= stale_after_ns => {
-                                Liveness::Gapped {
-                                    spans: s.recent_gaps.clone(),
-                                }
-                            }
-                            _ => Liveness::Live,
-                        },
-                    }
-                },
+                liveness: liveness(s, snapshot.captured_at, stale_after_ns),
                 last_event_source_ts: s.last_source_ts,
                 gap_count: s.gap_count,
                 latency: s.latency_ns.map(|last_ns| LatencySummary { last_ns }),
@@ -213,12 +216,71 @@ impl HealthView {
     }
 }
 
+/// Disabled wins; then `Idle` when nothing is requested (whatever the
+/// connection aggregate says); then the connection aggregate.
+fn provider_state(p: &ProviderSnapshot) -> ProviderState {
+    if !p.enabled {
+        return ProviderState::Disabled;
+    }
+    if p.active_subscriptions == 0 {
+        return ProviderState::Idle;
+    }
+    match p.connection_state {
+        ConnectionState::Connected => ProviderState::Connected,
+        ConnectionState::Disconnected => ProviderState::Disconnected,
+        ConnectionState::Unauthenticated => ProviderState::Unauthenticated,
+        ConnectionState::Unknown => ProviderState::Connecting,
+    }
+}
+
+/// Precedence as documented on [`Liveness`].
+fn liveness(
+    s: &AuthoritativeSessionSnapshot,
+    captured_at: Timestamp,
+    stale_after_ns: i64,
+) -> Liveness {
+    if s.backfilling {
+        return Liveness::Backfilling;
+    }
+    if let Some(since) = fault_since(s) {
+        return Liveness::Stale { since };
+    }
+    match s.last_rx_ts {
+        None => Liveness::Idle,
+        Some(rx) if captured_at.0 - rx.0 > stale_after_ns => Liveness::Quiet { since: rx },
+        Some(_) => match s.last_gap_rx_ts {
+            Some(gap_rx) if captured_at.0 - gap_rx.0 <= stale_after_ns => Liveness::Gapped {
+                spans: s.recent_gaps.clone(),
+            },
+            _ => Liveness::Live,
+        },
+    }
+}
+
+/// When this substream's fault evidence was received, if it has any: the
+/// disconnect while it is down, or a provider error received after both its
+/// last data event and its last connect (either clears an earlier error).
+fn fault_since(s: &AuthoritativeSessionSnapshot) -> Option<Timestamp> {
+    let connected_at = match s.connection {
+        StreamConnection::Down { since, .. } => return Some(since),
+        StreamConnection::Up { since } => Some(since),
+        StreamConnection::Pending => None,
+    };
+    let error_at = s.last_error_rx_ts?;
+    let cleared = [connected_at, s.last_rx_ts]
+        .into_iter()
+        .flatten()
+        .any(|t| t.0 >= error_at.0);
+    (!cleared).then_some(error_at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{HealthView, Liveness, ProviderState};
     use crate::{
-        AssetClass, AuthoritativeSessionSnapshot, CacheSnapshot, ConnectionState, EventKind,
-        GapSpan, Instrument, ProviderId, ProviderSnapshot, SystemSnapshot, Timestamp,
+        AssetClass, AuthoritativeSessionSnapshot, CacheSnapshot, ConnectionState, DisconnectCause,
+        EventKind, GapSpan, Instrument, ProviderId, ProviderSnapshot, StreamConnection,
+        SystemSnapshot, Timestamp,
     };
 
     fn provider_snapshot(state: ConnectionState, last_error: Option<&str>) -> ProviderSnapshot {
@@ -235,6 +297,9 @@ mod tests {
             0,
             last_error.map(str::to_string),
         )
+        // One live substream requested, so the connection state is reported;
+        // `Idle` (none requested) has its own tests.
+        .with_active_subscriptions(1)
     }
 
     fn stream_snapshot(last_rx_ns: Option<i64>) -> AuthoritativeSessionSnapshot {
@@ -292,14 +357,14 @@ mod tests {
     }
 
     #[test]
-    fn liveness_is_idle_live_or_stale_per_symbol() {
+    fn liveness_is_idle_live_or_quiet_per_symbol() {
         let now = 100_000_000_000_i64; // 100s in ns
         let snap = snapshot(
             vec![provider_snapshot(ConnectionState::Connected, None)],
             vec![
                 stream_snapshot(None),                       // no data yet -> Idle
                 stream_snapshot(Some(now - 1_000_000_000)),  // 1s ago -> Live
-                stream_snapshot(Some(now - 30_000_000_000)), // 30s ago -> Stale
+                stream_snapshot(Some(now - 30_000_000_000)), // 30s ago, no fault -> Quiet
             ],
             now,
         );
@@ -311,7 +376,7 @@ mod tests {
         assert_eq!(view.streams[1].latency.map(|l| l.last_ns), Some(7));
         assert_eq!(
             view.streams[2].liveness,
-            Liveness::Stale {
+            Liveness::Quiet {
                 since: Timestamp(now - 30_000_000_000)
             }
         );
@@ -344,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn staleness_boundary_is_strictly_greater() {
+    fn quiet_boundary_is_strictly_greater() {
         // Exact-threshold age counts Live (cycle-1 triage residual, locked in).
         let now = 100_000_000_000_i64;
         let exactly = now - HealthView::DEFAULT_STALE_AFTER_NS;
@@ -379,54 +444,54 @@ mod tests {
     }
 
     #[test]
-    fn stale_wins_over_gapped_and_backfilling_wins_over_all() {
+    fn quiet_wins_over_gapped_and_backfilling_wins_over_all() {
         let now = 100_000_000_000_i64;
         let span = GapSpan {
             from_source_ts: Timestamp(1),
             to_source_ts: Timestamp(2),
         };
-        // Stale data + old gap => Stale (gap outside window).
-        let stale = stream_snapshot(Some(now - 30_000_000_000))
+        // Old data + old gap => Quiet (gap outside window).
+        let quiet = stream_snapshot(Some(now - 30_000_000_000))
             .with_gaps(vec![span.clone()], Some(Timestamp(now - 30_000_000_000)));
-        // Backfilling => Backfilling even with stale data.
+        // Backfilling => Backfilling even with old data.
         let backfilling = stream_snapshot(Some(now - 30_000_000_000)).with_backfilling(true);
         let snap = snapshot(
             vec![provider_snapshot(ConnectionState::Connected, None)],
-            vec![stale, backfilling],
+            vec![quiet, backfilling],
             now,
         );
         let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
-        assert!(matches!(view.streams[0].liveness, Liveness::Stale { .. }));
+        assert!(matches!(view.streams[0].liveness, Liveness::Quiet { .. }));
         assert_eq!(view.streams[1].liveness, Liveness::Backfilling);
     }
 
     #[test]
-    fn stale_short_circuits_before_gapped_even_with_a_recent_gap() {
-        // Stale data (30s old) with a *recent* gap (2s ago, inside the 5s
-        // window) must still resolve to Stale: proves the Stale branch is
-        // checked (and short-circuits) before Gapped is considered, not just
-        // that Stale wins when the gap also happens to be old.
+    fn quiet_short_circuits_before_gapped_even_with_a_recent_gap() {
+        // Old data (30s) with a *recent* gap (2s ago, inside the 5s window)
+        // must still resolve to Quiet: proves the Quiet branch is checked
+        // (and short-circuits) before Gapped is considered, not just that
+        // Quiet wins when the gap also happens to be old.
         let now = 100_000_000_000_i64;
         let span = GapSpan {
             from_source_ts: Timestamp(1),
             to_source_ts: Timestamp(2),
         };
-        let stale_with_recent_gap = stream_snapshot(Some(now - 30_000_000_000))
+        let quiet_with_recent_gap = stream_snapshot(Some(now - 30_000_000_000))
             .with_gaps(vec![span], Some(Timestamp(now - 2_000_000_000)));
         let snap = snapshot(
             vec![provider_snapshot(ConnectionState::Connected, None)],
-            vec![stale_with_recent_gap],
+            vec![quiet_with_recent_gap],
             now,
         );
         let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
-        assert!(matches!(view.streams[0].liveness, Liveness::Stale { .. }));
+        assert!(matches!(view.streams[0].liveness, Liveness::Quiet { .. }));
     }
 
     #[test]
-    fn schema_version_is_2() {
+    fn schema_version_is_3() {
         let snap = snapshot(vec![], vec![], 0);
         let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
-        assert_eq!(view.schema_version, 2);
+        assert_eq!(view.schema_version, 3);
     }
 
     #[test]
@@ -458,9 +523,9 @@ mod tests {
 
     #[test]
     fn ibkr_reserved_states_serde_round_trip() {
-        // Nothing produces these in cycle 1; they are reserved for IBKR
-        // (spec appendix). Guard the wire names now so shipped apps parse them
-        // when cycle 4 starts emitting them.
+        // Alpaca auth rejections produce Unauthenticated; CompanionUnreachable
+        // is still reserved for IBKR (spec appendix). Guard both wire names so
+        // shipped apps parse them.
         for (state, wire) in [
             (ProviderState::Unauthenticated, "\"unauthenticated\""),
             (
@@ -486,5 +551,206 @@ mod tests {
         let json = serde_json::to_string(&view).unwrap();
         let back: HealthView = serde_json::from_str(&json).unwrap();
         assert_eq!(view, back);
+    }
+
+    const NOW: i64 = 100_000_000_000; // 100s in ns
+    const SEC: i64 = 1_000_000_000;
+
+    fn stream_with(
+        last_rx_ns: Option<i64>,
+        connection: StreamConnection,
+        last_error_rx_ns: Option<i64>,
+    ) -> AuthoritativeSessionSnapshot {
+        stream_snapshot(last_rx_ns).with_connection(connection, last_error_rx_ns.map(Timestamp))
+    }
+
+    fn liveness_of(sessions: Vec<AuthoritativeSessionSnapshot>) -> Vec<Liveness> {
+        let snap = snapshot(
+            vec![provider_snapshot(ConnectionState::Connected, None)],
+            sessions,
+            NOW,
+        );
+        HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS)
+            .streams
+            .into_iter()
+            .map(|s| s.liveness)
+            .collect()
+    }
+
+    #[test]
+    fn provider_with_nothing_requested_is_idle_whatever_its_connection() {
+        // Unknown is today's "connecting forever"; Disconnected/Connected are
+        // what an unsubscribe-all leaves behind.
+        let snap = snapshot(
+            [
+                ConnectionState::Unknown,
+                ConnectionState::Connected,
+                ConnectionState::Disconnected,
+                ConnectionState::Unauthenticated,
+            ]
+            .into_iter()
+            .map(|c| provider_snapshot(c, None).with_active_subscriptions(0))
+            .collect(),
+            vec![],
+            1_000,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        let states: Vec<_> = view.providers.iter().map(|p| p.state).collect();
+        assert_eq!(states, vec![ProviderState::Idle; 4]);
+    }
+
+    #[test]
+    fn disabled_wins_over_idle() {
+        let snap = snapshot(
+            vec![
+                provider_snapshot(ConnectionState::Unknown, None)
+                    .with_active_subscriptions(0)
+                    .with_enabled(false),
+            ],
+            vec![],
+            1_000,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+        assert_eq!(view.providers[0].state, ProviderState::Disabled);
+    }
+
+    #[test]
+    fn disconnected_substream_is_stale_since_the_disconnect() {
+        let down = |cause| StreamConnection::Down {
+            since: Timestamp(NOW - 2 * SEC),
+            cause,
+        };
+        let stale = Liveness::Stale {
+            since: Timestamp(NOW - 2 * SEC),
+        };
+        assert_eq!(
+            liveness_of(vec![
+                // Data before the drop: Stale, not Live (data is 3s old).
+                stream_with(Some(NOW - 3 * SEC), down(DisconnectCause::Error), None),
+                // Never received anything: Stale, not Idle.
+                stream_with(None, down(DisconnectCause::Error), None),
+                stream_with(None, down(DisconnectCause::Unauthenticated), None),
+            ]),
+            vec![stale.clone(), stale.clone(), stale]
+        );
+    }
+
+    #[test]
+    fn provider_error_after_last_event_and_connect_is_stale() {
+        let up = StreamConnection::Up {
+            since: Timestamp(NOW - 10 * SEC),
+        };
+        assert_eq!(
+            liveness_of(vec![
+                stream_with(Some(NOW - 3 * SEC), up, Some(NOW - SEC)),
+                stream_with(None, StreamConnection::Pending, Some(NOW - SEC)),
+            ]),
+            vec![
+                Liveness::Stale {
+                    since: Timestamp(NOW - SEC)
+                },
+                Liveness::Stale {
+                    since: Timestamp(NOW - SEC)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn later_data_or_reconnect_clears_a_provider_error() {
+        let up_long_ago = StreamConnection::Up {
+            since: Timestamp(NOW - 10 * SEC),
+        };
+        let reconnected = StreamConnection::Up {
+            since: Timestamp(NOW - SEC),
+        };
+        assert_eq!(
+            liveness_of(vec![
+                // Data after the error.
+                stream_with(Some(NOW - SEC), up_long_ago, Some(NOW - 3 * SEC)),
+                // Reconnect after the error, nothing received since.
+                stream_with(None, reconnected, Some(NOW - 3 * SEC)),
+                // Data received in the same instant as the error: not newer.
+                stream_with(Some(NOW - SEC), up_long_ago, Some(NOW - SEC)),
+            ]),
+            vec![Liveness::Live, Liveness::Idle, Liveness::Live]
+        );
+    }
+
+    #[test]
+    fn backfilling_wins_over_stale() {
+        let down = StreamConnection::Down {
+            since: Timestamp(NOW - SEC),
+            cause: DisconnectCause::Error,
+        };
+        assert_eq!(
+            liveness_of(vec![stream_with(None, down, None).with_backfilling(true)]),
+            vec![Liveness::Backfilling]
+        );
+    }
+
+    #[test]
+    fn v3_wire_golden() {
+        assert_eq!(
+            serde_json::to_string(&ProviderState::Idle).unwrap(),
+            r#""idle""#
+        );
+        for (liveness, wire) in [
+            (
+                Liveness::Quiet {
+                    since: Timestamp(5),
+                },
+                r#"{"quiet":{"since":5}}"#,
+            ),
+            (
+                Liveness::Stale {
+                    since: Timestamp(6),
+                },
+                r#"{"stale":{"since":6}}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&liveness).unwrap(), wire);
+        }
+        assert_eq!(
+            serde_json::to_string(&StreamConnection::Pending).unwrap(),
+            r#""pending""#
+        );
+        assert_eq!(
+            serde_json::to_string(&StreamConnection::Down {
+                since: Timestamp(7),
+                cause: DisconnectCause::Unauthenticated,
+            })
+            .unwrap(),
+            r#"{"down":{"since":7,"cause":"unauthenticated"}}"#
+        );
+    }
+
+    #[test]
+    fn frames_without_the_schema_3_fields_still_parse() {
+        // A snapshot frame from before schema 3 has no `active_subscriptions`,
+        // `connection` or `last_error_rx_ts`; they default.
+        let mut provider =
+            serde_json::to_value(provider_snapshot(ConnectionState::Connected, None)).unwrap();
+        provider
+            .as_object_mut()
+            .unwrap()
+            .remove("active_subscriptions");
+        let provider: ProviderSnapshot = serde_json::from_value(provider).unwrap();
+        assert_eq!(provider.active_subscriptions, 0);
+
+        let mut session = serde_json::to_value(stream_with(
+            Some(1),
+            StreamConnection::Up {
+                since: Timestamp(1),
+            },
+            Some(1),
+        ))
+        .unwrap();
+        let fields = session.as_object_mut().unwrap();
+        fields.remove("connection");
+        fields.remove("last_error_rx_ts");
+        let session: AuthoritativeSessionSnapshot = serde_json::from_value(session).unwrap();
+        assert_eq!(session.connection, StreamConnection::Pending);
+        assert_eq!(session.last_error_rx_ts, None);
     }
 }

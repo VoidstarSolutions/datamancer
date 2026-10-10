@@ -717,6 +717,37 @@ impl Datamancer {
     fn assemble_snapshot(&self, cache: CacheSnapshot) -> SystemSnapshot {
         let captured_at = wall_clock_ts();
 
+        // Authoritative sessions first (step 3 below): take the registry lock
+        // only to upgrade each Weak, read the referrer refcount, and clone the
+        // LiveStats handle; drop the lock before reading atomics (and never
+        // hold it across an await). Provider accounting counts its active
+        // substreams from this same sample.
+        let auth_handles: Vec<_> = {
+            let map = self
+                .inner
+                .live_sessions
+                .lock()
+                .expect("live-session registry mutex poisoned");
+            map.values()
+                .filter_map(|weak| {
+                    weak.upgrade().map(|auth| {
+                        // True subscriber count from the fan-out, not the `Arc`
+                        // strong count (which over-counts: one referrer holds
+                        // several strong `Arc<AuthoritativeSession>`).
+                        let refcount =
+                            u32::try_from(auth.stats.subscriber_count()).unwrap_or(u32::MAX);
+                        (
+                            auth.provider_id.clone(),
+                            auth.instrument.clone(),
+                            auth.kind,
+                            refcount,
+                            auth.stats.clone(),
+                        )
+                    })
+                })
+                .collect()
+        };
+
         // 1. Provider accounting, folding in the optional metrics hook.
         let providers = self
             .inner
@@ -729,6 +760,10 @@ impl Datamancer {
                     (Some(m.bytes()), Some(m.rate_limit_hits()))
                 });
                 let enabled = provider.is_none_or(|p| p.enabled());
+                let active = auth_handles
+                    .iter()
+                    .filter(|(provider_id, ..)| provider_id.as_str() == id.as_str())
+                    .count();
                 ProviderSnapshot::new(
                     id.clone(),
                     acc.connection_state(),
@@ -745,47 +780,23 @@ impl Datamancer {
                 .with_bytes(bytes)
                 .with_rate_limit_hits(rate_limit_hits)
                 .with_enabled(enabled)
+                .with_active_subscriptions(u32::try_from(active).unwrap_or(u32::MAX))
             })
             .collect();
 
         // 2. Cache catalog is supplied by the caller (already computed, or empty
         // for `snapshot_live`).
 
-        // 3. Authoritative sessions: take the registry lock only to upgrade each
-        // Weak, read the referrer refcount, and clone the LiveStats handle; drop
-        // the lock before reading atomics (and never hold it across an await).
-        let auth_handles: Vec<_> = {
-            let map = self
-                .inner
-                .live_sessions
-                .lock()
-                .expect("live-session registry mutex poisoned");
-            map.values()
-                .filter_map(|weak| {
-                    weak.upgrade().map(|auth| {
-                        // True subscriber count from the fan-out, not the `Arc`
-                        // strong count (which over-counts: one referrer holds
-                        // several strong `Arc<AuthoritativeSession>`).
-                        let refcount =
-                            u32::try_from(auth.stats.subscriber_count()).unwrap_or(u32::MAX);
-                        (
-                            auth.instrument.clone(),
-                            auth.kind,
-                            refcount,
-                            auth.stats.clone(),
-                        )
-                    })
-                })
-                .collect()
-        };
+        // 3. Authoritative sessions, from the handles sampled above.
         let authoritative_sessions = auth_handles
             .into_iter()
-            .map(|(instrument, kind, refcount, stats)| {
+            .map(|(_, instrument, kind, refcount, stats)| {
                 AuthoritativeSessionSnapshot::new(instrument, kind, refcount, stats.gap_count())
                     .with_seq_position(stats.seq_position())
                     .with_timestamps(stats.last_source_ts(), stats.last_rx_ts())
                     .with_gaps(stats.recent_gaps(), stats.last_gap_rx_ts())
                     .with_backfilling(stats.backfilling())
+                    .with_connection(stats.connection(), stats.last_error_rx_ts())
             })
             .collect();
 
@@ -2075,7 +2086,16 @@ impl Controller {
     /// Release the upstream provider subscription and flush the tap log. No
     /// `SessionClosing` is emitted: by teardown the fan-out is empty (each
     /// referrer emits its own `SessionClosing` on `close`).
+    ///
+    /// A substream torn down while connected releases its share of the
+    /// provider's connection count first: no `ProviderDisconnected` follows a
+    /// teardown, so without this the count leaks and the provider reads
+    /// `Connected` after its last live substream has dropped.
     async fn teardown_upstream(&mut self, live: &Arc<Mutex<Option<Box<dyn LiveHandle>>>>) {
+        if self.connection_up {
+            self.connection_up = false;
+            self.accounting.record_connection_down();
+        }
         if let Some(h) = live.lock().await.take() {
             self.accounting.record_unsubscribe();
             let _ = h

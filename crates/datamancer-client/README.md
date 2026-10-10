@@ -235,11 +235,18 @@ while let Some(event) = events.next().await {
 re-exported via the orchestrator too): a versioned, per-`(instrument, kind)`
 reduction of the daemon's snapshot for app rendering. It's per-symbol only —
 there is no cross-instrument aggregate — and its latency/liveness fields are
-wall-clock observability, never engine-decision inputs. `ProviderState`
-includes reserved `Unauthenticated` / `CompanionUnreachable` variants for a
-future IBKR-style provider that attaches to a local companion process;
-nothing produces them yet, but the wire shape is stable now so consumers
-already parse them. `daemon.version` and `daemon.credential_backend` come
+wall-clock observability, never engine-decision inputs. Schema 3 judges
+health on evidence, not silence: a provider enabled with nothing requested is
+`Idle` (not an error); `Connecting` means a requested substream has not
+connected yet; a stream is `Stale` only on evidence of a fault (its substream
+disconnected, or a provider error after its last event), with `since` set to
+when that evidence arrived; a healthy stream with nothing arriving past the
+threshold is `Quiet`. Both enums are `#[non_exhaustive]`, so match with a
+wildcard arm. `Unauthenticated` is produced on an Alpaca auth rejection;
+`CompanionUnreachable` is reserved for a future IBKR-style provider that
+attaches to a local companion process (nothing produces it yet, but the wire
+shape is stable so consumers already parse it). `daemon.version` and
+`daemon.credential_backend` come
 from the `ping` handshake (`{"op":"ping"}` →
 `{"ok":true,"version":"…","credential_backend":"…"}`), not the snapshot
 itself — see `datamancerd/README.md` for the control-protocol side of `ping`.

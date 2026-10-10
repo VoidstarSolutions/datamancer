@@ -73,25 +73,26 @@ pub(crate) async fn sessions(State(state): State<WebState>) -> Json<SessionsView
 /// web surface is another consumer of the core reduction, not a fork).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct HealthEnvelope {
-    /// `true` once every *enabled* provider reports `Connected` (and at
-    /// least one is enabled). Disabled providers are deliberate and do not
-    /// block readiness.
+    /// `true` when at least one provider is enabled and every enabled one is
+    /// `Connected` or `Idle`. Disabled providers are deliberate and an `Idle`
+    /// one (nothing requested) is healthy, so neither blocks readiness.
     pub ready: bool,
     pub health: datamancer::HealthView,
 }
 
 impl HealthEnvelope {
     pub(crate) fn from_snapshot(snap: &SystemSnapshot, credential_backend: &str) -> Self {
+        use datamancer::ProviderState;
         let health = crate::server::stamped_health_view(snap, credential_backend);
         let enabled: Vec<_> = health
             .providers
             .iter()
-            .filter(|p| p.state != datamancer::ProviderState::Disabled)
+            .filter(|p| p.state != ProviderState::Disabled)
             .collect();
         let ready = !enabled.is_empty()
             && enabled
                 .iter()
-                .all(|p| p.state == datamancer::ProviderState::Connected);
+                .all(|p| matches!(p.state, ProviderState::Connected | ProviderState::Idle));
         Self { ready, health }
     }
 }
@@ -166,7 +167,8 @@ mod tests {
                     0,
                     0,
                     None,
-                ),
+                )
+                .with_active_subscriptions(1),
                 ProviderSnapshot::new(
                     ProviderId::from_static("off"),
                     ConnectionState::Unknown,
@@ -188,7 +190,8 @@ mod tests {
         );
         let env = HealthEnvelope::from_snapshot(&snap, "keychain");
         assert!(env.ready); // the disabled provider does not block readiness
-        assert_eq!(env.health.schema_version, 2);
+        assert_eq!(env.health.schema_version, 3);
+        assert_eq!(env.health.providers[0].state, ProviderState::Connected);
         assert_eq!(
             env.health.daemon.credential_backend.as_deref(),
             Some("keychain")
@@ -243,7 +246,8 @@ mod tests {
                     0,
                     0,
                     None,
-                ),
+                )
+                .with_active_subscriptions(1),
                 ProviderSnapshot::new(
                     ProviderId::from_static("flaky"),
                     ConnectionState::Disconnected,
@@ -256,7 +260,8 @@ mod tests {
                     0,
                     0,
                     None,
-                ),
+                )
+                .with_active_subscriptions(1),
             ],
             CacheSnapshot::new(vec![], None),
             vec![],
@@ -266,6 +271,47 @@ mod tests {
         assert!(!env.ready);
         assert_eq!(env.health.providers[0].state, ProviderState::Connected);
         assert_eq!(env.health.providers[1].state, ProviderState::Disconnected);
+    }
+
+    #[test]
+    fn health_envelope_idle_provider_does_not_block_readiness() {
+        // Enabled with nothing requested is Idle, which is healthy: a daemon
+        // with no subscriptions yet is ready. A requested substream that has
+        // not connected (Connecting) still blocks it.
+        let provider = |requested| {
+            ProviderSnapshot::new(
+                ProviderId::from_static("p"),
+                ConnectionState::Unknown,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+            )
+            .with_active_subscriptions(requested)
+        };
+        let snap = |requested| {
+            SystemSnapshot::new(
+                Timestamp(1_000),
+                vec![provider(requested)],
+                CacheSnapshot::new(vec![], None),
+                vec![],
+                vec![],
+            )
+        };
+        let idle = HealthEnvelope::from_snapshot(&snap(0), "keychain");
+        assert_eq!(idle.health.providers[0].state, ProviderState::Idle);
+        assert!(idle.ready);
+        let connecting = HealthEnvelope::from_snapshot(&snap(1), "keychain");
+        assert_eq!(
+            connecting.health.providers[0].state,
+            ProviderState::Connecting
+        );
+        assert!(!connecting.ready);
     }
 
     fn config_state() -> ConfigState {
