@@ -82,6 +82,15 @@ pub enum Error {
     #[error("provider {provider}: {message}")]
     Provider { provider: String, message: String },
 
+    /// The provider cannot serve because it has no usable credentials: none
+    /// are provisioned, or the ones it has were rejected. Retrying without new
+    /// credentials cannot help; the fix is provisioning (for a daemon,
+    /// `set-credentials`). Surfaced as [`crate::ProviderState::Unauthenticated`]
+    /// when it fails a live open, so a provider that never connected still
+    /// reports why.
+    #[error("provider {provider}: unauthenticated: {message}")]
+    Unauthenticated { provider: String, message: String },
+
     /// Storage-layer error.
     #[error("storage: {0}")]
     Storage(String),

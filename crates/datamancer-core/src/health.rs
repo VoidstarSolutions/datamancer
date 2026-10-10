@@ -88,9 +88,11 @@ pub enum ProviderState {
     /// A requested substream has not connected yet: a connect is in flight.
     Connecting,
     Disconnected,
-    /// Credentials rejected or an auth session lapsed (an Alpaca auth
-    /// rejection produces it); reconnecting without new credentials cannot
-    /// help.
+    /// No usable credentials: rejected, lapsed, or never provisioned (an
+    /// Alpaca auth rejection produces it, and so does a live open that fails
+    /// for want of credentials). Reconnecting without new credentials cannot
+    /// help, so it is reported even with nothing requested — it wins over
+    /// `Idle` — until a connect succeeds.
     Unauthenticated,
     /// A required companion process (e.g. IB Gateway) is unreachable (reserved).
     CompanionUnreachable,
@@ -98,9 +100,10 @@ pub enum ProviderState {
     /// error: enable via the daemon config service.
     Disabled,
     /// Enabled, with no live substream requested. Not an error: the provider
-    /// connects when something subscribes. Wins over the connection state, so
+    /// connects when something subscribes. Wins over the connection state —
     /// a provider whose last subscription ended reads `Idle`, not
-    /// `Disconnected`.
+    /// `Disconnected` — except a known fault that the next request would hit
+    /// (`Unauthenticated`), which wins over `Idle`.
     Idle,
 }
 
@@ -216,11 +219,16 @@ impl HealthView {
     }
 }
 
-/// Disabled wins; then `Idle` when nothing is requested (whatever the
-/// connection aggregate says); then the connection aggregate.
+/// Disabled wins; then a known fault (`Unauthenticated`: the next request
+/// will fail too, so it is reported whether or not anything is requested);
+/// then `Idle` when nothing is requested (whatever else the connection
+/// aggregate says); then the connection aggregate.
 fn provider_state(p: &ProviderSnapshot) -> ProviderState {
     if !p.enabled {
         return ProviderState::Disabled;
+    }
+    if p.connection_state == ConnectionState::Unauthenticated {
+        return ProviderState::Unauthenticated;
     }
     if p.active_subscriptions == 0 {
         return ProviderState::Idle;
@@ -578,9 +586,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_with_nothing_requested_is_idle_whatever_its_connection() {
-        // Unknown is today's "connecting forever"; Disconnected/Connected are
-        // what an unsubscribe-all leaves behind.
+    fn provider_with_nothing_requested_is_idle_unless_unauthenticated() {
+        // Unknown is "never connected"; Disconnected/Connected are what an
+        // unsubscribe-all leaves behind: all Idle. Unauthenticated is a fault
+        // the next request would hit, so it is reported even with nothing
+        // requested (rejected credentials, then unsubscribe; or a live open
+        // that failed for want of credentials).
         let snap = snapshot(
             [
                 ConnectionState::Unknown,
@@ -589,14 +600,23 @@ mod tests {
                 ConnectionState::Unauthenticated,
             ]
             .into_iter()
-            .map(|c| provider_snapshot(c, None).with_active_subscriptions(0))
+            .map(|c| provider_snapshot(c, Some("rejected")).with_active_subscriptions(0))
             .collect(),
             vec![],
             1_000,
         );
         let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
         let states: Vec<_> = view.providers.iter().map(|p| p.state).collect();
-        assert_eq!(states, vec![ProviderState::Idle; 4]);
+        assert_eq!(
+            states,
+            vec![
+                ProviderState::Idle,
+                ProviderState::Idle,
+                ProviderState::Idle,
+                ProviderState::Unauthenticated,
+            ]
+        );
+        assert_eq!(view.providers[3].detail.as_deref(), Some("rejected"));
     }
 
     #[test]

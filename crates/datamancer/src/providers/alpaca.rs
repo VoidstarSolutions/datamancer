@@ -511,7 +511,7 @@ async fn run_streaming_task(
             let Some(rx) = settings_rx.as_mut() else {
                 return;
             };
-            if !wait_for_provisioning(rx, &mut cmd_rx, "provider disabled").await {
+            if !wait_for_provisioning(rx, &mut cmd_rx, Park::Disabled).await {
                 return;
             }
             continue 'outer;
@@ -546,7 +546,7 @@ async fn run_streaming_task(
                 // always present here; exit defensively if it isn't (never
                 // busy-loop).
                 let Some(rx) = cred_rx.as_mut() else { return };
-                if !wait_for_provisioning(rx, &mut cmd_rx, "waiting for credentials").await {
+                if !wait_for_provisioning(rx, &mut cmd_rx, Park::MissingCredentials).await {
                     return;
                 }
                 continue 'outer;
@@ -590,13 +590,7 @@ async fn run_streaming_task(
                     // a rotation (set-credentials hot-apply) or disable —
                     // mirrors the Missing-credentials park above. Static
                     // sources can't rotate, so they fall through to backoff.
-                    if !wait_for_provisioning(
-                        rx,
-                        &mut cmd_rx,
-                        "waiting for new credentials after auth rejection",
-                    )
-                    .await
-                    {
+                    if !wait_for_provisioning(rx, &mut cmd_rx, Park::RejectedCredentials).await {
                         return;
                     }
                     continue 'outer;
@@ -751,12 +745,8 @@ async fn run_streaming_task(
                                 // as the connect-time arm does. Static
                                 // sources can't rotate, so they fall through
                                 // to backoff.
-                                if !wait_for_provisioning(
-                                    rx,
-                                    &mut cmd_rx,
-                                    "waiting for new credentials after auth rejection",
-                                )
-                                .await
+                                if !wait_for_provisioning(rx, &mut cmd_rx, Park::RejectedCredentials)
+                                    .await
                                 {
                                     return;
                                 }
@@ -837,14 +827,46 @@ async fn run_streaming_task(
     }
 }
 
+/// Why the streaming task is parked in [`wait_for_provisioning`], and so
+/// which error a subscribe/unsubscribe gets meanwhile: a credential park is
+/// `Error::Unauthenticated` (retrying cannot help; provisioning can), a
+/// disable is a plain provider error.
+#[derive(Debug, Clone, Copy)]
+enum Park {
+    Disabled,
+    MissingCredentials,
+    RejectedCredentials,
+}
+
+impl Park {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Disabled => "provider disabled",
+            Self::MissingCredentials => "waiting for credentials",
+            Self::RejectedCredentials => "waiting for new credentials after auth rejection",
+        }
+    }
+
+    fn error(self) -> Error {
+        let message = self.reason().to_string();
+        let provider = PROVIDER_ID.to_string();
+        match self {
+            Self::Disabled => Error::Provider { provider, message },
+            Self::MissingCredentials | Self::RejectedCredentials => {
+                Error::Unauthenticated { provider, message }
+            }
+        }
+    }
+}
+
 /// Waits for a `Watch` source (settings or credentials) to deliver a new
 /// value, servicing the command channel meanwhile (close exits,
-/// subscribe/unsubscribe fail fast with `reason`). Returns `false` if the
-/// task should exit.
+/// subscribe/unsubscribe fail fast with `park`'s error). Returns `false` if
+/// the task should exit.
 async fn wait_for_provisioning<T>(
     rx: &mut watch::Receiver<T>,
     cmd_rx: &mut mpsc::Receiver<LiveCommand>,
-    reason: &'static str,
+    park: Park,
 ) -> bool {
     loop {
         tokio::select! {
@@ -866,10 +888,7 @@ async fn wait_for_provisioning<T>(
                             LiveCommand::Subscribe(_, _, ack)
                             | LiveCommand::Unsubscribe(_, _, ack),
                         ) => {
-                            let _ = ack.send(Err(Error::Provider {
-                                provider: PROVIDER_ID.to_string(),
-                                message: reason.to_string(),
-                            }));
+                            let _ = ack.send(Err(park.error()));
                         }
                         None => return false,
                     }
@@ -885,10 +904,7 @@ async fn wait_for_provisioning<T>(
                         LiveCommand::Subscribe(_, _, ack)
                         | LiveCommand::Unsubscribe(_, _, ack),
                     ) => {
-                        let _ = ack.send(Err(Error::Provider {
-                            provider: PROVIDER_ID.to_string(),
-                            message: reason.to_string(),
-                        }));
+                        let _ = ack.send(Err(park.error()));
                     }
                     None => return false,
                 }

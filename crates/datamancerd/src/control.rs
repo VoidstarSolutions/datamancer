@@ -28,7 +28,7 @@ pub fn error_code(err: &datamancer::Error) -> &'static str {
         Error::EventsAlreadyTaken => codes::EVENTS_ALREADY_TAKEN,
         Error::Storage(_) => codes::STORAGE,
         Error::Config(_) => codes::CONFIG,
-        Error::Provider { .. } | Error::Io(_) => codes::PROVIDER,
+        Error::Provider { .. } | Error::Unauthenticated { .. } | Error::Io(_) => codes::PROVIDER,
         // `Error` is `#[non_exhaustive]`; any future variant maps to internal.
         _ => codes::INTERNAL,
     }

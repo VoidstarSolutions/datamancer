@@ -487,10 +487,23 @@ impl Datamancer {
         // first value, so they skip this.
         let seed_rx = (backfill_from.is_none())
             .then(|| Self::spawn_latest_seed(provider.clone(), instrument.clone(), kind));
+        // A failed open leaves no controller and no substream behind, so its
+        // evidence is recorded on the provider here (`last_error`, and the
+        // auth-rejection flag for `Error::Unauthenticated`); otherwise a
+        // provider that never connects would have nothing to report.
         accounting.record_live_start();
-        let live = provider.start_live(provider_tx).await?;
+        let live = match provider.start_live(provider_tx).await {
+            Ok(live) => live,
+            Err(e) => {
+                accounting.record_open_failure(&e);
+                return Err(e);
+            }
+        };
         accounting.record_subscribe();
-        live.subscribe(instrument, kind).await?;
+        if let Err(e) = live.subscribe(instrument, kind).await {
+            accounting.record_open_failure(&e);
+            return Err(e);
+        }
         tokio::spawn(controller.run_live(
             live,
             backfill_from,
@@ -2569,6 +2582,7 @@ fn data_source_ts(ev: &MarketEvent) -> Option<Timestamp> {
 fn provider_error_message(e: &Error) -> String {
     match e {
         Error::Provider { message, .. } => message.clone(),
+        Error::Unauthenticated { message, .. } => format!("unauthenticated: {message}"),
         other => other.to_string(),
     }
 }

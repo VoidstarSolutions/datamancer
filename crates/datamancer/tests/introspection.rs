@@ -825,6 +825,176 @@ async fn duplicate_connect_is_not_a_transition() {
     assert_eq!(p.connection_state, datamancer::ConnectionState::Connected);
 }
 
+fn disconnected_with(id: &str, cause: DisconnectCause, reason: &str) -> MarketEvent {
+    MarketEvent::Control(Control {
+        source_ts: Timestamp(0),
+        rx_ts: Timestamp(0),
+        seq: Seq(0),
+        kind: ControlKind::ProviderDisconnected {
+            provider: id.to_string(),
+            reason: reason.to_string(),
+            cause,
+        },
+    })
+}
+
+#[tokio::test]
+async fn rejected_credentials_outlive_the_last_subscription() {
+    // Rejected credentials, then unsubscribe: the provider must keep reading
+    // Unauthenticated (the next request would fail the same way), not Idle.
+    let (provider, ctrl) = LiveProvider::new("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+    ctrl.push(
+        "AAPL",
+        disconnected_with("fake", DisconnectCause::Unauthenticated, "auth rejected"),
+    )
+    .await;
+    ctrl.push("AAPL", trade("AAPL", 1, 1)).await;
+    drain_until_marker(&mut stream, 1).await;
+    let snap = dm.snapshot().await.unwrap();
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    assert_eq!(view.providers[0].state, ProviderState::Unauthenticated);
+
+    drop(stream);
+    session.close().await.unwrap();
+    let snap = snapshot_until(&dm, "AAPL left the registry", |s| {
+        s.authoritative_sessions.is_empty()
+    })
+    .await;
+    let p = provider_snap(&snap, "fake");
+    assert_eq!(p.active_subscriptions, 0);
+    assert_eq!(
+        p.connection_state,
+        datamancer::ConnectionState::Unauthenticated
+    );
+    assert_eq!(p.last_error.as_deref(), Some("auth rejected"));
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    assert_eq!(view.providers[0].state, ProviderState::Unauthenticated);
+    assert_eq!(view.providers[0].detail.as_deref(), Some("auth rejected"));
+}
+
+/// A provider whose live handle refuses every subscribe with `error()`, the
+/// shape of a streaming task parked for want of credentials (or disabled):
+/// the open fails before any controller exists.
+struct RefusingProvider {
+    error: fn() -> datamancer::Error,
+}
+
+struct RefusingLive {
+    error: fn() -> datamancer::Error,
+}
+
+#[async_trait]
+impl Provider for RefusingProvider {
+    fn id(&self) -> &'static str {
+        "fake"
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(RefusingLive { error: self.error }))
+    }
+    async fn fetch_history(
+        &self,
+        _request: HistoryRequest,
+        _sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl LiveHandle for RefusingLive {
+    async fn subscribe(&self, _i: Instrument, _k: EventKind) -> Result<()> {
+        Err((self.error)())
+    }
+    async fn unsubscribe(&self, _i: Instrument, _k: EventKind) -> Result<()> {
+        Ok(())
+    }
+    async fn close(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+}
+
+async fn open_fails(error: fn() -> datamancer::Error) -> datamancer_core::SystemSnapshot {
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(RefusingProvider { error }))
+        .build()
+        .unwrap();
+    let opened = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await;
+    match opened {
+        Ok(_) => panic!("the open must fail"),
+        Err(err) => assert_eq!(err.to_string(), error().to_string()),
+    }
+    dm.snapshot().await.unwrap()
+}
+
+#[tokio::test]
+async fn open_refused_for_want_of_credentials_reads_unauthenticated() {
+    // No controller, no substream: the failed open itself is the evidence.
+    let snap = open_fails(|| datamancer::Error::Unauthenticated {
+        provider: "fake".to_string(),
+        message: "waiting for credentials".to_string(),
+    })
+    .await;
+    let p = provider_snap(&snap, "fake");
+    assert_eq!(p.active_subscriptions, 0);
+    assert_eq!(
+        p.connection_state,
+        datamancer::ConnectionState::Unauthenticated
+    );
+    assert_eq!(
+        p.last_error.as_deref(),
+        Some("provider fake: unauthenticated: waiting for credentials")
+    );
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    assert_eq!(view.providers[0].state, ProviderState::Unauthenticated);
+}
+
+#[tokio::test]
+async fn open_refused_for_another_reason_reads_idle_with_detail() {
+    // A non-credential refusal (a disabled park, a transport fault) is kept
+    // as detail; with nothing requested the provider reads Idle.
+    let snap = open_fails(|| datamancer::Error::Provider {
+        provider: "fake".to_string(),
+        message: "provider disabled".to_string(),
+    })
+    .await;
+    let p = provider_snap(&snap, "fake");
+    assert_eq!(p.connection_state, datamancer::ConnectionState::Unknown);
+    assert_eq!(
+        p.last_error.as_deref(),
+        Some("provider fake: provider disabled")
+    );
+    let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_STALE_AFTER_NS);
+    assert_eq!(view.providers[0].state, ProviderState::Idle);
+    assert_eq!(
+        view.providers[0].detail.as_deref(),
+        Some("provider fake: provider disabled")
+    );
+}
+
 /// Stamp a control with a wall-clock receipt time.
 fn received_at(ev: MarketEvent, rx: i64) -> MarketEvent {
     match ev {

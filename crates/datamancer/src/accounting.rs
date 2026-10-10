@@ -23,7 +23,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use datamancer_core::{
-    ConnectionState, Control, ControlKind, DisconnectCause, MarketEvent, StreamConnection,
+    ConnectionState, Control, ControlKind, DisconnectCause, Error, MarketEvent, StreamConnection,
 };
 
 use crate::client_session::ConnectionChange;
@@ -156,6 +156,18 @@ impl ProviderAccounting {
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = Some(message.to_string());
         }
+    }
+
+    /// Record a failed live open (`start_live`/`subscribe` returned `Err`, so
+    /// no controller and no substream exist to carry the evidence). The error
+    /// text becomes `last_error`; an [`Error::Unauthenticated`] also sets the
+    /// sticky auth-rejection flag, so a provider that never connected because
+    /// it has no usable credentials reads `Unauthenticated`, not `Unknown`.
+    pub(crate) fn record_open_failure(&self, error: &Error) {
+        if let Error::Unauthenticated { .. } = error {
+            self.auth_failed.store(true, Ordering::Relaxed);
+        }
+        self.record_error(&error.to_string());
     }
 }
 

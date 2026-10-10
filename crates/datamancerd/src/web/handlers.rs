@@ -314,6 +314,44 @@ mod tests {
         assert!(!connecting.ready);
     }
 
+    #[test]
+    fn unauthenticated_provider_is_not_ready_even_with_nothing_requested() {
+        // Rejected credentials, then the last subscription ends (or a live
+        // open that failed for want of credentials): the next request would
+        // fail the same way, so the fault wins over Idle and blocks readiness.
+        let provider = ProviderSnapshot::new(
+            ProviderId::from_static("p"),
+            ConnectionState::Unauthenticated,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            Some("auth rejected".to_string()),
+        )
+        .with_active_subscriptions(0);
+        let snap = SystemSnapshot::new(
+            Timestamp(1_000),
+            vec![provider],
+            CacheSnapshot::new(vec![], None),
+            vec![],
+            vec![],
+        );
+        let env = HealthEnvelope::from_snapshot(&snap, "keychain");
+        assert_eq!(
+            env.health.providers[0].state,
+            ProviderState::Unauthenticated
+        );
+        assert_eq!(
+            env.health.providers[0].detail.as_deref(),
+            Some("auth rejected")
+        );
+        assert!(!env.ready);
+    }
+
     fn config_state() -> ConfigState {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
