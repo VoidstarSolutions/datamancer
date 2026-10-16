@@ -63,6 +63,17 @@ impl Drop for Daemon {
     }
 }
 
+impl Daemon {
+    /// Simulate a crash: SIGKILL the daemon and reap it, so it never runs its
+    /// drain and its iceoryx2 node and per-client services stay registered
+    /// with a dead owner. Dropping the guard afterwards is a no-op on the
+    /// reaped child and releases the suite lock.
+    fn kill_abruptly(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Spawn the daemon with a memory-backed config and wait for its control
 /// socket to appear. Returns the daemon guard and the socket path.
 fn spawn_daemon(dir: &std::path::Path) -> (Daemon, PathBuf) {
@@ -194,6 +205,60 @@ fn open_client_creates_a_service_then_closes() {
     assert!(
         !clients.iter().any(|c| c == "exec-1"),
         "client not torn down"
+    );
+}
+
+/// A daemon that starts after its predecessor crashed must serve its first
+/// client (#96). The predecessor owns a live data service when it is killed
+/// with SIGKILL, so its node and `data/0` + `symbols/0` services stay behind
+/// with a dead owner; the successor numbers its first client 0 as well and
+/// re-creates the same names. iceoryx2 0.10 attempts dead-node cleanup both
+/// when the successor creates its node and when it opens the service, so
+/// this test pins whether that is enough: a rejected `open-client` here is
+/// the same `IsMarkedForDestruction` the nightly suite showed before #92,
+/// reproduced on purpose instead of by test order.
+#[test]
+#[ignore = "spawns the daemon twice, needs a live iceoryx2 runtime"]
+fn a_restarted_daemon_serves_its_first_client_after_a_crash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut victim, socket) = spawn_daemon(dir.path());
+
+    // Hold the client's connection open so its data service exists at the
+    // moment the daemon dies.
+    let stream = UnixStream::connect(&socket).expect("connect");
+    let mut writer = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    writer
+        .write_all(br#"{"op":"open-client","client":"crash-victim"}"#)
+        .expect("write");
+    writer.write_all(b"\n").expect("nl");
+    writer.flush().expect("flush");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
+    assert_eq!(
+        reply["ok"],
+        serde_json::Value::Bool(true),
+        "victim open-client: {reply}"
+    );
+
+    victim.kill_abruptly();
+    // Release the suite lock before the successor spawns; the connection is
+    // dead with the daemon.
+    drop(victim);
+    drop(writer);
+    drop(reader);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_successor, socket) = spawn_daemon(dir.path());
+    let reply = round_trip(
+        &socket,
+        r#"{"op":"open-client","client":"crash-successor"}"#,
+    );
+    assert_eq!(
+        reply["ok"],
+        serde_json::Value::Bool(true),
+        "first open after a crashed predecessor was rejected: {reply}"
     );
 }
 
