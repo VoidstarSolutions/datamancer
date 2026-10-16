@@ -61,9 +61,24 @@ jobs:
       # output is the difference between a diagnosable log and a silent
       # 30-minute timeout. Step-level timeouts keep a recurrence from eating
       # the whole job budget.
+      # The spawned daemons inherit the test's stderr, so RUST_LOG puts their
+      # logs (service creation, drain phases) in the step output (#87).
       - name: daemon e2e
         timeout-minutes: 10
+        env:
+          RUST_LOG: datamancerd=debug,datamancer=debug
         run: cargo test -p datamancerd --all-features --test daemon_e2e -- --ignored --nocapture
       - name: client transport e2e
         timeout-minutes: 10
+        env:
+          RUST_LOG: datamancerd=debug,datamancer=debug
         run: cargo test -p datamancerd --all-features --test client_transport_e2e -- --ignored --nocapture
+      # On failure, show what iceoryx2 state survived the run: its root
+      # (`/tmp/iceoryx2/` is the 0.10 Linux default) and its shared-memory
+      # segments. Lingering service or node entries point at a daemon that
+      # did not drain (#87).
+      - name: dump iceoryx2 state on failure
+        if: failure()
+        run: |
+          ls -laR /tmp/iceoryx2 || true
+          ls -la /dev/shm || true
