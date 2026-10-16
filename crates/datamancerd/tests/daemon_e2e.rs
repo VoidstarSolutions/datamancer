@@ -113,6 +113,10 @@ publish_interval_ms = 200
     let child = Command::new(bin)
         .arg("--config")
         .arg(&config_path)
+        // iceoryx2's own log (dead-node detection, cleanup, service
+        // open/create retries) on the daemon's inherited stderr, so a
+        // rejected open is diagnosable from the `--nocapture` output (#96).
+        .env("IOX2_LOG_LEVEL", "trace")
         .spawn()
         .expect("spawn datamancerd");
 
@@ -236,6 +240,9 @@ fn a_restarted_daemon_serves_its_first_client_after_a_crash() {
     let mut line = String::new();
     reader.read_line(&mut line).expect("read");
     let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
+    if reply["ok"] != serde_json::Value::Bool(true) {
+        dump_iceoryx2_state("victim open-client rejected");
+    }
     assert_eq!(
         reply["ok"],
         serde_json::Value::Bool(true),
@@ -255,11 +262,42 @@ fn a_restarted_daemon_serves_its_first_client_after_a_crash() {
         &socket,
         r#"{"op":"open-client","client":"crash-successor"}"#,
     );
+    if reply["ok"] != serde_json::Value::Bool(true) {
+        dump_iceoryx2_state("successor open-client rejected");
+    }
     assert_eq!(
         reply["ok"],
         serde_json::Value::Bool(true),
         "first open after a crashed predecessor was rejected: {reply}"
     );
+}
+
+/// Print what iceoryx2 left under its root (`/tmp/iceoryx2`, the 0.10 Linux
+/// default) and in shared memory, for a failure only a leftover service or
+/// node can explain. Best-effort: a missing directory prints nothing.
+fn dump_iceoryx2_state(why: &str) {
+    fn walk(dir: &std::path::Path, depth: usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            eprintln!("{:indent$}{}", "", path.display(), indent = depth * 2);
+            if path.is_dir() {
+                walk(&path, depth + 1);
+            }
+        }
+    }
+    eprintln!("daemon_e2e: {why}; iceoryx2 state:");
+    walk(std::path::Path::new("/tmp/iceoryx2"), 1);
+    if let Ok(entries) = std::fs::read_dir("/dev/shm") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains("iox2") {
+                eprintln!("  /dev/shm/{name}");
+            }
+        }
+    }
 }
 
 /// A bounded historical bar query over a month-long, long-closed range: real

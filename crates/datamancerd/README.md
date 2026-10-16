@@ -180,6 +180,12 @@ the normal load path runs). **`RUST_LOG` always wins**: when set, it overrides
 without touching the config file). `format = "json"` emits newline-delimited
 JSON records instead of the default human-readable text.
 
+The iceoryx2 library logs separately, through its own stderr logger at `info`
+by default. Unix/macOS daemons honour `IOX2_LOG_LEVEL` (`trace`, `debug`,
+`info`, `warn`, `error`, `fatal`) at node creation, so a service open/create
+retry or a dead-node cleanup can be followed at boot; `[log]` and `RUST_LOG`
+do not affect it.
+
 For `embedded`, `path` is optional and defaults to the platform-native
 data directory (`<data dir>` above): macOS
 `~/Library/Application Support/datamancer`, Linux
