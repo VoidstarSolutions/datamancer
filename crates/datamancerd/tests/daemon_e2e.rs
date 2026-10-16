@@ -27,11 +27,17 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-/// Makes every daemon's `service_prefix` unique (`<pid>-<n>`). iceoryx2
-/// reports `SystemInFlux` when a service name is created and removed in quick
-/// succession (#72); with a fixed prefix and client ids restarting at 0, each
-/// test's daemon re-created the previous one's service names seconds after
-/// its kill. Distinct names per daemon remove the trigger entirely.
+/// Makes every daemon's `service_prefix` unique (`<pid>-<n>`), so a reply's
+/// advertised service name identifies the daemon that sent it.
+///
+/// This does **not** make the underlying iceoryx2 services unique: the data
+/// sink names them `datamancer/v<wire>/data/{id}` and
+/// `datamancer/v<wire>/symbols/{id}` without the prefix, and every daemon
+/// starts ids at 0. Each test's daemon therefore re-creates the previous
+/// daemon's service names. What keeps that safe is [`Daemon`]'s graceful stop
+/// (#87): the previous daemon's drain removes its services before the next
+/// daemon starts. After a SIGKILL they linger with a dead owner, and opening
+/// one fails with `IsMarkedForDestruction` (#87) or `SystemInFlux` (#72).
 static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Serializes the whole suite: `datamancerd` takes a **global** single-instance
@@ -42,24 +48,90 @@ static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
 /// is not an option; the tests take turns instead.
 static DAEMON_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A spawned daemon that is killed when the test ends — **including on
-/// panic**, which a bare `child.kill()` at the end of a test body skips. A
-/// leaked daemon keeps holding the single-instance lock and makes every later
-/// run of this suite fail at `spawn_daemon`.
+/// How long [`Daemon`]'s `Drop` waits for a graceful exit before it falls back
+/// to SIGKILL. The daemon's own drain is bounded by `shutdown_timeout_secs`
+/// (30 s by default), but a test daemon with a handful of clients drains in
+/// well under a second.
+const GRACEFUL_STOP: Duration = Duration::from_secs(15);
+
+/// A spawned daemon that is stopped when the test ends — **including on
+/// panic**, which a bare stop at the end of a test body skips. A leaked daemon
+/// keeps holding the single-instance lock and makes every later run of this
+/// suite fail at `spawn_daemon`.
 struct Daemon {
-    // Field order is drop order: kill the child before releasing the lock, or
+    // Field order is drop order: stop the child before releasing the lock, or
     // the next test races the dying daemon for the single-instance lock.
     child: Child,
     _lock: std::sync::MutexGuard<'static, ()>,
+    /// The control socket, for the graceful `shutdown` op in `Drop`.
+    socket: PathBuf,
     /// The `[server].service_prefix` this daemon was started with, for tests
     /// that assert on a reply's full service name.
     service_prefix: String,
 }
 
 impl Drop for Daemon {
+    /// Stop the daemon with the `shutdown` control op and wait for it to exit,
+    /// so its drain removes its iceoryx2 services and node before the next
+    /// test's daemon re-creates the same service names (see [`PREFIX_SEQ`]).
+    /// Falls back to SIGKILL if the op cannot be sent, is refused, or the
+    /// daemon does not exit within [`GRACEFUL_STOP`].
+    ///
+    /// The graceful stop lives in `Drop`, not at the end of each test body,
+    /// because this suite runs several daemons in sequence: one test's
+    /// teardown is the next test's setup, so it must be graceful on the panic
+    /// path too. The `shutdown` op is used because this suite already speaks
+    /// the control protocol; it runs the same drain as SIGTERM. The fallback
+    /// is reported on stderr, so a drain that stops working shows up in the
+    /// `--nocapture` log instead of silently reintroducing the race.
+    ///
+    /// Nothing here may panic — a panic in `Drop` while a failing test unwinds
+    /// aborts the process.
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        let stopped =
+            request_shutdown(&self.socket) && wait_for_exit(&mut self.child, GRACEFUL_STOP);
+        if !stopped {
+            eprintln!(
+                "daemon_e2e: graceful shutdown failed or timed out after {GRACEFUL_STOP:?}; \
+                 killing the daemon (its iceoryx2 services are left behind)"
+            );
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
+    }
+}
+
+/// Send `{"op":"shutdown"}` and read the reply if one arrives. Returns `false`
+/// if the daemon could not be reached or refused the op. A missing reply
+/// counts as sent: the daemon replies before it drains, best-effort.
+fn request_shutdown(socket: &std::path::Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    if stream.write_all(b"{\"op\":\"shutdown\"}\n").is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    let _ = BufReader::new(stream).read_line(&mut line);
+    match serde_json::from_str::<serde_json::Value>(&line) {
+        Ok(reply) => reply["ok"] == true,
+        Err(_) => true,
+    }
+}
+
+/// Poll `child` until it exits or `timeout` passes. Returns whether it exited.
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -108,6 +180,7 @@ publish_interval_ms = 200
     let daemon = Daemon {
         child,
         _lock: lock,
+        socket: socket.clone(),
         service_prefix,
     };
 
