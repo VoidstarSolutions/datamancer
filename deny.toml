@@ -36,6 +36,17 @@ ignore = true
 
 [advisories]
 yanked = "deny"
+# zbus 6.0 absorbed zvariant, zvariant_derive and zbus_names, and RustSec marks
+# the standalone crates unmaintained. They reach us only through the Linux
+# secret-service keyring backend (keyring -> zbus-secret-service-keyring-store
+# -> secret-service 5 -> zbus 5), and no release of that chain builds on zbus 6
+# yet (checked 2026-10-20: secret-service 5.2.0 still requires zbus ^5). Drop
+# these once secret-service ships on zbus 6 and the lockfile moves with it.
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained standalone; no zbus 6 path via secret-service yet" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained standalone; no zbus 6 path via secret-service yet" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained standalone; no zbus 6 path via secret-service yet" },
+]
 
 [bans]
 multiple-versions = "warn"
