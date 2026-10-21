@@ -102,6 +102,10 @@ publish_interval_ms = 200
     let child = Command::new(bin)
         .arg("--config")
         .arg(&config_path)
+        // iceoryx2's own log (dead-node detection, cleanup, service
+        // open/create retries) on the daemon's inherited stderr, so a
+        // rejected open is diagnosable from the `--nocapture` output (#96).
+        .env("IOX2_LOG_LEVEL", "trace")
         .spawn()
         .expect("spawn datamancerd");
 
