@@ -117,8 +117,9 @@ query_persistence = "cached"      # none | cached | cached_with_tap | read_only 
 # explicitly on both sides.
 # admin_socket = "/run/datamancer/control.sock"
 # Prefix of every per-client iceoryx2 service name
-# (`{service_prefix}/v{WIRE_VERSION}/data/{id}`); daemons with different
-# prefixes never share a service. Non-empty, checked at boot.
+# (`{service_prefix}/{boot_id}/v{WIRE_VERSION}/data/{id}`); daemons with
+# different prefixes never share a service, and the per-process boot id keeps
+# a restart off its predecessor's names. Non-empty, checked at boot.
 service_prefix = "datamancerd"
 shutdown_timeout_secs = 30
 
@@ -201,15 +202,18 @@ directory (where no default can be derived).
 
 One **long-lived control connection per client**. The client names itself with
 `open-client`; the daemon creates **one** iceoryx2 data-plane service for it
-(`{service_prefix}/v{WIRE_VERSION}/data/{id}`, with a sibling
+(`{service_prefix}/{boot_id}/v{WIRE_VERSION}/data/{id}`, with a sibling
 `.../symbols/{id}` announcement service) and a per-client multiplexing session
 whose output is pumped into that service. The reply's `service` is that exact
 name: a consumer opens it verbatim and derives the announcement name from it.
 `[server].service_prefix` scopes every per-client service, so two daemons
 with different prefixes never share a service name; the prefix must form a
-valid iceoryx2 service name or the daemon refuses to boot. There is strictly
-**one sink per client** (never shared), so per-client resume/gap accounting
-stays isolated.
+valid iceoryx2 service name or the daemon refuses to boot. `{boot_id}` is
+`{unix_secs}-{pid}` of the daemon process, so a daemon never re-creates a
+crashed predecessor's names either, even with the same config (see
+"Recovering from a crashed predecessor" below). There is strictly **one sink
+per client** (never shared), so per-client resume/gap accounting stays
+isolated.
 
 A graceful `close-client` or a connection **EOF** tears the client down,
 flushing its sink and releasing its authoritative refcounts.
@@ -395,12 +399,12 @@ One JSON object per line; one reply line per request.
 
 ```jsonc
 {"op":"open-client","client":"exec-1","subscriptions":[ /* SubscriptionSpec… */ ]}
-  -> {"ok":true,"service":"datamancerd/v3/data/0"}
+  -> {"ok":true,"service":"datamancerd/1729600000-4321/v3/data/0"}
 {"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
 {"op":"unsubscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
 {"op":"close-client","client":"exec-1"}
 {"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1704067200000000000,"to":1704672000000000000}
-  -> {"ok":true,"query":0,"service":"datamancerd/v3/data/0"}
+  -> {"ok":true,"query":0,"service":"datamancerd/1729600000-4321/v3/data/0"}
 {"op":"cancel-query","query":0}
   -> {"ok":true}
 {"op":"list-queries"}  -> {"ok":true,"queries":[0,1]}
@@ -434,10 +438,10 @@ One JSON object per line; one reply line per request.
 `from..to` (inclusive `from`, `to >= from` or `bad_request`) — **ungated**,
 like `snapshot`, and, unlike `open-client`/`subscribe`, it needs **no** prior
 `open-client`: the daemon opens its own historical `Session`, allocates its
-own short-lived data service (`{service_prefix}/v{WIRE_VERSION}/data/{id}`,
-the same id space and name shape as `open-client`'s per-client services,
-advertised verbatim in the reply's `service`), and pumps the bounded stream
-into it.
+own short-lived data service
+(`{service_prefix}/{boot_id}/v{WIRE_VERSION}/data/{id}`, the same id space
+and name shape as `open-client`'s per-client services, advertised verbatim in
+the reply's `service`), and pumps the bounded stream into it.
 A query that runs to completion ends with a terminal `SessionClosing` control
 on its data stream and the daemon reaps the entry (and the service) on its
 own — no `cancel-query` needed. A provider fetch failure is emitted
@@ -534,6 +538,34 @@ supported subscriber: a same-host shared-memory subscription independent of
 the control connection, returning an infallible `HealthStream`
 (`tokio_stream::wrappers::ReceiverStream<HealthView>`) that never errors —
 a setup failure ends the stream immediately instead.
+
+### Recovering from a crashed predecessor (iceoryx2)
+
+A `datamancerd` killed while removing one of its iceoryx2 services (the
+normal teardown after a client or query closes) leaves that service marked
+for destruction with no live owner. iceoryx2 0.10's dead-node cleanup, which
+runs when a node is created and when a service is opened, only visits
+services a dead node still references, so such a service is never cleaned up
+and every later open of its name fails `IsMarkedForDestruction` (or
+`SystemInFlux`, the other timeout exit of the same retry loop).
+
+- **Per-client services never hit this.** Their names carry the daemon
+  process's boot id, so a restart re-creates none of its predecessor's names
+  and a stale one is simply left behind (one static service file plus its
+  dynamic storage under iceoryx2's root, bounded by the number of crashes).
+- **The host-global `datamancer/diagnostics` and `datamancer/health` names
+  can.** Clients find them by fixed name, so they cannot be boot-scoped. If
+  one is stale, the daemon refuses to boot with
+  `transport: … is marked for destruction with no live owner …` naming the
+  service and this recovery. iceoryx2 0.10 ships no supported way for the
+  daemon to remove such a service on its own (`Node::force_remove_service` is
+  `unsafe` and this workspace forbids unsafe code outside Win32/FFI), so the
+  recovery is manual: stop every iceoryx2 process on the host for this user
+  (`datamancerd` and its consumers), remove iceoryx2's root directory
+  (`/tmp/iceoryx2` by default; `global.root_path` in the iceoryx2 config) and
+  the `iox2_*` entries in `/dev/shm`, then start `datamancerd` again. Never
+  remove them while any participant is running: that destroys live
+  participants' data.
 
 `get-config`/`configure-provider`/`remove-provider`/`shutdown` are the
 config-service ops (spec cycle 3); see the dedicated section below for
