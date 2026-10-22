@@ -157,7 +157,7 @@ mod runtime {
                 .publish_subscribe::<[u8]>()
                 .history_size(1)
                 .open_or_create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+                .map_err(|e| crate::error::open_or_create_error(name.as_str(), e))?;
             let publisher = service
                 .publisher_builder()
                 .initial_max_slice_len(DIAGNOSTICS_PAYLOAD_CAPACITY)
@@ -192,7 +192,7 @@ mod runtime {
                 .publish_subscribe::<[u8]>()
                 .history_size(1)
                 .open_or_create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+                .map_err(|e| crate::error::open_or_create_error(name.as_str(), e))?;
             let subscriber = service
                 .subscriber_builder()
                 .create()
