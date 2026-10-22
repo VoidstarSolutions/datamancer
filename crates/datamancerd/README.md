@@ -546,8 +546,12 @@ normal teardown after a client or query closes) leaves that service marked
 for destruction with no live owner. iceoryx2 0.10's dead-node cleanup, which
 runs when a node is created and when a service is opened, only visits
 services a dead node still references, so such a service is never cleaned up
-and every later open of its name fails `IsMarkedForDestruction` (or
-`SystemInFlux`, the other timeout exit of the same retry loop).
+and every later open of its name fails `IsMarkedForDestruction` once the
+creation timeout passes. (`SystemInFlux` is a different, transient condition:
+open and create alternating because another participant is creating or
+removing the same name at that moment, typically a restart's own dead-node
+cleanup racing its first create. It clears on its own and is not treated as
+stale.)
 
 - **Per-client services never hit this.** Their names carry the daemon
   process's boot id, so a restart re-creates none of its predecessor's names
