@@ -278,6 +278,18 @@ pub struct Server {
     draining: bool,
 }
 
+/// The prefix becomes part of every per-client iceoryx2 service name
+/// (`{prefix}/v{WIRE_VERSION}/data/{id}`), so a prefix that cannot form a
+/// valid name is a config error at boot, not an `open-client` failure for
+/// every client later.
+#[cfg(not(windows))]
+fn checked_service_prefix(prefix: &str) -> Result<String> {
+    datamancer::transport::validate_service_prefix(prefix).map_err(|e| {
+        crate::error::DaemonError::ConfigInvalid(format!("[server].service_prefix: {e}"))
+    })?;
+    Ok(prefix.to_string())
+}
+
 impl Server {
     /// Build the daemon from a validated [`Config`]: assemble the
     /// [`Datamancer`], create the one process-wide iceoryx2 node, and open the
@@ -289,7 +301,7 @@ impl Server {
     pub async fn bootstrap(config: Config, config_path: std::path::PathBuf) -> Result<Self> {
         let admin_socket = config.server.admin_socket.clone();
         #[cfg(not(windows))]
-        let service_prefix = config.server.service_prefix.clone();
+        let service_prefix = checked_service_prefix(&config.server.service_prefix)?;
         #[cfg(not(windows))]
         let max_clients = config.iceoryx2.max_clients;
         let max_queries = config.iceoryx2.max_queries;
@@ -972,13 +984,15 @@ impl Server {
         }
 
         let id = self.next_client_id;
-        let sink = match Iceoryx2DataSink::new(&self.node, id) {
-            Ok(sink) => Arc::new(sink) as Arc<dyn EventSink>,
+        let sink = match Iceoryx2DataSink::new(&self.node, &self.service_prefix, id) {
+            Ok(sink) => sink,
             Err(e) => {
                 return Reply::error(codes::INTERNAL, format!("data sink: {e:?}"));
             }
         };
-        let service = format!("{}/data/{id}", self.service_prefix);
+        // Advertise the service by the exact name the sink created it under.
+        let service = sink.data_service_name().to_string();
+        let sink = Arc::new(sink) as Arc<dyn EventSink>;
 
         let session = self.dm.client_session();
         // Apply seed subscriptions before taking the stream.
@@ -1061,14 +1075,16 @@ impl Server {
         // every error path must `close_query_session` — dropping the handle
         // leaves the controller (and the provider fetch) running with nobody
         // draining it. See `close_query_session`.
-        let sink = match Iceoryx2DataSink::new(&self.node, id) {
-            Ok(sink) => Arc::new(sink) as Arc<dyn EventSink>,
+        let sink = match Iceoryx2DataSink::new(&self.node, &self.service_prefix, id) {
+            Ok(sink) => sink,
             Err(e) => {
                 close_query_session(session);
                 return Reply::error(codes::INTERNAL, format!("query data sink: {e:?}"));
             }
         };
-        let service = format!("{}/data/{id}", self.service_prefix);
+        // Advertise the service by the exact name the sink created it under.
+        let service = sink.data_service_name().to_string();
+        let sink = Arc::new(sink) as Arc<dyn EventSink>;
         let stream = match session.take_events().await {
             Ok(stream) => stream,
             Err(e) => {

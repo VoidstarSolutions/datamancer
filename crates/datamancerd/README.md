@@ -116,6 +116,9 @@ query_persistence = "cached"      # none | cached | cached_with_tap | read_only 
 # `default_control_socket()` cannot discover that path — configure it
 # explicitly on both sides.
 # admin_socket = "/run/datamancer/control.sock"
+# Prefix of every per-client iceoryx2 service name
+# (`{service_prefix}/v{WIRE_VERSION}/data/{id}`); daemons with different
+# prefixes never share a service. Non-empty, checked at boot.
 service_prefix = "datamancerd"
 shutdown_timeout_secs = 30
 
@@ -198,9 +201,15 @@ directory (where no default can be derived).
 
 One **long-lived control connection per client**. The client names itself with
 `open-client`; the daemon creates **one** iceoryx2 data-plane service for it
-(`{service_prefix}/data/{id}`) and a per-client multiplexing session whose
-output is pumped into that service. There is strictly **one sink per client**
-(never shared), so per-client resume/gap accounting stays isolated.
+(`{service_prefix}/v{WIRE_VERSION}/data/{id}`, with a sibling
+`.../symbols/{id}` announcement service) and a per-client multiplexing session
+whose output is pumped into that service. The reply's `service` is that exact
+name: a consumer opens it verbatim and derives the announcement name from it.
+`[server].service_prefix` scopes every per-client service, so two daemons
+with different prefixes never share a service name; the prefix must form a
+valid iceoryx2 service name or the daemon refuses to boot. There is strictly
+**one sink per client** (never shared), so per-client resume/gap accounting
+stays isolated.
 
 A graceful `close-client` or a connection **EOF** tears the client down,
 flushing its sink and releasing its authoritative refcounts.
@@ -386,12 +395,12 @@ One JSON object per line; one reply line per request.
 
 ```jsonc
 {"op":"open-client","client":"exec-1","subscriptions":[ /* SubscriptionSpec… */ ]}
-  -> {"ok":true,"service":"datamancerd/data/0"}
+  -> {"ok":true,"service":"datamancerd/v3/data/0"}
 {"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
 {"op":"unsubscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
 {"op":"close-client","client":"exec-1"}
 {"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1704067200000000000,"to":1704672000000000000}
-  -> {"ok":true,"query":0,"service":"datamancerd/data/0"}
+  -> {"ok":true,"query":0,"service":"datamancerd/v3/data/0"}
 {"op":"cancel-query","query":0}
   -> {"ok":true}
 {"op":"list-queries"}  -> {"ok":true,"queries":[0,1]}
@@ -425,8 +434,10 @@ One JSON object per line; one reply line per request.
 `from..to` (inclusive `from`, `to >= from` or `bad_request`) — **ungated**,
 like `snapshot`, and, unlike `open-client`/`subscribe`, it needs **no** prior
 `open-client`: the daemon opens its own historical `Session`, allocates its
-own short-lived data service (`{service_prefix}/data/{id}`, the same id space
-as `open-client`'s per-client services), and pumps the bounded stream into it.
+own short-lived data service (`{service_prefix}/v{WIRE_VERSION}/data/{id}`,
+the same id space and name shape as `open-client`'s per-client services,
+advertised verbatim in the reply's `service`), and pumps the bounded stream
+into it.
 A query that runs to completion ends with a terminal `SessionClosing` control
 on its data stream and the daemon reaps the entry (and the service) on its
 own — no `cancel-query` needed. A provider fetch failure is emitted

@@ -646,11 +646,11 @@ mod tests {
 
     #[test]
     fn query_reply_carries_id_and_service_and_omits_absent_fields() {
-        let reply = Reply::query(7, "datamancer/v2/data/7".to_string());
+        let reply = Reply::query(7, "datamancerd/v3/data/7".to_string());
         let json = serde_json::to_string(&reply).expect("serialize");
         assert!(json.contains(r#""query":7"#), "got {json}");
         assert!(
-            json.contains(r#""service":"datamancer/v2/data/7""#),
+            json.contains(r#""service":"datamancerd/v3/data/7""#),
             "got {json}"
         );
         assert!(

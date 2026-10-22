@@ -170,12 +170,12 @@ fn open_client_creates_a_service_then_closes() {
     reader.read_line(&mut line).expect("read");
     let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
     assert_eq!(reply["ok"], serde_json::Value::Bool(true));
-    let expected_prefix = format!("{}/data/", daemon.service_prefix);
-    assert!(
-        reply["service"]
-            .as_str()
-            .is_some_and(|s| s.contains(&expected_prefix))
-    );
+    // The advertised name is the real service name: `spawn_daemon`'s
+    // per-daemon `service_prefix`, the wire version, then the client id.
+    let service = reply["service"].as_str().expect("service name");
+    let (prefix, _id) = datamancer::transport::parse_data_service_name(service)
+        .unwrap_or_else(|| panic!("not a data-service name: {service}"));
+    assert_eq!(prefix, daemon.service_prefix);
 
     // The client appears in list-clients (separate connection).
     let listing = round_trip(daemon.socket(), r#"{"op":"list-clients"}"#);
@@ -246,11 +246,12 @@ fn open_query_streams_bars_then_reaps_its_service() {
     let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
     assert_eq!(reply["ok"], true, "open-query rejected: {reply}");
     let id = reply["query"].as_u64().expect("query id");
-    // The service name carries `spawn_daemon`'s per-daemon `service_prefix`,
-    // not the daemon's own out-of-the-box default ("datamancerd").
+    // The advertised name is the real service name under `spawn_daemon`'s
+    // per-daemon `service_prefix`, not the daemon's out-of-the-box default
+    // ("datamancerd"), and it is exactly what the transport would create.
     assert_eq!(
         reply["service"],
-        format!("{}/data/{id}", daemon.service_prefix)
+        datamancer::transport::data_service_name(&daemon.service_prefix, id)
     );
 
     // The query is in flight immediately after the reply. `list-queries` owns

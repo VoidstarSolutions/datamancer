@@ -51,6 +51,9 @@ struct State {
 /// Per-client iceoryx2 data-plane sink. Not cloneable; dropped on client-session
 /// close (after [`flush`](EventSink::flush)).
 pub struct Iceoryx2DataSink {
+    /// The data service's full name, exactly as created; what the daemon
+    /// advertises in its `open-client` / `open-query` reply.
+    data_service_name: String,
     data: Publisher<ipc_threadsafe::Service, DataPayload, ()>,
     announcements: Publisher<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
     state: Mutex<State>,
@@ -61,16 +64,22 @@ pub struct Iceoryx2DataSink {
 
 impl Iceoryx2DataSink {
     /// Create the per-client data + announcement services on `node` and their
-    /// publishers. `node` is the one process-wide iceoryx2 node (Phase 5 owns
-    /// its lifetime); the caller keeps it alive for the sink's lifetime.
+    /// publishers, named `{prefix}/v{WIRE_VERSION}/data/{client_id}` and
+    /// `.../symbols/{client_id}` (see [`crate::naming`]). `prefix` is the
+    /// daemon's configured service prefix, so daemons with different prefixes
+    /// never share a service. `node` is the one process-wide iceoryx2 node
+    /// (Phase 5 owns its lifetime); the caller keeps it alive for the sink's
+    /// lifetime.
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError`] if a service name is invalid or a service /
-    /// publisher port cannot be created.
-    pub fn new(node: &Node<ipc_threadsafe::Service>, client_id: u64) -> Result<Self> {
-        let data_name = service_name(&crate::naming::data_service_name(client_id))?;
-        let ann_name = service_name(&crate::naming::announcement_service_name(client_id))?;
+    /// Returns [`TransportError`] if a service name is invalid (empty prefix,
+    /// or longer than iceoryx2 allows) or a service / publisher port cannot be
+    /// created.
+    pub fn new(node: &Node<ipc_threadsafe::Service>, prefix: &str, client_id: u64) -> Result<Self> {
+        let advertised = crate::naming::data_service_name(prefix, client_id);
+        let data_name = service_name(&advertised)?;
+        let ann_name = service_name(&crate::naming::announcement_service_name(prefix, client_id))?;
 
         let data_service = node
             .service_builder(&data_name)
@@ -106,6 +115,7 @@ impl Iceoryx2DataSink {
             .map_err(|e| TransportError::Service(format!("{e:?}")))?;
 
         Ok(Self {
+            data_service_name: advertised,
             data,
             announcements,
             state: Mutex::new(State {
@@ -114,6 +124,14 @@ impl Iceoryx2DataSink {
             }),
             sends: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The data service's full name, exactly as created on the node. A
+    /// consumer opens this name verbatim (see
+    /// [`DataSubscriber::open`](crate::DataSubscriber::open)).
+    #[must_use]
+    pub fn data_service_name(&self) -> &str {
+        &self.data_service_name
     }
 
     /// Publish one announcement sample.
