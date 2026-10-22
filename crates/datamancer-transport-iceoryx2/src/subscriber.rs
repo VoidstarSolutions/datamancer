@@ -97,18 +97,30 @@ mod runtime {
     }
 
     impl DataSubscriber {
-        /// Open the data and announcement services for `client_id` on `node`.
+        /// Open the data service named `data_service` on `node`, verbatim, plus
+        /// its companion announcement service. `data_service` is the name the
+        /// daemon advertised in its `open-client` / `open-query` reply
+        /// (`{prefix}/v{WIRE_VERSION}/data/{id}`); the announcement name is
+        /// derived from it, never rebuilt from a guessed prefix.
         ///
         /// # Errors
         ///
-        /// Returns [`TransportError`] if either service or subscriber port
+        /// Returns [`TransportError::BadServiceName`] if `data_service` is not
+        /// a data-service name of this crate's wire version, and
+        /// [`TransportError::Service`] if either service or subscriber port
         /// cannot be opened.
-        pub fn open(node: &Node<ipc_threadsafe::Service>, client_id: u64) -> Result<Self> {
-            let data_name: ServiceName = crate::naming::data_service_name(client_id)
-                .as_str()
+        pub fn open(node: &Node<ipc_threadsafe::Service>, data_service: &str) -> Result<Self> {
+            let (prefix, client_id) = crate::naming::parse_data_service_name(data_service)
+                .ok_or_else(|| {
+                    TransportError::BadServiceName(format!(
+                        "not a v{} data-service name: {data_service}",
+                        crate::naming::WIRE_VERSION
+                    ))
+                })?;
+            let data_name: ServiceName = data_service
                 .try_into()
                 .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))?;
-            let ann_name: ServiceName = crate::naming::announcement_service_name(client_id)
+            let ann_name: ServiceName = crate::naming::announcement_service_name(prefix, client_id)
                 .as_str()
                 .try_into()
                 .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))?;
