@@ -102,10 +102,10 @@ fn control_endpoint(_dir: &std::path::Path) -> PathBuf {
 /// `service_prefix` is unique per daemon (`<pid>-<n>`): iceoryx2 reports
 /// `SystemInFlux` when a service name is created and removed in quick
 /// succession (#72), which a fixed prefix plus client ids restarting at 0
-/// did on every respawn. `datamancer_client::iceoryx2::parse_client_id`
-/// extracts the client id from the trailing `/data/{id}` segments of the
-/// `open-client` reply's service name regardless of the configured prefix,
-/// so no particular prefix value is required here.
+/// did on every respawn. The prefix scopes the real iceoryx2 service names
+/// (`{prefix}/v{WIRE_VERSION}/data/{id}`, #95), and the client opens the
+/// name the `open-client` reply advertises verbatim, so no particular prefix
+/// value is required here and daemons never share a service.
 async fn spawn_daemon(dir: &std::path::Path, ws_port: u16) -> DaemonHandle {
     static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
     let socket = control_endpoint(dir);

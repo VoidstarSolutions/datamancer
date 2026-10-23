@@ -31,7 +31,10 @@ pub use diagnostics::{
     decode_health, decode_snapshot, encode_health, encode_snapshot,
 };
 pub use error::{Result, TransportError};
-pub use naming::{WIRE_VERSION, announcement_service_name, data_service_name};
+pub use naming::{
+    WIRE_VERSION, announcement_service_name, data_service_name, parse_data_service_name,
+    validate_service_prefix,
+};
 pub use payload::{ControlTag, DataPayload, FromPodError, PayloadKind, from_pod, to_pod};
 pub use sink::Iceoryx2DataSink;
 pub use subscriber::{DataSubscriber, HoldBuffer};
