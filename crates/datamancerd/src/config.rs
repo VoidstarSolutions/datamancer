@@ -255,10 +255,13 @@ pub struct ServerConfig {
     #[serde(default = "default_admin_socket")]
     pub admin_socket: PathBuf,
     /// Prefix of every per-client iceoryx2 service this daemon creates
-    /// (`{service_prefix}/v{WIRE_VERSION}/data/{id}` and `.../symbols/{id}`),
-    /// advertised verbatim in `open-client` / `open-query` replies. Daemons
-    /// with different prefixes never share a service. Must be non-empty and
-    /// short enough to form a valid iceoryx2 service name; checked at boot.
+    /// (`{service_prefix}/{boot_id}/v{WIRE_VERSION}/data/{id}` and
+    /// `.../symbols/{id}`, where `{boot_id}` is `{unix_secs}-{pid}` of the
+    /// daemon process), advertised verbatim in `open-client` / `open-query`
+    /// replies. Daemons with different prefixes never share a service, and a
+    /// restart never reuses its predecessor's names. Must be non-empty and
+    /// short enough to form a valid iceoryx2 service name once the boot id is
+    /// appended; checked at boot.
     /// The host-global `datamancer/diagnostics` and `datamancer/health`
     /// services are not scoped by it.
     #[serde(default = "default_service_prefix")]

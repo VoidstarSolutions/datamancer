@@ -286,16 +286,21 @@ pub struct Server {
 /// [`host_global_open_error`] instead.
 ///
 /// A configured prefix that cannot form a valid name is a config error at
-/// boot, not an `open-client` failure for every client later.
+/// boot, not an `open-client` failure for every client later. The configured
+/// value is checked on its own first (an empty prefix would otherwise hide
+/// behind the boot id, since `/{secs}-{pid}` is a valid name by itself), then
+/// the scoped result, which is what must fit the service-name budget.
 #[cfg(not(windows))]
 fn effective_service_prefix(configured: &str) -> Result<String> {
+    let invalid = |e: datamancer::transport::TransportError| {
+        crate::error::DaemonError::ConfigInvalid(format!("[server].service_prefix: {e}"))
+    };
+    datamancer::transport::validate_service_prefix(configured).map_err(invalid)?;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let prefix = boot_scoped_prefix(configured, secs, std::process::id());
-    datamancer::transport::validate_service_prefix(&prefix).map_err(|e| {
-        crate::error::DaemonError::ConfigInvalid(format!("[server].service_prefix: {e}"))
-    })?;
+    datamancer::transport::validate_service_prefix(&prefix).map_err(invalid)?;
     Ok(prefix)
 }
 
@@ -2008,7 +2013,13 @@ mod tests {
         assert_eq!(prefix, effective);
         assert!(prefix.starts_with("datamancerd/"), "{prefix}");
         assert_eq!(id, 7);
-        assert!(effective_service_prefix("").is_err());
+        // The configured value is checked before the boot id is appended:
+        // `"/{secs}-{pid}"` alone would be a valid name.
+        let empty = effective_service_prefix("")
+            .expect_err("empty prefix")
+            .to_string();
+        assert!(empty.contains("[server].service_prefix"), "{empty}");
+        assert!(empty.contains("empty"), "{empty}");
         assert!(effective_service_prefix(&"p".repeat(300)).is_err());
     }
 
