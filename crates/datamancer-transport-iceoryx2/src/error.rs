@@ -13,6 +13,12 @@ pub enum TransportError {
     BadServiceName(String),
     /// Creating or opening an iceoryx2 service/port failed.
     Service(String),
+    /// The named service exists on the host but is marked for destruction and
+    /// no live node references it: a previous owner was killed while removing
+    /// it, and iceoryx2's dead-node cleanup never visits such a service.
+    /// Opening it fails until the stale resources are removed (see the daemon
+    /// README, "Recovering from a crashed predecessor").
+    StaleService(String),
     /// Loaning or sending a sample failed.
     Send(String),
     /// An instrument could not be interned for transport (tuple too long).
@@ -28,6 +34,12 @@ impl std::fmt::Display for TransportError {
         match self {
             Self::BadServiceName(m) => write!(f, "invalid iceoryx2 service name: {m}"),
             Self::Service(m) => write!(f, "iceoryx2 service error: {m}"),
+            Self::StaleService(name) => write!(
+                f,
+                "iceoryx2 service {name} is marked for destruction with no live owner \
+                 (a previous owner was killed while removing it); it cannot be opened \
+                 until its stale resources are removed"
+            ),
             Self::Send(m) => write!(f, "iceoryx2 send error: {m}"),
             Self::Interning(m) => write!(f, "symbol interning error: {m}"),
             Self::Unsupported(m) => write!(f, "unsupported event for transport: {m}"),
@@ -37,6 +49,37 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
+/// Classify a publish-subscribe `open_or_create` failure on service `name`.
+///
+/// `IsMarkedForDestruction` after the creation timeout is what iceoryx2
+/// 0.10's `open_or_create` returns for a service whose dynamic config is
+/// locked for destruction and which no node references any more: the open
+/// keeps failing, a create is never attempted, and the loop gives up with
+/// that last error. Only that state means a stale service with no live owner
+/// is in the way, and only it becomes [`TransportError::StaleService`].
+///
+/// `SystemInFlux` is deliberately *not* classified as stale: the loop returns
+/// it when open and create alternate (does-not-exist, then already-exists)
+/// more than once within the timeout, which is a transient race with another
+/// participant creating or removing the same name (for a restart, typically
+/// the successor's own dead-node cleanup deleting the predecessor's service
+/// while the successor creates it) and clears on its own. It keeps its debug
+/// text as [`TransportError::Service`], like every other failure.
+pub(crate) fn open_or_create_error(
+    name: &str,
+    e: iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenOrCreateError,
+) -> TransportError {
+    use iceoryx2::service::builder::publish_subscribe::{
+        PublishSubscribeOpenError, PublishSubscribeOpenOrCreateError,
+    };
+    match e {
+        PublishSubscribeOpenOrCreateError::PublishSubscribeOpenError(
+            PublishSubscribeOpenError::IsMarkedForDestruction,
+        ) => TransportError::StaleService(name.to_string()),
+        other => TransportError::Service(format!("{other:?}")),
+    }
+}
+
 impl From<TransportError> for datamancer_core::Error {
     fn from(e: TransportError) -> Self {
         datamancer_core::Error::Io(std::io::Error::other(e.to_string()))
@@ -45,3 +88,49 @@ impl From<TransportError> for datamancer_core::Error {
 
 /// Convenience alias for transport-crate results.
 pub type Result<T, E = TransportError> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::{TransportError, open_or_create_error};
+    use iceoryx2::service::builder::publish_subscribe::{
+        PublishSubscribeOpenError, PublishSubscribeOpenOrCreateError,
+    };
+
+    #[test]
+    fn a_service_marked_for_destruction_classifies_as_stale() {
+        let stale = TransportError::StaleService("p/v3/data/0".to_string());
+        assert_eq!(
+            open_or_create_error(
+                "p/v3/data/0",
+                PublishSubscribeOpenOrCreateError::PublishSubscribeOpenError(
+                    PublishSubscribeOpenError::IsMarkedForDestruction
+                )
+            ),
+            stale
+        );
+        assert!(stale.to_string().contains("p/v3/data/0"));
+    }
+
+    /// `SystemInFlux` is a transient race (open/create ping-pong), not a
+    /// stale service; it must not send an operator to the stale-service
+    /// recovery.
+    #[test]
+    fn system_in_flux_is_not_classified_as_stale() {
+        let e = open_or_create_error(
+            "p/v3/data/0",
+            PublishSubscribeOpenOrCreateError::SystemInFlux,
+        );
+        assert!(matches!(&e, TransportError::Service(m) if m.contains("SystemInFlux")));
+    }
+
+    #[test]
+    fn other_open_failures_keep_the_debug_text() {
+        let e = open_or_create_error(
+            "p/v3/data/0",
+            PublishSubscribeOpenOrCreateError::PublishSubscribeOpenError(
+                PublishSubscribeOpenError::IncompatibleTypes,
+            ),
+        );
+        assert!(matches!(&e, TransportError::Service(m) if m.contains("IncompatibleTypes")));
+    }
+}

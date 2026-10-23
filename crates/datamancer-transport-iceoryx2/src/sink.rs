@@ -91,7 +91,7 @@ impl Iceoryx2DataSink {
             .subscriber_max_buffer_size(DEFAULT_DATA_HISTORY * 2)
             .max_subscribers(DEFAULT_MAX_SUBSCRIBERS)
             .open_or_create()
-            .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+            .map_err(|e| crate::error::open_or_create_error(data_name.as_str(), e))?;
         let ann_history = DEFAULT_MAX_SUBSCRIBERS * 64;
         let ann_service = node
             .service_builder(&ann_name)
@@ -102,7 +102,7 @@ impl Iceoryx2DataSink {
             .subscriber_max_buffer_size(ann_history * 2)
             .max_subscribers(DEFAULT_MAX_SUBSCRIBERS)
             .open_or_create()
-            .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+            .map_err(|e| crate::error::open_or_create_error(ann_name.as_str(), e))?;
 
         let data = data_service
             .publisher_builder()

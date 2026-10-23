@@ -129,12 +129,12 @@ mod runtime {
                 .service_builder(&data_name)
                 .publish_subscribe::<DataPayload>()
                 .open_or_create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+                .map_err(|e| crate::error::open_or_create_error(data_name.as_str(), e))?;
             let ann_service = node
                 .service_builder(&ann_name)
                 .publish_subscribe::<SymbolAnnouncement>()
                 .open_or_create()
-                .map_err(|e| TransportError::Service(format!("{e:?}")))?;
+                .map_err(|e| crate::error::open_or_create_error(ann_name.as_str(), e))?;
 
             let data = data_service
                 .subscriber_builder()

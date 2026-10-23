@@ -63,9 +63,31 @@ impl Drop for Daemon {
     }
 }
 
+impl Daemon {
+    /// Simulate a crash: SIGKILL the daemon and reap it, so it never runs its
+    /// drain and its iceoryx2 node and per-client services stay registered
+    /// with a dead owner. Dropping the guard afterwards is a no-op on the
+    /// reaped child and releases the suite lock.
+    fn kill_abruptly(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Spawn the daemon with a memory-backed config and wait for its control
 /// socket to appear. Returns the daemon guard and the socket path.
 fn spawn_daemon(dir: &std::path::Path) -> (Daemon, PathBuf) {
+    let service_prefix = format!(
+        "datamancerd-e2e-{}-{}",
+        std::process::id(),
+        PREFIX_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    spawn_daemon_with_prefix(dir, service_prefix)
+}
+
+/// [`spawn_daemon`] with an explicit `[server].service_prefix`, for a test
+/// that needs two daemons configured identically (the crash-restart case).
+fn spawn_daemon_with_prefix(dir: &std::path::Path, service_prefix: String) -> (Daemon, PathBuf) {
     // Poisoning just means an earlier test panicked; its `Daemon` guard has
     // already killed that daemon, so the lock is still meaningful.
     let lock = DAEMON_LOCK
@@ -73,11 +95,6 @@ fn spawn_daemon(dir: &std::path::Path) -> (Daemon, PathBuf) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let socket = dir.join("admin.sock");
     let config_path = dir.join("datamancerd.toml");
-    let service_prefix = format!(
-        "datamancerd-e2e-{}-{}",
-        std::process::id(),
-        PREFIX_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
     let config = format!(
         r#"
 [provider.alpaca]
@@ -174,11 +191,16 @@ fn open_client_creates_a_service_then_closes() {
     let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
     assert_eq!(reply["ok"], serde_json::Value::Bool(true));
     // The advertised name is the real service name: `spawn_daemon`'s
-    // per-daemon `service_prefix`, the wire version, then the client id.
+    // per-daemon `service_prefix`, this daemon process's boot id, the wire
+    // version, then the client id.
     let service = reply["service"].as_str().expect("service name");
     let (prefix, _id) = datamancer::transport::parse_data_service_name(service)
         .unwrap_or_else(|| panic!("not a data-service name: {service}"));
-    assert_eq!(prefix, daemon.service_prefix);
+    assert!(
+        prefix.starts_with(&format!("{}/", daemon.service_prefix)),
+        "advertised prefix {prefix:?} is not boot-scoped under {:?}",
+        daemon.service_prefix
+    );
 
     // The client appears in list-clients (separate connection).
     let listing = round_trip(&socket, r#"{"op":"list-clients"}"#);
@@ -195,6 +217,121 @@ fn open_client_creates_a_service_then_closes() {
         !clients.iter().any(|c| c == "exec-1"),
         "client not torn down"
     );
+}
+
+/// A daemon that starts after its predecessor crashed must serve its first
+/// client (#96). The predecessor owns a live data service when it is killed
+/// with SIGKILL; if the kill lands while it is removing a service, that
+/// service stays marked for destruction with no owner and iceoryx2 0.10's
+/// dead-node cleanup never visits it, so any later open of the same name
+/// fails `IsMarkedForDestruction` (the nightly signature before #92). Both
+/// daemons here share one configured `service_prefix` and number their first
+/// client 0; the fix is the per-boot segment in the advertised name, so this
+/// test pins two things that hold whatever the kill timing: the successor's
+/// first `open-client` succeeds, and its service name differs from the
+/// victim's.
+#[test]
+#[ignore = "spawns the daemon twice, needs a live iceoryx2 runtime"]
+fn a_restarted_daemon_serves_its_first_client_after_a_crash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut victim, socket) = spawn_daemon(dir.path());
+    // The successor is configured identically: same `service_prefix`, so the
+    // only thing keeping its names apart from the victim's is the boot id.
+    let configured_prefix = victim.service_prefix.clone();
+
+    // Hold the client's connection open so its data service exists at the
+    // moment the daemon dies.
+    let stream = UnixStream::connect(&socket).expect("connect");
+    let mut writer = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    writer
+        .write_all(br#"{"op":"open-client","client":"crash-victim"}"#)
+        .expect("write");
+    writer.write_all(b"\n").expect("nl");
+    writer.flush().expect("flush");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
+    if reply["ok"] != serde_json::Value::Bool(true) {
+        dump_iceoryx2_state("victim open-client rejected");
+    }
+    assert_eq!(
+        reply["ok"],
+        serde_json::Value::Bool(true),
+        "victim open-client: {reply}"
+    );
+    let victim_service = reply["service"]
+        .as_str()
+        .expect("victim service name")
+        .to_string();
+
+    victim.kill_abruptly();
+    // Release the suite lock before the successor spawns; the connection is
+    // dead with the daemon.
+    drop(victim);
+    drop(writer);
+    drop(reader);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_successor, socket) = spawn_daemon_with_prefix(dir.path(), configured_prefix.clone());
+    let reply = round_trip(
+        &socket,
+        r#"{"op":"open-client","client":"crash-successor"}"#,
+    );
+    if reply["ok"] != serde_json::Value::Bool(true) {
+        dump_iceoryx2_state("successor open-client rejected");
+    }
+    assert_eq!(
+        reply["ok"],
+        serde_json::Value::Bool(true),
+        "first open after a crashed predecessor was rejected: {reply}"
+    );
+
+    // Both daemons numbered their first client 0 under the same configured
+    // prefix; the boot id is what keeps the successor off the dead daemon's
+    // (possibly zombie) service name. This holds whatever the kill timing.
+    let successor_service = reply["service"].as_str().expect("successor service name");
+    assert_ne!(
+        successor_service, victim_service,
+        "successor re-created its crashed predecessor's service name"
+    );
+    for service in [victim_service.as_str(), successor_service] {
+        let (prefix, id) = datamancer::transport::parse_data_service_name(service)
+            .unwrap_or_else(|| panic!("not a data-service name: {service}"));
+        assert!(
+            prefix.starts_with(&format!("{configured_prefix}/")),
+            "{service}: prefix {prefix:?} is not boot-scoped under {configured_prefix:?}"
+        );
+        assert_eq!(id, 0, "{service}: first client of each boot is id 0");
+    }
+}
+
+/// Print what iceoryx2 left under its root (`/tmp/iceoryx2`, the 0.10 Linux
+/// default) and in shared memory, for a failure only a leftover service or
+/// node can explain. Best-effort: a missing directory prints nothing.
+fn dump_iceoryx2_state(why: &str) {
+    fn walk(dir: &std::path::Path, depth: usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            eprintln!("{:indent$}{}", "", path.display(), indent = depth * 2);
+            if path.is_dir() {
+                walk(&path, depth + 1);
+            }
+        }
+    }
+    eprintln!("daemon_e2e: {why}; iceoryx2 state:");
+    walk(std::path::Path::new("/tmp/iceoryx2"), 1);
+    if let Ok(entries) = std::fs::read_dir("/dev/shm") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains("iox2") {
+                eprintln!("  /dev/shm/{name}");
+            }
+        }
+    }
 }
 
 /// A bounded historical bar query over a month-long, long-closed range: real
@@ -250,12 +387,17 @@ fn open_query_streams_bars_then_reaps_its_service() {
     assert_eq!(reply["ok"], true, "open-query rejected: {reply}");
     let id = reply["query"].as_u64().expect("query id");
     // The advertised name is the real service name under `spawn_daemon`'s
-    // per-daemon `service_prefix`, not the daemon's out-of-the-box default
-    // ("datamancerd"), and it is exactly what the transport would create.
-    assert_eq!(
-        reply["service"],
-        datamancer::transport::data_service_name(&daemon.service_prefix, id)
+    // per-daemon `service_prefix` and this process's boot id, not the
+    // daemon's out-of-the-box default ("datamancerd"), carrying the query id.
+    let service = reply["service"].as_str().expect("service name");
+    let (prefix, service_id) = datamancer::transport::parse_data_service_name(service)
+        .unwrap_or_else(|| panic!("not a data-service name: {service}"));
+    assert!(
+        prefix.starts_with(&format!("{}/", daemon.service_prefix)),
+        "advertised prefix {prefix:?} is not boot-scoped under {:?}",
+        daemon.service_prefix
     );
+    assert_eq!(service_id, id);
 
     // The query is in flight immediately after the reply. `list-queries` owns
     // nothing, so checking it over a fresh `round_trip` connection cannot
