@@ -182,7 +182,7 @@ JSON records instead of the default human-readable text.
 
 The iceoryx2 library logs separately, through its own stderr logger at `info`
 by default. Unix/macOS daemons honour `IOX2_LOG_LEVEL` (`trace`, `debug`,
-`info`, `warn`, `error`, `fatal`) at node creation, so a service open/create
+`info`, `warn`, `error`, `fatal`) at startup, so a service open/create
 retry or a dead-node cleanup can be followed at boot; `[log]` and `RUST_LOG`
 do not affect it.
 
