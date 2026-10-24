@@ -37,12 +37,15 @@
 
 #![cfg(feature = "ws")]
 
+mod common;
+
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use common::DaemonGuard;
 use datamancer_client::spec::{SubscriptionSpec, UnsubscribeSpec};
 use datamancer_client::{Client, ClientError, codes};
 use datamancer_core::{ControlKind, MarketEvent};
@@ -58,8 +61,7 @@ static DAEMON_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// (config ported from `ws_e2e.rs`) and the UDS admin socket (config ported
 /// from `daemon_e2e.rs`), in one process.
 struct DaemonHandle {
-    child: Child,
-    socket: PathBuf,
+    daemon: DaemonGuard,
     ws_port: u16,
 }
 
@@ -69,14 +71,7 @@ impl DaemonHandle {
     }
 
     fn uds_path(&self) -> PathBuf {
-        self.socket.clone()
-    }
-}
-
-impl Drop for DaemonHandle {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.daemon.control_endpoint().to_path_buf()
     }
 }
 
@@ -99,13 +94,8 @@ fn control_endpoint(_dir: &std::path::Path) -> PathBuf {
 /// generation with `daemon_e2e.rs`'s admin-socket wait) and block until both
 /// surfaces are reachable.
 ///
-/// `service_prefix` is unique per daemon (`<pid>-<n>`): iceoryx2 reports
-/// `SystemInFlux` when a service name is created and removed in quick
-/// succession (#72), which a fixed prefix plus client ids restarting at 0
-/// did on every respawn. `datamancer_client::iceoryx2::parse_client_id`
-/// extracts the client id from the trailing `/data/{id}` segments of the
-/// `open-client` reply's service name regardless of the configured prefix,
-/// so no particular prefix value is required here.
+/// `service_prefix` is unique per daemon (`<pid>-<n>`); no particular value
+/// is required here, the client takes what the `open-client` reply advertises.
 async fn spawn_daemon(dir: &std::path::Path, ws_port: u16) -> DaemonHandle {
     static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
     let socket = control_endpoint(dir);
@@ -143,6 +133,8 @@ port = {ws_port}
         .arg(&config_path)
         .spawn()
         .expect("spawn datamancerd");
+    // Guard first, so a readiness panic below still stops the daemon.
+    let daemon = DaemonGuard::new(child, socket);
 
     // Wait for the UDS control socket to appear (ported from
     // `daemon_e2e.rs::spawn_daemon`). Unix only: probing a named pipe's
@@ -151,7 +143,7 @@ port = {ws_port}
     #[cfg(unix)]
     {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !socket.exists() {
+        while !daemon.control_endpoint().exists() {
             assert!(Instant::now() < deadline, "daemon socket never appeared");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -186,11 +178,7 @@ port = {ws_port}
         }
     }
 
-    DaemonHandle {
-        child,
-        socket,
-        ws_port,
-    }
+    DaemonHandle { daemon, ws_port }
 }
 
 /// The transport-agnosticism guarantee, stated executably: everything a
