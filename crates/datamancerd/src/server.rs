@@ -74,14 +74,8 @@ type Node = iceoryx2::prelude::Node<ipc_threadsafe::Service>;
 /// Create the one process-wide iceoryx2 node. Unix/macOS only — on Windows
 /// `create()` fails at runtime (native-Windows spec §2.5), so the daemon
 /// runs WS-only there with no node.
-///
-/// iceoryx2 logs through its own stderr logger (Info by default) and reads
-/// `IOX2_LOG_LEVEL` only when asked; honouring it lets an operator see
-/// dead-node cleanup and service open/create decisions (#96). Unset, nothing
-/// changes.
 #[cfg(not(windows))]
 fn create_node() -> Result<Node> {
-    iceoryx2::prelude::set_log_level_from_env_or_default();
     NodeBuilder::new()
         .create::<ipc_threadsafe::Service>()
         .map_err(|e| DaemonError::Transport(format!("node create: {e:?}")))

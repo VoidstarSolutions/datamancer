@@ -40,7 +40,6 @@
 mod common;
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -127,10 +126,7 @@ port = {ws_port}
     );
     std::fs::write(&config_path, config).expect("write config");
 
-    let bin: PathBuf = env!("CARGO_BIN_EXE_datamancerd").into();
-    let child = Command::new(bin)
-        .arg("--config")
-        .arg(&config_path)
+    let child = common::daemon_command(&config_path)
         .spawn()
         .expect("spawn datamancerd");
     // Guard first, so a readiness panic below still stops the daemon.
