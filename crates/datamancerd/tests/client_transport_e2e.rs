@@ -37,12 +37,15 @@
 
 #![cfg(feature = "ws")]
 
+mod common;
+
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use common::DaemonGuard;
 use datamancer_client::spec::{SubscriptionSpec, UnsubscribeSpec};
 use datamancer_client::{Client, ClientError, codes};
 use datamancer_core::{ControlKind, MarketEvent};
@@ -58,8 +61,7 @@ static DAEMON_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// (config ported from `ws_e2e.rs`) and the UDS admin socket (config ported
 /// from `daemon_e2e.rs`), in one process.
 struct DaemonHandle {
-    child: Child,
-    socket: PathBuf,
+    daemon: DaemonGuard,
     ws_port: u16,
 }
 
@@ -69,94 +71,7 @@ impl DaemonHandle {
     }
 
     fn uds_path(&self) -> PathBuf {
-        self.socket.clone()
-    }
-}
-
-impl Drop for DaemonHandle {
-    /// Unix: stop the daemon with the `shutdown` control op and wait for it to
-    /// exit, so its drain removes its iceoryx2 services and node before the
-    /// next test's daemon re-creates the same service names (see
-    /// `spawn_daemon`). Falls back to a kill if the op cannot be sent, is
-    /// refused, or the daemon does not exit within [`GRACEFUL_STOP`].
-    ///
-    /// Windows: kill. The Windows daemon runs no iceoryx2 node, so there is
-    /// nothing for a drain to release between tests.
-    ///
-    /// The graceful stop lives in `Drop`, not at the end of each test body,
-    /// because this file runs its daemons in sequence: one test's teardown is
-    /// the next test's setup, so it must be graceful on the panic path too.
-    /// The `shutdown` op runs the same drain as SIGTERM. On Unix the fallback
-    /// is reported on stderr, so a drain that stops working shows up in the
-    /// `--nocapture` log instead of silently reintroducing the race.
-    ///
-    /// Nothing here may panic — a panic in `Drop` while a failing test unwinds
-    /// aborts the process.
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        let stopped = {
-            let stopped = request_shutdown(&self.socket) && wait_for_exit(&mut self.child);
-            if !stopped {
-                eprintln!(
-                    "client_transport_e2e: graceful shutdown failed or timed out after \
-                     {GRACEFUL_STOP:?}; killing the daemon (its iceoryx2 services are left behind)"
-                );
-            }
-            stopped
-        };
-        #[cfg(not(unix))]
-        let stopped = false;
-        if !stopped {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-    }
-}
-
-/// How long `DaemonHandle`'s `Drop` waits for a graceful exit before it falls
-/// back to a kill. The daemon's own drain is bounded by
-/// `shutdown_timeout_secs` (30 s by default), but a test daemon drains in well
-/// under a second.
-#[cfg(unix)]
-const GRACEFUL_STOP: Duration = Duration::from_secs(15);
-
-/// Send `{"op":"shutdown"}` over the UDS control socket and read the reply if
-/// one arrives. Returns `false` if the daemon could not be reached or refused
-/// the op. A missing reply counts as sent: the daemon replies before it
-/// drains, best-effort. Blocking I/O is fine here: `Drop` is synchronous.
-#[cfg(unix)]
-fn request_shutdown(socket: &std::path::Path) -> bool {
-    use std::io::{BufRead as _, Write as _};
-
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    if stream.write_all(b"{\"op\":\"shutdown\"}\n").is_err() {
-        return false;
-    }
-    let mut line = String::new();
-    let _ = std::io::BufReader::new(stream).read_line(&mut line);
-    match serde_json::from_str::<serde_json::Value>(&line) {
-        Ok(reply) => reply["ok"] == true,
-        Err(_) => true,
-    }
-}
-
-/// Poll `child` until it exits or [`GRACEFUL_STOP`] passes. Returns whether it
-/// exited.
-#[cfg(unix)]
-fn wait_for_exit(child: &mut Child) -> bool {
-    let deadline = Instant::now() + GRACEFUL_STOP;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => return false,
-        }
+        self.daemon.control_endpoint().to_path_buf()
     }
 }
 
@@ -179,17 +94,8 @@ fn control_endpoint(_dir: &std::path::Path) -> PathBuf {
 /// generation with `daemon_e2e.rs`'s admin-socket wait) and block until both
 /// surfaces are reachable.
 ///
-/// `service_prefix` is unique per daemon (`<pid>-<n>`), but that only changes
-/// the name the reply advertises: the data sink names the iceoryx2 services
-/// `datamancer/v<wire>/data/{id}` without the prefix, and ids restart at 0 in
-/// every daemon, so each respawn re-creates the previous daemon's service
-/// names. `DaemonHandle`'s graceful stop is what keeps that safe (#87); after
-/// a kill the services linger with a dead owner and opening one fails with
-/// `IsMarkedForDestruction` (#87) or `SystemInFlux` (#72).
-/// `datamancer_client::iceoryx2::parse_client_id`
-/// extracts the client id from the trailing `/data/{id}` segments of the
-/// `open-client` reply's service name regardless of the configured prefix,
-/// so no particular prefix value is required here.
+/// `service_prefix` is unique per daemon (`<pid>-<n>`); no particular value
+/// is required here, the client takes what the `open-client` reply advertises.
 async fn spawn_daemon(dir: &std::path::Path, ws_port: u16) -> DaemonHandle {
     static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
     let socket = control_endpoint(dir);
@@ -227,6 +133,8 @@ port = {ws_port}
         .arg(&config_path)
         .spawn()
         .expect("spawn datamancerd");
+    // Guard first, so a readiness panic below still stops the daemon.
+    let daemon = DaemonGuard::new(child, socket);
 
     // Wait for the UDS control socket to appear (ported from
     // `daemon_e2e.rs::spawn_daemon`). Unix only: probing a named pipe's
@@ -235,7 +143,7 @@ port = {ws_port}
     #[cfg(unix)]
     {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !socket.exists() {
+        while !daemon.control_endpoint().exists() {
             assert!(Instant::now() < deadline, "daemon socket never appeared");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -270,11 +178,7 @@ port = {ws_port}
         }
     }
 
-    DaemonHandle {
-        child,
-        socket,
-        ws_port,
-    }
+    DaemonHandle { daemon, ws_port }
 }
 
 /// The transport-agnosticism guarantee, stated executably: everything a

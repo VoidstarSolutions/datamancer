@@ -20,24 +20,19 @@
 #![cfg(unix)]
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use common::DaemonGuard;
+
 /// Makes every daemon's `service_prefix` unique (`<pid>-<n>`), so a reply's
 /// advertised service name identifies the daemon that sent it.
-///
-/// This does **not** make the underlying iceoryx2 services unique: the data
-/// sink names them `datamancer/v<wire>/data/{id}` and
-/// `datamancer/v<wire>/symbols/{id}` without the prefix, and every daemon
-/// starts ids at 0. Each test's daemon therefore re-creates the previous
-/// daemon's service names. What keeps that safe is [`Daemon`]'s graceful stop
-/// (#87): the previous daemon's drain removes its services before the next
-/// daemon starts. After a SIGKILL they linger with a dead owner, and opening
-/// one fails with `IsMarkedForDestruction` (#87) or `SystemInFlux` (#72).
 static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Serializes the whole suite: `datamancerd` takes a **global** single-instance
@@ -48,96 +43,30 @@ static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
 /// is not an option; the tests take turns instead.
 static DAEMON_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// How long [`Daemon`]'s `Drop` waits for a graceful exit before it falls back
-/// to SIGKILL. The daemon's own drain is bounded by `shutdown_timeout_secs`
-/// (30 s by default), but a test daemon with a handful of clients drains in
-/// well under a second.
-const GRACEFUL_STOP: Duration = Duration::from_secs(15);
-
-/// A spawned daemon that is stopped when the test ends — **including on
-/// panic**, which a bare stop at the end of a test body skips. A leaked daemon
-/// keeps holding the single-instance lock and makes every later run of this
-/// suite fail at `spawn_daemon`.
+/// This suite's daemon: the shared [`DaemonGuard`] plus the suite lock and
+/// the prefix the daemon was configured with. A leaked daemon keeps holding
+/// the single-instance lock and makes every later run of this suite fail at
+/// `spawn_daemon`, which is why the stop lives in the guard's `Drop`.
 struct Daemon {
     // Field order is drop order: stop the child before releasing the lock, or
     // the next test races the dying daemon for the single-instance lock.
-    child: Child,
+    guard: DaemonGuard,
     _lock: std::sync::MutexGuard<'static, ()>,
-    /// The control socket, for the graceful `shutdown` op in `Drop`.
-    socket: PathBuf,
     /// The `[server].service_prefix` this daemon was started with, for tests
     /// that assert on a reply's full service name.
     service_prefix: String,
 }
 
-impl Drop for Daemon {
-    /// Stop the daemon with the `shutdown` control op and wait for it to exit,
-    /// so its drain removes its iceoryx2 services and node before the next
-    /// test's daemon re-creates the same service names (see [`PREFIX_SEQ`]).
-    /// Falls back to SIGKILL if the op cannot be sent, is refused, or the
-    /// daemon does not exit within [`GRACEFUL_STOP`].
-    ///
-    /// The graceful stop lives in `Drop`, not at the end of each test body,
-    /// because this suite runs several daemons in sequence: one test's
-    /// teardown is the next test's setup, so it must be graceful on the panic
-    /// path too. The `shutdown` op is used because this suite already speaks
-    /// the control protocol; it runs the same drain as SIGTERM. The fallback
-    /// is reported on stderr, so a drain that stops working shows up in the
-    /// `--nocapture` log instead of silently reintroducing the race.
-    ///
-    /// Nothing here may panic — a panic in `Drop` while a failing test unwinds
-    /// aborts the process.
-    fn drop(&mut self) {
-        let stopped =
-            request_shutdown(&self.socket) && wait_for_exit(&mut self.child, GRACEFUL_STOP);
-        if !stopped {
-            eprintln!(
-                "daemon_e2e: graceful shutdown failed or timed out after {GRACEFUL_STOP:?}; \
-                 killing the daemon (its iceoryx2 services are left behind)"
-            );
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-    }
-}
-
-/// Send `{"op":"shutdown"}` and read the reply if one arrives. Returns `false`
-/// if the daemon could not be reached or refused the op. A missing reply
-/// counts as sent: the daemon replies before it drains, best-effort.
-fn request_shutdown(socket: &std::path::Path) -> bool {
-    let Ok(mut stream) = UnixStream::connect(socket) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    if stream.write_all(b"{\"op\":\"shutdown\"}\n").is_err() {
-        return false;
-    }
-    let mut line = String::new();
-    let _ = BufReader::new(stream).read_line(&mut line);
-    match serde_json::from_str::<serde_json::Value>(&line) {
-        Ok(reply) => reply["ok"] == true,
-        Err(_) => true,
-    }
-}
-
-/// Poll `child` until it exits or `timeout` passes. Returns whether it exited.
-fn wait_for_exit(child: &mut Child, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => return false,
-        }
+impl Daemon {
+    /// The UDS control socket.
+    fn socket(&self) -> &Path {
+        self.guard.control_endpoint()
     }
 }
 
 /// Spawn the daemon with a memory-backed config and wait for its control
-/// socket to appear. Returns the daemon guard and the socket path.
-fn spawn_daemon(dir: &std::path::Path) -> (Daemon, PathBuf) {
+/// socket to appear.
+fn spawn_daemon(dir: &Path) -> Daemon {
     // Poisoning just means an earlier test panicked; its `Daemon` guard has
     // already killed that daemon, so the lock is still meaningful.
     let lock = DAEMON_LOCK
@@ -178,23 +107,22 @@ publish_interval_ms = 200
         .expect("spawn datamancerd");
 
     let daemon = Daemon {
-        child,
+        guard: DaemonGuard::new(child, socket),
         _lock: lock,
-        socket: socket.clone(),
         service_prefix,
     };
 
     // Wait for the socket to appear (daemon bound).
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
+    while !daemon.socket().exists() {
         assert!(Instant::now() < deadline, "daemon socket never appeared");
         std::thread::sleep(Duration::from_millis(50));
     }
-    (daemon, socket)
+    daemon
 }
 
 /// Send one JSON line and read one JSON reply line.
-fn round_trip(socket: &std::path::Path, request: &str) -> serde_json::Value {
+fn round_trip(socket: &Path, request: &str) -> serde_json::Value {
     let stream = UnixStream::connect(socket).expect("connect socket");
     let mut writer = stream.try_clone().expect("clone");
     writer.write_all(request.as_bytes()).expect("write");
@@ -210,18 +138,18 @@ fn round_trip(socket: &std::path::Path, request: &str) -> serde_json::Value {
 #[ignore = "needs a live iceoryx2 runtime"]
 fn control_round_trip_list_and_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (_daemon, socket) = spawn_daemon(dir.path());
+    let daemon = spawn_daemon(dir.path());
 
-    let reply = round_trip(&socket, r#"{"op":"list-clients"}"#);
+    let reply = round_trip(daemon.socket(), r#"{"op":"list-clients"}"#);
     assert_eq!(reply["ok"], serde_json::Value::Bool(true));
     assert!(reply["clients"].is_array());
 
-    let snap = round_trip(&socket, r#"{"op":"snapshot"}"#);
+    let snap = round_trip(daemon.socket(), r#"{"op":"snapshot"}"#);
     assert_eq!(snap["ok"], serde_json::Value::Bool(true));
     assert!(snap["snapshot"].is_object());
 
     // Unknown op -> structured error reply with a stable code.
-    let err = round_trip(&socket, r#"{"op":"frobnicate"}"#);
+    let err = round_trip(daemon.socket(), r#"{"op":"frobnicate"}"#);
     assert_eq!(err["ok"], serde_json::Value::Bool(false));
     assert_eq!(err["code"], "bad_request");
 }
@@ -230,10 +158,10 @@ fn control_round_trip_list_and_snapshot() {
 #[ignore = "needs a live iceoryx2 runtime"]
 fn open_client_creates_a_service_then_closes() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (daemon, socket) = spawn_daemon(dir.path());
+    let daemon = spawn_daemon(dir.path());
 
     // open-client over its own long-lived connection.
-    let stream = UnixStream::connect(&socket).expect("connect");
+    let stream = UnixStream::connect(daemon.socket()).expect("connect");
     let mut writer = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
 
@@ -254,7 +182,7 @@ fn open_client_creates_a_service_then_closes() {
     );
 
     // The client appears in list-clients (separate connection).
-    let listing = round_trip(&socket, r#"{"op":"list-clients"}"#);
+    let listing = round_trip(daemon.socket(), r#"{"op":"list-clients"}"#);
     let clients = listing["clients"].as_array().expect("array");
     assert!(clients.iter().any(|c| c == "exec-1"));
 
@@ -262,7 +190,7 @@ fn open_client_creates_a_service_then_closes() {
     drop(writer);
     drop(reader);
     std::thread::sleep(Duration::from_millis(300));
-    let after = round_trip(&socket, r#"{"op":"list-clients"}"#);
+    let after = round_trip(daemon.socket(), r#"{"op":"list-clients"}"#);
     let clients = after["clients"].as_array().expect("array");
     assert!(
         !clients.iter().any(|c| c == "exec-1"),
@@ -304,9 +232,9 @@ fn open_client_creates_a_service_then_closes() {
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
 fn open_query_streams_bars_then_reaps_its_service() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (daemon, socket) = spawn_daemon(dir.path());
+    let daemon = spawn_daemon(dir.path());
 
-    let stream = UnixStream::connect(&socket).expect("connect");
+    let stream = UnixStream::connect(daemon.socket()).expect("connect");
     let mut writer = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
 
@@ -332,7 +260,7 @@ fn open_query_streams_bars_then_reaps_its_service() {
     // The query is in flight immediately after the reply. `list-queries` owns
     // nothing, so checking it over a fresh `round_trip` connection cannot
     // itself cancel anything.
-    let listed = round_trip(&socket, r#"{"op":"list-queries"}"#);
+    let listed = round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
     assert!(
         listed["queries"]
             .as_array()
@@ -348,7 +276,7 @@ fn open_query_streams_bars_then_reaps_its_service() {
     // completion, not EOF teardown. Poll rather than a single fixed sleep:
     // real Alpaca REST latency (and any rate-limit backoff) varies.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut after = round_trip(&socket, r#"{"op":"list-queries"}"#);
+    let mut after = round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
     while after["queries"]
         .as_array()
         .expect("queries array")
@@ -359,7 +287,7 @@ fn open_query_streams_bars_then_reaps_its_service() {
             "query {id} never self-reaped: {after}"
         );
         std::thread::sleep(std::time::Duration::from_millis(500));
-        after = round_trip(&socket, r#"{"op":"list-queries"}"#);
+        after = round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
     }
 
     drop((writer, reader));
@@ -369,10 +297,10 @@ fn open_query_streams_bars_then_reaps_its_service() {
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
 fn open_query_rejects_an_inverted_range_and_an_unserved_pair() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (_daemon, socket) = spawn_daemon(dir.path());
+    let daemon = spawn_daemon(dir.path());
 
     let inverted = round_trip(
-        &socket,
+        daemon.socket(),
         r#"{"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":200,"to":100}"#,
     );
     assert_eq!(inverted["ok"], false);
@@ -381,7 +309,7 @@ fn open_query_rejects_an_inverted_range_and_an_unserved_pair() {
     // Alpaca's crypto provider reports `Surface::History => false`, so routing
     // rejects the pair before any session opens.
     let crypto = round_trip(
-        &socket,
+        daemon.socket(),
         r#"{"op":"open-query","provider":"alpaca","asset_class":"crypto","symbol":"BTC/USD","kind":"bar1d","from":100,"to":200}"#,
     );
     assert_eq!(crypto["ok"], false);
@@ -392,9 +320,9 @@ fn open_query_rejects_an_inverted_range_and_an_unserved_pair() {
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
 fn cancel_query_reports_unknown_for_a_stale_id_and_caps_concurrency() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (_daemon, socket) = spawn_daemon(dir.path());
+    let daemon = spawn_daemon(dir.path());
 
-    let stale = round_trip(&socket, r#"{"op":"cancel-query","query":9999}"#);
+    let stale = round_trip(daemon.socket(), r#"{"op":"cancel-query","query":9999}"#);
     assert_eq!(stale["ok"], false);
     assert_eq!(stale["code"], "unknown_query");
 
@@ -410,7 +338,7 @@ fn cancel_query_reports_unknown_for_a_stale_id_and_caps_concurrency() {
     let mut conns = Vec::new();
     let mut replies = Vec::new();
     for _ in 0..3 {
-        let stream = UnixStream::connect(&socket).expect("connect");
+        let stream = UnixStream::connect(daemon.socket()).expect("connect");
         let mut writer = stream.try_clone().expect("clone");
         let mut reader = BufReader::new(stream);
         writer.write_all(open.as_bytes()).expect("write");
@@ -428,7 +356,7 @@ fn cancel_query_reports_unknown_for_a_stale_id_and_caps_concurrency() {
 
     // Confirm the daemon really does see two concurrent queries, not just two
     // successful replies.
-    let listed = round_trip(&socket, r#"{"op":"list-queries"}"#);
+    let listed = round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
     let ids = listed["queries"].as_array().expect("queries array");
     assert_eq!(
         ids.len(),
@@ -438,7 +366,7 @@ fn cancel_query_reports_unknown_for_a_stale_id_and_caps_concurrency() {
 
     let first_id = replies[0]["query"].as_u64().expect("id");
     let cancelled = round_trip(
-        &socket,
+        daemon.socket(),
         &format!(r#"{{"op":"cancel-query","query":{first_id}}}"#),
     );
     assert_eq!(cancelled["ok"], true, "{cancelled}");
@@ -452,18 +380,18 @@ fn cancel_query_reports_unknown_for_a_stale_id_and_caps_concurrency() {
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
 fn dropping_the_control_connection_aborts_its_queries() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (_daemon, socket) = spawn_daemon(dir.path());
+    let daemon = spawn_daemon(dir.path());
 
     // `round_trip` opens and drops a connection per call, so the query it
     // opens is torn down when it returns.
     let opened = round_trip(
-        &socket,
+        daemon.socket(),
         r#"{"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","from":1704067200000000000,"to":1706745600000000000}"#,
     );
     assert_eq!(opened["ok"], true, "{opened}");
 
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let listed = round_trip(&socket, r#"{"op":"list-queries"}"#);
+    let listed = round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
     assert_eq!(
         listed["queries"],
         serde_json::json!([]),
