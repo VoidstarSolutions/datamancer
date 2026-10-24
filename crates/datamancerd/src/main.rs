@@ -88,6 +88,17 @@ fn peek_log_config(explicit: Option<&std::path::Path>) -> config::LogConfig {
         .unwrap_or_default()
 }
 
+/// Configure the iceoryx2 library's own logger from the environment. It logs
+/// through its own stderr logger (`info` by default), outside `tracing`, so
+/// neither `[log]` nor `RUST_LOG` reaches it; `IOX2_LOG_LEVEL` does, when
+/// set, and lets an operator follow dead-node cleanup and service
+/// open/create decisions at boot (#96). Unset, nothing changes. Unix/macOS
+/// only: the Windows daemon creates no node.
+#[cfg(not(windows))]
+fn init_iceoryx2_logging() {
+    iceoryx2::prelude::set_log_level_from_env_or_default();
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let args = Args::parse();
@@ -101,6 +112,8 @@ async fn main() -> std::process::ExitCode {
             .with_env_filter(filter)
             .init(),
     }
+    #[cfg(not(windows))]
+    init_iceoryx2_logging();
 
     match run(args).await {
         Ok(()) => std::process::ExitCode::SUCCESS,

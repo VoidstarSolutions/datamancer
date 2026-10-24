@@ -71,6 +71,16 @@ use crate::shutdown::{DrainClient, DrainRecorder, drain};
 #[cfg(not(windows))]
 type Node = iceoryx2::prelude::Node<ipc_threadsafe::Service>;
 
+/// Create the one process-wide iceoryx2 node. Unix/macOS only — on Windows
+/// `create()` fails at runtime (native-Windows spec §2.5), so the daemon
+/// runs WS-only there with no node.
+#[cfg(not(windows))]
+fn create_node() -> Result<Node> {
+    NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .map_err(|e| DaemonError::Transport(format!("node create: {e:?}")))
+}
+
 /// Reduce a [`datamancer::SystemSnapshot`] into the app-facing
 /// [`HealthView`] and stamp the two daemon-only fields the core reduction
 /// leaves `None` (`version`, `credential_backend`) — the one place this
@@ -328,13 +338,8 @@ impl Server {
         let dm = built.datamancer;
         let tap_log = built.tap_log;
 
-        // The one process-wide iceoryx2 node. Unix/macOS only — on Windows
-        // `create()` fails at runtime (native-Windows spec §2.5), so the daemon
-        // runs WS-only there with no node.
         #[cfg(not(windows))]
-        let node = NodeBuilder::new()
-            .create::<ipc_threadsafe::Service>()
-            .map_err(|e| DaemonError::Transport(format!("node create: {e:?}")))?;
+        let node = create_node()?;
 
         // `always_on=true` anchors are held for the process lifetime regardless
         // of client presence. `always_on=false` startup sessions are
