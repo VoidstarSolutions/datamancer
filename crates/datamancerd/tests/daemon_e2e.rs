@@ -173,9 +173,10 @@ fn open_client_creates_a_service_then_closes() {
     // The advertised name is the real service name: `spawn_daemon`'s
     // per-daemon `service_prefix`, the wire version, then the client id.
     let service = reply["service"].as_str().expect("service name");
-    let (prefix, _id) = datamancer::transport::parse_data_service_name(service)
-        .unwrap_or_else(|| panic!("not a data-service name: {service}"));
-    assert_eq!(prefix, daemon.service_prefix);
+    let name: datamancer::transport::DataServiceName = service
+        .parse()
+        .unwrap_or_else(|e| panic!("not a data-service name: {service}: {e}"));
+    assert_eq!(name.prefix().as_str(), daemon.service_prefix);
 
     // The client appears in list-clients (separate connection).
     let listing = round_trip(daemon.socket(), r#"{"op":"list-clients"}"#);
@@ -249,9 +250,11 @@ fn open_query_streams_bars_then_reaps_its_service() {
     // The advertised name is the real service name under `spawn_daemon`'s
     // per-daemon `service_prefix`, not the daemon's out-of-the-box default
     // ("datamancerd"), and it is exactly what the transport would create.
+    let prefix =
+        datamancer::transport::ServicePrefix::new(&daemon.service_prefix).expect("valid prefix");
     assert_eq!(
         reply["service"],
-        datamancer::transport::data_service_name(&daemon.service_prefix, id)
+        datamancer::transport::DataServiceName::new(&prefix, id).to_string()
     );
 
     // The query is in flight immediately after the reply. `list-queries` owns

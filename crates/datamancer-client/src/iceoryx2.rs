@@ -13,7 +13,7 @@ use std::time::Duration;
 use datamancer_core::{
     ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
 };
-use datamancer_transport_iceoryx2::DataSubscriber;
+use datamancer_transport_iceoryx2::{DataServiceName, DataSubscriber};
 use futures::Stream;
 // `::` prefix: this module is itself named `iceoryx2`, so the extern crate is
 // named explicitly (bare paths here happen to resolve to the crate today, but
@@ -71,25 +71,6 @@ pub enum Iceoryx2ClientError {
     /// errors `datamancer-transport-iceoryx2` funnels into `Transport`.
     #[error("iceoryx2 node creation failed: {0}")]
     Node(String),
-}
-
-/// Check that an advertised service name (from an `open-client` or
-/// `open-query` reply) is a data-service name of this build's wire version.
-///
-/// The name is opened verbatim afterwards: the daemon's configured
-/// `service_prefix` is whatever precedes `/v{WIRE_VERSION}/data/{id}` and is
-/// never guessed or rebuilt here. A daemon on another wire version advertises
-/// a different shape and is refused up front, with the name in the error,
-/// instead of silently finding no service.
-fn check_data_service(service: &str) -> Result<(), Iceoryx2ClientError> {
-    datamancer_transport_iceoryx2::parse_data_service_name(service)
-        .map(|_| ())
-        .ok_or_else(|| {
-            Iceoryx2ClientError::Protocol(format!(
-                "not a v{} data-service name: {service}",
-                datamancer_transport_iceoryx2::WIRE_VERSION
-            ))
-        })
 }
 
 /// Map a control [`Reply`] to the two-layer error model.
@@ -247,7 +228,7 @@ impl ControlHandle {
 /// daemon reaps the finished query's service once it has delivered every
 /// event.
 async fn spawn_subscriber(
-    service: String,
+    service: DataServiceName,
     poll_interval: Duration,
     event_buffer: usize,
     stop: Arc<AtomicBool>,
@@ -424,7 +405,14 @@ impl Client for Iceoryx2Client {
                 "open-client reply missing service name".to_string(),
             ))
         })?;
-        check_data_service(&service).map_err(ClientError::Transport)?;
+        // The advertised name is parsed exactly once, here, and opened as
+        // parsed: the daemon's `service_prefix` is whatever it advertised,
+        // never guessed. A daemon on another wire version advertises a
+        // different shape and is refused before any shared-memory attach,
+        // with the name in the error.
+        let service: DataServiceName = service
+            .parse()
+            .map_err(|e| ClientError::Transport(Iceoryx2ClientError::Transport(e)))?;
 
         let stop = Arc::new(AtomicBool::new(false));
         // Shm attach (node create + subscriber open) must surface as a
@@ -601,10 +589,13 @@ impl Client for Iceoryx2Client {
                 "open-query reply missing service name".to_string(),
             )));
         };
-        if let Err(e) = check_data_service(&service) {
-            self.control.fire(Request::CancelQuery { query: id });
-            return Err(ClientError::Transport(e));
-        }
+        let service = match service.parse::<DataServiceName>() {
+            Ok(service) => service,
+            Err(e) => {
+                self.control.fire(Request::CancelQuery { query: id });
+                return Err(ClientError::Transport(Iceoryx2ClientError::Transport(e)));
+            }
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let events = match spawn_subscriber(
             service,
@@ -669,8 +660,9 @@ impl Iceoryx2Client {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
+    use super::Iceoryx2ClientError;
+    #[cfg(unix)]
     use super::{ControlConn, ControlHandle, QueryStream};
-    use super::{Iceoryx2ClientError, check_data_service};
     #[cfg(unix)]
     use crate::codes;
     #[cfg(unix)]
@@ -691,40 +683,6 @@ mod tests {
     use tokio::net::UnixListener;
     #[cfg(unix)]
     use tokio_stream::wrappers::ReceiverStream;
-
-    /// Any prefix the daemon was configured with is accepted as-is: the
-    /// client opens the advertised name verbatim and never assumes a
-    /// particular `service_prefix`.
-    #[test]
-    fn advertised_names_of_this_wire_version_are_accepted_whatever_the_prefix() {
-        assert!(check_data_service("datamancerd/v3/data/3").is_ok());
-        assert!(check_data_service("custom-prefix/v3/data/40").is_ok());
-        assert!(check_data_service("datamancerd-ct-e2e-123-4/v3/data/0").is_ok());
-        assert!(check_data_service("team/box/v3/data/7").is_ok());
-    }
-
-    /// A name of another wire version, or not a data-service name at all,
-    /// is refused before any shared-memory attach, with the name in the
-    /// error.
-    #[test]
-    fn other_shapes_are_refused_up_front() {
-        for bad in [
-            "datamancer/v2/data/3",
-            "datamancerd/data/40",
-            "datamancerd/v3/data/",
-            "datamancerd/v3/data/not-a-number",
-            "datamancerd/v3/symbols/3",
-            "/v3/data/3",
-            "nonsense",
-            "3",
-        ] {
-            let err = check_data_service(bad).unwrap_err();
-            assert!(
-                matches!(&err, Iceoryx2ClientError::Protocol(m) if m.contains(bad)),
-                "{bad}: {err}"
-            );
-        }
-    }
 
     /// Scripted fake UDS daemon: reads one request line, sends one reply line.
     /// UDS-only; the Windows named-pipe control path is exercised by the

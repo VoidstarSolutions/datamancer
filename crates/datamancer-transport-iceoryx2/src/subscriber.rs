@@ -82,11 +82,12 @@ pub use runtime::DataSubscriber;
 mod runtime {
     use super::HoldBuffer;
     use crate::error::{Result, TransportError};
+    use crate::naming::DataServiceName;
     use crate::payload::DataPayload;
     use crate::symbol_table::SymbolAnnouncement;
     use datamancer_core::MarketEvent;
     use iceoryx2::port::subscriber::Subscriber;
-    use iceoryx2::prelude::{Node, ServiceName, ipc_threadsafe};
+    use iceoryx2::prelude::{Node, ipc_threadsafe};
 
     /// Live subscriber over a client's data + announcement services. Public so
     /// the Phase-5 fan-out node can reuse it.
@@ -97,33 +98,19 @@ mod runtime {
     }
 
     impl DataSubscriber {
-        /// Open the data service named `data_service` on `node`, verbatim, plus
-        /// its companion announcement service. `data_service` is the name the
-        /// daemon advertised in its `open-client` / `open-query` reply
-        /// (`{prefix}/v{WIRE_VERSION}/data/{id}`); the announcement name is
-        /// derived from it, never rebuilt from a guessed prefix.
+        /// Open the data service `name` on `node` plus its companion
+        /// announcement service. `name` is the [`DataServiceName`] parsed from
+        /// the daemon's `open-client` / `open-query` reply
+        /// (`{prefix}/v{WIRE_VERSION}/data/{id}`): parsing is the wire-version
+        /// check, and the announcement name is derived from the same parts,
+        /// never rebuilt from a guessed prefix.
         ///
         /// # Errors
         ///
-        /// Returns [`TransportError::BadServiceName`] if `data_service` is not
-        /// a data-service name of this crate's wire version, and
-        /// [`TransportError::Service`] if either service or subscriber port
-        /// cannot be opened.
-        pub fn open(node: &Node<ipc_threadsafe::Service>, data_service: &str) -> Result<Self> {
-            let (prefix, client_id) = crate::naming::parse_data_service_name(data_service)
-                .ok_or_else(|| {
-                    TransportError::BadServiceName(format!(
-                        "not a v{} data-service name: {data_service}",
-                        crate::naming::WIRE_VERSION
-                    ))
-                })?;
-            let data_name: ServiceName = data_service
-                .try_into()
-                .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))?;
-            let ann_name: ServiceName = crate::naming::announcement_service_name(prefix, client_id)
-                .as_str()
-                .try_into()
-                .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))?;
+        /// Returns [`TransportError::Service`] if either service or subscriber
+        /// port cannot be opened.
+        pub fn open(node: &Node<ipc_threadsafe::Service>, name: &DataServiceName) -> Result<Self> {
+            let (data_name, ann_name) = name.service_names();
 
             let data_service = node
                 .service_builder(&data_name)

@@ -23,7 +23,8 @@ use async_trait::async_trait;
 // node stack is `#[cfg(not(windows))]` and the daemon boots WS-only there.
 #[cfg(not(windows))]
 use datamancer::transport::{
-    Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2HealthPublisher,
+    DataServiceName, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2HealthPublisher,
+    ServicePrefix,
 };
 use datamancer::{
     AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
@@ -236,7 +237,7 @@ pub struct Server {
     // data services; the whole `open-client` flow is unix-only (Windows data
     // rides WS), so both are `#[cfg(not(windows))]`.
     #[cfg(not(windows))]
-    service_prefix: String,
+    service_prefix: ServicePrefix,
     #[cfg(not(windows))]
     max_clients: usize,
     admin_socket: PathBuf,
@@ -281,13 +282,13 @@ pub struct Server {
 /// The prefix becomes part of every per-client iceoryx2 service name
 /// (`{prefix}/v{WIRE_VERSION}/data/{id}`), so a prefix that cannot form a
 /// valid name is a config error at boot, not an `open-client` failure for
-/// every client later.
+/// every client later. The validated [`ServicePrefix`] is the only form the
+/// transport accepts, so the configured string never reaches it.
 #[cfg(not(windows))]
-fn checked_service_prefix(prefix: &str) -> Result<String> {
-    datamancer::transport::validate_service_prefix(prefix).map_err(|e| {
+fn checked_service_prefix(prefix: &str) -> Result<ServicePrefix> {
+    ServicePrefix::new(prefix).map_err(|e| {
         crate::error::DaemonError::ConfigInvalid(format!("[server].service_prefix: {e}"))
-    })?;
-    Ok(prefix.to_string())
+    })
 }
 
 impl Server {
@@ -984,7 +985,8 @@ impl Server {
         }
 
         let id = self.next_client_id;
-        let sink = match Iceoryx2DataSink::new(&self.node, &self.service_prefix, id) {
+        let name = DataServiceName::new(&self.service_prefix, id);
+        let sink = match Iceoryx2DataSink::new(&self.node, name) {
             Ok(sink) => sink,
             Err(e) => {
                 return Reply::error(codes::INTERNAL, format!("data sink: {e:?}"));
@@ -1075,7 +1077,8 @@ impl Server {
         // every error path must `close_query_session` — dropping the handle
         // leaves the controller (and the provider fetch) running with nobody
         // draining it. See `close_query_session`.
-        let sink = match Iceoryx2DataSink::new(&self.node, &self.service_prefix, id) {
+        let name = DataServiceName::new(&self.service_prefix, id);
+        let sink = match Iceoryx2DataSink::new(&self.node, name) {
             Ok(sink) => sink,
             Err(e) => {
                 close_query_session(session);
