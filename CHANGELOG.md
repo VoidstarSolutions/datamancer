@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.10.0...v0.11.0) - 2026-10-25
+
+### Added
+
+- *(transport)* [**breaking**] typed service names replace the string helpers
+- *(transport)* [**breaking**] scope iceoryx2 data services by service_prefix
+- *(datamancerd)* read IOX2_LOG_LEVEL in its own boot step
+- *(datamancerd)* honour IOX2_LOG_LEVEL for the iceoryx2 logger
+
+### Fixed
+
+- *(transport)* [**breaking**] names derive only from a typed boot-scoped prefix
+- *(transport)* SystemInFlux is not a stale service
+- *(datamancerd)* [**breaking**] boot-scoped service names and a typed stale error
+- *(datamancerd)* reject an empty service_prefix before the boot id
+
+### Other
+
+- *(transport)* comment cleanup after the typed-names review
+- *(datamancerd)* a query's bars reach a data-plane subscriber
+- *(datamancerd)* trim the boot-scoped prefix docs to the type
+- *(datamancerd)* share one daemon guard between the e2e suites
+- *(datamancerd)* stop e2e daemons gracefully before the next spawn
+
 ## [0.10.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.9.0...v0.10.0) - 2026-10-10
 
 ### Added
