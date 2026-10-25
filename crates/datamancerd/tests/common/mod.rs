@@ -5,9 +5,24 @@
 //! each suite pulls it in with `mod common;`.
 
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, Command};
 #[cfg(unix)]
 use std::time::Duration;
+
+/// The command that starts the daemon under test from `config_path`.
+///
+/// iceoryx2's own log (dead-node detection, cleanup, service open/create
+/// retries) goes to the daemon's inherited stderr at `trace`, so a rejected
+/// open is diagnosable from the `--nocapture` output (#96). Set here once so
+/// every suite's daemon logs the same way.
+pub fn daemon_command(config_path: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_datamancerd"));
+    command
+        .arg("--config")
+        .arg(config_path)
+        .env("IOX2_LOG_LEVEL", "trace");
+    command
+}
 
 /// How long [`DaemonGuard`] waits for a graceful exit before it falls back to
 /// a kill. The daemon's own drain is bounded by `shutdown_timeout_secs` (30 s

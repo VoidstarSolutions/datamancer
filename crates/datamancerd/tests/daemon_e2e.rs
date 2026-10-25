@@ -25,7 +25,6 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -99,10 +98,7 @@ publish_interval_ms = 200
     );
     std::fs::write(&config_path, config).expect("write config");
 
-    let bin = env!("CARGO_BIN_EXE_datamancerd");
-    let child = Command::new(bin)
-        .arg("--config")
-        .arg(&config_path)
+    let child = common::daemon_command(&config_path)
         .spawn()
         .expect("spawn datamancerd");
 
