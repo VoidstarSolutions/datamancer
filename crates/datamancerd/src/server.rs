@@ -235,9 +235,7 @@ pub struct Server {
     next_client_id: u64,
     // `service_prefix`/`max_clients` name and bound the per-client iceoryx2
     // data services; the whole `open-client` flow is unix-only (Windows data
-    // rides WS), so both are `#[cfg(not(windows))]`. The type says it: every
-    // per-client name is derived from this process's boot-scoped prefix, never
-    // from the configured value (see `effective_service_prefix`).
+    // rides WS), so both are `#[cfg(not(windows))]`.
     #[cfg(not(windows))]
     service_prefix: BootScopedPrefix,
     #[cfg(not(windows))]
@@ -284,21 +282,8 @@ pub struct Server {
 /// The prefix every per-client iceoryx2 service name of this daemon process
 /// starts with: the configured `[server].service_prefix` plus a boot id
 /// (`{service_prefix}/{unix_secs}-{pid}`), so names read
-/// `{service_prefix}/{boot_id}/v{WIRE_VERSION}/data/{id}`.
-///
-/// The boot id is what makes a crash survivable: a daemon killed while
-/// removing one of its services leaves that service marked for destruction
-/// with no owner, and iceoryx2's dead-node cleanup never visits it (#96). A
-/// successor with the same config therefore never re-creates a predecessor's
-/// names, whatever the kill timing. Clients open the advertised name verbatim
-/// (#95), so the extra segment costs them nothing. The host-global
-/// `datamancer/diagnostics` / `datamancer/health` names cannot carry a boot id
-/// (clients find them by fixed name) and are handled by
-/// [`host_global_open_error`] instead.
-///
-/// A configured prefix that is not a valid [`ServicePrefix`], or that leaves
-/// no room for the boot id, is a config error at boot, not an `open-client`
-/// failure for every client later.
+/// `{service_prefix}/{boot_id}/v{WIRE_VERSION}/data/{id}`. Why the boot id
+/// exists, and what it buys after a crash, is on [`BootScopedPrefix`].
 #[cfg(not(windows))]
 fn effective_service_prefix(configured: &str) -> Result<BootScopedPrefix> {
     let invalid = |e: datamancer::transport::TransportError| {
