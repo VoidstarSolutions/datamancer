@@ -53,22 +53,10 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// Classify a publish-subscribe `open_or_create` failure on service `name`.
-///
-/// `IsMarkedForDestruction` after the creation timeout is what iceoryx2
-/// 0.10's `open_or_create` returns for a service whose dynamic config is
-/// locked for destruction and which no node references any more: the open
-/// keeps failing, a create is never attempted, and the loop gives up with
-/// that last error. Only that state means a stale service with no live owner
-/// is in the way, and only it becomes [`TransportError::StaleService`].
-///
-/// `SystemInFlux` is deliberately *not* classified as stale: the loop returns
-/// it when open and create alternate (does-not-exist, then already-exists)
-/// more than once within the timeout, which is a transient race with another
-/// participant creating or removing the same name (for a restart, typically
-/// the successor's own dead-node cleanup deleting the predecessor's service
-/// while the successor creates it) and clears on its own. It keeps its debug
-/// text as [`TransportError::Service`], like every other failure.
+/// Classify a publish-subscribe `open_or_create` failure on service `name`:
+/// `IsMarkedForDestruction` is [`TransportError::StaleService`]; everything
+/// else, `SystemInFlux` included (a transient race, not a stale service),
+/// keeps its debug text as [`TransportError::Service`].
 pub(crate) fn open_or_create_error(
     name: &str,
     e: iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenOrCreateError,

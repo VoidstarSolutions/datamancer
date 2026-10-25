@@ -7,12 +7,14 @@
 //! iceoryx2's type check would happily let through. A mismatched peer simply
 //! finds no service — loud absence instead of silently 1e9x-wrong sizes.
 //!
-//! Two types carry a name across the crate boundary instead of strings:
+//! Three types carry a name across the crate boundary instead of strings:
 //! [`ServicePrefix`], a daemon's `[server].service_prefix` validated once at
-//! construction, and [`DataServiceName`], one client's data-service name,
-//! either derived from a prefix and a client id (the creating side) or parsed
-//! from the name a daemon advertised (the opening side). One parser, one wire
-//! version, and no bare string in between.
+//! construction; [`BootScopedPrefix`], that prefix scoped to one daemon
+//! process and the only prefix a name is ever derived from; and
+//! [`DataServiceName`], one client's data-service name, either derived from a
+//! boot-scoped prefix and a client id (the creating side) or parsed from the
+//! name a daemon advertised (the opening side). One parser, one wire version,
+//! and no bare string in between.
 
 use std::fmt;
 use std::str::FromStr;
@@ -35,9 +37,10 @@ pub const WIRE_VERSION: u32 = 3;
 
 /// A daemon's `[server].service_prefix`, validated once: non-empty, and short
 /// enough that every per-client name derived from it is a legal iceoryx2
-/// [`ServiceName`]. Constructing one is the only check the prefix ever gets;
-/// the sink and the subscriber take a derived [`DataServiceName`] and never
-/// see the configured string.
+/// [`ServiceName`]. Constructing one is the only check the configured value
+/// ever gets. Names are not derived from it directly but from its
+/// [`boot_scoped`](Self::boot_scoped) form, so the configured string never
+/// reaches the sink or the subscriber.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ServicePrefix(String);
 
@@ -68,6 +71,19 @@ impl ServicePrefix {
         Ok(Self(prefix.to_string()))
     }
 
+    /// Scope this prefix to one daemon process: `{prefix}/{unix_secs}-{pid}`.
+    /// The result is what names are derived from, so two processes with the
+    /// same configuration never create the same name, whatever happened to
+    /// the earlier one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::BadServiceName`] if the scoped prefix no
+    /// longer fits the longest name it has to produce.
+    pub fn boot_scoped(&self, unix_secs: u64, pid: u32) -> Result<BootScopedPrefix> {
+        Self::new(&format!("{self}/{unix_secs}-{pid}")).map(BootScopedPrefix)
+    }
+
     /// The configured prefix string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -89,16 +105,41 @@ impl FromStr for ServicePrefix {
     }
 }
 
-/// The data-plane service name of one client under a [`ServicePrefix`]:
-/// `{prefix}/v{WIRE_VERSION}/data/{client_id}`, with the companion
-/// announcement service at `{prefix}/v{WIRE_VERSION}/symbols/{client_id}`.
+/// A [`ServicePrefix`] scoped to one daemon process,
+/// `{configured}/{unix_secs}-{pid}`, obtained only through
+/// [`ServicePrefix::boot_scoped`]. It is the sole input to
+/// [`DataServiceName::new`]: a daemon cannot create a name under its bare
+/// configured prefix, so a restart never re-creates a crashed predecessor's
+/// names and never meets the stale service such a predecessor can leave
+/// behind ([`TransportError::StaleService`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BootScopedPrefix(ServicePrefix);
+
+impl BootScopedPrefix {
+    /// The scoped prefix string, `{configured}/{unix_secs}-{pid}`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Display for BootScopedPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// The data-plane service name of one client under a daemon's
+/// [`BootScopedPrefix`]: `{prefix}/v{WIRE_VERSION}/data/{client_id}`, with
+/// the companion announcement service at
+/// `{prefix}/v{WIRE_VERSION}/symbols/{client_id}`.
 ///
-/// A daemon derives one from its prefix and a client id ([`new`](Self::new)),
-/// creates the services under it and advertises it with [`Display`](fmt::Display); a
-/// consumer parses the advertised string back ([`FromStr`]) and opens it. A
-/// name from another wire version does not parse, so a mismatched peer is
-/// refused before any shared-memory attach instead of silently finding no
-/// service.
+/// A daemon derives one from its boot-scoped prefix and a client id
+/// ([`new`](Self::new)), creates the services under it and advertises it with
+/// [`Display`](fmt::Display); a consumer parses the advertised string back
+/// ([`FromStr`]) and opens it. A name from another wire version does not
+/// parse, so a mismatched peer is refused before any shared-memory attach
+/// instead of silently finding no service.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DataServiceName {
     prefix: ServicePrefix,
@@ -107,17 +148,18 @@ pub struct DataServiceName {
 
 impl DataServiceName {
     /// The name of `client_id`'s data service under `prefix`. Infallible: the
-    /// prefix was validated for its longest derivable name.
+    /// prefix was validated for its longest derivable name when it was
+    /// scoped.
     #[must_use]
-    pub fn new(prefix: &ServicePrefix, client_id: u64) -> Self {
+    pub fn new(prefix: &BootScopedPrefix, client_id: u64) -> Self {
         Self {
-            prefix: prefix.clone(),
+            prefix: prefix.0.clone(),
             client_id,
         }
     }
 
-    /// The prefix this name was derived from (the daemon's configured
-    /// `service_prefix`).
+    /// Everything before `/v{WIRE_VERSION}/data/`: the daemon's boot-scoped
+    /// prefix, which a consumer treats as opaque.
     #[must_use]
     pub fn prefix(&self) -> &ServicePrefix {
         &self.prefix
@@ -164,8 +206,8 @@ impl fmt::Display for DataServiceName {
 impl FromStr for DataServiceName {
     type Err = TransportError;
 
-    /// Accepts exactly the shape [`Display`](fmt::Display) produces for *this*
-    /// [`WIRE_VERSION`]. A prefix may itself contain slashes; the last
+    /// Accepts exactly the shape [`Display`](fmt::Display) produces for
+    /// *this* [`WIRE_VERSION`]. A prefix may itself contain slashes; the last
     /// `/v{WIRE_VERSION}/data/` marker wins.
     fn from_str(name: &str) -> Result<Self> {
         let bad = || {
@@ -187,11 +229,17 @@ impl FromStr for DataServiceName {
 
 #[cfg(test)]
 mod tests {
-    use super::{DataServiceName, ServicePrefix, WIRE_VERSION};
+    use super::{BootScopedPrefix, DataServiceName, ServicePrefix, WIRE_VERSION};
     use iceoryx2::prelude::ServiceName;
 
-    fn prefix(p: &str) -> ServicePrefix {
-        ServicePrefix::new(p).expect("valid prefix")
+    const SECS: u64 = 1_729_600_000;
+    const PID: u32 = 4321;
+
+    fn scoped(configured: &str) -> BootScopedPrefix {
+        ServicePrefix::new(configured)
+            .expect("valid prefix")
+            .boot_scoped(SECS, PID)
+            .expect("fits")
     }
 
     #[test]
@@ -204,69 +252,103 @@ mod tests {
         assert!(ServicePrefix::new(&too_long).is_err());
     }
 
-    /// The longest name a prefix can produce is the bound checked at
-    /// construction, so every derived name converts without a second check.
     #[test]
-    fn every_name_derived_from_a_valid_prefix_is_a_valid_service_name() {
+    fn boot_scoping_appends_secs_and_pid_and_keeps_the_budget() {
+        assert_eq!(
+            scoped("datamancerd").as_str(),
+            "datamancerd/1729600000-4321"
+        );
+        assert_eq!(
+            scoped("datamancerd").to_string(),
+            "datamancerd/1729600000-4321"
+        );
+        // A configured prefix can be valid on its own and still leave no room
+        // for the boot id: scoping is where that is caught.
         let longest_suffix = format!("/v{WIRE_VERSION}/symbols/{}", u64::MAX);
-        let longest_prefix = "p".repeat(ServiceName::max_len() - longest_suffix.len());
-        let prefix = prefix(&longest_prefix);
+        let budget = ServiceName::max_len() - longest_suffix.len();
+        let configured = ServicePrefix::new(&"p".repeat(budget)).expect("fits unscoped");
+        assert!(configured.boot_scoped(SECS, PID).is_err());
+    }
+
+    /// The longest name a scoped prefix can produce is the bound checked when
+    /// it is scoped, so every derived name converts without a second check.
+    #[test]
+    fn every_name_derived_from_a_scoped_prefix_is_a_valid_service_name() {
+        let longest_suffix = format!("/v{WIRE_VERSION}/symbols/{}", u64::MAX);
+        let longest_boot_id = format!("/{}-{}", u64::MAX, u32::MAX);
+        let configured_len = ServiceName::max_len() - longest_suffix.len() - longest_boot_id.len();
+        let configured = ServicePrefix::new(&"p".repeat(configured_len)).expect("valid");
+        let prefix = configured
+            .boot_scoped(u64::MAX, u32::MAX)
+            .expect("exactly at the budget");
         for id in [0, 1, u64::MAX] {
             let (data, announcement) = DataServiceName::new(&prefix, id).service_names();
-            assert_eq!(
-                data.as_str(),
-                format!("{longest_prefix}/v{WIRE_VERSION}/data/{id}")
-            );
+            assert_eq!(data.as_str(), format!("{prefix}/v{WIRE_VERSION}/data/{id}"));
             assert_eq!(
                 announcement.as_str(),
-                format!("{longest_prefix}/v{WIRE_VERSION}/symbols/{id}")
+                format!("{prefix}/v{WIRE_VERSION}/symbols/{id}")
             );
         }
-        let one_too_many = format!("{longest_prefix}p");
-        assert!(ServicePrefix::new(&one_too_many).is_err());
+        let one_too_many = ServicePrefix::new(&"p".repeat(configured_len + 1)).expect("valid");
+        assert!(one_too_many.boot_scoped(u64::MAX, u32::MAX).is_err());
     }
 
     #[test]
-    fn service_names_embed_the_prefix_and_the_wire_version() {
-        let name = DataServiceName::new(&prefix("datamancerd"), 7);
-        assert_eq!(name.to_string(), "datamancerd/v3/data/7");
-        assert_eq!(name.prefix().as_str(), "datamancerd");
+    fn service_names_embed_the_scoped_prefix_and_the_wire_version() {
+        let name = DataServiceName::new(&scoped("datamancerd"), 7);
+        assert_eq!(name.to_string(), "datamancerd/1729600000-4321/v3/data/7");
+        assert_eq!(name.prefix().as_str(), "datamancerd/1729600000-4321");
         assert_eq!(name.client_id(), 7);
         let (data, announcement) = name.service_names();
-        assert_eq!(data.as_str(), "datamancerd/v3/data/7");
-        assert_eq!(announcement.as_str(), "datamancerd/v3/symbols/7");
+        assert_eq!(data.as_str(), "datamancerd/1729600000-4321/v3/data/7");
         assert_eq!(
-            DataServiceName::new(&prefix("run-42"), 0).to_string(),
-            "run-42/v3/data/0"
+            announcement.as_str(),
+            "datamancerd/1729600000-4321/v3/symbols/7"
+        );
+        assert_eq!(
+            DataServiceName::new(&scoped("run-42"), 0).to_string(),
+            "run-42/1729600000-4321/v3/data/0"
         );
     }
 
     #[test]
-    fn different_prefixes_never_share_a_name() {
-        let a = DataServiceName::new(&prefix("a"), 0);
-        let b = DataServiceName::new(&prefix("b"), 0);
+    fn different_prefixes_or_boots_never_share_a_name() {
+        let a = DataServiceName::new(&scoped("a"), 0);
+        let b = DataServiceName::new(&scoped("b"), 0);
         assert_ne!(a, b);
         assert_ne!(a.to_string(), b.to_string());
         assert_ne!(a.service_names().1, b.service_names().1);
+        let configured = ServicePrefix::new("a").expect("valid");
+        let earlier = configured.boot_scoped(SECS, PID).expect("fits");
+        let later = configured.boot_scoped(SECS + 1, PID).expect("fits");
+        assert_ne!(
+            DataServiceName::new(&earlier, 0),
+            DataServiceName::new(&later, 0)
+        );
     }
 
     #[test]
     fn versioned_names_never_collide_with_earlier_namespaces() {
-        let name = DataServiceName::new(&prefix("datamancer"), 7).to_string();
+        let name = DataServiceName::new(&scoped("datamancer"), 7).to_string();
         assert_ne!(name, "datamancer/data/7");
         assert_ne!(name, "datamancer/v2/data/7");
+        assert_ne!(name, "datamancer/v3/data/7");
     }
 
     #[test]
     fn an_advertised_name_round_trips_to_its_parts() {
-        let name = DataServiceName::new(&prefix("datamancerd-ct-e2e-123-4"), 40);
+        let name = DataServiceName::new(&scoped("datamancerd-ct-e2e-123-4"), 40);
         let parsed: DataServiceName = name.to_string().parse().expect("parses");
         assert_eq!(parsed, name);
-        assert_eq!(parsed.prefix().as_str(), "datamancerd-ct-e2e-123-4");
+        assert_eq!(
+            parsed.prefix().as_str(),
+            "datamancerd-ct-e2e-123-4/1729600000-4321"
+        );
         assert_eq!(parsed.client_id(), 40);
         // A prefix may itself contain slashes; the last marker wins.
         let parsed: DataServiceName = "team/box/v3/data/3".parse().expect("parses");
-        assert_eq!(parsed, DataServiceName::new(&prefix("team/box"), 3));
+        assert_eq!(parsed.prefix().as_str(), "team/box");
+        assert_eq!(parsed.client_id(), 3);
     }
 
     #[test]

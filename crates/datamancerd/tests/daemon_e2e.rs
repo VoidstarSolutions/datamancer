@@ -302,7 +302,11 @@ fn a_restarted_daemon_serves_its_first_client_after_a_crash() {
             prefix.starts_with(&format!("{configured_prefix}/")),
             "{service}: prefix {prefix:?} is not boot-scoped under {configured_prefix:?}"
         );
-        assert_eq!(name.client_id(), 0, "{service}: first client of each boot is id 0");
+        assert_eq!(
+            name.client_id(),
+            0,
+            "{service}: first client of each boot is id 0"
+        );
     }
 }
 
