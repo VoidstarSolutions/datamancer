@@ -254,6 +254,13 @@ impl From<AdjustmentCfg> for Adjustment {
 pub struct ServerConfig {
     #[serde(default = "default_admin_socket")]
     pub admin_socket: PathBuf,
+    /// Prefix of every per-client iceoryx2 service this daemon creates
+    /// (`{service_prefix}/v{WIRE_VERSION}/data/{id}` and `.../symbols/{id}`),
+    /// advertised verbatim in `open-client` / `open-query` replies. Daemons
+    /// with different prefixes never share a service. Must be non-empty and
+    /// short enough to form a valid iceoryx2 service name; checked at boot.
+    /// The host-global `datamancer/diagnostics` and `datamancer/health`
+    /// services are not scoped by it.
     #[serde(default = "default_service_prefix")]
     pub service_prefix: String,
     #[serde(default = "default_shutdown_timeout")]

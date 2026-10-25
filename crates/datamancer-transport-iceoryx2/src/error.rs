@@ -7,7 +7,11 @@
 //! [`std::io::Error`] so no `datamancer-core` change is needed.
 
 /// An error originating in the iceoryx2 transport.
+///
+/// `#[non_exhaustive]`: a consumer matches with a wildcard arm, so a variant
+/// added later is an additive change rather than a break.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransportError {
     /// A service name was not a valid iceoryx2 `ServiceName`.
     BadServiceName(String),

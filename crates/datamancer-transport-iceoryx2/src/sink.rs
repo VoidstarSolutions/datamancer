@@ -17,9 +17,10 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use datamancer_core::{EventSink, MarketEvent, PublishOutcome, Result as CoreResult};
 use iceoryx2::port::publisher::Publisher;
-use iceoryx2::prelude::{BackpressureStrategy, Node, ServiceName, ipc_threadsafe};
+use iceoryx2::prelude::{BackpressureStrategy, Node, ipc_threadsafe};
 
 use crate::error::{Result, TransportError};
+use crate::naming::DataServiceName;
 use crate::payload::{DataPayload, to_pod};
 use crate::symbol_table::{SymbolAnnouncement, SymbolId, SymbolTable};
 
@@ -51,6 +52,9 @@ struct State {
 /// Per-client iceoryx2 data-plane sink. Not cloneable; dropped on client-session
 /// close (after [`flush`](EventSink::flush)).
 pub struct Iceoryx2DataSink {
+    /// The data service's name, exactly as created; what the daemon
+    /// advertises in its `open-client` / `open-query` reply.
+    name: DataServiceName,
     data: Publisher<ipc_threadsafe::Service, DataPayload, ()>,
     announcements: Publisher<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
     state: Mutex<State>,
@@ -60,17 +64,21 @@ pub struct Iceoryx2DataSink {
 }
 
 impl Iceoryx2DataSink {
-    /// Create the per-client data + announcement services on `node` and their
-    /// publishers. `node` is the one process-wide iceoryx2 node (Phase 5 owns
-    /// its lifetime); the caller keeps it alive for the sink's lifetime.
+    /// Create the client's data + announcement services on `node` under
+    /// `name` (`{prefix}/v{WIRE_VERSION}/data/{client_id}` and
+    /// `.../symbols/{client_id}`, see [`DataServiceName`]) and their
+    /// publishers. A [`DataServiceName`] only exists for a validated
+    /// [`ServicePrefix`](crate::ServicePrefix), so daemons with different
+    /// prefixes never share a service and no name is re-checked here. `node`
+    /// is the one process-wide iceoryx2 node (Phase 5 owns its lifetime); the
+    /// caller keeps it alive for the sink's lifetime.
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError`] if a service name is invalid or a service /
-    /// publisher port cannot be created.
-    pub fn new(node: &Node<ipc_threadsafe::Service>, client_id: u64) -> Result<Self> {
-        let data_name = service_name(&crate::naming::data_service_name(client_id))?;
-        let ann_name = service_name(&crate::naming::announcement_service_name(client_id))?;
+    /// Returns [`TransportError::Service`] if a service or a publisher port
+    /// cannot be created.
+    pub fn new(node: &Node<ipc_threadsafe::Service>, name: DataServiceName) -> Result<Self> {
+        let (data_name, ann_name) = name.service_names();
 
         let data_service = node
             .service_builder(&data_name)
@@ -106,6 +114,7 @@ impl Iceoryx2DataSink {
             .map_err(|e| TransportError::Service(format!("{e:?}")))?;
 
         Ok(Self {
+            name,
             data,
             announcements,
             state: Mutex::new(State {
@@ -114,6 +123,14 @@ impl Iceoryx2DataSink {
             }),
             sends: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The data service's name, exactly as created on the node. The daemon
+    /// advertises its `Display` form; a consumer parses that back and opens
+    /// it (see [`DataSubscriber::open`](crate::DataSubscriber::open)).
+    #[must_use]
+    pub fn data_service_name(&self) -> &DataServiceName {
+        &self.name
     }
 
     /// Publish one announcement sample.
@@ -239,9 +256,4 @@ impl EventSink for Iceoryx2DataSink {
         self.republish_all_announcements()?;
         Ok(())
     }
-}
-
-fn service_name(name: &str) -> Result<ServiceName> {
-    name.try_into()
-        .map_err(|e| TransportError::BadServiceName(format!("{e:?}")))
 }

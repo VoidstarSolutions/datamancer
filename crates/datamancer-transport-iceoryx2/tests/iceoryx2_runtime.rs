@@ -19,10 +19,21 @@ use datamancer_core::{
     Timestamp, Trade,
 };
 use datamancer_transport_iceoryx2::{
-    DataSubscriber, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2DiagnosticsSubscriber,
-    Iceoryx2HealthPublisher, Iceoryx2HealthSubscriber,
+    DataServiceName, DataSubscriber, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher,
+    Iceoryx2DiagnosticsSubscriber, Iceoryx2HealthPublisher, Iceoryx2HealthSubscriber,
+    ServicePrefix,
 };
 use iceoryx2::prelude::{Node, NodeBuilder, ipc_threadsafe};
+
+/// The `[server].service_prefix` a daemon would configure; every service name
+/// in these tests is scoped by it.
+const PREFIX: &str = "transport-runtime-test";
+
+/// The data-service name a daemon would derive for `client` under [`PREFIX`].
+fn name(client: u64) -> DataServiceName {
+    let prefix = ServicePrefix::new(PREFIX).expect("valid prefix");
+    DataServiceName::new(&prefix, client)
+}
 
 fn unique_client_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -73,8 +84,8 @@ fn drain_until(sub: &mut DataSubscriber, expected: usize) -> Vec<MarketEvent> {
 async fn data_plane_reconstructs_logical_stream() {
     let node = node();
     let client = unique_client_id();
-    let sink = Iceoryx2DataSink::new(&node, client).expect("sink");
-    let mut sub = DataSubscriber::open(&node, client).expect("subscriber");
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
 
     // Two symbols interleaved; per-symbol seq is monotonic.
     let events = vec![
@@ -108,8 +119,8 @@ async fn data_plane_reconstructs_logical_stream() {
 async fn flush_drains_before_exit() {
     let node = node();
     let client = unique_client_id();
-    let sink = Iceoryx2DataSink::new(&node, client).expect("sink");
-    let mut sub = DataSubscriber::open(&node, client).expect("subscriber");
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
 
     sink.publish(trade("BTC/USD", 0, 100)).await;
     sink.publish(MarketEvent::Control(Control {
@@ -133,10 +144,10 @@ async fn two_clients_same_symbol_see_identical_seq() {
     let node = node();
     let client_a = unique_client_id();
     let client_b = unique_client_id();
-    let sink_a = Iceoryx2DataSink::new(&node, client_a).expect("sink a");
-    let sink_b = Iceoryx2DataSink::new(&node, client_b).expect("sink b");
-    let mut sub_a = DataSubscriber::open(&node, client_a).expect("sub a");
-    let mut sub_b = DataSubscriber::open(&node, client_b).expect("sub b");
+    let sink_a = Iceoryx2DataSink::new(&node, name(client_a)).expect("sink a");
+    let sink_b = Iceoryx2DataSink::new(&node, name(client_b)).expect("sink b");
+    let mut sub_a = DataSubscriber::open(&node, sink_a.data_service_name()).expect("sub a");
+    let mut sub_b = DataSubscriber::open(&node, sink_b.data_service_name()).expect("sub b");
 
     let ev = trade("BTC/USD", 7, 100);
     sink_a.publish(ev.clone()).await;
@@ -153,7 +164,7 @@ async fn two_clients_same_symbol_see_identical_seq() {
 async fn late_joiner_resolves_all_symbols() {
     let node = node();
     let client = unique_client_id();
-    let sink = Iceoryx2DataSink::new(&node, client).expect("sink");
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
 
     // Publish before any subscriber attaches; history retains the samples.
     for ev in [trade("BTC/USD", 0, 100), trade("ETH/USD", 0, 200)] {
@@ -164,7 +175,7 @@ async fn late_joiner_resolves_all_symbols() {
     // a new subscriber on the publisher's next send (mirrors a live stream that
     // keeps ticking), so publish one more sample + flush to trigger delivery and
     // republish the full symbol table for resolution.
-    let mut sub = DataSubscriber::open(&node, client).expect("late subscriber");
+    let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("late subscriber");
     sink.publish(trade("BTC/USD", 1, 101)).await;
     sink.flush().await.expect("flush");
 

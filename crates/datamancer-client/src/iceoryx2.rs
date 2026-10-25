@@ -13,7 +13,7 @@ use std::time::Duration;
 use datamancer_core::{
     ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
 };
-use datamancer_transport_iceoryx2::DataSubscriber;
+use datamancer_transport_iceoryx2::{DataServiceName, DataSubscriber};
 use futures::Stream;
 // `::` prefix: this module is itself named `iceoryx2`, so the extern crate is
 // named explicitly (bare paths here happen to resolve to the crate today, but
@@ -71,23 +71,6 @@ pub enum Iceoryx2ClientError {
     /// errors `datamancer-transport-iceoryx2` funnels into `Transport`.
     #[error("iceoryx2 node creation failed: {0}")]
     Node(String),
-}
-
-/// Extract the numeric client id from the `open-client` reply's service name.
-/// The id sits in the trailing `.../data/{id}` segments regardless of the
-/// daemon's configured service prefix (`service_prefix` in the daemon's
-/// config is not fixed to `"datamancer"`, so this must not hardcode it).
-fn parse_client_id(service: &str) -> Result<u64, Iceoryx2ClientError> {
-    let mut segments = service.rsplit('/');
-    let id = segments.next();
-    let marker = segments.next();
-    match (marker, id) {
-        (Some("data"), Some(id)) => id.parse().ok(),
-        _ => None,
-    }
-    .ok_or_else(|| {
-        Iceoryx2ClientError::Protocol(format!("unparseable data-service name: {service}"))
-    })
 }
 
 /// Map a control [`Reply`] to the two-layer error model.
@@ -245,7 +228,7 @@ impl ControlHandle {
 /// daemon reaps the finished query's service once it has delivered every
 /// event.
 async fn spawn_subscriber(
-    service_id: u64,
+    service: DataServiceName,
     poll_interval: Duration,
     event_buffer: usize,
     stop: Arc<AtomicBool>,
@@ -260,7 +243,7 @@ async fn spawn_subscriber(
                 return;
             }
         };
-        let mut subscriber = match DataSubscriber::open(&node, service_id) {
+        let mut subscriber = match DataSubscriber::open(&node, &service) {
             Ok(s) => s,
             Err(e) => {
                 let _ = attach_tx.send(Err(Iceoryx2ClientError::from(e)));
@@ -422,14 +405,16 @@ impl Client for Iceoryx2Client {
                 "open-client reply missing service name".to_string(),
             ))
         })?;
-        let client_id = parse_client_id(&service).map_err(ClientError::Transport)?;
+        let service: DataServiceName = service
+            .parse()
+            .map_err(|e| ClientError::Transport(Iceoryx2ClientError::Transport(e)))?;
 
         let stop = Arc::new(AtomicBool::new(false));
         // Shm attach (node create + subscriber open) must surface as a
         // `connect` failure, not an eprintln plus a silently-ended stream —
         // the spec's error contract treats it as a `ClientError::Transport`.
         let events = spawn_subscriber(
-            client_id,
+            service,
             cfg.poll_interval,
             cfg.event_buffer,
             Arc::clone(&stop),
@@ -590,20 +575,37 @@ impl Client for Iceoryx2Client {
                 "open-query reply missing query id".to_string(),
             ))
         })?;
+        // The query is already open daemon-side: every failure from here on
+        // must cancel it, or it holds one of the daemon's few query slots
+        // (and keeps paging the provider) until it finishes on its own.
+        let Some(service) = reply.service else {
+            self.control.fire(Request::CancelQuery { query: id });
+            return Err(ClientError::Transport(Iceoryx2ClientError::Protocol(
+                "open-query reply missing service name".to_string(),
+            )));
+        };
+        let service = match service.parse::<DataServiceName>() {
+            Ok(service) => service,
+            Err(e) => {
+                self.control.fire(Request::CancelQuery { query: id });
+                return Err(ClientError::Transport(Iceoryx2ClientError::Transport(e)));
+            }
+        };
         let stop = Arc::new(AtomicBool::new(false));
-        // The query is already open daemon-side. If attaching fails we must
-        // cancel it here, or it holds one of the daemon's few query slots (and
-        // keeps paging the provider) until it finishes on its own.
-        let events =
-            match spawn_subscriber(id, self.poll_interval, self.event_buffer, Arc::clone(&stop))
-                .await
-            {
-                Ok(events) => events,
-                Err(e) => {
-                    self.control.fire(Request::CancelQuery { query: id });
-                    return Err(ClientError::Transport(e));
-                }
-            };
+        let events = match spawn_subscriber(
+            service,
+            self.poll_interval,
+            self.event_buffer,
+            Arc::clone(&stop),
+        )
+        .await
+        {
+            Ok(events) => events,
+            Err(e) => {
+                self.control.fire(Request::CancelQuery { query: id });
+                return Err(ClientError::Transport(e));
+            }
+        };
         Ok((
             id,
             QueryStream {
@@ -652,9 +654,10 @@ impl Iceoryx2Client {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_client_id;
     #[cfg(unix)]
-    use super::{ControlConn, ControlHandle, Iceoryx2ClientError, QueryStream};
+    use super::Iceoryx2ClientError;
+    #[cfg(unix)]
+    use super::{ControlConn, ControlHandle, QueryStream};
     #[cfg(unix)]
     use crate::codes;
     #[cfg(unix)]
@@ -675,28 +678,6 @@ mod tests {
     use tokio::net::UnixListener;
     #[cfg(unix)]
     use tokio_stream::wrappers::ReceiverStream;
-
-    #[test]
-    fn client_id_parses_from_the_service_name() {
-        assert_eq!(parse_client_id("datamancer/data/3").unwrap(), 3);
-        assert_eq!(parse_client_id("datamancer/data/40").unwrap(), 40);
-        assert!(parse_client_id("datamancer/data/").is_err());
-        assert!(parse_client_id("nonsense").is_err());
-        assert!(parse_client_id("datamancer/data/not-a-number").is_err());
-    }
-
-    /// The id is extracted from the trailing `/data/{id}` segments
-    /// regardless of the daemon's configured `service_prefix` — it need not
-    /// be literally `"datamancer"`.
-    #[test]
-    fn client_id_parses_regardless_of_daemon_service_prefix() {
-        assert_eq!(parse_client_id("datamancerd/data/40").unwrap(), 40);
-        assert_eq!(parse_client_id("custom-prefix/data/7").unwrap(), 7);
-        assert!(parse_client_id("data/").is_err());
-        assert!(parse_client_id("prefix/data/not-a-number").is_err());
-        assert!(parse_client_id("prefix/notdata/3").is_err());
-        assert!(parse_client_id("3").is_err());
-    }
 
     /// Scripted fake UDS daemon: reads one request line, sends one reply line.
     /// UDS-only; the Windows named-pipe control path is exercised by the
@@ -723,7 +704,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn control_conn_round_trips_a_request() {
-        let path = fake_uds(vec![Reply::service("datamancer/data/7")]);
+        let path = fake_uds(vec![Reply::service("datamancerd/v3/data/7")]);
         let mut conn = ControlConn::connect(&path).await.unwrap();
         let reply = conn
             .request(&Request::OpenClient {
@@ -733,7 +714,7 @@ mod tests {
             .await
             .unwrap();
         assert!(reply.ok);
-        assert_eq!(reply.service.as_deref(), Some("datamancer/data/7"));
+        assert_eq!(reply.service.as_deref(), Some("datamancerd/v3/data/7"));
     }
 
     #[cfg(unix)]

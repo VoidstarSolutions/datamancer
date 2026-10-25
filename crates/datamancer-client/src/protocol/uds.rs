@@ -391,9 +391,9 @@ mod tests {
 
     #[test]
     fn reply_serialization_omits_empty_fields() {
-        let ok = serde_json::to_value(Reply::service("datamancerd/data/3")).expect("ser");
+        let ok = serde_json::to_value(Reply::service("datamancerd/v3/data/3")).expect("ser");
         assert_eq!(ok["ok"], serde_json::Value::Bool(true));
-        assert_eq!(ok["service"], "datamancerd/data/3");
+        assert_eq!(ok["service"], "datamancerd/v3/data/3");
         assert!(ok.get("code").is_none());
         assert!(ok.get("snapshot").is_none());
 
@@ -646,11 +646,11 @@ mod tests {
 
     #[test]
     fn query_reply_carries_id_and_service_and_omits_absent_fields() {
-        let reply = Reply::query(7, "datamancer/v2/data/7".to_string());
+        let reply = Reply::query(7, "datamancerd/v3/data/7".to_string());
         let json = serde_json::to_string(&reply).expect("serialize");
         assert!(json.contains(r#""query":7"#), "got {json}");
         assert!(
-            json.contains(r#""service":"datamancer/v2/data/7""#),
+            json.contains(r#""service":"datamancerd/v3/data/7""#),
             "got {json}"
         );
         assert!(
