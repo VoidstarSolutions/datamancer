@@ -29,6 +29,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use common::DaemonGuard;
+use datamancer::{ControlKind, MarketEvent};
+use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 
 /// Makes every daemon's `service_prefix` unique (`<pid>-<n>`), so a reply's
 /// advertised service name identifies the daemon that sent it.
@@ -421,9 +423,18 @@ fn open_query_streams_bars_then_reaps_its_service() {
     // `reader`) is still alive here — then confirm the daemon reaped the
     // query on its own: nobody called cancel-query, and the connection that
     // opened it never dropped, so this can only be the query's own
-    // completion, not EOF teardown. Poll rather than a single fixed sleep:
-    // real Alpaca REST latency (and any rate-limit backoff) varies.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // completion, not EOF teardown.
+    wait_until_reaped(&daemon, id);
+
+    drop((writer, reader));
+}
+
+/// Poll `list-queries` until query `id` is gone, failing after 30 s. Poll
+/// rather than sleep once: real Alpaca REST latency (and any rate-limit
+/// backoff) varies. `list-queries` owns nothing, so a fresh `round_trip`
+/// connection cannot itself cancel anything.
+fn wait_until_reaped(daemon: &Daemon, id: u64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut after = round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
     while after["queries"]
         .as_array()
@@ -431,14 +442,99 @@ fn open_query_streams_bars_then_reaps_its_service() {
         .contains(&serde_json::json!(id))
     {
         assert!(
-            std::time::Instant::now() < deadline,
+            Instant::now() < deadline,
             "query {id} never self-reaped: {after}"
         );
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(500));
         after = round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
     }
+}
 
-    drop((writer, reader));
+/// `open-query` streams bars: a subscriber on the advertised data service
+/// receives the queried instrument's bars and then the terminal
+/// `SessionClosing`, after which the daemon reaps the query on its own
+/// (#108). Until now only the reap was asserted; a query whose events were
+/// dropped before the sink would have passed. The subscriber attaches right
+/// after the reply: the pump is already running (see `open_query`'s "Attach
+/// race"), and a month of 1-minute bars pages through Alpaca's REST API for
+/// far longer than the attach takes, so the service is still there. Same
+/// request as [`open_query_streams_bars_then_reaps_its_service`].
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
+fn open_query_delivers_bars_to_a_subscriber_then_closes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_daemon(dir.path());
+
+    let stream = UnixStream::connect(daemon.socket()).expect("connect");
+    let mut writer = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    writer
+        .write_all(
+            br#"{"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","from":1704067200000000000,"to":1706745600000000000}"#,
+        )
+        .expect("write");
+    writer.write_all(b"\n").expect("nl");
+    writer.flush().expect("flush");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
+    assert_eq!(reply["ok"], true, "open-query rejected: {reply}");
+    let id = reply["query"].as_u64().expect("query id");
+    let service = reply["service"].as_str().expect("service name");
+    let name: datamancer::transport::DataServiceName = service
+        .parse()
+        .unwrap_or_else(|e| panic!("not a data-service name: {service}: {e}"));
+
+    // Attach as a consumer would: a node of our own, opening the advertised
+    // name verbatim.
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut subscriber =
+        datamancer::transport::DataSubscriber::open(&node, &name).expect("subscriber");
+
+    // Drain until the terminal control, then a little longer: a bar whose
+    // symbol announcement lands on a later poll is held and released then,
+    // so the last bars may follow `SessionClosing` out of the buffer.
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let mut bars = 0u64;
+    let mut closed = false;
+    let mut settle = 0;
+    while !closed || settle < 10 {
+        if closed {
+            settle += 1;
+        } else {
+            assert!(
+                Instant::now() < deadline,
+                "no SessionClosing within 60 s ({bars} bars so far)"
+            );
+        }
+        for event in subscriber.poll().expect("poll") {
+            match event {
+                MarketEvent::Bar(bar) => {
+                    assert_eq!(bar.instrument.symbol(), "AAPL", "{bar:?}");
+                    bars += 1;
+                }
+                MarketEvent::Control(control) => {
+                    if control.kind == ControlKind::SessionClosing {
+                        closed = true;
+                    }
+                }
+                other => panic!("unexpected event on a bar query: {other:?}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(bars > 0, "SessionClosing arrived before any bar");
+    assert_eq!(
+        subscriber.held_len(),
+        0,
+        "bars held back for an announcement that never came"
+    );
+
+    // The pump reaps the query once the stream has drained and flushed.
+    wait_until_reaped(&daemon, id);
+    drop((subscriber, node, writer, reader));
 }
 
 #[test]
