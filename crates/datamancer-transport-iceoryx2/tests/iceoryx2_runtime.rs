@@ -29,9 +29,13 @@ use iceoryx2::prelude::{Node, NodeBuilder, ipc_threadsafe};
 /// in these tests is scoped by it.
 const PREFIX: &str = "transport-runtime-test";
 
-/// The data-service name a daemon would derive for `client` under [`PREFIX`].
+/// The data-service name a daemon would derive for `client` under [`PREFIX`]
+/// scoped to this test process.
 fn name(client: u64) -> DataServiceName {
-    let prefix = ServicePrefix::new(PREFIX).expect("valid prefix");
+    let prefix = ServicePrefix::new(PREFIX)
+        .expect("valid prefix")
+        .boot_scoped(0, std::process::id())
+        .expect("fits");
     DataServiceName::new(&prefix, client)
 }
 

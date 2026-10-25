@@ -23,8 +23,8 @@ use async_trait::async_trait;
 // node stack is `#[cfg(not(windows))]` and the daemon boots WS-only there.
 #[cfg(not(windows))]
 use datamancer::transport::{
-    DataServiceName, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher, Iceoryx2HealthPublisher,
-    ServicePrefix,
+    BootScopedPrefix, DataServiceName, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher,
+    Iceoryx2HealthPublisher, ServicePrefix,
 };
 use datamancer::{
     AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
@@ -237,7 +237,7 @@ pub struct Server {
     // data services; the whole `open-client` flow is unix-only (Windows data
     // rides WS), so both are `#[cfg(not(windows))]`.
     #[cfg(not(windows))]
-    service_prefix: ServicePrefix,
+    service_prefix: BootScopedPrefix,
     #[cfg(not(windows))]
     max_clients: usize,
     admin_socket: PathBuf,
@@ -279,16 +279,41 @@ pub struct Server {
     draining: bool,
 }
 
-/// The prefix becomes part of every per-client iceoryx2 service name
-/// (`{prefix}/v{WIRE_VERSION}/data/{id}`), so a prefix that cannot form a
-/// valid name is a config error at boot, not an `open-client` failure for
-/// every client later. The validated [`ServicePrefix`] is the only form the
-/// transport accepts, so the configured string never reaches it.
+/// The prefix every per-client iceoryx2 service name of this daemon process
+/// starts with: the configured `[server].service_prefix` plus a boot id
+/// (`{service_prefix}/{unix_secs}-{pid}`), so names read
+/// `{service_prefix}/{boot_id}/v{WIRE_VERSION}/data/{id}`. Why the boot id
+/// exists, and what it buys after a crash, is on [`BootScopedPrefix`].
 #[cfg(not(windows))]
-fn checked_service_prefix(prefix: &str) -> Result<ServicePrefix> {
-    ServicePrefix::new(prefix).map_err(|e| {
+fn effective_service_prefix(configured: &str) -> Result<BootScopedPrefix> {
+    let invalid = |e: datamancer::transport::TransportError| {
         crate::error::DaemonError::ConfigInvalid(format!("[server].service_prefix: {e}"))
-    })
+    };
+    let configured = ServicePrefix::new(configured).map_err(invalid)?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    configured
+        .boot_scoped(secs, std::process::id())
+        .map_err(invalid)
+}
+
+/// Map a failure to open one of the host-global iceoryx2 services at boot to
+/// a daemon error an operator can act on. A stale service left by a crashed
+/// predecessor is named and the operator is pointed at the README section
+/// that owns the recovery procedure; every other failure keeps the
+/// transport's text.
+#[cfg(not(windows))]
+fn host_global_open_error(what: &str, e: &datamancer::transport::TransportError) -> DaemonError {
+    match e {
+        datamancer::transport::TransportError::StaleService(name) => {
+            DaemonError::Transport(format!(
+                "{what}: stale iceoryx2 service {name} left by a crashed predecessor; see \
+                 \"Recovering from a crashed predecessor\" in the datamancerd README"
+            ))
+        }
+        other => DaemonError::Transport(format!("{what}: {other:?}")),
+    }
 }
 
 impl Server {
@@ -302,7 +327,7 @@ impl Server {
     pub async fn bootstrap(config: Config, config_path: std::path::PathBuf) -> Result<Self> {
         let admin_socket = config.server.admin_socket.clone();
         #[cfg(not(windows))]
-        let service_prefix = checked_service_prefix(&config.server.service_prefix)?;
+        let service_prefix = effective_service_prefix(&config.server.service_prefix)?;
         #[cfg(not(windows))]
         let max_clients = config.iceoryx2.max_clients;
         let max_queries = config.iceoryx2.max_queries;
@@ -460,9 +485,9 @@ impl Server {
         #[cfg(not(windows))]
         let diagnostics = {
             let publisher = Iceoryx2DiagnosticsPublisher::new(&self.node)
-                .map_err(|e| DaemonError::Transport(format!("diagnostics publisher: {e:?}")))?;
+                .map_err(|e| host_global_open_error("diagnostics publisher", &e))?;
             let health_publisher = Iceoryx2HealthPublisher::new(&self.node)
-                .map_err(|e| DaemonError::Transport(format!("health publisher: {e:?}")))?;
+                .map_err(|e| host_global_open_error("health publisher", &e))?;
             spawn_diagnostics(
                 self.dm.clone(),
                 publisher,
@@ -1944,6 +1969,56 @@ fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The effective prefix is the configured value scoped to this process,
+    /// and a name derived from it parses back to that scoped prefix and the
+    /// plain client id. A bad configured value is a config error naming the
+    /// knob.
+    #[cfg(not(windows))]
+    #[test]
+    fn effective_prefix_is_the_configured_prefix_scoped_to_this_process() {
+        let effective = effective_service_prefix("datamancerd").expect("valid prefix");
+        let expected_tail = format!("-{}", std::process::id());
+        assert!(
+            effective.as_str().starts_with("datamancerd/"),
+            "{effective}"
+        );
+        assert!(effective.as_str().ends_with(&expected_tail), "{effective}");
+        let name = DataServiceName::new(&effective, 7);
+        let parsed: DataServiceName = name.to_string().parse().expect("advertised shape");
+        assert_eq!(parsed.prefix().as_str(), effective.as_str());
+        assert_eq!(parsed.client_id(), 7);
+        let empty = effective_service_prefix("")
+            .expect_err("empty prefix")
+            .to_string();
+        assert!(empty.contains("[server].service_prefix"), "{empty}");
+        assert!(empty.contains("empty"), "{empty}");
+        assert!(effective_service_prefix(&"p".repeat(300)).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn host_global_open_error_names_the_stale_service_and_the_recovery() {
+        use datamancer::transport::TransportError;
+        let stale = host_global_open_error(
+            "health publisher",
+            &TransportError::StaleService("datamancer/health".to_string()),
+        );
+        let text = stale.to_string();
+        assert!(text.contains("health publisher"), "{text}");
+        assert!(text.contains("datamancer/health"), "{text}");
+        assert!(
+            text.contains("Recovering from a crashed predecessor"),
+            "{text}"
+        );
+        let other = host_global_open_error(
+            "diagnostics publisher",
+            &TransportError::Service("ExceedsMaxNumberOfNodes".to_string()),
+        );
+        let text = other.to_string();
+        assert!(text.contains("ExceedsMaxNumberOfNodes"), "{text}");
+        assert!(!text.contains("Recovering"), "{text}");
+    }
 
     // The peer-cred gate is Unix-only (Windows uses the pipe owner DACL).
     #[cfg(unix)]

@@ -60,6 +60,16 @@ impl DaemonGuard {
     pub fn control_endpoint(&self) -> &Path {
         &self.control
     }
+
+    /// Simulate a crash: kill the daemon outright and reap it, so it never
+    /// runs its drain and its iceoryx2 node and per-client services stay
+    /// registered with a dead owner. `Drop` then finds a reaped child and
+    /// only reports that the graceful stop was not possible.
+    #[allow(dead_code)] // only the crash-restart test simulates a crash
+    pub fn kill_abruptly(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for DaemonGuard {
