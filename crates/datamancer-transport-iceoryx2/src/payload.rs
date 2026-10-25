@@ -119,6 +119,8 @@ pub struct DataPayload {
     /// `u64`; only the interpretation is now fixed-point — which is exactly
     /// why the service names embed [`WIRE_VERSION`](crate::WIRE_VERSION):
     /// a mixed-version peer must fail to attach, not read 1e9x-wrong sizes.
+    /// The same constant also versions the name shape itself (v3 scoped
+    /// every per-client name by the daemon's prefix), so it moves for either.
     pub size0: u64,
     /// Quote `ask_size`, in raw `Quantity` units (1e-9 of a base unit).
     pub size1: u64,

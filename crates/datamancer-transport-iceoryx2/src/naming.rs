@@ -139,8 +139,10 @@ impl DataServiceName {
     /// in that order.
     pub(crate) fn service_names(&self) -> (ServiceName, ServiceName) {
         let announcement = Self::announcement_string(self.prefix.as_str(), self.client_id);
-        // Both names are no longer than the one `ServicePrefix::new` accepted
-        // and share its leading characters, which is all iceoryx2 checks.
+        // iceoryx2 0.10's `ServiceName::new` rejects an `iox2_` prefix and an
+        // over-length name, nothing else (re-verify on an iceoryx2 bump). Both
+        // names are no longer than the one `ServicePrefix::new` accepted and
+        // share its leading characters, so neither check can fail here.
         let as_service_name = |name: String| -> ServiceName {
             name.as_str()
                 .try_into()

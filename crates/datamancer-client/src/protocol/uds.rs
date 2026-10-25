@@ -391,9 +391,9 @@ mod tests {
 
     #[test]
     fn reply_serialization_omits_empty_fields() {
-        let ok = serde_json::to_value(Reply::service("datamancerd/data/3")).expect("ser");
+        let ok = serde_json::to_value(Reply::service("datamancerd/v3/data/3")).expect("ser");
         assert_eq!(ok["ok"], serde_json::Value::Bool(true));
-        assert_eq!(ok["service"], "datamancerd/data/3");
+        assert_eq!(ok["service"], "datamancerd/v3/data/3");
         assert!(ok.get("code").is_none());
         assert!(ok.get("snapshot").is_none());
 

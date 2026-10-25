@@ -992,7 +992,6 @@ impl Server {
                 return Reply::error(codes::INTERNAL, format!("data sink: {e:?}"));
             }
         };
-        // Advertise the service by the exact name the sink created it under.
         let service = sink.data_service_name().to_string();
         let sink = Arc::new(sink) as Arc<dyn EventSink>;
 
@@ -1085,7 +1084,6 @@ impl Server {
                 return Reply::error(codes::INTERNAL, format!("query data sink: {e:?}"));
             }
         };
-        // Advertise the service by the exact name the sink created it under.
         let service = sink.data_service_name().to_string();
         let sink = Arc::new(sink) as Arc<dyn EventSink>;
         let stream = match session.take_events().await {

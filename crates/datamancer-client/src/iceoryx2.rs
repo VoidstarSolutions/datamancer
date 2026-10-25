@@ -405,11 +405,6 @@ impl Client for Iceoryx2Client {
                 "open-client reply missing service name".to_string(),
             ))
         })?;
-        // The advertised name is parsed exactly once, here, and opened as
-        // parsed: the daemon's `service_prefix` is whatever it advertised,
-        // never guessed. A daemon on another wire version advertises a
-        // different shape and is refused before any shared-memory attach,
-        // with the name in the error.
         let service: DataServiceName = service
             .parse()
             .map_err(|e| ClientError::Transport(Iceoryx2ClientError::Transport(e)))?;
