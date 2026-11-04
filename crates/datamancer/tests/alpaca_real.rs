@@ -224,6 +224,96 @@ async fn paper_keys_authenticate_on_the_iex_stream() {
     let _ = handle.close().await;
 }
 
+/// Two live sessions on one provider share one websocket. Before the hub,
+/// each authoritative `(instrument, kind)` session opened its own socket and
+/// Alpaca refused the second with `406 connection limit exceeded`, which the
+/// provider then mistook for rejected credentials and parked — so trades and
+/// quotes on one symbol, or two symbols, could never stream together. Opens
+/// FAKEPACA Trade and FAKEPACA Quote on the `Test` feed through
+/// `Datamancer::session` (two authoritative sessions) and requires a trade on
+/// the first and a quote on the second, with no `Unauthenticated` disconnect
+/// on either.
+#[tokio::test]
+#[ignore = "requires real Alpaca credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
+async fn two_live_sessions_share_one_stream_connection() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let provider = AlpacaProvider::new(AlpacaProviderConfig {
+        settings: SettingsSource::Static(AlpacaSettings {
+            account_type: AccountType::Paper,
+            ..Default::default()
+        }),
+        stream_feed: AlpacaStreamFeed::Test,
+        ..Default::default()
+    });
+    let dm = Datamancer::builder()
+        .provider(Box::new(provider))
+        .build()
+        .unwrap();
+    let fakepaca = || {
+        Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "FAKEPACA",
+        )
+    };
+    let open = |kind| {
+        dm.session(
+            fakepaca(),
+            kind,
+            Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        )
+    };
+    let trades = open(EventKind::Trade).await.expect("trade session open");
+    let quotes = open(EventKind::Quote).await.expect("quote session open");
+    let mut trade_stream = trades.take_events().await.unwrap();
+    let mut quote_stream = quotes.take_events().await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
+    let (mut got_trade, mut got_quote) = (false, false);
+    while !(got_trade && got_quote) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let ev = tokio::select! {
+            ev = trade_stream.next() => ev,
+            ev = quote_stream.next() => ev,
+            () = tokio::time::sleep(remaining) => {
+                panic!("timed out: trade={got_trade} quote={got_quote}");
+            }
+        }
+        .expect("stream closed early");
+        eprintln!("event: {ev:?}");
+        match ev {
+            MarketEvent::Trade(t) => {
+                assert_eq!(t.instrument.symbol(), "FAKEPACA");
+                got_trade = true;
+            }
+            MarketEvent::Quote(q) => {
+                assert_eq!(q.instrument.symbol(), "FAKEPACA");
+                got_quote = true;
+            }
+            MarketEvent::Control(c) => {
+                if let datamancer::ControlKind::ProviderDisconnected { cause, reason, .. } = &c.kind
+                {
+                    assert_ne!(
+                        *cause,
+                        DisconnectCause::Unauthenticated,
+                        "second session must not be refused as a credential rejection: {reason}"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let _ = trades.close().await;
+    let _ = quotes.close().await;
+}
+
 /// Bad-credentials smoke test: connecting the streaming client with a
 /// deliberately-invalid explicit key pair must land as an in-band
 /// `ProviderDisconnected { cause: Unauthenticated, .. }` control — the

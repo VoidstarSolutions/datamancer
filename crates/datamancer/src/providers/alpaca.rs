@@ -17,15 +17,31 @@
 //! see [`stream_url`]); `account_type` keeps selecting the trading/REST host
 //! and, for the env credential source, the credential pair.
 //!
+//! # Single shared connection
+//!
+//! Alpaca allows one market-data websocket per key pair; a second connect is
+//! refused with `406 connection limit exceeded`. The session layer calls
+//! [`Provider::start_live`] once per authoritative `(instrument, kind)`
+//! session, so those calls must not each open a socket. This provider lazily
+//! spawns a single hub task on the first `start_live`; every subsequent
+//! `start_live` returns a [`LiveHandle`] that talks to that hub over a
+//! command channel. The hub owns the upstream socket, applies the aggregate
+//! subscription set to it, and routes incoming events to the right
+//! per-session sink by `(instrument, kind)`. The session-registry rule (at
+//! most one live session per pair) keeps that routing a function.
+//!
 //! # Reconnect
 //!
-//! On websocket failure the streaming task tears down the client, sleeps with
-//! exponential backoff per the configured [`ReconnectPolicy`], and reconnects
-//! — re-applying the active subscription set. A `ProviderDisconnected` /
-//! `ProviderConnected` control pair is emitted in-band so consumers see the
-//! gap window in the event stream.
+//! On websocket failure the hub tears down the client, sleeps with
+//! exponential backoff per the configured [`ReconnectPolicy`], and
+//! reconnects — re-applying the aggregate subscription set. A
+//! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast to
+//! every active sink so consumers see the gap window in the event stream. A
+//! rejected credential pair (`402`) parks instead of retrying until the
+//! credentials rotate; a `406` or any other server error is transient and
+//! backs off (see `classify_stream_failure` for the upstream caveat).
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -48,7 +64,7 @@ use oxidized_alpaca::{
         trading::assets::{Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus},
     },
     streaming::{
-        StockStreamMessage, StockSubscriptionList, StreamingStockClient,
+        StockStreamMessage, StockSubscriptionList, StreamErrorCode, StreamingStockClient,
         messages::stock::{StockBar, StockQuoteEvent, StockTradeEvent},
     },
 };
@@ -320,6 +336,23 @@ struct RestState {
 pub struct AlpacaProvider {
     cfg: AlpacaProviderConfig,
     rest: std::sync::Mutex<RestState>,
+    /// The one hub task behind every live session (see the module docs);
+    /// spawned lazily on the first `start_live`.
+    hub: std::sync::Mutex<HubSlot>,
+    #[cfg(test)]
+    hub_spawns: std::sync::atomic::AtomicUsize,
+}
+
+enum HubSlot {
+    Idle,
+    Active {
+        cmd_tx: mpsc::Sender<HubCommand>,
+        /// The hub exits on its own once the provider and every handle are
+        /// gone (its command channel closes); the join handle is kept so a
+        /// test can observe that.
+        #[allow(dead_code, reason = "observed by the lifecycle test only")]
+        task: JoinHandle<()>,
+    },
 }
 
 impl AlpacaProvider {
@@ -340,7 +373,13 @@ impl AlpacaProvider {
             cred_rx,
             settings_rx,
         });
-        Self { cfg, rest }
+        Self {
+            cfg,
+            rest,
+            hub: std::sync::Mutex::new(HubSlot::Idle),
+            #[cfg(test)]
+            hub_spawns: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     /// Construct with an explicit market-data REST client. Useful in tests.
@@ -359,7 +398,56 @@ impl AlpacaProvider {
             cred_rx,
             settings_rx,
         });
-        Self { cfg, rest }
+        Self {
+            cfg,
+            rest,
+            hub: std::sync::Mutex::new(HubSlot::Idle),
+            #[cfg(test)]
+            hub_spawns: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Lazily spawn the hub task and return its command channel. Every
+    /// `start_live` goes through here, so the provider never holds more
+    /// than one upstream socket.
+    fn ensure_hub(&self) -> mpsc::Sender<HubCommand> {
+        // A std mutex, never held across an await (the spawn is synchronous):
+        // keeps the provider `UnwindSafe`/`RefUnwindSafe` like its REST state.
+        let mut slot = self.hub.lock().expect("hub slot poisoned");
+        match &*slot {
+            HubSlot::Active { cmd_tx, .. } => cmd_tx.clone(),
+            HubSlot::Idle => {
+                let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(64);
+                let cfg = self.cfg.clone();
+                let task = tokio::spawn(run_hub_task(cfg, cmd_rx));
+                #[cfg(test)]
+                self.hub_spawns
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *slot = HubSlot::Active {
+                    cmd_tx: cmd_tx.clone(),
+                    task,
+                };
+                cmd_tx
+            }
+        }
+    }
+
+    /// How many hub tasks this provider has spawned (test observability).
+    #[cfg(test)]
+    fn hub_spawns(&self) -> usize {
+        self.hub_spawns.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Take the hub task out of the provider, dropping the provider's own
+    /// command sender: once every handle is gone too, the task exits and the
+    /// returned join handle resolves (test observability).
+    #[cfg(test)]
+    fn take_hub_task(&self) -> Option<JoinHandle<()>> {
+        let mut slot = self.hub.lock().expect("hub slot poisoned");
+        match std::mem::replace(&mut *slot, HubSlot::Idle) {
+            HubSlot::Active { task, .. } => Some(task),
+            HubSlot::Idle => None,
+        }
     }
 
     /// Current REST clients, rebuilt first if the credential or settings
@@ -416,12 +504,11 @@ impl Provider for AlpacaProvider {
     }
 
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<LiveCommand>(32);
-        let cfg = self.cfg.clone();
-        let task = tokio::spawn(run_streaming_task(cfg, sink, cmd_rx));
-        Ok(Box::new(AlpacaLiveHandle {
+        let cmd_tx = self.ensure_hub();
+        Ok(Box::new(SharedLiveHandle {
             cmd_tx,
-            task: Mutex::new(Some(task)),
+            sink,
+            subscribed: Mutex::new(None),
         }))
     }
 
@@ -520,68 +607,145 @@ impl Provider for AlpacaProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Live handle + command channel
+// Hub command channel and live handle
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-enum LiveCommand {
-    Subscribe(Instrument, EventKind, oneshot::Sender<Result<()>>),
-    Unsubscribe(Instrument, EventKind, oneshot::Sender<Result<()>>),
-    Close(oneshot::Sender<()>),
+enum HubCommand {
+    Subscribe {
+        instrument: Instrument,
+        kind: EventKind,
+        sink: mpsc::Sender<MarketEvent>,
+        ack: oneshot::Sender<Result<()>>,
+    },
+    Unsubscribe {
+        instrument: Instrument,
+        kind: EventKind,
+        ack: oneshot::Sender<Result<()>>,
+    },
 }
 
-struct AlpacaLiveHandle {
-    cmd_tx: mpsc::Sender<LiveCommand>,
-    task: Mutex<Option<JoinHandle<()>>>,
+/// One session's handle onto the shared hub: it carries the session's sink
+/// to the hub on subscribe and cleans its route up on close. The socket
+/// itself belongs to the hub, never to a handle.
+struct SharedLiveHandle {
+    cmd_tx: mpsc::Sender<HubCommand>,
+    /// Per-session sink the hub will route events to once subscribed.
+    sink: mpsc::Sender<MarketEvent>,
+    /// Tracks the pair this handle is subscribed to so `close` can clean it
+    /// up. With a per-session handle this is at most one pair.
+    subscribed: Mutex<Option<(Instrument, EventKind)>>,
 }
 
 #[async_trait]
-impl LiveHandle for AlpacaLiveHandle {
+impl LiveHandle for SharedLiveHandle {
     async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(LiveCommand::Subscribe(instrument, kind, tx))
+            .send(HubCommand::Subscribe {
+                instrument: instrument.clone(),
+                kind,
+                sink: self.sink.clone(),
+                ack: tx,
+            })
             .await
             .map_err(|_| Error::SessionClosed)?;
-        rx.await.map_err(|_| Error::SessionClosed)?
+        let res = rx.await.map_err(|_| Error::SessionClosed)?;
+        if res.is_ok() {
+            *self.subscribed.lock().await = Some((instrument, kind));
+        }
+        res
     }
 
     async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(LiveCommand::Unsubscribe(instrument, kind, tx))
+            .send(HubCommand::Unsubscribe {
+                instrument: instrument.clone(),
+                kind,
+                ack: tx,
+            })
             .await
             .map_err(|_| Error::SessionClosed)?;
-        rx.await.map_err(|_| Error::SessionClosed)?
+        let res = rx.await.map_err(|_| Error::SessionClosed)?;
+        if res.is_ok() {
+            let mut slot = self.subscribed.lock().await;
+            if slot.as_ref() == Some(&(instrument, kind)) {
+                *slot = None;
+            }
+        }
+        res
     }
 
     async fn close(self: Box<Self>) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(LiveCommand::Close(tx)).await;
-        let _ = rx.await;
-        if let Some(task) = self.task.lock().await.take() {
-            let _ = task.await;
+        // If the session never explicitly unsubscribed, do it now so the hub
+        // drops the route. The hub itself is shared; its lifetime is tied to
+        // the provider, not any one session.
+        let pair = self.subscribed.lock().await.take();
+        if let Some((instrument, kind)) = pair {
+            let (tx, rx) = oneshot::channel();
+            let _ = self
+                .cmd_tx
+                .send(HubCommand::Unsubscribe {
+                    instrument,
+                    kind,
+                    ack: tx,
+                })
+                .await;
+            let _ = rx.await;
         }
         Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Streaming task
+// Hub task
 // ---------------------------------------------------------------------------
+
+/// How a streaming failure is handled. A rejected credential pair parks the
+/// hub until a rotation (retrying cannot help, provisioning can); everything
+/// else — a dropped socket, `406 connection limit exceeded`, `407 slow
+/// client` — is transient and backs off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFailure {
+    Unauthenticated,
+    Transient,
+}
+
+/// Classify a connect-time or mid-stream error from `oxidized_alpaca`.
+///
+/// `406 connection limit exceeded` is transient: another connection on the
+/// same key pair holds the slot, which clears when it closes. Only
+/// `402 auth failed` means the credentials themselves are rejected.
+/// Limitation to know about: at **connect** time `oxidized_alpaca` 0.0.10
+/// (and 0.0.11) collapses every non-`authenticated` auth response into the
+/// payload-less `Error::StreamingAuth` and only logs the envelope, so a 406
+/// there is indistinguishable from a 402 and lands in the park. The hub
+/// itself never opens a second connection, so a connect-time rejection is
+/// treated as the credential case it is in practice; once upstream carries
+/// the `StreamError` on that path, it classifies through the same arm as
+/// the mid-stream case below with no further change here.
+fn classify_stream_failure(err: &oxidized_alpaca::Error) -> StreamFailure {
+    match err {
+        oxidized_alpaca::Error::StreamingAuth => StreamFailure::Unauthenticated,
+        oxidized_alpaca::Error::StreamingError(e) => match e.code {
+            StreamErrorCode::AuthFailed => StreamFailure::Unauthenticated,
+            _ => StreamFailure::Transient,
+        },
+        _ => StreamFailure::Transient,
+    }
+}
 
 #[allow(
     clippy::too_many_lines,
     reason = "single-pass connect / authenticate / subscribe / dispatch / reconnect state machine; extraction would obscure the linear lifecycle"
 )]
-async fn run_streaming_task(
-    cfg: AlpacaProviderConfig,
-    sink: mpsc::Sender<MarketEvent>,
-    mut cmd_rx: mpsc::Receiver<LiveCommand>,
-) {
-    // Authoritative subscription state, applied to every fresh client.
-    let active: Arc<Mutex<StockSubscriptionList>> =
-        Arc::new(Mutex::new(StockSubscriptionList::new()));
+async fn run_hub_task(cfg: AlpacaProviderConfig, mut cmd_rx: mpsc::Receiver<HubCommand>) {
+    // Per-session sinks keyed by the pair they own; the session registry's
+    // at-most-one-live-session-per-pair rule keeps this a function.
+    let mut routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>> = HashMap::new();
+    // Authoritative aggregate subscription set, applied to every fresh socket.
+    let mut subs = StockSubscriptionList::new();
     let mut backoff = cfg.reconnect.initial_backoff_ms;
 
     'outer: loop {
@@ -652,8 +816,8 @@ async fn run_streaming_task(
         let mut client = match connect_result {
             Ok(client) => {
                 backoff = cfg.reconnect.initial_backoff_ms;
-                emit_control(
-                    &sink,
+                broadcast_control(
+                    &routes,
                     ControlKind::ProviderConnected {
                         provider: PROVIDER_ID.to_string(),
                     },
@@ -662,17 +826,19 @@ async fn run_streaming_task(
                 client
             }
             Err(err) => {
-                // oxidized_alpaca 0.0.10 returns `Error::StreamingAuth` when
-                // the market-data connect handshake's auth response is not
-                // `Authenticated` (fixed upstream in
-                // fix(streaming): return StreamingAuth on rejected
-                // market-data credentials); this classification consumes it.
-                let unauthenticated = matches!(err, oxidized_alpaca::Error::StreamingAuth);
-                emit_control(
-                    &sink,
+                let failure = classify_stream_failure(&err);
+                let unauthenticated = failure == StreamFailure::Unauthenticated;
+                tracing::warn!(
+                    provider = PROVIDER_ID,
+                    ?failure,
+                    error = %error_chain(&err),
+                    "market-data stream connect failed"
+                );
+                broadcast_control(
+                    &routes,
                     ControlKind::ProviderDisconnected {
                         provider: PROVIDER_ID.to_string(),
-                        reason: format!("connect failed: {err}"),
+                        reason: format!("connect failed: {}", error_chain(&err)),
                         cause: if unauthenticated {
                             DisconnectCause::Unauthenticated
                         } else {
@@ -698,44 +864,58 @@ async fn run_streaming_task(
             }
         };
 
-        // Re-apply persistent subscription set, if any.
+        // Re-apply the aggregate subscription set on a fresh socket.
+        if !is_empty(&subs)
+            && let Err(err) = client.add_subscriptions(&subs).await
         {
-            let snapshot = active.lock().await.clone();
-            if !is_empty(&snapshot)
-                && let Err(err) = client.add_subscriptions(&snapshot).await
-            {
-                emit_control(
-                    &sink,
-                    ControlKind::ProviderError {
-                        provider: PROVIDER_ID.to_string(),
-                        message: format!("re-subscribe failed: {err}"),
-                    },
-                )
-                .await;
-            }
+            broadcast_control(
+                &routes,
+                ControlKind::ProviderError {
+                    provider: PROVIDER_ID.to_string(),
+                    message: format!("re-subscribe failed: {}", error_chain(&err)),
+                },
+            )
+            .await;
         }
 
-        // Event loop: select between commands and incoming messages.
+        // Event loop: select between commands, incoming messages, and the
+        // credential/settings watches.
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(LiveCommand::Subscribe(instrument, kind, ack)) => {
-                            let mut list = active.lock().await;
-                            apply_pair_to_list(&mut list, &instrument, kind, true);
-                            let snapshot = list.clone();
-                            drop(list);
+                        Some(HubCommand::Subscribe { instrument, kind, sink, ack }) => {
+                            routes.insert((instrument.clone(), kind), sink);
+                            apply_pair_to_list(&mut subs, &instrument, kind, true);
                             let res = client
-                                .add_subscriptions(&snapshot)
+                                .add_subscriptions(&subs)
                                 .await
                                 .map(|_| ())
                                 .map_err(|e| Error::Provider {
                                     provider: PROVIDER_ID.to_string(),
-                                    message: format!("add_subscriptions: {e}"),
+                                    message: format!("add_subscriptions: {}", error_chain(&e)),
                                 });
-                            if res.is_ok() {
-                                emit_control(
-                                    &sink,
+                            if res.is_err() {
+                                // Roll back so reconnect doesn't keep trying to
+                                // apply a subscription the server rejected.
+                                routes.remove(&(instrument.clone(), kind));
+                                apply_pair_to_list(&mut subs, &instrument, kind, false);
+                            } else {
+                                // We are in the connected loop, so the provider is
+                                // up. `ProviderConnected` is otherwise only
+                                // broadcast on the connect *edge*, which a route
+                                // that subscribes afterward misses — leaving its
+                                // connection state Unknown even as data flows. Tell
+                                // the freshly-subscribed route the provider is up.
+                                broadcast_control_to(
+                                    routes.get(&(instrument.clone(), kind)),
+                                    ControlKind::ProviderConnected {
+                                        provider: PROVIDER_ID.to_string(),
+                                    },
+                                )
+                                .await;
+                                broadcast_control_to(
+                                    routes.get(&(instrument.clone(), kind)),
                                     ControlKind::SubscriptionChanged {
                                         provider: PROVIDER_ID.to_string(),
                                         instrument,
@@ -744,20 +924,14 @@ async fn run_streaming_task(
                                     },
                                 )
                                 .await;
-                            } else {
-                                // Roll back so reconnect doesn't keep trying to apply a
-                                // subscription the server rejected.
-                                let mut list = active.lock().await;
-                                apply_pair_to_list(&mut list, &instrument, kind, false);
                             }
                             let _ = ack.send(res);
                         }
-                        Some(LiveCommand::Unsubscribe(instrument, kind, ack)) => {
-                            let mut list = active.lock().await;
-                            apply_pair_to_list(&mut list, &instrument, kind, false);
-                            drop(list);
-                            // Build a list containing only the pair being removed; that's
-                            // what the Alpaca API expects in remove_subscriptions.
+                        Some(HubCommand::Unsubscribe { instrument, kind, ack }) => {
+                            apply_pair_to_list(&mut subs, &instrument, kind, false);
+                            // A list containing only the pair being removed;
+                            // that's what the Alpaca API expects in
+                            // remove_subscriptions.
                             let mut removal = StockSubscriptionList::new();
                             apply_pair_to_list(&mut removal, &instrument, kind, true);
                             let res = client
@@ -766,11 +940,14 @@ async fn run_streaming_task(
                                 .map(|_| ())
                                 .map_err(|e| Error::Provider {
                                     provider: PROVIDER_ID.to_string(),
-                                    message: format!("remove_subscriptions: {e}"),
+                                    message: format!("remove_subscriptions: {}", error_chain(&e)),
                                 });
                             if res.is_ok() {
-                                emit_control(
-                                    &sink,
+                                // Drop the route after the upstream ack so any
+                                // tail events still in flight are routable.
+                                let removed = routes.remove(&(instrument.clone(), kind));
+                                broadcast_control_to(
+                                    removed.as_ref(),
                                     ControlKind::SubscriptionChanged {
                                         provider: PROVIDER_ID.to_string(),
                                         instrument,
@@ -780,23 +957,17 @@ async fn run_streaming_task(
                                 )
                                 .await;
                             } else {
-                                // Roll back so the upstream server's view stays consistent
-                                // with ours: the pair is still streaming, so we should still
-                                // include it on reconnect.
-                                let mut list = active.lock().await;
-                                apply_pair_to_list(&mut list, &instrument, kind, true);
+                                // Roll back so the upstream server's view stays
+                                // consistent with ours: the pair is still
+                                // streaming, so reconnect must re-apply it.
+                                apply_pair_to_list(&mut subs, &instrument, kind, true);
                             }
                             let _ = ack.send(res);
                         }
-                        Some(LiveCommand::Close(ack)) => {
-                            let _ = client.shut_down().await;
-                            // SessionClosing is emitted by Controller::shutdown;
-                            // don't double-emit here.
-                            let _ = ack.send(());
-                            return;
-                        }
                         None => {
-                            // The handle was dropped. Close the websocket and exit.
+                            // The provider and every handle are gone; no
+                            // command can ever arrive again. Close the
+                            // websocket and exit.
                             let _ = client.shut_down().await;
                             return;
                         }
@@ -806,25 +977,28 @@ async fn run_streaming_task(
                     match next {
                         Ok(msg) => {
                             for ev in translate_stock_message(msg) {
-                                if sink.send(ev).await.is_err() {
-                                    // Consumer dropped; shut down.
-                                    let _ = client.shut_down().await;
-                                    return;
-                                }
+                                dispatch_event(&routes, ev).await;
                             }
                         }
                         Err(err) => {
                             // oxidized_alpaca 0.0.10: `Error::StreamingError`
-                            // (mid-stream server error envelope). A mid-stream
-                            // `StreamingAuth` is connect-only upstream today;
-                            // handled defensively, mirroring the connect arm.
-                            let unauthenticated =
-                                matches!(err, oxidized_alpaca::Error::StreamingAuth);
-                            emit_control(
-                                &sink,
+                            // carries the server's envelope mid-stream, so a
+                            // `402` parks and a `406`/`407` backs off; a
+                            // mid-stream `StreamingAuth` is connect-only
+                            // upstream today and handled the same way.
+                            let failure = classify_stream_failure(&err);
+                            let unauthenticated = failure == StreamFailure::Unauthenticated;
+                            tracing::warn!(
+                                provider = PROVIDER_ID,
+                                ?failure,
+                                error = %error_chain(&err),
+                                "market-data stream failed"
+                            );
+                            broadcast_control(
+                                &routes,
                                 ControlKind::ProviderDisconnected {
                                     provider: PROVIDER_ID.to_string(),
-                                    reason: format!("websocket: {err}"),
+                                    reason: format!("websocket: {}", error_chain(&err)),
                                     cause: if unauthenticated {
                                         DisconnectCause::Unauthenticated
                                     } else {
@@ -868,11 +1042,11 @@ async fn run_streaming_task(
                             "credentials changed; reconnecting"
                         );
                         // Same in-band control the websocket error path
-                        // emits, then reconnect immediately with the new
-                        // credentials — reset the backoff, this is a
+                        // broadcasts, then reconnect immediately with the
+                        // new credentials — reset the backoff, this is a
                         // deliberate rotation, not a failure.
-                        emit_control(
-                            &sink,
+                        broadcast_control(
+                            &routes,
                             ControlKind::ProviderDisconnected {
                                 provider: PROVIDER_ID.to_string(),
                                 reason: "credentials rotated".to_string(),
@@ -905,8 +1079,8 @@ async fn run_streaming_task(
                             ("settings changed", DisconnectCause::Error)
                         };
                         tracing::info!(provider = PROVIDER_ID, reason, "settings changed; reconnecting");
-                        emit_control(
-                            &sink,
+                        broadcast_control(
+                            &routes,
                             ControlKind::ProviderDisconnected {
                                 provider: PROVIDER_ID.to_string(),
                                 reason: reason.to_string(),
@@ -925,8 +1099,8 @@ async fn run_streaming_task(
     }
 }
 
-/// Why the streaming task is parked in [`wait_for_provisioning`], and so
-/// which error a subscribe/unsubscribe gets meanwhile: a credential park is
+/// Why the hub task is parked in [`wait_for_provisioning`], and so which
+/// error a subscribe/unsubscribe gets meanwhile: a credential park is
 /// `Error::Unauthenticated` (retrying cannot help; provisioning can), a
 /// disable is a plain provider error.
 #[derive(Debug, Clone, Copy)]
@@ -958,12 +1132,12 @@ impl Park {
 }
 
 /// Waits for a `Watch` source (settings or credentials) to deliver a new
-/// value, servicing the command channel meanwhile (close exits,
-/// subscribe/unsubscribe fail fast with `park`'s error). Returns `false` if
-/// the task should exit.
+/// value, servicing the command channel meanwhile (drop of the provider and
+/// every handle exits; subscribe/unsubscribe fail fast with `park`'s error).
+/// Returns `false` if the hub task should exit.
 async fn wait_for_provisioning<T>(
     rx: &mut watch::Receiver<T>,
-    cmd_rx: &mut mpsc::Receiver<LiveCommand>,
+    cmd_rx: &mut mpsc::Receiver<HubCommand>,
     park: Park,
 ) -> bool {
     loop {
@@ -975,16 +1149,13 @@ async fn wait_for_provisioning<T>(
                     return true;
                 }
                 // Sender dropped with no value: it can never arrive. Keep
-                // servicing commands so close still works.
+                // servicing commands so hub shutdown (all handles dropped)
+                // still works.
                 loop {
                     match cmd_rx.recv().await {
-                        Some(LiveCommand::Close(ack)) => {
-                            let _ = ack.send(());
-                            return false;
-                        }
                         Some(
-                            LiveCommand::Subscribe(_, _, ack)
-                            | LiveCommand::Unsubscribe(_, _, ack),
+                            HubCommand::Subscribe { ack, .. }
+                            | HubCommand::Unsubscribe { ack, .. },
                         ) => {
                             let _ = ack.send(Err(park.error()));
                         }
@@ -994,13 +1165,9 @@ async fn wait_for_provisioning<T>(
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(LiveCommand::Close(ack)) => {
-                        let _ = ack.send(());
-                        return false;
-                    }
                     Some(
-                        LiveCommand::Subscribe(_, _, ack)
-                        | LiveCommand::Unsubscribe(_, _, ack),
+                        HubCommand::Subscribe { ack, .. }
+                        | HubCommand::Unsubscribe { ack, .. },
                     ) => {
                         let _ = ack.send(Err(park.error()));
                     }
@@ -1011,17 +1178,17 @@ async fn wait_for_provisioning<T>(
     }
 }
 
-/// Sleeps with exponential backoff. Returns `false` if a Close command came in
-/// during the sleep (caller should exit the task).
+/// Sleeps with exponential backoff, servicing the command channel meanwhile.
+/// Returns `false` if the hub task should exit (provider and handles gone).
 async fn sleep_with_jitter(
     backoff_ms: &mut u64,
     policy: &ReconnectPolicy,
-    cmd_rx: &mut mpsc::Receiver<LiveCommand>,
+    cmd_rx: &mut mpsc::Receiver<HubCommand>,
 ) -> bool {
     // Full jitter: pick a sleep uniformly in [0, backoff_ms]. With many
-    // sessions reconnecting after a shared upstream blip this avoids
-    // synchronized retry storms; without it every session retries on the
-    // same exponential ladder.
+    // providers reconnecting after a shared upstream blip this avoids
+    // synchronized retry storms; without it every one retries on the same
+    // exponential ladder.
     let delay_ms = if policy.jitter {
         fastrand::u64(0..=*backoff_ms)
     } else {
@@ -1034,22 +1201,47 @@ async fn sleep_with_jitter(
         () = tokio::time::sleep(delay) => true,
         cmd = cmd_rx.recv() => {
             match cmd {
-                Some(LiveCommand::Close(ack)) => {
-                    // SessionClosing is emitted by Controller::shutdown;
-                    // don't double-emit here.
-                    let _ = ack.send(());
-                    false
-                }
-                Some(LiveCommand::Subscribe(_, _, ack) | LiveCommand::Unsubscribe(_, _, ack)) => {
+                // While disconnected, fail subscribe/unsubscribe immediately so
+                // sessions see a clear error rather than stalling.
+                Some(HubCommand::Subscribe { ack, .. } | HubCommand::Unsubscribe { ack, .. }) => {
                     let _ = ack.send(Err(Error::Provider {
                         provider: PROVIDER_ID.to_string(),
                         message: "provider is reconnecting".to_string(),
                     }));
                     true
                 }
+                // SessionClosing is emitted by Controller::shutdown for each
+                // session; the hub serves all of them and shouldn't double-emit.
                 None => false,
             }
         }
+    }
+}
+
+/// Route one translated event to the sink owning its `(instrument, kind)`;
+/// a control (no pair) fans out to every active sink so each session sees
+/// provider-level state changes.
+async fn dispatch_event(
+    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    ev: MarketEvent,
+) {
+    if let Some(key) = event_route_key(&ev) {
+        if let Some(sink) = routes.get(&key) {
+            let _ = sink.send(ev).await;
+        }
+        return;
+    }
+    for sink in routes.values() {
+        let _ = sink.send(ev.clone()).await;
+    }
+}
+
+fn event_route_key(ev: &MarketEvent) -> Option<(Instrument, EventKind)> {
+    match ev {
+        MarketEvent::Trade(t) => Some((t.instrument.clone(), EventKind::Trade)),
+        MarketEvent::Quote(q) => Some((q.instrument.clone(), EventKind::Quote)),
+        MarketEvent::Bar(b) => Some((b.instrument.clone(), EventKind::Bar(b.interval))),
+        _ => None,
     }
 }
 
@@ -1091,15 +1283,32 @@ fn mutate_field(field: &mut Option<Vec<String>>, symbol: &str, add: bool) {
     }
 }
 
-async fn emit_control(sink: &mpsc::Sender<MarketEvent>, kind: ControlKind) {
+fn control_event(kind: ControlKind) -> MarketEvent {
     let now = wall_clock_ts();
-    let ev = MarketEvent::Control(Control {
+    MarketEvent::Control(Control {
         source_ts: now,
         rx_ts: now,
         seq: Seq(0),
         kind,
-    });
-    let _ = sink.send(ev).await;
+    })
+}
+
+/// Fan a control out to every active sink.
+async fn broadcast_control(
+    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    kind: ControlKind,
+) {
+    let ev = control_event(kind);
+    for sink in routes.values() {
+        let _ = sink.send(ev.clone()).await;
+    }
+}
+
+/// Send a control to one sink, if present.
+async fn broadcast_control_to(sink: Option<&mpsc::Sender<MarketEvent>>, kind: ControlKind) {
+    if let Some(s) = sink {
+        let _ = s.send(control_event(kind)).await;
+    }
 }
 
 fn wall_clock_ts() -> Timestamp {
@@ -1112,6 +1321,19 @@ fn wall_clock_ts() -> Timestamp {
         n
     });
     Timestamp(nanos)
+}
+
+/// Walk a `std::error::Error` source chain to a single string, so a wrapped
+/// websocket or I/O cause lands in the control's reason and the log line
+/// rather than only the outer variant's text.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut src = err.source();
+    while let Some(e) = src {
+        parts.push(e.to_string());
+        src = e.source();
+    }
+    parts.join(" -> ")
 }
 
 // ---------------------------------------------------------------------------
@@ -2047,5 +2269,162 @@ mod tests {
         let ok = asset_to_entry(&assets[3]).expect("eligible equity");
         assert_eq!(ok.instrument.symbol(), "AAPL");
         assert_eq!(ok.instrument.asset_class(), AssetClass::Equity);
+    }
+
+    /// Two live sessions on one provider share one hub (and so one socket):
+    /// the second `start_live` spawns nothing, both handles are served by the
+    /// same task, and the task exits once the provider's sender and every
+    /// handle are gone. Parked (disabled) so no socket is opened.
+    #[tokio::test]
+    async fn two_start_live_calls_share_one_hub() {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let p = AlpacaProvider::new(AlpacaProviderConfig {
+            settings: SettingsSource::Watch(rx),
+            ..Default::default()
+        });
+        let (sink_a, _events_a) = mpsc::channel(8);
+        let (sink_b, _events_b) = mpsc::channel(8);
+        let a = p.start_live(sink_a).await.expect("start_live a");
+        let b = p.start_live(sink_b).await.expect("start_live b");
+        assert_eq!(p.hub_spawns(), 1, "one hub for two sessions");
+
+        for (handle, symbol) in [(&a, "AAPL"), (&b, "SPY")] {
+            let err = handle
+                .subscribe(provider_instrument(symbol), EventKind::Trade)
+                .await
+                .expect_err("parked hub fails subscribes fast");
+            assert!(format!("{err}").contains("provider disabled"), "{err}");
+        }
+
+        let task = p.take_hub_task().expect("the hub was spawned");
+        a.close().await.expect("close a");
+        b.close().await.expect("close b");
+        // Provider sender and both handles gone: the command channel closes
+        // and the parked hub exits.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("hub exits once nothing can command it")
+            .expect("hub task did not panic");
+    }
+
+    /// Data routes to the one sink owning its pair and nowhere else; a pair
+    /// nobody subscribed to is dropped rather than misrouted; controls fan
+    /// out to every sink.
+    #[tokio::test]
+    async fn dispatch_routes_data_by_pair_and_fans_out_controls() {
+        let now = Timestamp(1);
+        let trade = |symbol: &str| {
+            MarketEvent::Trade(Trade {
+                instrument: provider_instrument(symbol),
+                source_ts: now,
+                rx_ts: now,
+                seq: Seq(0),
+                price: Price::from_f64_round(1.0),
+                size: Quantity::from_units(1),
+            })
+        };
+        let mut routes = HashMap::new();
+        let (aapl_tx, mut aapl_rx) = mpsc::channel(8);
+        let (spy_tx, mut spy_rx) = mpsc::channel(8);
+        routes.insert((provider_instrument("AAPL"), EventKind::Trade), aapl_tx);
+        routes.insert((provider_instrument("SPY"), EventKind::Quote), spy_tx);
+
+        dispatch_event(&routes, trade("AAPL")).await;
+        assert!(
+            matches!(aapl_rx.try_recv(), Ok(MarketEvent::Trade(t)) if t.instrument.symbol() == "AAPL")
+        );
+        assert!(
+            spy_rx.try_recv().is_err(),
+            "SPY quote sink must not see an AAPL trade"
+        );
+
+        // SPY trades have no subscriber (only SPY quotes do): dropped.
+        dispatch_event(&routes, trade("SPY")).await;
+        assert!(aapl_rx.try_recv().is_err());
+        assert!(spy_rx.try_recv().is_err());
+
+        broadcast_control(
+            &routes,
+            ControlKind::ProviderConnected {
+                provider: PROVIDER_ID.to_string(),
+            },
+        )
+        .await;
+        for rx in [&mut aapl_rx, &mut spy_rx] {
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(MarketEvent::Control(Control {
+                    kind: ControlKind::ProviderConnected { .. },
+                    ..
+                }))
+            ));
+        }
+    }
+
+    #[test]
+    fn event_route_key_matches_pair() {
+        let now = Timestamp(1);
+        let bar = MarketEvent::Bar(Bar {
+            instrument: provider_instrument("AAPL"),
+            interval: BarInterval::OneDay,
+            source_ts: now,
+            rx_ts: now,
+            seq: Seq(0),
+            open: Price::ZERO,
+            high: Price::ZERO,
+            low: Price::ZERO,
+            close: Price::ZERO,
+            volume: Quantity::ZERO,
+        });
+        assert_eq!(
+            event_route_key(&bar),
+            Some((
+                provider_instrument("AAPL"),
+                EventKind::Bar(BarInterval::OneDay)
+            ))
+        );
+        assert_eq!(
+            event_route_key(&control_event(ControlKind::ProviderConnected {
+                provider: PROVIDER_ID.to_string(),
+            })),
+            None
+        );
+    }
+
+    /// `402 auth failed` is the only server error that parks the hub; a
+    /// `406 connection limit exceeded` (another connection holds the slot),
+    /// `407 slow client` and subscribe-level rejections back off instead.
+    /// The payload-less connect-time `StreamingAuth` parks (see the
+    /// classifier's docs for the upstream limitation).
+    #[test]
+    fn stream_failures_park_on_402_and_back_off_on_406() {
+        use oxidized_alpaca::streaming::StreamError;
+        let server_error = |code: u16| {
+            let e: StreamError =
+                serde_json::from_str(&format!(r#"{{"code":{code},"msg":"server says {code}"}}"#))
+                    .expect("documented code");
+            oxidized_alpaca::Error::StreamingError(e)
+        };
+        assert_eq!(
+            classify_stream_failure(&server_error(402)),
+            StreamFailure::Unauthenticated
+        );
+        for code in [406_u16, 407, 405, 409, 400] {
+            assert_eq!(
+                classify_stream_failure(&server_error(code)),
+                StreamFailure::Transient,
+                "code {code}"
+            );
+        }
+        assert_eq!(
+            classify_stream_failure(&oxidized_alpaca::Error::StreamingAuth),
+            StreamFailure::Unauthenticated
+        );
+        assert_eq!(
+            classify_stream_failure(&oxidized_alpaca::Error::UnexpectedConnectionMessage(
+                "boom".to_string()
+            )),
+            StreamFailure::Transient
+        );
     }
 }
