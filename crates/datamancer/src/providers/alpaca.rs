@@ -42,7 +42,9 @@ use oxidized_alpaca::{
     restful::{
         market_data::TimeFrame,
         market_data::stock::Adjustment as AlpacaAdjustment,
-        market_data::stock::quotes::StockQuote,
+        market_data::stock::bars::StockBarsRequest,
+        market_data::stock::quotes::{StockQuote, StockQuotesRequest},
+        market_data::stock::trades::StockTradesRequest,
         trading::assets::{Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus},
     },
     streaming::{
@@ -180,6 +182,29 @@ fn stream_url(feed: AlpacaStreamFeed) -> &'static str {
     streaming_feed(feed).url(STREAM_ACCOUNT_TYPE)
 }
 
+/// Which Alpaca REST feed historical fetches (`fetch_history`) query.
+///
+/// Alpaca's history endpoints default to SIP when no feed is named, and a
+/// free data plan refuses SIP for the most recent fifteen minutes
+/// (`403 subscription does not permit querying recent SIP data`), so a
+/// backfill window ending at "now" fails outright. The provider therefore
+/// always names a feed; see [`AlpacaSettings::history_feed`] for the
+/// default rule.
+///
+/// Only the two feeds the history endpoints (bars, trades, quotes) accept
+/// are offered: `delayed_sip` is a stream/snapshot feed and those endpoints
+/// answer it with `400 invalid feed` (verified against the live API on
+/// 2026-11-04), so it is deliberately absent here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlpacaHistoryFeed {
+    /// IEX only: served on every plan up to "now", but IEX-only volume and
+    /// prices that can differ from the consolidated tape.
+    Iex,
+    /// Full consolidated SIP: requires the unlimited data plan for recent
+    /// data.
+    Sip,
+}
+
 /// Runtime settings for [`AlpacaProvider`] — the hot-reconfigurable subset
 /// of its configuration, delivered through a [`SettingsSource`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +214,21 @@ pub struct AlpacaSettings {
     /// loaded. The market-data stream host does not depend on it (see
     /// [`STREAM_ACCOUNT_TYPE`]).
     pub account_type: AccountType,
+    /// The REST feed historical fetches query. `None` (the default) follows
+    /// the stream feed: `Sip` for a SIP stream, otherwise `Iex` — the only
+    /// feed a free plan may query up to "now". Set it explicitly to override
+    /// (for example `Sip` once the account has the unlimited plan).
+    pub history_feed: Option<AlpacaHistoryFeed>,
+}
+
+impl Default for AlpacaSettings {
+    /// Paper account, history feed following the stream feed.
+    fn default() -> Self {
+        Self {
+            account_type: AccountType::Paper,
+            history_feed: None,
+        }
+    }
 }
 
 /// Configuration for [`AlpacaProvider`].
@@ -211,9 +251,7 @@ pub struct AlpacaProviderConfig {
 impl Default for AlpacaProviderConfig {
     fn default() -> Self {
         Self {
-            settings: SettingsSource::Static(AlpacaSettings {
-                account_type: AccountType::Paper,
-            }),
+            settings: SettingsSource::Static(AlpacaSettings::default()),
             stream_feed: AlpacaStreamFeed::Iex,
             reconnect: ReconnectPolicy::default(),
             credentials: CredentialsSource::Env,
@@ -399,7 +437,12 @@ impl Provider for AlpacaProvider {
                 provider: PROVIDER_ID.to_string(),
                 message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
             })?;
-        fetch_history_via(&rest, request, sink).await
+        // The REST client above is `None` whenever the settings are, so a
+        // missing value here is unreachable; fall back to the default rule
+        // rather than fail a fetch the client would otherwise serve.
+        let explicit = self.cfg.settings.current().and_then(|s| s.history_feed);
+        let feed = history_feed(explicit, self.cfg.stream_feed);
+        fetch_history_via(&rest, request, sink, feed).await
     }
 
     async fn latest(
@@ -1185,6 +1228,25 @@ fn snapshot_feed(stream_feed: AlpacaStreamFeed) -> Option<RestFeed> {
     }
 }
 
+/// The REST feed a historical fetch queries: the explicit setting when one is
+/// given, otherwise derived from the stream feed — `SIP` for a SIP stream
+/// (the account can query it), `IEX` for everything else (the only feed a
+/// free plan may query up to "now"; the history endpoints reject
+/// `delayed_sip`). Never unset: Alpaca's own default is SIP, which a free
+/// plan refuses for the most recent fifteen minutes.
+fn history_feed(explicit: Option<AlpacaHistoryFeed>, stream_feed: AlpacaStreamFeed) -> RestFeed {
+    match explicit {
+        Some(AlpacaHistoryFeed::Iex) => RestFeed::IEX,
+        Some(AlpacaHistoryFeed::Sip) => RestFeed::SIP,
+        None => match stream_feed {
+            AlpacaStreamFeed::Sip => RestFeed::SIP,
+            AlpacaStreamFeed::Iex | AlpacaStreamFeed::DelayedSip | AlpacaStreamFeed::Test => {
+                RestFeed::IEX
+            }
+        },
+    }
+}
+
 /// Map a stock snapshot onto the canonical event for `kind`, or `None` when the
 /// snapshot lacks that datum (or the bar interval has no snapshot field). `seq`
 /// is a placeholder; the authoritative controller re-stamps on delivery.
@@ -1265,10 +1327,52 @@ fn map_adjustment(adjustment: Adjustment) -> AlpacaAdjustment {
     }
 }
 
+/// The historical-trades request for one window. Always names `feed`: left
+/// unset, Alpaca defaults to SIP, which a free plan refuses for a window
+/// reaching into the last fifteen minutes.
+fn trades_request<'a>(
+    rest: &'a MarketDataClient,
+    symbol: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    feed: RestFeed,
+) -> StockTradesRequest<'a> {
+    rest.stock_trades(symbol).start(from).end(to).feed(feed)
+}
+
+/// The historical-quotes request for one window; see [`trades_request`].
+fn quotes_request<'a>(
+    rest: &'a MarketDataClient,
+    symbol: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    feed: RestFeed,
+) -> StockQuotesRequest<'a> {
+    rest.stock_quotes(symbol).start(from).end(to).feed(feed)
+}
+
+/// The historical-bars request for one window; see [`trades_request`].
+fn bars_request<'a>(
+    rest: &'a MarketDataClient,
+    symbol: &str,
+    timeframe: TimeFrame,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    adjustment: AlpacaAdjustment,
+    feed: RestFeed,
+) -> StockBarsRequest<'a> {
+    rest.stock_bars(symbol, timeframe)
+        .start(from)
+        .end(to)
+        .adjustment(adjustment)
+        .feed(feed)
+}
+
 async fn fetch_history_via(
     rest: &MarketDataClient,
     request: HistoryRequest,
     sink: mpsc::Sender<MarketEvent>,
+    feed: RestFeed,
 ) -> Result<()> {
     let symbol = request.instrument.symbol();
     let from = ts_to_chrono(request.from);
@@ -1276,10 +1380,7 @@ async fn fetch_history_via(
     let rx = wall_clock_ts();
     match request.kind {
         EventKind::Trade => {
-            let trades = rest
-                .stock_trades(symbol)
-                .start(from)
-                .end(to)
+            let trades = trades_request(rest, symbol, from, to, feed)
                 .execute()
                 .await
                 .map_err(|e| Error::Provider {
@@ -1301,10 +1402,7 @@ async fn fetch_history_via(
             }
         }
         EventKind::Quote => {
-            let quotes = rest
-                .stock_quotes(symbol)
-                .start(from)
-                .end(to)
+            let quotes = quotes_request(rest, symbol, from, to, feed)
                 .execute()
                 .await
                 .map_err(|e| Error::Provider {
@@ -1333,17 +1431,21 @@ async fn fetch_history_via(
                 BarInterval::OneHour => TimeFrame::ONE_HOUR,
                 BarInterval::OneDay => TimeFrame::ONE_DAY,
             };
-            let bars = rest
-                .stock_bars(symbol, timeframe)
-                .start(from)
-                .end(to)
-                .adjustment(map_adjustment(request.adjustment))
-                .execute()
-                .await
-                .map_err(|e| Error::Provider {
-                    provider: PROVIDER_ID.to_string(),
-                    message: format!("stock_bars: {e}"),
-                })?;
+            let bars = bars_request(
+                rest,
+                symbol,
+                timeframe,
+                from,
+                to,
+                map_adjustment(request.adjustment),
+                feed,
+            )
+            .execute()
+            .await
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("stock_bars: {e}"),
+            })?;
             for b in bars {
                 let bar = Bar {
                     instrument: request.instrument.clone(),
@@ -1725,9 +1827,97 @@ mod tests {
         assert_eq!(
             cfg.settings.current(),
             Some(AlpacaSettings {
-                account_type: AccountType::Paper
+                account_type: AccountType::Paper,
+                history_feed: None,
             })
         );
+        assert_eq!(cfg.settings.current(), Some(AlpacaSettings::default()));
+    }
+
+    /// With no explicit setting the history feed follows the stream feed:
+    /// SIP history for a SIP stream, IEX for everything else — the only feed
+    /// a free plan may query up to "now" (the history endpoints reject
+    /// `delayed_sip`, so a delayed-SIP stream also backfills from IEX).
+    #[test]
+    fn history_feed_follows_the_stream_feed_by_default() {
+        assert_eq!(history_feed(None, AlpacaStreamFeed::Sip), RestFeed::SIP);
+        for stream in [
+            AlpacaStreamFeed::Iex,
+            AlpacaStreamFeed::DelayedSip,
+            AlpacaStreamFeed::Test,
+        ] {
+            assert_eq!(history_feed(None, stream), RestFeed::IEX, "{stream:?}");
+        }
+    }
+
+    /// The derived feed is never one the history endpoints refuse outright:
+    /// `delayed_sip` is a stream/snapshot feed only (`400 invalid feed` on
+    /// bars, trades and quotes).
+    #[test]
+    fn history_feed_never_derives_delayed_sip() {
+        for stream in ALL_STREAM_FEEDS {
+            assert_ne!(
+                history_feed(None, stream),
+                RestFeed::DelayedSip,
+                "{stream:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_history_feed_overrides_the_stream_feed() {
+        for stream in ALL_STREAM_FEEDS {
+            assert_eq!(
+                history_feed(Some(AlpacaHistoryFeed::Iex), stream),
+                RestFeed::IEX
+            );
+            assert_eq!(
+                history_feed(Some(AlpacaHistoryFeed::Sip), stream),
+                RestFeed::SIP
+            );
+        }
+    }
+
+    /// A REST client that never talks to the network: enough to build and
+    /// serialize request builders.
+    fn offline_rest_client() -> MarketDataClient {
+        MarketDataClient::new_with_credentials(
+            AccountType::Paper,
+            oxidized_alpaca::ApiKey::new("key-id", "secret"),
+        )
+        .expect("an offline REST client builds without network access")
+    }
+
+    /// Every historical request names its feed on the wire. The builders
+    /// serialize to the query string (`serde_urlencoded` upstream), so the
+    /// JSON view is the same field set; an absent `feed` key here would mean
+    /// Alpaca falls back to SIP and a free plan 403s a window ending at now.
+    #[test]
+    fn history_requests_always_name_a_feed() {
+        let rest = offline_rest_client();
+        let from = DateTime::<Utc>::from_timestamp(1_704_200_000, 0).unwrap();
+        let to = DateTime::<Utc>::from_timestamp(1_704_300_000, 0).unwrap();
+
+        let bars = serde_json::to_value(bars_request(
+            &rest,
+            "AAPL",
+            TimeFrame::ONE_DAY,
+            from,
+            to,
+            AlpacaAdjustment::All,
+            RestFeed::IEX,
+        ))
+        .unwrap();
+        assert_eq!(bars["feed"], "iex", "{bars}");
+        assert_eq!(bars["adjustment"], "all", "{bars}");
+
+        let trades =
+            serde_json::to_value(trades_request(&rest, "AAPL", from, to, RestFeed::SIP)).unwrap();
+        assert_eq!(trades["feed"], "sip", "{trades}");
+
+        let quotes =
+            serde_json::to_value(quotes_request(&rest, "AAPL", from, to, RestFeed::IEX)).unwrap();
+        assert_eq!(quotes["feed"], "iex", "{quotes}");
     }
 
     #[test]

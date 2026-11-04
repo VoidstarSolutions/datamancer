@@ -107,6 +107,7 @@ function render(cfg) {
     `<fieldset><legend>provider.alpaca (equities)</legend>`
       + L('enabled', CHK('alpaca-on', !!p.alpaca))
       + L('account_type', SEL('alpaca-account', ['paper','live'], p.alpaca?.account_type ?? 'paper'))
+      + L('history_feed', SEL('alpaca-history', ['auto','iex','sip'], p.alpaca?.history_feed ?? 'auto'))
     + `</fieldset>`
     + `<fieldset><legend>provider.alpaca_crypto</legend>`
       + L('enabled', CHK('crypto-on', !!p.alpaca_crypto))
@@ -152,7 +153,12 @@ const opt = (v) => (v === '' ? undefined : v);
 
 function collect() {
   const cfg = { provider: {} };
-  if (chk('alpaca-on')) cfg.provider.alpaca = { account_type: val('alpaca-account') };
+  if (chk('alpaca-on')) {
+    cfg.provider.alpaca = { account_type: val('alpaca-account') };
+    // 'auto' = omit the key: the daemon then follows the stream feed.
+    const historyFeed = val('alpaca-history');
+    if (historyFeed !== 'auto') cfg.provider.alpaca.history_feed = historyFeed;
+  }
   if (chk('crypto-on')) cfg.provider.alpaca_crypto = { account_type: val('crypto-account'), venue: val('crypto-venue') };
   for (const key of ['cache','tap_log']) {
     if (chk(`${key}-on`)) cfg[key] = { backend: val(`${key}-backend`), path: opt(val(`${key}-path`)) };

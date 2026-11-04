@@ -13,7 +13,9 @@ pub mod credentials;
 pub mod runtime;
 
 #[cfg(feature = "provider-alpaca")]
-pub use alpaca::{AlpacaProvider, AlpacaProviderConfig, AlpacaSettings, AlpacaStreamFeed};
+pub use alpaca::{
+    AlpacaHistoryFeed, AlpacaProvider, AlpacaProviderConfig, AlpacaSettings, AlpacaStreamFeed,
+};
 #[cfg(feature = "provider-alpaca")]
 pub use alpaca_crypto::{
     AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoSettings, AlpacaCryptoVenue,
