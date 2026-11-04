@@ -6,6 +6,17 @@
 //! [`MarketEvent`] sink with a placeholder [`Seq`]; the session merger assigns
 //! the final session-monotonic sequence.
 //!
+//! # Stream host
+//!
+//! Alpaca's market-data websocket is account-type independent: paper and
+//! live keys both authenticate on `stream.data.alpaca.markets`. The
+//! `stream.data.sandbox.alpaca.markets` host that `oxidized_alpaca` selects
+//! for [`AccountType::Paper`] is the Broker-API sandbox, which rejects
+//! ordinary paper keys with `402 auth failed`. The streaming client is
+//! therefore always built with [`STREAM_ACCOUNT_TYPE`] (a URL choice only —
+//! see [`stream_url`]); `account_type` keeps selecting the trading/REST host
+//! and, for the env credential source, the credential pair.
+//!
 //! # Reconnect
 //!
 //! On websocket failure the streaming task tears down the client, sleeps with
@@ -143,12 +154,40 @@ pub enum AlpacaStreamFeed {
     Test,
 }
 
+/// The account type handed to `oxidized_alpaca`'s streaming constructors.
+/// There it is a **URL selector only**: `StreamingFeed::url(Paper)` is the
+/// Broker-API sandbox host, which rejects ordinary paper keys, while the
+/// production data host authenticates paper and live keys alike. The
+/// configured [`AlpacaSettings::account_type`] still selects the trading/REST
+/// host and the env credential pair; it never reaches the stream URL choice.
+const STREAM_ACCOUNT_TYPE: AccountType = AccountType::Live;
+
+/// Map the provider's feed selector onto `oxidized_alpaca`'s.
+fn streaming_feed(feed: AlpacaStreamFeed) -> StreamingFeed {
+    match feed {
+        AlpacaStreamFeed::Iex => StreamingFeed::IEX,
+        AlpacaStreamFeed::Sip => StreamingFeed::SIP,
+        AlpacaStreamFeed::DelayedSip => StreamingFeed::DelayedSip,
+        AlpacaStreamFeed::Test => StreamingFeed::Test,
+    }
+}
+
+/// The websocket URL the streaming task connects to for `feed`, whatever the
+/// configured account type — the production market-data host, never the
+/// sandbox. Pure so the host choice is testable without a socket; the connect
+/// path reaches the same URL through `new_with_credentials(STREAM_ACCOUNT_TYPE, ..)`.
+fn stream_url(feed: AlpacaStreamFeed) -> &'static str {
+    streaming_feed(feed).url(STREAM_ACCOUNT_TYPE)
+}
+
 /// Runtime settings for [`AlpacaProvider`] — the hot-reconfigurable subset
 /// of its configuration, delivered through a [`SettingsSource`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlpacaSettings {
-    /// Paper or live account; selects endpoints and, for the legacy `Env`
-    /// credential source, which env credential pair is loaded.
+    /// Paper or live account; selects the trading/REST endpoints and, for
+    /// the legacy `Env` credential source, which env credential pair is
+    /// loaded. The market-data stream host does not depend on it (see
+    /// [`STREAM_ACCOUNT_TYPE`]).
     pub account_type: AccountType,
 }
 
@@ -517,23 +556,37 @@ async fn run_streaming_task(
             continue 'outer;
         };
 
-        let feed = match cfg.stream_feed {
-            AlpacaStreamFeed::Iex => StreamingFeed::IEX,
-            AlpacaStreamFeed::Sip => StreamingFeed::SIP,
-            AlpacaStreamFeed::DelayedSip => StreamingFeed::DelayedSip,
-            AlpacaStreamFeed::Test => StreamingFeed::Test,
-        };
+        let feed = streaming_feed(cfg.stream_feed);
         // Fresh receiver per connect attempt: `watch()` marks the current
         // value as seen on the clone (tokio's `Receiver::clone` would
         // otherwise inherit the stored receiver's stale seen-version), so
         // the hot-reconnect arm below only fires on rotations that land
         // *after* this resolution.
         let mut cred_rx = cfg.credentials.watch();
+        // Every path connects through `new_with_credentials` so the account
+        // type it sees is `STREAM_ACCOUNT_TYPE` (the production data host);
+        // the configured account type only picks which env pair `Env` reads.
+        tracing::info!(
+            provider = PROVIDER_ID,
+            url = stream_url(cfg.stream_feed),
+            account_type = ?settings.account_type,
+            "connecting to the market-data stream"
+        );
         let connect_result = match cfg.credentials.current() {
-            Resolved::Env => StreamingStockClient::new(settings.account_type, feed).await,
+            Resolved::Env => match AlpacaCredentials::from_env(settings.account_type) {
+                Ok(c) => {
+                    StreamingStockClient::new_with_credentials(
+                        STREAM_ACCOUNT_TYPE,
+                        feed,
+                        c.to_api_key(),
+                    )
+                    .await
+                }
+                Err(missing) => Err(missing),
+            },
             Resolved::Creds(c) => {
                 StreamingStockClient::new_with_credentials(
-                    settings.account_type,
+                    STREAM_ACCOUNT_TYPE,
                     feed,
                     c.to_api_key(),
                 )
@@ -1316,6 +1369,68 @@ async fn fetch_history_via(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALL_STREAM_FEEDS: [AlpacaStreamFeed; 4] = [
+        AlpacaStreamFeed::Iex,
+        AlpacaStreamFeed::Sip,
+        AlpacaStreamFeed::DelayedSip,
+        AlpacaStreamFeed::Test,
+    ];
+
+    /// The equities stream must connect to the production market-data host
+    /// for every feed, whatever the account type: the sandbox host that
+    /// `oxidized_alpaca` picks for `Paper` only accepts Broker-API sandbox
+    /// keys and answers ordinary paper keys with `402 auth failed`.
+    #[test]
+    fn stream_url_never_targets_the_sandbox_host() {
+        for feed in ALL_STREAM_FEEDS {
+            let url = stream_url(feed);
+            assert!(
+                url.starts_with("wss://stream.data.alpaca.markets/"),
+                "{feed:?} -> {url}"
+            );
+            assert!(!url.contains("sandbox"), "{feed:?} -> {url}");
+        }
+    }
+
+    /// Pin the premise the fix rests on: upstream's `Paper` URL *is* the
+    /// sandbox host for the real feeds (Test has no sandbox variant), so
+    /// `STREAM_ACCOUNT_TYPE` must stay `Live` until `oxidized_alpaca` stops
+    /// routing paper accounts there. If this fails, upstream changed and the
+    /// override can be revisited.
+    #[test]
+    fn upstream_paper_url_is_the_sandbox_host() {
+        for feed in [
+            AlpacaStreamFeed::Iex,
+            AlpacaStreamFeed::Sip,
+            AlpacaStreamFeed::DelayedSip,
+        ] {
+            let paper = streaming_feed(feed).url(AccountType::Paper);
+            assert!(paper.contains("sandbox"), "{feed:?} -> {paper}");
+            assert_ne!(paper, stream_url(feed));
+        }
+        assert_eq!(STREAM_ACCOUNT_TYPE, AccountType::Live);
+    }
+
+    #[test]
+    fn stream_url_keeps_the_feed_path() {
+        assert_eq!(
+            stream_url(AlpacaStreamFeed::Iex),
+            "wss://stream.data.alpaca.markets/v2/iex"
+        );
+        assert_eq!(
+            stream_url(AlpacaStreamFeed::Sip),
+            "wss://stream.data.alpaca.markets/v2/sip"
+        );
+        assert_eq!(
+            stream_url(AlpacaStreamFeed::DelayedSip),
+            "wss://stream.data.alpaca.markets/v2/delayed_sip"
+        );
+        assert_eq!(
+            stream_url(AlpacaStreamFeed::Test),
+            "wss://stream.data.alpaca.markets/v2/test"
+        );
+    }
 
     #[test]
     fn snapshot_feed_mirrors_stream_feed() {

@@ -170,6 +170,57 @@ async fn live_test_feed_delivers_a_trade() {
     let _ = session.close().await;
 }
 
+/// Paper keys must authenticate on the **IEX** stream. `oxidized_alpaca`
+/// routes `AccountType::Paper` to the Broker-API sandbox host, which rejects
+/// ordinary paper keys with `402 auth failed`; the provider overrides the
+/// host choice. The `Test` feed never exposed this (it has no sandbox URL),
+/// so this test uses the real IEX endpoint. Outside market hours no data
+/// flows, but the connect/auth handshake still completes, so the assertion is
+/// on the first control: `ProviderConnected`, never an `Unauthenticated`
+/// disconnect. Drives `start_live` directly, as the bad-credentials test does.
+#[tokio::test]
+#[ignore = "requires real Alpaca paper credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
+async fn paper_keys_authenticate_on_the_iex_stream() {
+    // `oxidized_alpaca` collapses every rejected auth response into a
+    // payload-less `StreamingAuth` and logs the server's envelope (402 auth
+    // failed vs 406 connection limit exceeded) at `error!`; surface that log
+    // so a failure here is diagnosable. `RUST_LOG=error` is enough.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let provider = AlpacaProvider::new(AlpacaProviderConfig {
+        settings: SettingsSource::Static(AlpacaSettings {
+            account_type: AccountType::Paper,
+        }),
+        stream_feed: AlpacaStreamFeed::Iex,
+        ..Default::default()
+    });
+
+    let (sink, mut events) = tokio::sync::mpsc::channel(32);
+    let handle = provider.start_live(sink).await.expect("start_live");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let control = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let ev = tokio::time::timeout(remaining, events.recv())
+            .await
+            .expect("timed out waiting for the connect control")
+            .expect("event channel closed before a control arrived");
+        eprintln!("event: {ev:?}");
+        if let MarketEvent::Control(c) = ev {
+            break c;
+        }
+    };
+
+    match control.kind {
+        datamancer::ControlKind::ProviderConnected { provider } => assert_eq!(provider, "alpaca"),
+        other => panic!("expected ProviderConnected on the IEX stream, got {other:?}"),
+    }
+
+    let _ = handle.close().await;
+}
+
 /// Bad-credentials smoke test: connecting the streaming client with a
 /// deliberately-invalid explicit key pair must land as an in-band
 /// `ProviderDisconnected { cause: Unauthenticated, .. }` control — the

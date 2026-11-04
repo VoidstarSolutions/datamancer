@@ -38,11 +38,14 @@ cargo test -p datamancerd --test daemon_e2e -- --ignored
 
 Provider credentials are **not** in the config. They live in the daemon-owned
 credential store, provisioned over the control socket with `set-credentials`
-(see [Credentials](#credentials)). The `account_type` selects paper vs. live
-endpoints — and, for the deprecated env-var fallback only, which environment
-pair is read at startup
+(see [Credentials](#credentials)). The `account_type` selects the paper vs.
+live **trading** endpoints — and, for the deprecated env-var fallback only,
+which environment pair is read at startup
 (`paper` → `ALPACA_PAPER_API_KEY_ID`/`ALPACA_PAPER_API_SECRET_KEY`,
-`live` → `ALPACA_LIVE_API_KEY_ID`/`ALPACA_LIVE_API_SECRET_KEY`).
+`live` → `ALPACA_LIVE_API_KEY_ID`/`ALPACA_LIVE_API_SECRET_KEY`). The
+market-data stream is account-type independent: paper and live keys both
+authenticate on Alpaca's production data host, which the daemon always uses
+(the Broker-API *sandbox* stream host rejects ordinary paper keys).
 
 ### Single instance
 

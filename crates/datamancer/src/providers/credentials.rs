@@ -5,7 +5,17 @@
 //! legacy env-var path (`ALPACA_{PAPER,LIVE}_API_*`), which is deprecated
 //! for daemon use but remains the embedder default.
 
-use oxidized_alpaca::ApiKey;
+use oxidized_alpaca::{AccountType, ApiKey};
+
+/// The `ALPACA_*` environment pair the legacy [`CredentialsSource::Env`]
+/// path reads for an account type — the same names `oxidized_alpaca`'s own
+/// env-var constructors use, so `Env` keeps its documented contract.
+pub(crate) fn env_var_names(account_type: AccountType) -> (&'static str, &'static str) {
+    match account_type {
+        AccountType::Paper => ("ALPACA_PAPER_API_KEY_ID", "ALPACA_PAPER_API_SECRET_KEY"),
+        AccountType::Live => ("ALPACA_LIVE_API_KEY_ID", "ALPACA_LIVE_API_SECRET_KEY"),
+    }
+}
 
 /// An Alpaca key-id/secret pair.
 #[derive(Clone, PartialEq, Eq)]
@@ -20,6 +30,36 @@ pub struct AlpacaCredentials {
 impl AlpacaCredentials {
     pub(crate) fn to_api_key(&self) -> ApiKey {
         ApiKey::new(self.key_id.clone(), self.secret.clone())
+    }
+
+    /// Read the pair from the environment for `account_type` (see
+    /// [`env_var_names`]). The streaming path needs the credentials in hand
+    /// rather than `oxidized_alpaca`'s env-var constructor, because that
+    /// constructor couples the credential pair *and* the stream host to one
+    /// account type (see `alpaca::STREAM_ACCOUNT_TYPE`). A missing variable
+    /// surfaces as the same [`oxidized_alpaca::Error`] the upstream
+    /// constructor raises, so callers classify it identically.
+    ///
+    /// # Errors
+    ///
+    /// [`oxidized_alpaca::Error::MissingEnvironmentVariable`] naming the first
+    /// variable that is unset.
+    pub(crate) fn from_env(
+        account_type: AccountType,
+    ) -> std::result::Result<Self, oxidized_alpaca::Error> {
+        let (key_var, secret_var) = env_var_names(account_type);
+        let read = |variable: &'static str| {
+            std::env::var(variable).map_err(|source| {
+                oxidized_alpaca::Error::MissingEnvironmentVariable {
+                    variable_name: variable.to_string(),
+                    source,
+                }
+            })
+        };
+        Ok(Self {
+            key_id: read(key_var)?,
+            secret: read(secret_var)?,
+        })
     }
 }
 
@@ -52,7 +92,9 @@ pub enum CredentialsSource {
 /// One resolution of a [`CredentialsSource`].
 #[derive(Debug, Clone)]
 pub(crate) enum Resolved {
-    /// Use the env-var constructor path.
+    /// Read the `ALPACA_*` pair for the account type (REST clients through
+    /// `oxidized_alpaca`'s env constructors, the stream through
+    /// [`AlpacaCredentials::from_env`]).
     Env,
     /// Use `new_with_credentials` with these.
     Creds(AlpacaCredentials),
@@ -115,6 +157,22 @@ mod tests {
     #[test]
     fn env_source_resolves_to_env() {
         assert!(matches!(CredentialsSource::Env.current(), Resolved::Env));
+    }
+
+    /// The `Env` source's contract is the `ALPACA_{PAPER,LIVE}_API_*` pair
+    /// keyed on the account type; the names must stay in lockstep with
+    /// `oxidized_alpaca`'s own env constructors.
+    #[test]
+    fn env_var_names_follow_the_account_type() {
+        use oxidized_alpaca::AccountType;
+        assert_eq!(
+            super::env_var_names(AccountType::Paper),
+            ("ALPACA_PAPER_API_KEY_ID", "ALPACA_PAPER_API_SECRET_KEY")
+        );
+        assert_eq!(
+            super::env_var_names(AccountType::Live),
+            ("ALPACA_LIVE_API_KEY_ID", "ALPACA_LIVE_API_SECRET_KEY")
+        );
     }
 
     #[test]
