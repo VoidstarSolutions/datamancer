@@ -268,6 +268,14 @@ pong predates the field and omits it. A current daemon always reports a
 backend — it selects one at bootstrap and refuses to boot when none is
 available.
 
+Each provider entry also carries `surfaces`: its `history` and `live` surfaces
+judged apart, each a `SurfaceOutcome` (`Unknown` before any attempt has
+concluded, `Ok { at }`, or `Failing { at, error }` until the next success). It
+is the field to read when a chart is empty while the provider reads `Connected`:
+the history surface says whether the fetch failed and with what. The daemon
+README's [control protocol](../datamancerd/README.md#control-protocol-newline-json)
+states what each surface records.
+
 `AppHandle::watch_health()` is a read-only subscription onto the daemon's
 `datamancer/health` push plane, distinct from the request/reply `health()`
 call above: it never touches the control connection, so it takes `&self`

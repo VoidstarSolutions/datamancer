@@ -15,7 +15,7 @@ use datamancer::{
     AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, DisconnectCause, EventKind,
     GapSpan, HealthView, Instrument, LiveHandle, LiveScope, Liveness, MarketEvent,
     PersistenceOptions, Price, Provider, ProviderId, ProviderSnapshot, ProviderState, Result,
-    Scope, Seq, StreamConnection, Timestamp, Trade,
+    Scope, Seq, StreamConnection, SurfaceOutcome, Timestamp, Trade,
 };
 use datamancer_core::{AuthoritativeSessionSnapshot, HistoryRequest};
 use futures::StreamExt;
@@ -1029,6 +1029,17 @@ async fn open_refused_for_want_of_credentials_reads_unauthenticated() {
     );
     let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
     assert_eq!(view.providers[0].state, ProviderState::Unauthenticated);
+    // The failed open is live-surface evidence; history was never tried.
+    let surfaces = &view.providers[0].surfaces;
+    assert!(
+        matches!(
+            &surfaces.live,
+            SurfaceOutcome::Failing { error, .. }
+                if error == "provider fake: unauthenticated: waiting for credentials"
+        ),
+        "{surfaces:?}"
+    );
+    assert_eq!(surfaces.history, SurfaceOutcome::Unknown);
 }
 
 #[tokio::test]
@@ -1415,4 +1426,267 @@ async fn health_reduces_live_snapshot_with_library_version() {
         health.daemon.version.as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Per-surface health: history outcomes are recorded where every provider
+// history call is joined; live outcomes follow the connect evidence.
+// ---------------------------------------------------------------------------
+
+/// Serves one bar, or fails every fetch while `fail` is set.
+struct FlakyHistoryProvider {
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Provider for FlakyHistoryProvider {
+    fn id(&self) -> &'static str {
+        "fake"
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(NoopLive))
+    }
+    async fn fetch_history(
+        &self,
+        request: HistoryRequest,
+        sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(datamancer::Error::Provider {
+                provider: "fake".to_string(),
+                message: "HTTP 401 from the history endpoint".to_string(),
+            });
+        }
+        let _ = sink.send(bar("AAPL", request.from.0 + 100, 1.0)).await;
+        Ok(())
+    }
+}
+
+async fn run_history(dm: &Datamancer, persistence: PersistenceOptions, from: i64) {
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(from),
+                to: Timestamp(from + 1000),
+            },
+            persistence,
+        )
+        .await
+        .unwrap();
+    drain_historical(&session).await;
+}
+
+fn surfaces_of(snap: &datamancer::SystemSnapshot) -> datamancer::ProviderSurfaces {
+    HealthView::from_snapshot(snap, HealthView::DEFAULT_QUIET_AFTER_NS)
+        .providers
+        .into_iter()
+        .find(|p| p.provider.as_str() == "fake")
+        .expect("fake provider in the view")
+        .surfaces
+}
+
+/// The failure-then-success story on the history surface, on the given
+/// persistence path (uncached single fetch, or the cached per-gap fetch).
+async fn history_surface_story(
+    dm: &Datamancer,
+    fail: &std::sync::atomic::AtomicBool,
+    p: PersistenceOptions,
+) {
+    // Before any fetch: nothing is known about either surface.
+    let s = surfaces_of(&dm.snapshot().await.unwrap());
+    assert_eq!(s.history, SurfaceOutcome::Unknown);
+    assert_eq!(s.live, SurfaceOutcome::Unknown);
+
+    // A failing fetch: Failing with the error, stamped; live untouched.
+    fail.store(true, Ordering::SeqCst);
+    run_history(dm, p, 0).await;
+    let snap = dm.snapshot().await.unwrap();
+    let s = surfaces_of(&snap);
+    let SurfaceOutcome::Failing {
+        at: failed_at,
+        error,
+    } = &s.history
+    else {
+        panic!("{s:?}");
+    };
+    assert_eq!(error, "HTTP 401 from the history endpoint");
+    assert!(
+        *failed_at <= snap.captured_at,
+        "stamped before the snapshot"
+    );
+    assert_eq!(s.live, SurfaceOutcome::Unknown, "live has no evidence");
+    // The provider-wide detail still carries it, as before (both in the
+    // in-band `ProviderError` form: message only, no provider prefix).
+    assert_eq!(
+        provider_snap(&snap, "fake").last_error.as_deref(),
+        Some("HTTP 401 from the history endpoint")
+    );
+    assert_eq!(provider_snap(&snap, "fake").surfaces, s);
+    let failed_at = *failed_at;
+
+    // The next success clears the error; a fresh range so the cached path
+    // fetches again rather than replaying.
+    fail.store(false, Ordering::SeqCst);
+    run_history(dm, p, 10_000).await;
+    let s = surfaces_of(&dm.snapshot().await.unwrap());
+    assert!(
+        matches!(s.history, SurfaceOutcome::Ok { at } if at >= failed_at),
+        "{s:?}"
+    );
+    assert_eq!(s.live, SurfaceOutcome::Unknown);
+}
+
+#[tokio::test]
+async fn history_surface_records_each_fetch_outcome_uncached() {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(FlakyHistoryProvider { fail: fail.clone() }))
+        .build()
+        .unwrap();
+    history_surface_story(&dm, &fail, PersistenceOptions::none()).await;
+}
+
+#[tokio::test]
+async fn history_surface_records_each_fetch_outcome_through_the_cache() {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(FlakyHistoryProvider { fail: fail.clone() }))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+    history_surface_story(&dm, &fail, PersistenceOptions::cached()).await;
+}
+
+#[tokio::test]
+async fn live_surface_follows_the_connect_evidence() {
+    let (provider, ctrl) = LiveProvider::new("fake");
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+
+    // start_live emitted ProviderConnected (rx 0): live Ok, history Unknown.
+    ctrl.push("AAPL", trade("AAPL", 1, 1)).await;
+    drain_until_marker(&mut stream, 1).await;
+    let s = surfaces_of(&dm.snapshot().await.unwrap());
+    assert_eq!(s.live, SurfaceOutcome::Ok { at: Timestamp(0) });
+    assert_eq!(s.history, SurfaceOutcome::Unknown);
+
+    // A fault disconnect: Failing with the reason, stamped at receipt.
+    ctrl.push("AAPL", received_at(disconnected("fake"), 50))
+        .await;
+    ctrl.push("AAPL", trade("AAPL", 2, 2)).await;
+    drain_until_marker(&mut stream, 2).await;
+    let dropped = SurfaceOutcome::Failing {
+        at: Timestamp(50),
+        error: "drop".to_string(),
+    };
+    assert_eq!(surfaces_of(&dm.snapshot().await.unwrap()).live, dropped);
+
+    // A provider error frame is detail, not live-surface evidence.
+    ctrl.push("AAPL", received_at(provider_error("fake", "boom"), 60))
+        .await;
+    ctrl.push("AAPL", trade("AAPL", 3, 3)).await;
+    drain_until_marker(&mut stream, 3).await;
+    let snap = dm.snapshot().await.unwrap();
+    assert_eq!(surfaces_of(&snap).live, dropped);
+    assert_eq!(
+        provider_snap(&snap, "fake").last_error.as_deref(),
+        Some("boom")
+    );
+
+    // The reconnect clears it.
+    ctrl.push("AAPL", received_at(connected("fake"), 70)).await;
+    ctrl.push("AAPL", trade("AAPL", 4, 4)).await;
+    drain_until_marker(&mut stream, 4).await;
+    let s = surfaces_of(&dm.snapshot().await.unwrap());
+    assert_eq!(s.live, SurfaceOutcome::Ok { at: Timestamp(70) });
+    assert_eq!(s.history, SurfaceOutcome::Unknown);
+}
+
+/// Sends no connect controls and refuses a subscribe to `BAD`.
+struct PickyLiveProvider;
+
+struct PickyLive;
+
+#[async_trait]
+impl LiveHandle for PickyLive {
+    async fn subscribe(&self, instrument: Instrument, _kind: EventKind) -> Result<()> {
+        if instrument.symbol() == "BAD" {
+            return Err(datamancer::Error::Provider {
+                provider: "fake".to_string(),
+                message: "symbol rejected".to_string(),
+            });
+        }
+        Ok(())
+    }
+    async fn unsubscribe(&self, _i: Instrument, _k: EventKind) -> Result<()> {
+        Ok(())
+    }
+    async fn close(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Provider for PickyLiveProvider {
+    fn id(&self) -> &'static str {
+        "fake"
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(PickyLive))
+    }
+    async fn fetch_history(
+        &self,
+        _request: HistoryRequest,
+        _sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_subscribe_fails_the_live_surface_until_a_good_one_clears_it() {
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(PickyLiveProvider))
+        .build()
+        .unwrap();
+    let open = |symbol| {
+        dm.session(
+            inst(symbol),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+    };
+
+    assert!(open("BAD").await.is_err());
+    let s = surfaces_of(&dm.snapshot().await.unwrap());
+    assert!(
+        matches!(&s.live, SurfaceOutcome::Failing { error, .. } if error.contains("symbol rejected")),
+        "{s:?}"
+    );
+
+    let _good = open("AAPL").await.unwrap();
+    let s = surfaces_of(&dm.snapshot().await.unwrap());
+    assert!(matches!(s.live, SurfaceOutcome::Ok { .. }), "{s:?}");
 }
