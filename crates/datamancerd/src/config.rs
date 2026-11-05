@@ -143,6 +143,9 @@ pub struct ScriptedSection {
     /// The symbol whose history requests fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failing_symbol: Option<String>,
+    /// Milliseconds a live subscribe takes to return; no live trade before then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_delay_ms: Option<u64>,
 }
 
 #[cfg(feature = "scripted-provider")]
@@ -161,6 +164,9 @@ impl ScriptedSection {
                 .map_or(defaults.live_interval, std::time::Duration::from_millis),
             latest: self.latest.unwrap_or(defaults.latest),
             failing_symbol: self.failing_symbol.clone(),
+            connect_delay: self
+                .connect_delay_ms
+                .map_or(defaults.connect_delay, std::time::Duration::from_millis),
         }
     }
 }

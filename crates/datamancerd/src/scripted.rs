@@ -7,11 +7,12 @@
 //!
 //! Behaviour, all knobs on [`ScriptedSettings`]:
 //! - `fetch_history` waits `history_delay`, then serves `history_prints` trades
-//!   spaced evenly over the requested range, prices `1.0, 2.0, …`, or fails if
-//!   the symbol is `failing_symbol`.
-//! - After `LiveHandle::subscribe`, one trade every `live_interval`, stamped
-//!   with the wall clock and priced `100.0, 101.0, …`, until unsubscribe or
-//!   close.
+//!   over the requested range `[from, to)`, the first at `from`, the last at
+//!   `to - 1`, the rest evenly between (a single print sits at `from`), prices
+//!   `1.0, 2.0, …`, or fails if the symbol is `failing_symbol`.
+//! - `LiveHandle::subscribe` returns after `connect_delay`; from then on, one
+//!   trade every `live_interval`, stamped with the wall clock and priced
+//!   `100.0, 101.0, …`, until unsubscribe or close.
 //! - `latest` returns one trade priced [`LATEST_PRICE`] at `source_ts` 1 when
 //!   `latest` is set.
 //!
@@ -52,6 +53,8 @@ pub struct ScriptedSettings {
     pub latest: bool,
     /// The symbol whose history requests fail.
     pub failing_symbol: Option<String>,
+    /// How long `LiveHandle::subscribe` takes to return; no live trade before it.
+    pub connect_delay: Duration,
 }
 
 impl Default for ScriptedSettings {
@@ -62,6 +65,7 @@ impl Default for ScriptedSettings {
             live_interval: Duration::from_millis(50),
             latest: true,
             failing_symbol: None,
+            connect_delay: Duration::ZERO,
         }
     }
 }
@@ -125,6 +129,7 @@ impl Provider for ScriptedProvider {
         Ok(Box::new(ScriptedLiveHandle {
             sink,
             interval: settings.live_interval,
+            connect_delay: settings.connect_delay,
             tasks: Mutex::new(Vec::new()),
         }))
     }
@@ -143,10 +148,16 @@ impl Provider for ScriptedProvider {
                 message: format!("scripted history failure for {symbol}"),
             });
         }
+        let last = request.to.0.saturating_sub(1).max(request.from.0);
+        let span = i128::from(last) - i128::from(request.from.0);
         let n = i64::from(settings.history_prints);
-        let step = request.to.0.saturating_sub(request.from.0) / n.max(1);
         for i in 0..n {
-            let ts = Timestamp(request.from.0 + step * i);
+            let offset = if n > 1 {
+                span * i128::from(i) / i128::from(n - 1)
+            } else {
+                0
+            };
+            let ts = Timestamp(request.from.0 + i64::try_from(offset).unwrap_or(0));
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "a handful of scripted prints; exact for any count a test uses"
@@ -178,6 +189,7 @@ impl Provider for ScriptedProvider {
 struct ScriptedLiveHandle {
     sink: mpsc::Sender<MarketEvent>,
     interval: Duration,
+    connect_delay: Duration,
     /// One emitter task per subscribed pair.
     tasks: Mutex<Vec<(Instrument, EventKind, JoinHandle<()>)>>,
 }
@@ -185,6 +197,7 @@ struct ScriptedLiveHandle {
 #[async_trait]
 impl LiveHandle for ScriptedLiveHandle {
     async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
+        tokio::time::sleep(self.connect_delay).await;
         let sink = self.sink.clone();
         let interval = self.interval;
         let task_instrument = instrument.clone();

@@ -290,10 +290,16 @@ survivors, so a seam overflow is the same real hole a resume-buffer overflow is.
 tail: the window `[t, live-edge)` is served through the historical
 read-through path (cache + provider gap-fetch, honoring the session's
 `read_cache`/`write_cache` axes) while live arrivals buffer; the seam drains
-in arrival order. Coverage for the segment touching the live edge is claimed
-conservatively (history endpoints lag the live feed), so a later request
-re-fetches the sliver instead of permanently masking it. The tap log captures
-only the live tail — backfill data belongs to the cache.
+in arrival order. The live edge is the local wall clock sampled once the
+provider has confirmed the live subscription (`LiveHandle::subscribe`
+returned), so a provider that connects lazily on the first subscribe has its
+socket up and the pair acknowledged by then. Coverage for the segment touching
+the live edge is claimed conservatively (history endpoints lag the live feed),
+so a later request re-fetches the sliver instead of permanently masking it. The
+edge is local time and `source_ts` is the venue's, and nothing dedupes at the
+seam, so a print at the edge can arrive on both sides, and a local clock behind
+the venue leaves a short span on neither. None of these is known loss, so none
+is a `Gap`. The tap log captures only the live tail — backfill data belongs to the cache.
 
 See `examples/resume.rs` for a runnable, credential-free demo.
 

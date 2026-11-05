@@ -190,11 +190,12 @@ A daemon built with the off-by-default `scripted-provider` feature also has
 `[provider.scripted]`, a deterministic test provider (`src/scripted.rs`) that
 serves scripted trades on both surfaces, for instruments naming `scripted`
 only, with no network or credentials. Its knobs are `history_prints`,
-`history_delay_ms`, `live_interval_ms`, `latest` and `failing_symbol` (history
-requests for that symbol fail). The hermetic tests in `tests/daemon_e2e.rs` and
-`tests/health_observability_e2e.rs` use it for the backfill seam, the
-latest-value seed and the surface health. A daemon built without the feature
-rejects the section as unknown.
+`history_delay_ms`, `live_interval_ms`, `latest`, `failing_symbol` (history
+requests for that symbol fail) and `connect_delay_ms` (how long a live subscribe
+takes to return; nothing is emitted before it). The hermetic tests in
+`tests/daemon_e2e.rs` and `tests/health_observability_e2e.rs` use it for the
+backfill seam on a warm and a cold socket, the latest-value seed and the surface
+health. A daemon built without the feature rejects the section as unknown.
 
 Validation fails fast on the remaining cross-section invariants:
 a startup session naming a provider this binary lacks is refused; one using a
