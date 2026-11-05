@@ -41,8 +41,8 @@ pub use price::Price;
 pub use quantity::Quantity;
 pub use snapshot::{
     AuthoritativeSessionSnapshot, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
-    ConnectionState, ProviderSnapshot, ResumeBufferSnapshot, StreamConnection, SubscriptionRef,
-    SystemSnapshot,
+    ConnectionState, ProviderSnapshot, ProviderSurfaces, ResumeBufferSnapshot, StreamConnection,
+    SubscriptionRef, SurfaceOutcome, SystemSnapshot,
 };
 pub use subscription::{LiveScope, REPLAY_STALL_LIMIT, ScopeMismatch, ScopeName, Subscribed};
 pub use traits::{

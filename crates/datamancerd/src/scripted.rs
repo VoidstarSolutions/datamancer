@@ -5,7 +5,8 @@
 //!
 //! Behavior, all knobs on [`ScriptedSettings`]:
 //! - `fetch_history` waits `history_delay_ms`, then serves `history_prints`
-//!   trades spaced evenly over the requested range, prices `1.0, 2.0, …`.
+//!   trades spaced evenly over the requested range, prices `1.0, 2.0, …`, or
+//!   fails if the symbol is `failing_symbol`.
 //! - `LiveHandle::subscribe` emits `ProviderConnected`, then one trade every
 //!   `live_interval_ms`, stamped with the wall clock and priced
 //!   `100.0, 101.0, …`, until unsubscribe or close. The interval is re-read
@@ -56,6 +57,9 @@ pub struct ScriptedSettings {
     pub latest: bool,
     /// Milliseconds `latest` waits before answering.
     pub latest_delay_ms: u64,
+    /// The symbol whose history requests fail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failing_symbol: Option<String>,
 }
 
 impl Default for ScriptedSettings {
@@ -66,6 +70,7 @@ impl Default for ScriptedSettings {
             live_interval_ms: 50,
             latest: true,
             latest_delay_ms: 0,
+            failing_symbol: None,
         }
     }
 }
@@ -141,6 +146,13 @@ impl Provider for ScriptedProvider {
     ) -> Result<()> {
         let settings = self.settings()?;
         tokio::time::sleep(Duration::from_millis(settings.history_delay_ms)).await;
+        let symbol = request.instrument.symbol();
+        if settings.failing_symbol.as_deref() == Some(symbol) {
+            return Err(Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("scripted history failure for {symbol}"),
+            });
+        }
         let n = i64::from(settings.history_prints);
         let step = request.to.0.saturating_sub(request.from.0) / n.max(1);
         for i in 0..n {

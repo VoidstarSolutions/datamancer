@@ -3,6 +3,10 @@
 //! Needs a live iceoryx2 runtime:
 //! `cargo test -p datamancerd --test health_observability_e2e -- --ignored --test-threads=1`
 //!
+//! The per-surface health test runs against the hermetic scripted
+//! provider and needs the `scripted-provider` feature:
+//! `cargo test -p datamancerd --features scripted-provider --test health_observability_e2e -- --ignored --test-threads=1`
+//!
 //! Mirrors `config_service_e2e.rs`'s fixtures exactly: zero `[provider.*]`
 //! sections, `service_prefix = "health-e2e"`, `publish_interval_ms = 200`,
 //! scrubbed `ALPACA_*` env, `DATAMANCER_CREDENTIALS_FILE` pinned to the
@@ -18,6 +22,11 @@ use std::time::{Duration, Instant};
 use datamancer_client::app::{AppHandle, EnsureConfig};
 use datamancer_core::ProviderState;
 use tokio_stream::StreamExt;
+
+#[cfg(feature = "scripted-provider")]
+const SCRIPTED_PROVIDER_ID: &str = "scripted";
+#[cfg(feature = "scripted-provider")]
+const FAILING_SYMBOL: &str = "FAIL";
 
 /// Write a daemon config with **no** provider sections and return the
 /// config/socket paths. Same shape as `config_service_e2e.rs`'s
@@ -254,5 +263,232 @@ async fn health_reflects_disabled_enabled_and_pushes() {
         .expect("daemon process must exit after shutdown");
     assert!(status.success(), "daemon must exit 0 on graceful shutdown");
 
+    stop_daemon();
+}
+
+/// Write a daemon config whose only provider is the scripted one (feature
+/// `scripted-provider`). The history delay is the same 400 ms the scripted
+/// `daemon_e2e` tests use: a query that completes before the client's
+/// data-plane subscriber attaches is reaped unseen (`open_query`'s
+/// documented attach race), so the fetch must outlast the attach.
+#[cfg(feature = "scripted-provider")]
+fn write_config_scripted(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let socket = dir.join("control.sock");
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[provider.scripted]
+history_delay_ms = 400
+history_prints = 3
+failing_symbol = "{FAILING_SYMBOL}"
+
+[server]
+admin_socket = "{}"
+service_prefix = "health-e2e-surfaces"
+
+[diagnostics]
+publish_interval_ms = 200
+"#,
+            socket.display()
+        ),
+    )
+    .unwrap();
+    (config, socket)
+}
+
+/// The scripted provider's `surfaces` from a view, by provider id.
+#[cfg(feature = "scripted-provider")]
+fn scripted_surfaces(view: &datamancer_core::HealthView) -> datamancer_core::ProviderSurfaces {
+    view.providers
+        .iter()
+        .find(|p| p.provider.as_str() == SCRIPTED_PROVIDER_ID)
+        .unwrap_or_else(|| panic!("scripted provider must be enumerated: {:?}", view.providers))
+        .surfaces
+        .clone()
+}
+
+#[cfg(feature = "scripted-provider")]
+fn scripted_instrument(symbol: &str) -> datamancer_core::Instrument {
+    datamancer_core::Instrument::new(
+        datamancer_core::ProviderId::from_static(SCRIPTED_PROVIDER_ID),
+        datamancer_core::AssetClass::Equity,
+        symbol,
+    )
+}
+
+/// Run one history query through the facade up to its terminal
+/// `SessionClosing` (the query stream's end marker: a subscriber that reads
+/// on past it polls the reaped service forever) and return how many data
+/// events it delivered.
+#[cfg(feature = "scripted-provider")]
+async fn drain_query(handle: &mut AppHandle, symbol: &str) -> usize {
+    use datamancer_client::spec::QuerySpec;
+    use datamancer_core::{ControlKind, EventKind, MarketEvent, Timestamp};
+
+    let spec = QuerySpec::new(
+        &scripted_instrument(symbol),
+        EventKind::Trade,
+        Timestamp(1_000_000_000),
+        Timestamp(2_000_000_000),
+    )
+    .expect("equity is a wire asset class");
+    let (_id, mut stream) = handle.query(&spec).await.expect("query accepted");
+    let mut data = 0;
+    let drained = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(ev) = stream.next().await {
+            match ev {
+                MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing => return true,
+                MarketEvent::Control(_) => {}
+                _ => data += 1,
+            }
+        }
+        false
+    })
+    .await
+    .expect("the query must reach SessionClosing within 10s");
+    assert!(drained, "the query stream ended without SessionClosing");
+    data
+}
+
+/// Per-surface health over the daemon's `health` op and push plane: the
+/// scripted provider's history surface fails on the `FAILING_SYMBOL` query and
+/// recovers on the next ordinary query while its live surface stays `Unknown`,
+/// a view from the push plane carries the same surfaces, and a live subscribe
+/// reads `Ok` on the live surface though the provider emits no connect
+/// controls.
+#[cfg(feature = "scripted-provider")]
+#[tokio::test]
+#[ignore = "needs a live iceoryx2 runtime and spawns the daemon binary"]
+#[allow(clippy::too_many_lines)] // one sequential e2e narrative
+async fn health_reports_the_history_and_live_surfaces_apart() {
+    use datamancer_client::spec::SubscriptionSpec;
+    use datamancer_core::SurfaceOutcome;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (config, socket) = write_config_scripted(dir.path());
+
+    let mut child = DaemonGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_datamancerd"))
+            .arg("--config")
+            .arg(&config)
+            .env(
+                "DATAMANCER_CREDENTIALS_FILE",
+                dir.path().join("credentials.json"),
+            )
+            .env_remove("ALPACA_PAPER_API_KEY_ID")
+            .env_remove("ALPACA_PAPER_API_SECRET_KEY")
+            .env_remove("ALPACA_LIVE_API_KEY_ID")
+            .env_remove("ALPACA_LIVE_API_SECRET_KEY")
+            .spawn()
+            .expect("spawn datamancerd"),
+    );
+    let bind_deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            Instant::now() < bind_deadline,
+            "daemon socket never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let cfg = ensure_cfg(
+        dir.path(),
+        "health-e2e-surfaces",
+        socket.clone(),
+        config.clone(),
+    );
+    let (mut handle, events) = AppHandle::ensure(cfg)
+        .await
+        .expect("ensure must find the already-running daemon");
+
+    // 1. Nothing used yet: both surfaces Unknown; the provider itself is Idle
+    // (enabled, nothing requested).
+    let health = handle.health().await.expect("health");
+    assert_eq!(health.schema_version, 3);
+    let s = scripted_surfaces(&health);
+    assert_eq!(s.history, SurfaceOutcome::Unknown);
+    assert_eq!(s.live, SurfaceOutcome::Unknown);
+    let scripted_state = health
+        .providers
+        .iter()
+        .find(|p| p.provider.as_str() == SCRIPTED_PROVIDER_ID)
+        .expect("scripted")
+        .state;
+    assert_eq!(scripted_state, ProviderState::Idle);
+
+    // 2. A failing history fetch: the query completes with no data (the
+    // failure is in-band), and the history surface alone reads Failing with
+    // the provider's message.
+    assert_eq!(drain_query(&mut handle, FAILING_SYMBOL).await, 0);
+    let health = handle.health().await.expect("health after the failure");
+    let s = scripted_surfaces(&health);
+    let SurfaceOutcome::Failing {
+        at: failed_at,
+        error,
+        ..
+    } = &s.history
+    else {
+        panic!("{s:?}");
+    };
+    assert!(error.contains(FAILING_SYMBOL), "{s:?}");
+    assert!(*failed_at <= health.daemon.captured_at, "{s:?}");
+    assert_eq!(s.live, SurfaceOutcome::Unknown, "live untouched");
+    let failed_at = *failed_at;
+
+    // 3. The next ordinary query succeeds: Ok, error cleared.
+    assert_eq!(drain_query(&mut handle, "AAPL").await, 3);
+    let health = handle.health().await.expect("health after the success");
+    let s = scripted_surfaces(&health);
+    assert!(
+        matches!(s.history, SurfaceOutcome::Ok { at, .. } if at >= failed_at),
+        "{s:?}"
+    );
+    assert_eq!(s.live, SurfaceOutcome::Unknown);
+
+    // 4. The push plane carries the same surfaces (history_size(1): wait for
+    // a sample published after the success rather than the first one).
+    let mut stream = handle.watch_health();
+    let pushed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let view = stream
+                .next()
+                .await
+                .expect("the push stream must not end while the daemon is alive");
+            if matches!(scripted_surfaces(&view).history, SurfaceOutcome::Ok { .. }) {
+                return view;
+            }
+        }
+    })
+    .await
+    .expect("no pushed view showed the history surface Ok within 3s");
+    assert_eq!(pushed.schema_version, 3);
+    assert_eq!(
+        scripted_surfaces(&pushed),
+        s,
+        "push plane and health op agree"
+    );
+    drop(stream);
+
+    // 5. A live subscribe: the provider sends no connect control, and the
+    // accepted subscribe is the evidence.
+    let spec = SubscriptionSpec::new(
+        &scripted_instrument("AAPL"),
+        datamancer_core::EventKind::Trade,
+    )
+    .expect("equity is a wire asset class");
+    handle.subscribe(&spec).await.expect("subscribe accepted");
+    let health = handle.health().await.expect("health after the subscribe");
+    let s = scripted_surfaces(&health);
+    assert!(matches!(s.live, SurfaceOutcome::Ok { .. }), "{s:?}");
+
+    drop(events);
+    handle.shutdown_daemon().await.expect("shutdown_daemon");
+    let status = child
+        .0
+        .wait()
+        .expect("daemon process must exit after shutdown");
+    assert!(status.success(), "daemon must exit 0 on graceful shutdown");
     stop_daemon();
 }
