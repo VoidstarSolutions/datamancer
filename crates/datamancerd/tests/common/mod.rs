@@ -54,28 +54,54 @@ pub const GRACEFUL_STOP: Duration = Duration::from_secs(15);
 pub struct DaemonGuard {
     child: Child,
     control: PathBuf,
+    /// Set once the child has been waited on (`kill_abruptly`, or a
+    /// `try_wait` that saw it exit): `Drop` then has nothing to stop.
+    reaped: bool,
 }
 
 impl DaemonGuard {
     /// Take ownership of a spawned daemon and the control endpoint it was
     /// configured with (a UDS path on Unix, a named pipe on Windows).
     pub fn new(child: Child, control: PathBuf) -> Self {
-        Self { child, control }
+        Self {
+            child,
+            control,
+            reaped: false,
+        }
     }
 
     /// The daemon's control endpoint.
+    #[allow(dead_code)] // not every suite reads it back
     pub fn control_endpoint(&self) -> &Path {
         &self.control
     }
 
+    /// The daemon's process id, for a test that signals it directly.
+    #[allow(dead_code)] // only the SIGTERM test signals the daemon itself
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Non-blocking exit check, for a test that stops the daemon itself and
+    /// asserts on how it exited. Once this reports an exit the guard treats
+    /// the child as reaped and `Drop` does nothing further.
+    #[allow(dead_code)] // only the SIGTERM test waits on the daemon itself
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
+
     /// Simulate a crash: kill the daemon outright and reap it, so it never
     /// runs its drain and its iceoryx2 node and per-client services stay
-    /// registered with a dead owner. `Drop` then finds a reaped child and
-    /// only reports that the graceful stop was not possible.
+    /// registered with a dead owner. `Drop` then has nothing left to stop.
     #[allow(dead_code)] // only the crash-restart test simulates a crash
     pub fn kill_abruptly(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.reaped = true;
     }
 }
 
@@ -83,6 +109,9 @@ impl Drop for DaemonGuard {
     // Nothing here may panic: a panic in `Drop` while a failing test unwinds
     // aborts the process.
     fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
         #[cfg(unix)]
         let stopped = request_shutdown(&self.control) && wait_for_exit(&mut self.child);
         #[cfg(not(unix))]

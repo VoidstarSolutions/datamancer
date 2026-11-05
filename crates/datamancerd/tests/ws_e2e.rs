@@ -9,8 +9,10 @@
 //! They exercise wiring (handshake/auth, snapshot reply + id echo, subscribe
 //! reply + id echo, teardown), not live market data. The tests that subscribe
 //! need `ALPACA_PAPER_API_KEY_ID` / `ALPACA_PAPER_API_SECRET_KEY` in the
-//! environment (each test's `#[ignore]` reason says which). The spawned daemon
-//! is the binary built WITH the `ws` feature, so it runs the ws listener.
+//! environment (each test's `#[ignore]` reason says which, and each checks for
+//! the pair before it spawns anything). The spawned daemon is the binary built
+//! WITH the `ws` feature, so it runs the ws listener. Every daemon starts from
+//! `common::daemon_command` and is owned by a [`common::DaemonGuard`].
 //!
 //! **Windows note:** on Windows the daemon boots **WS-only** (no iceoryx2 node),
 //! so `windows_ws_only_boot_smoke` needs no iceoryx2 runtime — it is the
@@ -19,11 +21,12 @@
 
 #![cfg(feature = "ws")]
 
-use std::path::PathBuf;
-use std::process::{Child, Command};
+mod common;
+
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use common::DaemonGuard;
 use futures::{SinkExt as _, StreamExt as _};
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
@@ -38,9 +41,24 @@ static DAEMON_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 // on the host — acceptable for these `#[ignore]`d, manually-run tests, which are
 // also serialized by `DAEMON_LOCK` so they never collide with each other.
 
-/// Spawn the daemon from a written config file. Returns the child; the caller is
-/// responsible for waiting on WS readiness.
-fn spawn_daemon(dir: &std::path::Path, port: u16, auth_token: Option<&str>) -> Child {
+/// The Alpaca paper key pair the subscribing tests need. Checked before a
+/// daemon is spawned, so a missing pair fails with a message that names it
+/// and leaves nothing running, instead of a rejected subscribe failing an
+/// assert halfway through the test.
+fn require_paper_credentials() {
+    for var in ["ALPACA_PAPER_API_KEY_ID", "ALPACA_PAPER_API_SECRET_KEY"] {
+        assert!(
+            std::env::var_os(var).is_some_and(|v| !v.is_empty()),
+            "{var} must be set in the test's own environment: this test subscribes a real \
+             alpaca-crypto pair (see the module docs)"
+        );
+    }
+}
+
+/// Spawn the daemon from a written config file. Returns the guard that stops
+/// it when the test ends; the caller is responsible for waiting on WS
+/// readiness.
+fn spawn_daemon(dir: &std::path::Path, port: u16, auth_token: Option<&str>) -> DaemonGuard {
     spawn_daemon_full(dir, port, auth_token, None)
 }
 
@@ -51,7 +69,7 @@ fn spawn_daemon_full(
     port: u16,
     auth_token: Option<&str>,
     channel_depth: Option<usize>,
-) -> Child {
+) -> DaemonGuard {
     let socket = dir.join("admin.sock");
     let config_path = dir.join("datamancerd.toml");
     let auth_line = match auth_token {
@@ -84,13 +102,10 @@ port = {port}
     );
     std::fs::write(&config_path, config).expect("write config");
 
-    let bin: PathBuf = env!("CARGO_BIN_EXE_datamancerd").into();
-    Command::new(bin)
-        .arg("--config")
-        .arg(&config_path)
-        .env("DATAMANCER_CREDENTIALS_FILE", dir.join("credentials.json"))
+    let child = common::daemon_command(&config_path)
         .spawn()
-        .expect("spawn datamancerd")
+        .expect("spawn datamancerd");
+    DaemonGuard::new(child, socket)
 }
 
 /// Build a client request for the daemon: the event-frame wire version rides
@@ -150,10 +165,11 @@ where
 #[tokio::test]
 #[ignore = "spawns the binary; needs a live iceoryx2 runtime and Alpaca paper credentials in the environment; run with --ignored"]
 async fn subscribe_reply_echoes_id_and_snapshot_returns() {
+    require_paper_credentials();
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let port = 19011;
-    let mut child = spawn_daemon(dir.path(), port, None);
+    let _daemon = spawn_daemon(dir.path(), port, None);
 
     let mut ws = connect_when_ready(port).await;
 
@@ -180,11 +196,9 @@ async fn subscribe_reply_echoes_id_and_snapshot_returns() {
         "subscribe reply: {sub}"
     );
 
-    // Close cleanly; the server tears down its side.
+    // Close cleanly; the server tears down its side. The guard stops the
+    // daemon.
     let _ = ws.close(None).await;
-
-    child.kill().expect("kill");
-    let _ = child.wait();
 }
 
 /// SIGTERM the daemon while a live WS client is connected and assert the client
@@ -201,10 +215,11 @@ async fn subscribe_reply_echoes_id_and_snapshot_returns() {
 #[tokio::test]
 #[ignore = "spawns the binary; needs a live iceoryx2 runtime and Alpaca paper credentials in the environment; run with --ignored"]
 async fn graceful_shutdown_closes_live_connection() {
+    require_paper_credentials();
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let port = 19013;
-    let mut child = spawn_daemon(dir.path(), port, None);
+    let mut daemon = spawn_daemon(dir.path(), port, None);
 
     let mut ws = connect_when_ready(port).await;
 
@@ -223,7 +238,7 @@ async fn graceful_shutdown_closes_live_connection() {
 
     // Graceful termination (NOT SIGKILL): the daemon must tear down live WS
     // connections on its drain path.
-    let pid = child.id().cast_signed();
+    let pid = daemon.id().cast_signed();
     assert_eq!(
         unsafe { libc::kill(pid, libc::SIGTERM) },
         0,
@@ -259,18 +274,16 @@ async fn graceful_shutdown_closes_live_connection() {
     );
 
     // The child must exit within the shutdown window (bounded try_wait poll so a
-    // wedged daemon fails rather than hanging the test).
+    // wedged daemon fails rather than hanging the test; the guard kills it on
+    // the way out).
     let exit_deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
-        match child.try_wait().expect("try_wait") {
+        match daemon.try_wait().expect("try_wait") {
             Some(status) => break status,
             None if Instant::now() < exit_deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            None => {
-                child.kill().expect("kill wedged daemon");
-                panic!("daemon did not exit within the shutdown window after SIGTERM");
-            }
+            None => panic!("daemon did not exit within the shutdown window after SIGTERM"),
         }
     };
     assert!(
@@ -285,7 +298,7 @@ async fn missing_bearer_token_is_rejected() {
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let port = 19012;
-    let mut child = spawn_daemon(dir.path(), port, Some("secret"));
+    let _daemon = spawn_daemon(dir.path(), port, Some("secret"));
 
     // Wait for the listener to bind: a bare connect (no Authorization header)
     // must be *rejected* with a handshake error once the server is up. Retry
@@ -313,9 +326,6 @@ async fn missing_bearer_token_is_rejected() {
         rejected,
         "server never rejected the unauthenticated handshake"
     );
-
-    child.kill().expect("kill");
-    let _ = child.wait();
 }
 
 /// A client that does not offer the event-frame wire-version subprotocol must
@@ -327,7 +337,7 @@ async fn missing_subprotocol_is_rejected() {
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let port = 19016;
-    let mut child = spawn_daemon(dir.path(), port, None);
+    let _daemon = spawn_daemon(dir.path(), port, None);
 
     let url = format!("ws://127.0.0.1:{port}/");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -353,9 +363,6 @@ async fn missing_subprotocol_is_rejected() {
         rejected,
         "server never rejected the subprotocol-less handshake"
     );
-
-    child.kill().expect("kill");
-    let _ = child.wait();
 }
 
 /// Happy-path auth: with a configured bearer token AND a correct
@@ -368,7 +375,7 @@ async fn correct_bearer_token_is_accepted() {
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let port = 19014;
-    let mut child = spawn_daemon(dir.path(), port, Some("secret"));
+    let _daemon = spawn_daemon(dir.path(), port, Some("secret"));
 
     // Retry the authenticated handshake until the listener is up (connection
     // refused during boot is transient); a definite success ends the loop.
@@ -401,8 +408,6 @@ async fn correct_bearer_token_is_accepted() {
     assert!(snap["snapshot"].is_object(), "expected snapshot object");
 
     let _ = ws.close(None).await;
-    child.kill().expect("kill");
-    let _ = child.wait();
 }
 
 /// Slow-consumer overrun tears the connection down (I-1). With a tiny
@@ -447,11 +452,12 @@ async fn slow_consumer_overrun_tears_down_connection() {
     // in warm-up before trusting the teardown assertion (else soft-pass).
     const MIN_EVENTS_TO_PROVE_FLOW: usize = 10;
 
+    require_paper_credentials();
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let port = 19015;
     // Pin the outbound channel to depth 1 so minimal un-drained events overrun.
-    let mut child = spawn_daemon_full(dir.path(), port, None, Some(1));
+    let _daemon = spawn_daemon_full(dir.path(), port, None, Some(1));
 
     // Connect with a tiny receive buffer so the client's TCP window fills after
     // only a few un-read frames, back-pressuring the writer and overflowing the
@@ -523,8 +529,6 @@ async fn slow_consumer_overrun_tears_down_connection() {
             "inconclusive: only {events_seen} market event(s) in warm-up window \
              (need {MIN_EVENTS_TO_PROVE_FLOW} to force overrun); skipping overrun assertion"
         );
-        child.kill().expect("kill");
-        let _ = child.wait();
         return;
     }
 
@@ -553,9 +557,6 @@ async fn slow_consumer_overrun_tears_down_connection() {
         torn_down,
         "client never observed teardown after slow-consumer overrun (connection stalled)"
     );
-
-    child.kill().expect("kill");
-    let _ = child.wait();
 }
 
 /// The Windows WS-only boot proof (native-Windows Phase 4 / daemon-boot design).
@@ -603,16 +604,13 @@ publish_interval_ms = 200
     );
     let config_path = dir.path().join("datamancerd.toml");
     std::fs::write(&config_path, config).expect("write config");
-    let bin: PathBuf = env!("CARGO_BIN_EXE_datamancerd").into();
-    let mut child = Command::new(bin)
-        .arg("--config")
-        .arg(&config_path)
-        .env(
-            "DATAMANCER_CREDENTIALS_FILE",
-            dir.path().join("credentials.json"),
-        )
+    let child = common::daemon_command(&config_path)
         .spawn()
         .expect("spawn datamancerd (WS-only boot on Windows)");
+    let _daemon = DaemonGuard::new(
+        child,
+        std::path::PathBuf::from(r"\\.\pipe\datamancerd-winboot-smoke"),
+    );
 
     let mut ws = connect_when_ready(port).await;
 
@@ -661,6 +659,4 @@ publish_interval_ms = 200
     );
 
     let _ = ws.close(None).await;
-    child.kill().expect("kill");
-    let _ = child.wait();
 }
