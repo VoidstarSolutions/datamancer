@@ -26,9 +26,14 @@ use datamancer::transport::{
     BootScopedPrefix, DataServiceName, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher,
     Iceoryx2HealthPublisher, ServicePrefix,
 };
+// `Scope` is named only by the unix `open_query` arm (`Scope::Historical`);
+// the subscribe paths resolve theirs through `control::requested_scope`, so
+// on Windows the import would be unused.
+#[cfg(not(windows))]
+use datamancer::Scope;
 use datamancer::{
-    AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
-    Session, TapLog, traits::EventSink,
+    AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Session,
+    TapLog, traits::EventSink,
 };
 // `Timestamp` only appears in `validate_query_open`'s signature and its
 // tests, both unix/macOS only — importing it unconditionally would be
