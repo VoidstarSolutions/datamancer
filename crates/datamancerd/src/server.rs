@@ -66,7 +66,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::control::{
-    Reply, Request, SubscriptionSpec, actual_scope, codes, reply_from_library_error,
+    Reply, Request, SubscriptionSpec, actual_scope, codes, live_edge_now, reply_from_library_error,
     requested_scope,
 };
 use crate::credentials::CredentialHub;
@@ -1028,16 +1028,24 @@ impl Server {
         let service = sink.data_service_name().to_string();
         let sink = Arc::new(sink) as Arc<dyn EventSink>;
 
+        // Validate every seed spec before any of them subscribes, so a bad
+        // spec rejects the whole request instead of leaving earlier seeds
+        // subscribed on a client that then fails to open.
+        let now = live_edge_now();
+        let mut seeds = Vec::with_capacity(subscriptions.len());
+        for spec in subscriptions {
+            match requested_scope(&spec, now) {
+                Ok(scope) => seeds.push((spec, scope)),
+                Err(message) => return Reply::error(codes::BAD_REQUEST, message),
+            }
+        }
+
         let session = self.dm.client_session();
         // Apply seed subscriptions before taking the stream. Their actual
         // scopes are not echoed (the reply names the service); a client that
         // needs them subscribes after opening.
-        for spec in subscriptions {
+        for (spec, scope) in seeds {
             let instrument = spec_instrument(&spec);
-            let scope = match requested_scope(&spec) {
-                Ok(scope) => scope,
-                Err(message) => return Reply::error(codes::BAD_REQUEST, message),
-            };
             if let Err(e) = session
                 .subscribe(
                     instrument,
@@ -1236,7 +1244,7 @@ impl Server {
             return Reply::error(codes::SESSION_CLOSED, "client session is closing");
         };
         let instrument = spec_instrument(&spec);
-        let scope = match requested_scope(&spec) {
+        let scope = match requested_scope(&spec, live_edge_now()) {
             Ok(scope) => scope,
             Err(message) => return Reply::error(codes::BAD_REQUEST, message),
         };
