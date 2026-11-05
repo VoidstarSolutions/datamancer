@@ -480,6 +480,7 @@ mod tests {
         let mut edited = boot.clone();
         edited.provider.alpaca = Some(crate::config::AlpacaSection {
             account_type: crate::config::AccountTypeCfg::Live,
+            history_feed: None,
         });
         state.write(&edited).await.expect("write");
         assert!(

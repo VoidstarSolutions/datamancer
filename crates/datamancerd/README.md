@@ -47,6 +47,19 @@ market-data stream is account-type independent: paper and live keys both
 authenticate on Alpaca's production data host, which the daemon always uses
 (the Broker-API *sandbox* stream host rejects ordinary paper keys).
 
+**Data plan and feeds.** The equities stream is IEX. Historical fetches name
+their REST feed explicitly (`[provider.alpaca] history_feed`), because
+Alpaca's unnamed default is SIP and the free data plan refuses SIP for the
+most recent fifteen minutes (`403 subscription does not permit querying
+recent SIP data`) — which fails every backfill window that ends at "now".
+The history endpoints (bars, trades, quotes) accept only `iex` and `sip`;
+`delayed_sip` is a stream/snapshot feed and they answer it with
+`400 invalid feed`. Omitted, `history_feed` follows the stream feed:
+**`iex`** for the IEX (or delayed-SIP) stream, `sip` for a SIP stream.
+Set it explicitly to override — `sip` once the account has the unlimited
+plan. It is a `provider.*` field, so `configure-provider` applies it
+without a restart.
+
 ### Single instance
 
 Only one `datamancerd` runs per user on a host — **regardless of which config it
@@ -92,6 +105,7 @@ the target, so a reader never observes a torn file.
 ```toml
 [provider.alpaca]
 account_type = "paper"            # paper | live
+# history_feed = "iex"            # iex | sip; omitted = follow the stream feed
 
 [provider.alpaca_crypto]
 account_type = "paper"

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use std::collections::HashMap;
 
-use datamancer::providers::AccountType;
+use datamancer::providers::{AccountType, AlpacaHistoryFeed};
 use datamancer::{
     Adjustment, CredentialsSource, Datamancer, Instrument, PersistenceOptions, ProviderId, Scope,
     Timestamp,
@@ -121,6 +121,31 @@ pub struct ProviderConfig {
 pub struct AlpacaSection {
     #[serde(default)]
     pub account_type: AccountTypeCfg,
+    /// The REST feed historical fetches query. Omitted (the default): follow
+    /// the stream feed — IEX for the IEX stream, the only feed a free data
+    /// plan may query up to "now". Set `sip` once the account has the
+    /// unlimited plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_feed: Option<HistoryFeedCfg>,
+}
+
+/// Which Alpaca REST feed historical fetches query (`[provider.alpaca]
+/// history_feed`). Only the feeds the history endpoints accept; `delayed_sip`
+/// is a stream/snapshot feed they reject (`400 invalid feed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryFeedCfg {
+    Iex,
+    Sip,
+}
+
+impl From<HistoryFeedCfg> for AlpacaHistoryFeed {
+    fn from(value: HistoryFeedCfg) -> Self {
+        match value {
+            HistoryFeedCfg::Iex => AlpacaHistoryFeed::Iex,
+            HistoryFeedCfg::Sip => AlpacaHistoryFeed::Sip,
+        }
+    }
 }
 
 /// Alpaca crypto provider section.
@@ -1064,6 +1089,51 @@ account_type = "paper"
             serde_json::to_string(&EventKindCfg::Bar1d).unwrap(),
             "\"bar1d\""
         );
+    }
+
+    #[test]
+    fn alpaca_history_feed_parses_and_is_omitted_when_unset() {
+        let explicit =
+            Config::parse("[provider.alpaca]\naccount_type = \"paper\"\nhistory_feed = \"sip\"\n")
+                .expect("parse");
+        let section = explicit.provider.alpaca.as_ref().expect("alpaca section");
+        assert_eq!(section.history_feed, Some(HistoryFeedCfg::Sip));
+        assert_eq!(
+            AlpacaHistoryFeed::from(HistoryFeedCfg::Sip),
+            AlpacaHistoryFeed::Sip
+        );
+        for (text, expected) in [("iex", HistoryFeedCfg::Iex), ("sip", HistoryFeedCfg::Sip)] {
+            let cfg = Config::parse(&format!("[provider.alpaca]\nhistory_feed = \"{text}\"\n"))
+                .expect("parse");
+            assert_eq!(cfg.provider.alpaca.unwrap().history_feed, Some(expected));
+            assert_eq!(
+                AlpacaHistoryFeed::from(expected),
+                match expected {
+                    HistoryFeedCfg::Iex => AlpacaHistoryFeed::Iex,
+                    HistoryFeedCfg::Sip => AlpacaHistoryFeed::Sip,
+                }
+            );
+        }
+        // Unset stays unset — and stays out of the serialized file, so a
+        // config written back by the daemon does not pin today's default.
+        let implicit =
+            Config::parse("[provider.alpaca]\naccount_type = \"paper\"\n").expect("parse");
+        assert_eq!(
+            implicit.provider.alpaca.as_ref().unwrap().history_feed,
+            None
+        );
+        let rendered = toml::to_string(&implicit).expect("serialize");
+        assert!(!rendered.contains("history_feed"), "{rendered}");
+        let rendered = toml::to_string(&explicit).expect("serialize");
+        assert!(rendered.contains("history_feed = \"sip\""), "{rendered}");
+        // Feeds the history endpoints refuse are rejected at parse time, like
+        // any unknown value: `delayed_sip` is stream/snapshot only.
+        for bad in ["delayed_sip", "otc"] {
+            assert!(
+                Config::parse(&format!("[provider.alpaca]\nhistory_feed = \"{bad}\"\n")).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

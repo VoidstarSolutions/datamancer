@@ -20,6 +20,7 @@ venue = "us"                      # us | us_kraken | eu_kraken
 
 # [provider.alpaca]               # equities; uncomment to enable
 # account_type = "paper"
+# history_feed = "iex"            # iex | sip; omit to follow the stream feed
 
 # ── Persistence ────────────────────────────────────────────────────────────
 # Required only if a startup session (or a client subscription) uses them.

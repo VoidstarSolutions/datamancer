@@ -17,8 +17,8 @@ use datamancer::providers::{
     AlpacaProviderConfig, AlpacaSettings, AlpacaStreamFeed, CredentialsSource, SettingsSource,
 };
 use datamancer::{
-    AssetClass, Datamancer, DisconnectCause, EventKind, Instrument, MarketEvent,
-    PersistenceOptions, Provider, ProviderId, Scope,
+    Adjustment, AssetClass, BarInterval, Datamancer, DisconnectCause, EventKind, HistoryRequest,
+    Instrument, MarketEvent, PersistenceOptions, Provider, ProviderId, Scope, Timestamp,
 };
 use futures::StreamExt;
 use oxidized_alpaca::AccountType;
@@ -29,6 +29,7 @@ async fn live_test_feed_yields_an_event() {
     let provider = AlpacaProvider::new(AlpacaProviderConfig {
         settings: SettingsSource::Static(AlpacaSettings {
             account_type: AccountType::Paper,
+            ..Default::default()
         }),
         stream_feed: AlpacaStreamFeed::Test,
         ..Default::default()
@@ -81,6 +82,7 @@ async fn live_test_feed_delivers_a_trade() {
     let provider = AlpacaProvider::new(AlpacaProviderConfig {
         settings: SettingsSource::Static(AlpacaSettings {
             account_type: AccountType::Paper,
+            ..Default::default()
         }),
         stream_feed: AlpacaStreamFeed::Test,
         ..Default::default()
@@ -192,6 +194,7 @@ async fn paper_keys_authenticate_on_the_iex_stream() {
     let provider = AlpacaProvider::new(AlpacaProviderConfig {
         settings: SettingsSource::Static(AlpacaSettings {
             account_type: AccountType::Paper,
+            ..Default::default()
         }),
         stream_feed: AlpacaStreamFeed::Iex,
         ..Default::default()
@@ -243,6 +246,7 @@ async fn bad_credentials_yield_unauthenticated_disconnect() {
     let provider = AlpacaProvider::new(AlpacaProviderConfig {
         settings: SettingsSource::Static(AlpacaSettings {
             account_type: AccountType::Paper,
+            ..Default::default()
         }),
         stream_feed: AlpacaStreamFeed::Test,
         credentials: CredentialsSource::Static(AlpacaCredentials {
@@ -278,6 +282,57 @@ async fn bad_credentials_yield_unauthenticated_disconnect() {
     }
 
     let _ = handle.close().await;
+}
+
+/// History smoke test on the free data plan: daily AAPL bars for a window
+/// ending **now**. With no feed named, Alpaca defaults to SIP and a free plan
+/// answers `403 subscription does not permit querying recent SIP data` for
+/// any window reaching into the last fifteen minutes — the empty-chart bug
+/// (and the history endpoints reject `delayed_sip` with `400 invalid feed`,
+/// so IEX is the only free-plan option). The default `history_feed` (IEX for
+/// an IEX stream) must make this fetch succeed and return bars. A paid
+/// (unlimited) plan passes trivially.
+#[tokio::test]
+#[ignore = "requires real Alpaca credentials; invoke with `cargo test --test alpaca_real -- --ignored`"]
+async fn recent_daily_bars_fetch_on_the_default_history_feed() {
+    let provider = AlpacaProvider::new(AlpacaProviderConfig::default());
+    let now_nanos = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+    .unwrap();
+    let thirty_days = 30 * 24 * 60 * 60 * 1_000_000_000_i64;
+    let request = HistoryRequest {
+        instrument: Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        ),
+        kind: EventKind::Bar(BarInterval::OneDay),
+        from: Timestamp(now_nanos - thirty_days),
+        to: Timestamp(now_nanos),
+        adjustment: Adjustment::All,
+    };
+    let (sink, mut events) = tokio::sync::mpsc::channel(4096);
+    provider
+        .fetch_history(request, sink)
+        .await
+        .expect("daily bars ending now must be served on the default history feed");
+    let mut bars = 0usize;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            MarketEvent::Bar(b) => {
+                assert_eq!(b.instrument.symbol(), "AAPL");
+                assert_eq!(b.interval, BarInterval::OneDay);
+                bars += 1;
+            }
+            other => panic!("expected only bars, got {other:?}"),
+        }
+    }
+    eprintln!("daily bars in the last 30 days: {bars}");
+    assert!(bars >= 15, "expected a month of trading days, got {bars}");
 }
 
 /// Latest-value smoke test (stock): `Provider::latest` against Alpaca's real

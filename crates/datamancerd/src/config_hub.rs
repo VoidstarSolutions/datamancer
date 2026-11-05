@@ -53,6 +53,7 @@ pub(crate) struct ConfigHub {
 fn alpaca_settings(section: &AlpacaSection) -> AlpacaSettings {
     AlpacaSettings {
         account_type: section.account_type.into(),
+        history_feed: section.history_feed.map(Into::into),
     }
 }
 
@@ -301,11 +302,37 @@ mod tests {
         assert_eq!(
             sources.alpaca.current(),
             Some(datamancer::providers::AlpacaSettings {
-                account_type: datamancer::providers::AccountType::Live
+                account_type: datamancer::providers::AccountType::Live,
+                history_feed: None,
             })
         );
         // Unconfigured provider: constructed but disabled.
         assert_eq!(sources.alpaca_crypto.current(), None);
+    }
+
+    /// `history_feed` is a `provider.*` field, so it is Hot: `configure-provider`
+    /// lands it on the running provider's settings watch without a restart.
+    #[tokio::test]
+    async fn configure_provider_hot_applies_the_history_feed() {
+        let (hub, sources, _dir) = hub_with("[provider.alpaca]\naccount_type = \"paper\"\n");
+        assert_eq!(sources.alpaca.current().unwrap().history_feed, None);
+        let reply = hub
+            .configure_provider(
+                "alpaca",
+                serde_json::json!({"account_type": "paper", "history_feed": "iex"}),
+            )
+            .await;
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(
+            sources.alpaca.current().unwrap().history_feed,
+            Some(datamancer::providers::AlpacaHistoryFeed::Iex)
+        );
+        // Omitting it again returns to the default rule.
+        let reply = hub
+            .configure_provider("alpaca", serde_json::json!({"account_type": "paper"}))
+            .await;
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(sources.alpaca.current().unwrap().history_feed, None);
     }
 
     #[tokio::test]
@@ -428,6 +455,7 @@ mod tests {
         let mut new = hub.current().await;
         new.provider.alpaca = Some(AlpacaSection {
             account_type: crate::config::AccountTypeCfg::Live,
+            history_feed: None,
         });
         new.session.resume_buffer_events = 42;
 
@@ -449,6 +477,7 @@ mod tests {
         let mut new = hub.current().await;
         new.provider.alpaca = Some(AlpacaSection {
             account_type: crate::config::AccountTypeCfg::Paper,
+            history_feed: None,
         });
 
         let restart_required = hub.apply_full(new).await.expect("apply_full");

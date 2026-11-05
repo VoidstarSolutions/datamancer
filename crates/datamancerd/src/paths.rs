@@ -99,6 +99,7 @@ port = 9001
 # environment; `live` the live pair.
 # [provider.alpaca]
 # account_type = "paper"
+# history_feed = "iex"            # iex | sip; omit to follow the stream feed
 
 # Uncomment for the crypto provider (venues: "us", "us_kraken", "eu_kraken").
 # [provider.alpaca_crypto]
