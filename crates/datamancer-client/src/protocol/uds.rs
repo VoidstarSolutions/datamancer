@@ -9,10 +9,10 @@
 //! Access control is filesystem permissions on the socket path only. This is
 //! **not** a network-safe surface.
 
-use datamancer_core::{HealthView, SystemSnapshot};
+use datamancer_core::{HealthView, SystemSnapshot, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, ScopeCfg, Subscribed, SubscriptionSpec, UnsubscribeSpec};
 
 /// A control request (one per line).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -161,6 +161,15 @@ pub struct Reply {
     /// The app-facing health view (on `health`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthView>,
+    /// The scope the subscription actually opened (on `subscribe`): the
+    /// shared authoritative session's creation-time scope, which may differ
+    /// from the requested one when another client opened the pair first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeCfg>,
+    /// The actual backfill start (on `subscribe`, when `scope` is
+    /// `live_backfill`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_from: Option<Timestamp>,
 }
 
 impl Reply {
@@ -185,6 +194,8 @@ impl Reply {
             restart_required: None,
             applied: None,
             health: None,
+            scope: None,
+            backfill_from: None,
         }
     }
 
@@ -293,6 +304,8 @@ impl Reply {
             restart_required: None,
             applied: None,
             health: None,
+            scope: None,
+            backfill_from: None,
         }
     }
 
@@ -324,6 +337,24 @@ impl Reply {
             ..Self::ok()
         }
     }
+
+    /// A successful `subscribe` reply carrying the actual scope.
+    #[must_use]
+    pub fn subscribed(actual: Subscribed) -> Self {
+        Self {
+            scope: Some(actual.scope),
+            backfill_from: actual.backfill_from,
+            ..Self::ok()
+        }
+    }
+
+    /// The actual scope a successful `subscribe` reply carries, or `None`
+    /// when the reply has no `scope` (an error reply, or any other op).
+    #[must_use]
+    pub fn subscribed_scope(&self) -> Option<Subscribed> {
+        self.scope
+            .map(|scope| Subscribed::new(scope, self.backfill_from))
+    }
 }
 
 #[cfg(test)]
@@ -341,12 +372,53 @@ mod tests {
                 symbol: "BTC/USD".to_string(),
                 kind: EventKindCfg::Trade,
                 scope: ScopeCfg::Live,
+                backfill_from: None,
                 persistence: PersistenceCfg::CachedWithTap,
             }],
         };
         let line = serde_json::to_string(&req).expect("ser");
         let back: Request = serde_json::from_str(&line).expect("de");
         assert_eq!(req, back);
+    }
+
+    /// The documented backfill subscribe parses with its timestamp, and the
+    /// reply that answers it round-trips the actual scope.
+    #[test]
+    fn control_protocol_parses_backfill_subscribe_and_reply_carries_scope() {
+        let line = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":1704067200000000000,"persistence":"cached"}"#;
+        let req: Request = serde_json::from_str(line).expect("de");
+        let Request::Subscribe { spec, .. } = req else {
+            panic!("wrong variant");
+        };
+        assert_eq!(spec.scope, ScopeCfg::LiveBackfill);
+        assert_eq!(
+            spec.backfill_from,
+            Some(Timestamp(1_704_067_200_000_000_000))
+        );
+
+        let reply = Reply::subscribed(Subscribed::new(
+            ScopeCfg::LiveBackfill,
+            Some(Timestamp(1_704_067_200_000_000_000)),
+        ));
+        let json = serde_json::to_string(&reply).expect("ser");
+        assert_eq!(
+            json,
+            r#"{"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000}"#
+        );
+        let back: Reply = serde_json::from_str(&json).expect("de");
+        assert_eq!(
+            back.subscribed_scope(),
+            Some(Subscribed::new(
+                ScopeCfg::LiveBackfill,
+                Some(Timestamp(1_704_067_200_000_000_000))
+            ))
+        );
+        assert_eq!(Reply::ok().subscribed_scope(), None);
+        assert_eq!(
+            serde_json::to_string(&Reply::subscribed(Subscribed::new(ScopeCfg::Live, None)))
+                .expect("ser"),
+            r#"{"ok":true,"scope":"live"}"#
+        );
     }
 
     #[test]

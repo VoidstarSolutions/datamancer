@@ -61,12 +61,11 @@ pub enum Error {
         kind: crate::EventKind,
     },
 
-    /// A client subscription requested an unsupported scope. Phase 2 client
-    /// subscriptions are pure-live (`Scope::Live { backfill_from: None }`); a
-    /// shared authoritative session has one creation-time scope, so a per-client
-    /// historical join or differing backfill would break the
-    /// identical-`(seq, source_ts)` guarantee.
-    #[error("client subscriptions are pure-live; historical and backfill scopes are unsupported")]
+    /// A client subscription requested a bounded historical scope. Client
+    /// subscriptions are unbounded (pure-live, or a backfill seamed into the
+    /// live tail); a bounded range has no live tail to join and stays a
+    /// single-pair session concern.
+    #[error("client subscriptions are unbounded; a historical scope is unsupported")]
     UnsupportedClientScope,
 
     /// The session's event stream has already been taken and is still live.

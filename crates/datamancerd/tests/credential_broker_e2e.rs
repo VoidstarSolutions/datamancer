@@ -154,6 +154,7 @@ async fn broker_provisions_credentials_and_provider_connects() {
         symbol: "BTC/USD".to_string(),
         kind: datamancer_client::spec::EventKindCfg::Trade,
         scope: datamancer_client::spec::ScopeCfg::default(),
+        backfill_from: None,
         persistence: datamancer_client::spec::PersistenceCfg::default(),
     };
     handle.subscribe(&spec).await.expect("subscribe");

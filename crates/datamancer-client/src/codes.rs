@@ -10,7 +10,8 @@ pub const UNSUPPORTED_EVENT_KIND: &str = "unsupported_event_kind";
 /// The requested persistence preset requires a backend that is not
 /// configured.
 pub const PERSISTENCE_REQUIRED: &str = "persistence_required";
-/// A client subscription requested an unsupported (non pure-live) scope.
+/// A client subscription requested an unsupported scope (a bounded
+/// historical range; client subscriptions are unbounded).
 pub const UNSUPPORTED_CLIENT_SCOPE: &str = "unsupported_client_scope";
 /// The client already holds a subscription for this pair.
 pub const DUPLICATE_SUBSCRIPTION: &str = "duplicate_subscription";

@@ -121,6 +121,7 @@ client
         symbol: "BTC/USD".to_string(),
         kind: EventKindCfg::Trade,
         scope: Default::default(),
+        backfill_from: None,
         persistence: Default::default(),
     })
     .await?;
@@ -154,6 +155,7 @@ client
         symbol: "BTC/USD".to_string(),
         kind: EventKindCfg::Trade,
         scope: Default::default(),
+        backfill_from: None,
         persistence: Default::default(),
     })
     .await?;

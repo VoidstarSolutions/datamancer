@@ -5,7 +5,7 @@ use datamancer_core::{InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, 
 use futures::Stream;
 
 use crate::error::ClientError;
-use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
 
 /// A connected datamancerd client, generic over transport.
 ///
@@ -43,11 +43,16 @@ pub trait Client: Sized + Send {
         cfg: Self::Config,
     ) -> impl Future<Output = Result<(Self, Self::Events), ClientError<Self::Error>>> + Send;
 
-    /// Add a subscription to this client's set.
+    /// Add a subscription to this client's set. Returns the scope the daemon
+    /// actually opened: the pair's shared authoritative session is created
+    /// with the first subscriber's scope and later subscribers join it as is,
+    /// so a `live_backfill` request can come back `live` (and vice versa).
+    /// Read the result, not the request, to know whether history precedes the
+    /// live tail.
     fn subscribe(
         &mut self,
         spec: &SubscriptionSpec,
-    ) -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
+    ) -> impl Future<Output = Result<Subscribed, ClientError<Self::Error>>> + Send;
 
     /// Remove a subscription from this client's set.
     fn unsubscribe(
@@ -128,7 +133,7 @@ pub trait Client: Sized + Send {
 mod tests {
     use super::Client;
     use crate::error::ClientError;
-    use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
+    use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
     use datamancer_core::{
         InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
     };
@@ -152,9 +157,9 @@ mod tests {
         }
         async fn subscribe(
             &mut self,
-            _spec: &SubscriptionSpec,
-        ) -> Result<(), ClientError<Self::Error>> {
-            Ok(())
+            spec: &SubscriptionSpec,
+        ) -> Result<Subscribed, ClientError<Self::Error>> {
+            Ok(Subscribed::new(spec.scope, spec.backfill_from))
         }
         async fn unsubscribe(
             &mut self,

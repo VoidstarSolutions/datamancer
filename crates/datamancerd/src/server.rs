@@ -60,7 +60,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
-use crate::control::{Reply, Request, SubscriptionSpec, codes, reply_from_library_error};
+use crate::control::{
+    Reply, Request, SubscriptionSpec, actual_scope, codes, reply_from_library_error,
+    requested_scope,
+};
 use crate::credentials::CredentialHub;
 // Unix gates each privileged op on the peer uid; Windows uses the pipe's
 // owner-only DACL (connect-time), so this helper is Unix-only.
@@ -1021,16 +1024,20 @@ impl Server {
         let sink = Arc::new(sink) as Arc<dyn EventSink>;
 
         let session = self.dm.client_session();
-        // Apply seed subscriptions before taking the stream.
+        // Apply seed subscriptions before taking the stream. Their actual
+        // scopes are not echoed (the reply names the service); a client that
+        // needs them subscribes after opening.
         for spec in subscriptions {
             let instrument = spec_instrument(&spec);
+            let scope = match requested_scope(&spec) {
+                Ok(scope) => scope,
+                Err(message) => return Reply::error(codes::BAD_REQUEST, message),
+            };
             if let Err(e) = session
                 .subscribe(
                     instrument,
                     spec.kind.into(),
-                    Scope::Live {
-                        backfill_from: None,
-                    },
+                    scope,
                     crate::config::persistence_options(spec.persistence),
                 )
                 .await
@@ -1224,18 +1231,20 @@ impl Server {
             return Reply::error(codes::SESSION_CLOSED, "client session is closing");
         };
         let instrument = spec_instrument(&spec);
+        let scope = match requested_scope(&spec) {
+            Ok(scope) => scope,
+            Err(message) => return Reply::error(codes::BAD_REQUEST, message),
+        };
         match session
             .subscribe(
                 instrument,
                 spec.kind.into(),
-                Scope::Live {
-                    backfill_from: None,
-                },
+                scope,
                 crate::config::persistence_options(spec.persistence),
             )
             .await
         {
-            Ok(()) => Reply::ok(),
+            Ok(actual) => Reply::subscribed(actual_scope(actual)),
             Err(e) => reply_from_library_error(&e),
         }
     }

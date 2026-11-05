@@ -24,7 +24,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::protocol::ws::{WsHealthPush, WsReply, WsRequest};
-use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
 
 /// Connection parameters for [`WsClient`].
 #[derive(Debug, Clone)]
@@ -288,12 +288,20 @@ impl Client for WsClient {
         ))
     }
 
-    async fn subscribe(&mut self, spec: &SubscriptionSpec) -> Result<(), ClientError<Self::Error>> {
+    async fn subscribe(
+        &mut self,
+        spec: &SubscriptionSpec,
+    ) -> Result<Subscribed, ClientError<Self::Error>> {
         let req = WsRequest::Subscribe {
             id: self.next_id(),
             spec: spec.clone(),
         };
-        self.request(&req).await.map(|_| ())
+        let reply = self.request(&req).await?;
+        reply.subscribed_scope().ok_or_else(|| {
+            ClientError::Transport(WsClientError::Protocol(
+                "ok subscribe reply missing the actual scope".to_string(),
+            ))
+        })
     }
 
     async fn unsubscribe(
@@ -387,7 +395,7 @@ mod tests {
     use crate::client::Client;
     use crate::error::ClientError;
     use crate::protocol::ws::{WsReply, WsRequest};
-    use crate::spec::SubscriptionSpec;
+    use crate::spec::{ScopeCfg, Subscribed, SubscriptionSpec};
     use datamancer_core::{MarketEvent, Price, Seq, Timestamp};
     use datamancer_transport_ws::to_wire;
     use futures::{SinkExt as _, StreamExt as _};
@@ -476,7 +484,9 @@ mod tests {
                 .await
                 .unwrap();
             ws.send(Message::Text(
-                serde_json::to_string(&WsReply::ok(id)).unwrap().into(),
+                serde_json::to_string(&WsReply::subscribed(id, Subscribed::new(spec.scope, None)))
+                    .unwrap()
+                    .into(),
             ))
             .await
             .unwrap();
@@ -490,7 +500,8 @@ mod tests {
             r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
         )
         .unwrap();
-        client.subscribe(&spec).await.expect("subscribe acked");
+        let actual = client.subscribe(&spec).await.expect("subscribe acked");
+        assert_eq!(actual, Subscribed::new(ScopeCfg::Live, None));
 
         let ev = events.next().await.expect("one event");
         assert_eq!(ev, trade()); // timestamp triple verbatim, price intact
@@ -611,9 +622,12 @@ mod tests {
                 .await
                 .unwrap();
             ws.send(Message::Text(
-                serde_json::to_string(&WsReply::ok(req.id()))
-                    .unwrap()
-                    .into(),
+                serde_json::to_string(&WsReply::subscribed(
+                    req.id(),
+                    Subscribed::new(ScopeCfg::Live, None),
+                ))
+                .unwrap()
+                .into(),
             ))
             .await
             .unwrap();
@@ -655,9 +669,12 @@ mod tests {
             let req: WsRequest = serde_json::from_str(&text).unwrap();
             assert!(matches!(req, WsRequest::CloseClient { .. }));
             ws.send(Message::Text(
-                serde_json::to_string(&WsReply::ok(req.id()))
-                    .unwrap()
-                    .into(),
+                serde_json::to_string(&WsReply::subscribed(
+                    req.id(),
+                    Subscribed::new(ScopeCfg::Live, None),
+                ))
+                .unwrap()
+                .into(),
             ))
             .await
             .unwrap();

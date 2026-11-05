@@ -34,7 +34,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::protocol::uds::{Reply, Request};
-use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
 
 /// Connection parameters for [`Iceoryx2Client`].
 #[derive(Debug, Clone)]
@@ -435,7 +435,10 @@ impl Client for Iceoryx2Client {
         ))
     }
 
-    async fn subscribe(&mut self, spec: &SubscriptionSpec) -> Result<(), ClientError<Self::Error>> {
+    async fn subscribe(
+        &mut self,
+        spec: &SubscriptionSpec,
+    ) -> Result<Subscribed, ClientError<Self::Error>> {
         let reply = self
             .control
             .request(&Request::Subscribe {
@@ -444,7 +447,11 @@ impl Client for Iceoryx2Client {
             })
             .await
             .map_err(ClientError::Transport)?;
-        check(reply).map(|_| ())
+        check(reply)?.subscribed_scope().ok_or_else(|| {
+            ClientError::Transport(Iceoryx2ClientError::Protocol(
+                "ok subscribe reply missing the actual scope".to_string(),
+            ))
+        })
     }
 
     async fn unsubscribe(

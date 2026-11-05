@@ -311,6 +311,7 @@ async fn config_service_enables_and_disables_a_provider_live() {
         symbol: "BTC/USD".to_string(),
         kind: datamancer_client::spec::EventKindCfg::Trade,
         scope: datamancer_client::spec::ScopeCfg::default(),
+        backfill_from: None,
         persistence: datamancer_client::spec::PersistenceCfg::default(),
     };
     let pre_configure = handle.subscribe(&spec).await;

@@ -7,10 +7,10 @@
 //! replies on the shared socket. `open-client` is implicit on connect and has no
 //! request.
 
-use datamancer_core::SystemSnapshot;
+use datamancer_core::{SystemSnapshot, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{ScopeCfg, Subscribed, SubscriptionSpec, UnsubscribeSpec};
 
 /// A WS control request (one JSON text frame).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +84,14 @@ pub struct WsReply {
     pub instruments: Option<Vec<datamancer_core::InstrumentInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<datamancer_core::InstrumentEntry>>,
+    /// The scope the subscription actually opened (on `subscribe`); see the
+    /// UDS [`Reply::scope`](crate::protocol::uds::Reply::scope).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeCfg>,
+    /// The actual backfill start (on `subscribe`, when `scope` is
+    /// `live_backfill`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_from: Option<Timestamp>,
 }
 
 /// A server-initiated health push (the Windows same-host health plane — the
@@ -110,6 +118,8 @@ impl WsReply {
             snapshot: None,
             instruments: None,
             capabilities: None,
+            scope: None,
+            backfill_from: None,
         }
     }
 
@@ -123,6 +133,8 @@ impl WsReply {
             snapshot: None,
             instruments: None,
             capabilities: None,
+            scope: None,
+            backfill_from: None,
         }
     }
 
@@ -136,6 +148,8 @@ impl WsReply {
             snapshot: Some(snapshot),
             instruments: None,
             capabilities: None,
+            scope: None,
+            backfill_from: None,
         }
     }
 
@@ -149,6 +163,8 @@ impl WsReply {
             snapshot: None,
             instruments: Some(catalog),
             capabilities: None,
+            scope: None,
+            backfill_from: None,
         }
     }
 
@@ -162,14 +178,55 @@ impl WsReply {
             snapshot: None,
             instruments: None,
             capabilities: Some(entries),
+            scope: None,
+            backfill_from: None,
         }
+    }
+
+    /// A successful `subscribe` reply carrying the actual scope.
+    #[must_use]
+    pub fn subscribed(id: u64, actual: Subscribed) -> Self {
+        Self {
+            scope: Some(actual.scope),
+            backfill_from: actual.backfill_from,
+            ..Self::ok(id)
+        }
+    }
+
+    /// The actual scope a successful `subscribe` reply carries, or `None`
+    /// when the reply has no `scope` (an error reply, or any other op).
+    #[must_use]
+    pub fn subscribed_scope(&self) -> Option<Subscribed> {
+        self.scope
+            .map(|scope| Subscribed::new(scope, self.backfill_from))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{WsHealthPush, WsReply, WsRequest};
-    use crate::spec::EventKindCfg;
+    use crate::spec::{EventKindCfg, ScopeCfg, Subscribed};
+    use datamancer_core::Timestamp;
+
+    /// A subscribe reply carries the actual scope, echoing the id.
+    #[test]
+    fn ws_subscribed_reply_round_trips_the_actual_scope() {
+        let reply = WsReply::subscribed(
+            4,
+            Subscribed::new(ScopeCfg::LiveBackfill, Some(Timestamp(99))),
+        );
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":4,"ok":true,"scope":"live_backfill","backfill_from":99}"#
+        );
+        let back: WsReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.subscribed_scope(),
+            Some(Subscribed::new(ScopeCfg::LiveBackfill, Some(Timestamp(99))))
+        );
+        assert_eq!(WsReply::ok(4).subscribed_scope(), None);
+    }
 
     #[test]
     fn ws_subscribe_parses_with_id_and_shared_spec() {

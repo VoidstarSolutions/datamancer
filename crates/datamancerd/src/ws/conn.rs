@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use datamancer::traits::{EventSink, PublishOutcome};
 use datamancer::transport_ws::{WS_SUBPROTOCOL, WsDataSink, run_writer};
-use datamancer::{AssetClass, ClientSession, Datamancer, Instrument, ProviderId, Scope};
+use datamancer::{AssetClass, ClientSession, Datamancer, Instrument, ProviderId};
 use futures::StreamExt as _;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse, Request as HsRequest, Response as HsResponse,
 };
 
-use crate::control::codes;
+use crate::control::{actual_scope, codes, requested_scope};
 use crate::ws::protocol::ws_reply_from_library_error;
 use crate::ws::{WsHealthPush, WsReply, WsRequest};
 
@@ -285,18 +285,26 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
                 spec.asset_class.into(),
                 spec.symbol.clone(),
             );
+            let scope = match requested_scope(&spec) {
+                Ok(scope) => scope,
+                Err(message) => {
+                    return (
+                        WsReply::error(id, codes::BAD_REQUEST, message),
+                        false,
+                        false,
+                    );
+                }
+            };
             match session
                 .subscribe(
                     instrument,
                     spec.kind.into(),
-                    Scope::Live {
-                        backfill_from: None,
-                    },
+                    scope,
                     crate::config::persistence_options(spec.persistence),
                 )
                 .await
             {
-                Ok(()) => WsReply::ok(id),
+                Ok(actual) => WsReply::subscribed(id, actual_scope(actual)),
                 Err(e) => ws_reply_from_library_error(id, &e),
             }
         }

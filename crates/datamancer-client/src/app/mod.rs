@@ -47,7 +47,7 @@ use crate::error::ClientError;
 #[cfg(not(windows))]
 use crate::iceoryx2::{Iceoryx2Client, Iceoryx2ClientError, Iceoryx2Config};
 use crate::protocol::uds::{Reply, Request};
-use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
 
 // Windows hybrid: admin ops ride the owner-DACL named pipe, the data plane
 // rides WS-loopback (iceoryx2 shm is not viable on Windows — Phase 4). Unix is
@@ -470,7 +470,7 @@ impl AppHandle {
     pub async fn subscribe(
         &mut self,
         spec: &SubscriptionSpec,
-    ) -> Result<(), ClientError<DataError>> {
+    ) -> Result<Subscribed, ClientError<DataError>> {
         self.data_mut().subscribe(spec).await
     }
 

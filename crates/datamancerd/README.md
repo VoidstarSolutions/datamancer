@@ -418,6 +418,9 @@ One JSON object per line; one reply line per request.
 {"op":"open-client","client":"exec-1","subscriptions":[ /* SubscriptionSpec… */ ]}
   -> {"ok":true,"service":"datamancerd/1729600000-4321/v3/data/0"}
 {"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
+  -> {"ok":true,"scope":"live"}
+{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":1704067200000000000,"persistence":"cached"}
+  -> {"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000}
 {"op":"unsubscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
 {"op":"close-client","client":"exec-1"}
 {"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1704067200000000000,"to":1704672000000000000}
@@ -450,6 +453,22 @@ One JSON object per line; one reply line per request.
 {"op":"health"}
   -> {"ok":true,"health":{ /* HealthView, schema_version 3, daemon-stamped */ }}
 ```
+
+`subscribe` opens an unbounded subscription. `scope` is `live` (purely from
+"now") or `live_backfill`, which fetches history from `backfill_from`
+(epoch nanoseconds, inclusive) up to the live edge and seams it into the
+live tail: the daemon subscribes first, buffers live arrivals while the
+backfill runs, flushes them after it in arrival order, and emits an in-band
+`Gap` only for real loss (a failed fetch, or a buffer overflow bounded by
+`[session] resume_buffer_events`). The two fields must agree: `live_backfill`
+without `backfill_from`, or `backfill_from` under `live`, is `bad_request`.
+Each `(instrument, kind)` pair is served by one shared authoritative session
+whose scope is fixed by whichever subscriber created it, and every later
+subscriber joins it as is — so the reply's `scope`/`backfill_from` carry the
+scope **actually** opened, which is the requested one only when this
+subscribe created the session. A joiner's stream begins where it joined. The
+seed subscriptions of `open-client` follow the same rules but are not echoed
+(that reply names the service).
 
 `open-query` opens a **bounded historical query** over
 `from..to` (inclusive `from`, `to >= from` or `bad_request`) — **ungated**,
@@ -837,7 +856,7 @@ connection identifies the client):
 
 ```jsonc
 {"id":1,"op":"subscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
-  -> {"id":1,"ok":true}
+  -> {"id":1,"ok":true,"scope":"live"}
 {"id":2,"op":"snapshot"}
   -> {"id":2,"ok":true,"snapshot":{ /* SystemSnapshot */ }}
 {"id":3,"op":"unsubscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}

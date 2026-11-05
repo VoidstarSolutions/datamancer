@@ -141,6 +141,14 @@ client.subscribe(aapl.clone(), EventKind::Trade, scope, options).await?;
 client.subscribe(aapl, EventKind::Quote, scope, options).await?;
 ```
 
+`scope` is `Scope::Live`: pure-live, or with `backfill_from: Some(t)` a backfill from `t` to the
+live edge seamed ahead of the live tail (history, then the live prints buffered during the
+backfill in arrival order, then live; one `Gap` only for real loss). `subscribe` returns the scope
+**actually** opened: the pair's authoritative session is created with its first subscriber's
+scope and later subscribers join it as is, so a backfill request on a pair another consumer
+already holds pure-live comes back pure-live, and vice versa. A bounded `Scope::Historical` is a
+`Session` concern and is rejected here.
+
 Subscriptions accumulate; the client session's multiplexed stream **interleaves** everything that has been requested — per-symbol deterministic (`(instrument, seq)`, source-stamped within each instrument), arrival-order across symbols, never globally merge-sorted. Each `(instrument, kind)` pair is backed by a refcounted shared **authoritative session**, so two consumers of the same pair observe identical `(seq, source_ts)`. Adding the same instrument with a new event kind extends the subscription set rather than duplicating it.
 
 ## Configuration

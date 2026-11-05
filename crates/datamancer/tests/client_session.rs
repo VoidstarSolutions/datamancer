@@ -27,6 +27,11 @@ struct Shared {
     /// One sink per subscribed symbol. Each `start_live` is its own connection;
     /// `subscribe` registers that connection's sink for the pair's symbol.
     sinks: HashMap<String, mpsc::Sender<MarketEvent>>,
+    /// What `fetch_history` serves, filtered to the requested symbol.
+    history: Vec<MarketEvent>,
+    /// When set, `fetch_history` waits for one notification before serving,
+    /// so a test can push live prints while the backfill is in flight.
+    history_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 struct FakeProvider {
@@ -83,6 +88,14 @@ impl Ctrl {
         self.live_starts.load(Ordering::SeqCst)
     }
 
+    async fn set_history(&self, events: Vec<MarketEvent>) {
+        self.shared.lock().await.history = events;
+    }
+
+    async fn gate_history(&self, gate: Arc<tokio::sync::Notify>) {
+        self.shared.lock().await.history_gate = Some(gate);
+    }
+
     fn unsubscribes(&self) -> usize {
         self.unsubscribes.load(Ordering::SeqCst)
     }
@@ -127,9 +140,25 @@ impl Provider for FakeProvider {
     }
     async fn fetch_history(
         &self,
-        _request: HistoryRequest,
-        _sink: mpsc::Sender<MarketEvent>,
+        request: HistoryRequest,
+        sink: mpsc::Sender<MarketEvent>,
     ) -> Result<()> {
+        let (history, gate) = {
+            let shared = self.shared.lock().await;
+            (shared.history.clone(), shared.history_gate.clone())
+        };
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        for ev in history {
+            let MarketEvent::Trade(t) = &ev else {
+                continue;
+            };
+            if t.instrument.symbol() == request.instrument.symbol() && sink.send(ev).await.is_err()
+            {
+                break;
+            }
+        }
         Ok(())
     }
 }
@@ -830,7 +859,7 @@ async fn unsubscribe_then_resubscribe_replays_subscription_changed() {
 }
 
 #[tokio::test]
-async fn client_subscribe_rejects_historical_and_backfill() {
+async fn client_subscribe_rejects_historical() {
     let (provider, _ctrl) = FakeProvider::new("fake", false);
     let dm = Datamancer::builder()
         .provider_arc(provider)
@@ -853,7 +882,26 @@ async fn client_subscribe_rejects_historical_and_backfill() {
         Err(datamancer::Error::UnsupportedClientScope) => {}
         other => panic!("expected UnsupportedClientScope, got {other:?}"),
     }
-    match client
+}
+
+/// A client subscription with `backfill_from` gets the library's seam: the
+/// history first, then the live prints that arrived during the backfill in
+/// arrival order, then the live tail — one monotonic `seq`, no `Gap` while
+/// nothing was lost (#89).
+#[tokio::test]
+async fn client_subscribe_with_backfill_serves_history_then_buffered_then_live() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1), trade("AAPL", 2)])
+        .await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+
+    let actual = client
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
@@ -863,10 +911,120 @@ async fn client_subscribe_rejects_historical_and_backfill() {
             PersistenceOptions::none(),
         )
         .await
-    {
-        Err(datamancer::Error::UnsupportedClientScope) => {}
-        other => panic!("expected UnsupportedClientScope, got {other:?}"),
+        .unwrap();
+    assert_eq!(
+        actual,
+        Scope::Live {
+            backfill_from: Some(Timestamp(0)),
+        }
+    );
+    let mut stream = client.take_events().await.unwrap();
+
+    // The provider is subscribed before the backfill runs, so a print that
+    // lands while history is still being fetched is buffered, not lost.
+    ctrl.push("AAPL", trade("AAPL", 200)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    let (data, controls) = drain_data(&mut stream, 3).await;
+    assert_eq!(
+        data,
+        vec![
+            ("AAPL".to_string(), 1, 0),
+            ("AAPL".to_string(), 2, 1),
+            ("AAPL".to_string(), 200, 2),
+        ]
+    );
+
+    // The live tail continues after the seam.
+    ctrl.push("AAPL", trade("AAPL", 300)).await;
+    let (tail, more_controls) = drain_data(&mut stream, 1).await;
+    assert_eq!(tail, vec![("AAPL".to_string(), 300, 3)]);
+    for control in controls.into_iter().chain(more_controls) {
+        assert!(
+            !matches!(control, ControlKind::Gap { .. }),
+            "no Gap at a healthy seam, got {control:?}"
+        );
     }
+    let _ = client.close().await;
+}
+
+/// The pair's authoritative session is created with the first subscriber's
+/// scope; a later subscriber joins it as is and is told the actual scope.
+#[tokio::test]
+async fn client_subscribe_reports_the_shared_sessions_actual_scope() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1)]).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let backfill = Scope::Live {
+        backfill_from: Some(Timestamp(0)),
+    };
+
+    // AAPL: opened with a backfill; a pure-live joiner gets the backfill
+    // scope back while the backfill is still in flight.
+    let first = dm.client_session();
+    assert_eq!(
+        first
+            .subscribe(
+                inst("AAPL"),
+                EventKind::Trade,
+                backfill,
+                PersistenceOptions::none()
+            )
+            .await
+            .unwrap(),
+        backfill
+    );
+    let second = dm.client_session();
+    assert_eq!(
+        second
+            .subscribe(
+                inst("AAPL"),
+                EventKind::Trade,
+                live(),
+                PersistenceOptions::none()
+            )
+            .await
+            .unwrap(),
+        backfill,
+        "a joiner is told the session's scope, not its own request"
+    );
+    assert_eq!(ctrl.live_starts(), 1, "the pair is shared, not reopened");
+
+    // MSFT: opened pure-live; a backfill request joins it and is told so.
+    assert_eq!(
+        first
+            .subscribe(
+                inst("MSFT"),
+                EventKind::Trade,
+                live(),
+                PersistenceOptions::none()
+            )
+            .await
+            .unwrap(),
+        live()
+    );
+    assert_eq!(
+        second
+            .subscribe(
+                inst("MSFT"),
+                EventKind::Trade,
+                backfill,
+                PersistenceOptions::none()
+            )
+            .await
+            .unwrap(),
+        live(),
+        "a backfill request on a pure-live pair comes back pure-live"
+    );
+
+    gate.notify_waiters();
+    let _ = first.close().await;
+    let _ = second.close().await;
 }
 
 #[tokio::test]
