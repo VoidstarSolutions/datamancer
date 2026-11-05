@@ -421,6 +421,8 @@ One JSON object per line; one reply line per request.
   -> {"ok":true,"scope":"live"}
 {"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":1704067200000000000,"persistence":"cached"}
   -> {"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000}
+{"op":"subscribe","client":"exec-2","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m"}
+  -> {"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000,"joined":true}
 {"op":"unsubscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
 {"op":"close-client","client":"exec-1"}
 {"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1704067200000000000,"to":1704672000000000000}
@@ -466,9 +468,16 @@ Each `(instrument, kind)` pair is served by one shared authoritative session
 whose scope is fixed by whichever subscriber created it, and every later
 subscriber joins it as is — so the reply's `scope`/`backfill_from` carry the
 scope **actually** opened, which is the requested one only when this
-subscribe created the session. A joiner's stream begins where it joined. The
-seed subscriptions of `open-client` follow the same rules but are not echoed
-(that reply names the service).
+subscribe created the session. A joiner's reply says `"joined":true` (absent
+for the creator): its stream begins where it joined, no history is replayed
+for it and no `Gap` marks what it missed, so a `backfill_from` on a joined
+reply is the creator's coverage, not the joiner's; a consumer that needs its
+own history on a joined pair fetches it with `open-query`. A `backfill_from`
+at or past the live edge is `bad_request` (there is nothing to backfill, and
+the reply would otherwise claim a backfill that never ran). The seed
+subscriptions of `open-client` are validated together before any of them
+subscribes, follow the same rules, and are not echoed (that reply names the
+service).
 
 `open-query` opens a **bounded historical query** over
 `from..to` (inclusive `from`, `to >= from` or `bad_request`) — **ungated**,

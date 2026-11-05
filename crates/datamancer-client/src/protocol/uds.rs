@@ -170,6 +170,11 @@ pub struct Reply {
     /// `live_backfill`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_from: Option<Timestamp>,
+    /// `true` when the subscribe joined a session another subscriber opened
+    /// (on `subscribe`; absent means this subscribe created it). See
+    /// [`Subscribed::joined`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined: Option<bool>,
 }
 
 impl Reply {
@@ -196,6 +201,7 @@ impl Reply {
             health: None,
             scope: None,
             backfill_from: None,
+            joined: None,
         }
     }
 
@@ -306,6 +312,7 @@ impl Reply {
             health: None,
             scope: None,
             backfill_from: None,
+            joined: None,
         }
     }
 
@@ -344,16 +351,19 @@ impl Reply {
         Self {
             scope: Some(actual.scope),
             backfill_from: actual.backfill_from,
+            joined: actual.joined.then_some(true),
             ..Self::ok()
         }
     }
 
     /// The actual scope a successful `subscribe` reply carries, or `None`
-    /// when the reply has no `scope` (an error reply, or any other op).
+    /// when the reply has no `scope` (an error reply, or any other op) or
+    /// an inconsistent one (`live_backfill` without `backfill_from`).
     #[must_use]
     pub fn subscribed_scope(&self) -> Option<Subscribed> {
-        self.scope
-            .map(|scope| Subscribed::new(scope, self.backfill_from))
+        self.scope.and_then(|scope| {
+            Subscribed::from_wire(scope, self.backfill_from, self.joined.unwrap_or(false))
+        })
     }
 }
 
@@ -396,10 +406,9 @@ mod tests {
             Some(Timestamp(1_704_067_200_000_000_000))
         );
 
-        let reply = Reply::subscribed(Subscribed::new(
-            ScopeCfg::LiveBackfill,
-            Some(Timestamp(1_704_067_200_000_000_000)),
-        ));
+        let reply = Reply::subscribed(Subscribed::live_backfill(Timestamp(
+            1_704_067_200_000_000_000,
+        )));
         let json = serde_json::to_string(&reply).expect("ser");
         assert_eq!(
             json,
@@ -408,17 +417,25 @@ mod tests {
         let back: Reply = serde_json::from_str(&json).expect("de");
         assert_eq!(
             back.subscribed_scope(),
-            Some(Subscribed::new(
-                ScopeCfg::LiveBackfill,
-                Some(Timestamp(1_704_067_200_000_000_000))
-            ))
+            Some(Subscribed::live_backfill(Timestamp(
+                1_704_067_200_000_000_000
+            )))
         );
         assert_eq!(Reply::ok().subscribed_scope(), None);
         assert_eq!(
-            serde_json::to_string(&Reply::subscribed(Subscribed::new(ScopeCfg::Live, None)))
-                .expect("ser"),
+            serde_json::to_string(&Reply::subscribed(Subscribed::live())).expect("ser"),
             r#"{"ok":true,"scope":"live"}"#
         );
+        // A joiner's reply says so; a creator's omits the flag.
+        let joined = Reply::subscribed(Subscribed::live().with_joined(true));
+        let json = serde_json::to_string(&joined).expect("ser");
+        assert_eq!(json, r#"{"ok":true,"scope":"live","joined":true}"#);
+        let back: Reply = serde_json::from_str(&json).expect("de");
+        assert!(back.subscribed_scope().expect("scope").joined);
+        // An inconsistent wire pair is not a scope.
+        let bad: Reply =
+            serde_json::from_str(r#"{"ok":true,"scope":"live_backfill"}"#).expect("de");
+        assert_eq!(bad.subscribed_scope(), None);
     }
 
     #[test]

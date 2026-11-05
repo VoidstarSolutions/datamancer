@@ -318,7 +318,7 @@ impl Datamancer {
                 // authoritative session: a second opener for the same pair shares
                 // it (no longer `LiveSessionConflict`). The single-pair `Session`
                 // is implemented as a one-subscription client referrer.
-                let (authoritative, guard, rx) = self
+                let (authoritative, guard, rx, _joined) = self
                     .authoritative(instrument.clone(), kind, scope, options)
                     .await?;
                 let provider = authoritative.provider_id.clone();
@@ -343,7 +343,10 @@ impl Datamancer {
     /// pair and register one subscriber. The lock is held across probe-and-decide
     /// so two concurrent openers cannot both create; the share path adds a
     /// subscriber to the existing session, the create path starts a fresh
-    /// provider connection.
+    /// provider connection. The returned flag is `true` on the share path:
+    /// the subscriber joined a session it did not create, so the session's
+    /// scope is not what this subscriber asked for and its stream begins
+    /// where it joined.
     pub(crate) async fn authoritative(
         &self,
         instrument: Instrument,
@@ -354,6 +357,7 @@ impl Datamancer {
         Arc<AuthoritativeSession>,
         SubscriberGuard,
         mpsc::Receiver<MarketEvent>,
+        bool,
     )> {
         // A backfilling live session seams a historical fetch into the live
         // tail, so it needs both surfaces from the one provider that will serve
@@ -380,7 +384,7 @@ impl Datamancer {
             && let Ok((id, rx)) = existing.add_subscriber().await
         {
             let guard = SubscriberGuard::new(existing.clone(), id);
-            return Ok((existing, guard, rx));
+            return Ok((existing, guard, rx, true));
         }
 
         self.create_authoritative(provider, instrument, kind, scope, options, key)
@@ -399,6 +403,7 @@ impl Datamancer {
         Arc<AuthoritativeSession>,
         SubscriberGuard,
         mpsc::Receiver<MarketEvent>,
+        bool,
     )> {
         let accounting = self.inner.accounting_for(provider.id());
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(default_buffer());
@@ -436,7 +441,7 @@ impl Datamancer {
         if let Some(winner) = winner {
             let (id, rx) = winner.add_subscriber().await?;
             let guard = SubscriberGuard::new(winner.clone(), id);
-            return Ok((winner, guard, rx));
+            return Ok((winner, guard, rx, true));
         }
 
         // Pre-seed the opener as the first fan-out subscriber *before* spawning
@@ -514,7 +519,7 @@ impl Datamancer {
         ));
 
         let guard = SubscriberGuard::new(authoritative.clone(), first_id);
-        Ok((authoritative, guard, first_rx))
+        Ok((authoritative, guard, first_rx, false))
     }
 
     /// Spawn the non-gating `Provider::latest` fetch for a pure-live session

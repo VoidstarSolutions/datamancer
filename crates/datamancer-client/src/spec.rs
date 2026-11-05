@@ -186,7 +186,8 @@ impl SubscriptionSpec {
 /// The scope a `subscribe` actually opened, echoed in the reply: the shared
 /// authoritative session's creation-time scope, which is the requested one
 /// only when this subscriber created the session. Read this, not the request,
-/// to learn whether history will precede the live tail.
+/// to learn whether history will precede the live tail — and read `joined`
+/// to learn whether it will precede *this* stream at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Subscribed {
@@ -195,20 +196,58 @@ pub struct Subscribed {
     /// The actual backfill start; `Some` exactly when `scope` is
     /// [`ScopeCfg::LiveBackfill`].
     pub backfill_from: Option<Timestamp>,
+    /// `true` when this subscribe joined a session another subscriber had
+    /// already opened. A joiner's stream begins where it joined: no history
+    /// is replayed for it and no `Gap` marks what it missed, so under
+    /// `live_backfill` the `backfill_from` describes the session creator's
+    /// coverage, not this subscriber's. A consumer that needs its own
+    /// history on a joined pair fetches it itself (`open-query`).
+    pub joined: bool,
 }
 
 impl Subscribed {
-    /// Build from the two reply fields. `backfill_from` is kept only under
-    /// `LiveBackfill`, so the pair is consistent whatever the wire carried.
+    /// Pure-live, opened by this subscriber.
     #[must_use]
-    pub fn new(scope: ScopeCfg, backfill_from: Option<Timestamp>) -> Self {
-        let backfill_from = match scope {
-            ScopeCfg::Live => None,
-            ScopeCfg::LiveBackfill => backfill_from,
-        };
+    pub const fn live() -> Self {
         Self {
-            scope,
-            backfill_from,
+            scope: ScopeCfg::Live,
+            backfill_from: None,
+            joined: false,
+        }
+    }
+
+    /// Backfill from `from`, opened by this subscriber.
+    #[must_use]
+    pub const fn live_backfill(from: Timestamp) -> Self {
+        Self {
+            scope: ScopeCfg::LiveBackfill,
+            backfill_from: Some(from),
+            joined: false,
+        }
+    }
+
+    /// Mark whether the session was joined rather than created.
+    #[must_use]
+    pub const fn with_joined(mut self, joined: bool) -> Self {
+        self.joined = joined;
+        self
+    }
+
+    /// Rebuild from reply fields. `None` when the wire is inconsistent
+    /// (`live_backfill` without a `backfill_from`), which a client reports
+    /// as a protocol error rather than guessing.
+    #[must_use]
+    pub fn from_wire(
+        scope: ScopeCfg,
+        backfill_from: Option<Timestamp>,
+        joined: bool,
+    ) -> Option<Self> {
+        match (scope, backfill_from) {
+            (ScopeCfg::Live, _) => Some(Self::live().with_joined(joined)),
+            (ScopeCfg::LiveBackfill, Some(from)) => {
+                Some(Self::live_backfill(from).with_joined(joined))
+            }
+            (ScopeCfg::LiveBackfill, None) => None,
         }
     }
 }
@@ -384,16 +423,24 @@ mod tests {
         assert_eq!(back, backfill);
     }
 
-    /// The reply-side pair is kept consistent: a `backfill_from` under a
-    /// pure-live scope is dropped.
+    /// The reply-side pair stays consistent: a stray `backfill_from` under
+    /// `live` is dropped, and `live_backfill` without one is not a value at
+    /// all.
     #[test]
-    fn subscribed_keeps_backfill_from_only_under_live_backfill() {
-        let live = Subscribed::new(ScopeCfg::Live, Some(Timestamp(5)));
-        assert_eq!(live.backfill_from, None);
-        let backfill = Subscribed::new(ScopeCfg::LiveBackfill, Some(Timestamp(5)));
-        assert_eq!(backfill.backfill_from, Some(Timestamp(5)));
-        let json = serde_json::to_string(&backfill).unwrap();
-        assert_eq!(json, r#"{"scope":"live_backfill","backfill_from":5}"#);
+    fn subscribed_from_wire_keeps_the_pair_consistent() {
+        let live = Subscribed::from_wire(ScopeCfg::Live, Some(Timestamp(5)), false).unwrap();
+        assert_eq!(live, Subscribed::live());
+        let backfill =
+            Subscribed::from_wire(ScopeCfg::LiveBackfill, Some(Timestamp(5)), true).unwrap();
+        assert_eq!(
+            backfill,
+            Subscribed::live_backfill(Timestamp(5)).with_joined(true)
+        );
+        assert!(backfill.joined);
+        assert_eq!(
+            Subscribed::from_wire(ScopeCfg::LiveBackfill, None, false),
+            None
+        );
     }
 
     mod query_spec_tests {

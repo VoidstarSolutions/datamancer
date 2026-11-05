@@ -913,11 +913,12 @@ async fn client_subscribe_with_backfill_serves_history_then_buffered_then_live()
         .await
         .unwrap();
     assert_eq!(
-        actual,
+        actual.scope,
         Scope::Live {
             backfill_from: Some(Timestamp(0)),
         }
     );
+    assert!(!actual.joined, "the first subscriber creates the session");
     let mut stream = client.take_events().await.unwrap();
 
     // The provider is subscribed before the backfill runs, so a print that
@@ -976,7 +977,8 @@ async fn client_subscribe_reports_the_shared_sessions_actual_scope() {
                 PersistenceOptions::none()
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .scope,
         backfill
     );
     let second = dm.client_session();
@@ -989,7 +991,8 @@ async fn client_subscribe_reports_the_shared_sessions_actual_scope() {
                 PersistenceOptions::none()
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .scope,
         backfill,
         "a joiner is told the session's scope, not its own request"
     );
@@ -1005,7 +1008,8 @@ async fn client_subscribe_reports_the_shared_sessions_actual_scope() {
                 PersistenceOptions::none()
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .scope,
         live()
     );
     assert_eq!(
@@ -1017,12 +1021,53 @@ async fn client_subscribe_reports_the_shared_sessions_actual_scope() {
                 PersistenceOptions::none()
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .scope,
         live(),
         "a backfill request on a pure-live pair comes back pure-live"
     );
 
     gate.notify_waiters();
+    let _ = first.close().await;
+    let _ = second.close().await;
+}
+
+/// `joined` tells a subscriber whether it created the pair's session or
+/// joined one already open — the difference between a stream that starts
+/// with history and one that starts where it joined.
+#[tokio::test]
+async fn client_subscribe_reports_whether_it_joined() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let first = dm.client_session();
+    let created = first
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert!(!created.joined);
+    let second = dm.client_session();
+    let joined = second
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        joined.joined,
+        "the second subscriber joins the open session"
+    );
+    assert_eq!(joined.scope, created.scope);
     let _ = first.close().await;
     let _ = second.close().await;
 }

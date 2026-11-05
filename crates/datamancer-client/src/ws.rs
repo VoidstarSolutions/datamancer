@@ -395,7 +395,7 @@ mod tests {
     use crate::client::Client;
     use crate::error::ClientError;
     use crate::protocol::ws::{WsReply, WsRequest};
-    use crate::spec::{ScopeCfg, Subscribed, SubscriptionSpec};
+    use crate::spec::{Subscribed, SubscriptionSpec};
     use datamancer_core::{MarketEvent, Price, Seq, Timestamp};
     use datamancer_transport_ws::to_wire;
     use futures::{SinkExt as _, StreamExt as _};
@@ -484,7 +484,7 @@ mod tests {
                 .await
                 .unwrap();
             ws.send(Message::Text(
-                serde_json::to_string(&WsReply::subscribed(id, Subscribed::new(spec.scope, None)))
+                serde_json::to_string(&WsReply::subscribed(id, Subscribed::live()))
                     .unwrap()
                     .into(),
             ))
@@ -501,7 +501,7 @@ mod tests {
         )
         .unwrap();
         let actual = client.subscribe(&spec).await.expect("subscribe acked");
-        assert_eq!(actual, Subscribed::new(ScopeCfg::Live, None));
+        assert_eq!(actual, Subscribed::live());
 
         let ev = events.next().await.expect("one event");
         assert_eq!(ev, trade()); // timestamp triple verbatim, price intact
@@ -622,12 +622,9 @@ mod tests {
                 .await
                 .unwrap();
             ws.send(Message::Text(
-                serde_json::to_string(&WsReply::subscribed(
-                    req.id(),
-                    Subscribed::new(ScopeCfg::Live, None),
-                ))
-                .unwrap()
-                .into(),
+                serde_json::to_string(&WsReply::subscribed(req.id(), Subscribed::live()))
+                    .unwrap()
+                    .into(),
             ))
             .await
             .unwrap();
@@ -669,12 +666,9 @@ mod tests {
             let req: WsRequest = serde_json::from_str(&text).unwrap();
             assert!(matches!(req, WsRequest::CloseClient { .. }));
             ws.send(Message::Text(
-                serde_json::to_string(&WsReply::subscribed(
-                    req.id(),
-                    Subscribed::new(ScopeCfg::Live, None),
-                ))
-                .unwrap()
-                .into(),
+                serde_json::to_string(&WsReply::subscribed(req.id(), Subscribed::live()))
+                    .unwrap()
+                    .into(),
             ))
             .await
             .unwrap();

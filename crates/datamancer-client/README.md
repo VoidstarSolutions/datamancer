@@ -171,6 +171,30 @@ Both examples are the same shape by design: code written against `C: Client`
 is transport-agnostic; only `C::Config` (`Iceoryx2Config` vs `WsConfig`) and
 the `connect` call differ.
 
+A subscription with history ahead of the live tail asks for a backfill, and
+reads the **actual** outcome from the reply: the pair's session is created by
+its first subscriber and later subscribers join it as is, so the scope can
+differ from the request and a joiner gets no history of its own.
+
+```rust,ignore
+use datamancer_client::spec::{ScopeCfg, SubscriptionSpec};
+use datamancer_core::Timestamp;
+
+let spec = SubscriptionSpec::new(&instrument, kind)?
+    .with_backfill_from(Timestamp(1_704_067_200_000_000_000));
+let actual = client.subscribe(&spec).await?;
+match (actual.scope, actual.joined) {
+    (ScopeCfg::LiveBackfill, false) => { /* history from backfill_from, then live */ }
+    (ScopeCfg::LiveBackfill, true) => { /* joined: live only; backfill_from is the creator's coverage */ }
+    (ScopeCfg::Live, _) => { /* pure-live: the pair was already open that way, or we asked for it */ }
+}
+```
+
+Mixed versions are out of policy: a client at this version talking to an
+older daemon errors on every `subscribe` with "reply missing the actual
+scope" (the daemon has already taken the subscription), and `AppHandle`'s
+version gate refuses such a daemon up front.
+
 When starting from discovery instead of a hand-written spec, use
 `SubscriptionSpec::new` to close the loop — it converts the core vocabulary
 `Client::instruments` returns into the wire vocabulary `subscribe` takes:

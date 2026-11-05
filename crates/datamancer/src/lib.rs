@@ -35,7 +35,7 @@ pub mod providers;
 mod session;
 pub mod storage;
 
-pub use client_session::ClientSession;
+pub use client_session::{ClientSession, SubscribeOutcome};
 pub use datamancer_core::traits;
 pub use datamancer_core::{
     Adjustment, AssetClass, AuthoritativeSessionSnapshot, Bar, BarInterval, CacheCatalogEntry,

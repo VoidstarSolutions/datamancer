@@ -949,7 +949,7 @@ enum ClientCommand {
         kind: EventKind,
         scope: Scope,
         options: PersistenceOptions,
-        reply: oneshot::Sender<Result<Scope>>,
+        reply: oneshot::Sender<Result<SubscribeOutcome>>,
     },
     Unsubscribe {
         instrument: Instrument,
@@ -1076,7 +1076,7 @@ impl ClientController {
         kind: EventKind,
         scope: Scope,
         options: PersistenceOptions,
-    ) -> Result<Scope> {
+    ) -> Result<SubscribeOutcome> {
         let key = (instrument.clone(), kind);
         if self.entries.contains_key(&key) {
             return Err(Error::DuplicateSubscription { instrument, kind });
@@ -1090,11 +1090,14 @@ impl ClientController {
         if matches!(scope, Scope::Historical { .. }) {
             return Err(Error::UnsupportedClientScope);
         }
-        let (auth, guard, rx) = self
+        let (auth, guard, rx, joined) = self
             .dm
             .authoritative(instrument.clone(), kind, scope, options)
             .await?;
-        let actual = auth.scope;
+        let outcome = SubscribeOutcome {
+            scope: auth.scope,
+            joined,
+        };
         let provider = guard.provider().to_string();
         self.entries.insert(
             key.clone(),
@@ -1105,7 +1108,7 @@ impl ClientController {
         );
         self.streams.insert(key, substream(rx));
         self.sync_subscriptions();
-        Ok(actual)
+        Ok(outcome)
     }
 
     async fn unsubscribe(&mut self, instrument: Instrument, kind: EventKind) -> Result<()> {
@@ -1376,7 +1379,7 @@ impl ClientHandle {
         kind: EventKind,
         scope: Scope,
         options: PersistenceOptions,
-    ) -> Result<Scope> {
+    ) -> Result<SubscribeOutcome> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(ClientCommand::Subscribe {
@@ -1480,13 +1483,28 @@ pub struct ClientSession {
     handle: ClientHandle,
 }
 
+/// What [`ClientSession::subscribe`] actually did: the shared authoritative
+/// session's scope, and whether this subscriber created that session or
+/// joined one another subscriber had already opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeOutcome {
+    /// The session's creation-time scope — the requested scope only when
+    /// `joined` is `false`.
+    pub scope: Scope,
+    /// `true` when the session already existed. A joiner's substream begins
+    /// where it joined: no history is replayed for it and no `Gap` marks what
+    /// it missed, so a `backfill_from` in `scope` is the creator's coverage,
+    /// not this subscriber's.
+    pub joined: bool,
+}
+
 impl ClientSession {
     pub(crate) fn new(handle: ClientHandle) -> Self {
         Self { handle }
     }
 
-    /// Add a subscription to this client's set and return the scope it
-    /// actually opened.
+    /// Add a subscription to this client's set and return what was actually
+    /// opened.
     ///
     /// `scope` must be [`Scope::Live`]; with `backfill_from: Some(t)` the
     /// substream carries history from `t` to the live edge first, then live
@@ -1497,7 +1515,7 @@ impl ClientSession {
     /// pair another consumer already holds pure-live comes back pure-live,
     /// and a pure-live request on a backfilling pair comes back with that
     /// session's `backfill_from`. A joiner's own substream begins where it
-    /// joined.
+    /// joined, which [`SubscribeOutcome::joined`] reports.
     ///
     /// # Errors
     ///
@@ -1514,7 +1532,7 @@ impl ClientSession {
         kind: EventKind,
         scope: Scope,
         options: PersistenceOptions,
-    ) -> Result<Scope> {
+    ) -> Result<SubscribeOutcome> {
         self.handle
             .subscribe(instrument, kind, scope, options)
             .await

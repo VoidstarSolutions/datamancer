@@ -46,9 +46,9 @@ pub trait Client: Sized + Send {
     /// Add a subscription to this client's set. Returns the scope the daemon
     /// actually opened: the pair's shared authoritative session is created
     /// with the first subscriber's scope and later subscribers join it as is,
-    /// so a `live_backfill` request can come back `live` (and vice versa).
-    /// Read the result, not the request, to know whether history precedes the
-    /// live tail.
+    /// so a `live_backfill` request can come back `live` (and vice versa),
+    /// and a joiner (`Subscribed::joined`) gets no history of its own. Read
+    /// the result, not the request, to know what precedes the live tail.
     fn subscribe(
         &mut self,
         spec: &SubscriptionSpec,
@@ -159,7 +159,7 @@ mod tests {
             &mut self,
             spec: &SubscriptionSpec,
         ) -> Result<Subscribed, ClientError<Self::Error>> {
-            Ok(Subscribed::new(spec.scope, spec.backfill_from))
+            Ok(Subscribed::from_wire(spec.scope, spec.backfill_from, false).expect("live"))
         }
         async fn unsubscribe(
             &mut self,
