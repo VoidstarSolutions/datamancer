@@ -103,7 +103,9 @@ These are load-bearing design rules — violating them breaks downstream consume
     the seam (a backfill's pending ring, whose flush skips the evicted slots),
     so an overflow is a real `seq` hole, surfaced in-band as `Control::Gap` at
     the evicted span; the delivered stream is contiguous only while nothing is
-    lost. The tap log persists this source `seq`
+    lost. A late joiner has lost nothing: its substream begins where it
+    joined, with no `Gap` for what preceded it (`joined` on the subscribe
+    outcome says so). The tap log persists this source `seq`
     verbatim (it no longer mints its own), so tap-log replay reproduces the
     delivered stream's `seq`. `Seq::SYNTHETIC = Seq(u64::MAX)` tags out-of-band
     synthetic controls and is exempt from per-symbol monotonicity.
