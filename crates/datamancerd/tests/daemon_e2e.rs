@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use common::DaemonGuard;
+#[cfg(feature = "scripted-provider")]
+use datamancer::transport::{DataServiceName, DataSubscriber, TransportError};
 use datamancer::{ControlKind, MarketEvent};
 use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 
@@ -369,8 +371,10 @@ fn dump_iceoryx2_state(why: &str) {
     }
 }
 
-/// A bounded historical bar query over a month-long, long-closed range: real
-/// bars, then `SessionClosing`, then the service disappears on its own.
+/// A bounded historical bar query nobody attaches to: in flight after the
+/// reply, then gone once the daemon's attach grace passes, without
+/// `cancel-query` and with the opening connection still up. No bar is
+/// published.
 ///
 /// The opening connection is held open for the query's whole lifetime rather
 /// than using `round_trip` to send `open-query` itself: a dropped connection
@@ -384,8 +388,8 @@ fn dump_iceoryx2_state(why: &str) {
 /// "still in flight" and "self-reaped without cancel-query" for real, instead
 /// of merely proving EOF-teardown a second time.
 ///
-/// Uses `bar1m` over `2024-01-01..2024-02-01` rather than the daily-bar,
-/// single-week range this docstring's title once suggested: in two
+/// Uses `bar1m` over `2024-01-01..2024-02-01` rather than a daily-bar,
+/// single-week range: in two
 /// independent real runs against Alpaca paper credentials, an equity
 /// `bar1d` request over `2024-01-01..2024-01-08` connected successfully
 /// (TCP+TLS to `data.alpaca.markets` completed) and then never received a
@@ -401,7 +405,7 @@ fn dump_iceoryx2_state(why: &str) {
 /// as a known bug.
 #[test]
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
-fn open_query_streams_bars_then_reaps_its_service() {
+fn open_query_nobody_attaches_to_is_reaped_after_the_grace() {
     let dir = tempfile::tempdir().expect("tempdir");
     let daemon = spawn_daemon(dir.path());
 
@@ -448,11 +452,10 @@ fn open_query_streams_bars_then_reaps_its_service() {
         "expected {id} in {listed}"
     );
 
-    // Let the bounded fetch finish — the opening connection (`writer`/
-    // `reader`) is still alive here — then confirm the daemon reaped the
-    // query on its own: nobody called cancel-query, and the connection that
-    // opened it never dropped, so this can only be the query's own
-    // completion, not EOF teardown.
+    // Nobody attaches, so the daemon gives the query up once its attach grace
+    // passes. The opening connection (`writer`/`reader`) is still alive here
+    // and nobody called cancel-query, so this can only be the daemon's own
+    // reap, not EOF teardown.
     wait_until_reaped(&daemon, id);
 
     drop((writer, reader));
@@ -483,11 +486,8 @@ fn wait_until_reaped(daemon: &Daemon, id: u64) {
 /// receives the queried instrument's bars and then the terminal
 /// `SessionClosing`, after which the daemon reaps the query on its own
 /// (#108). Until now only the reap was asserted; a query whose events were
-/// dropped before the sink would have passed. The subscriber attaches right
-/// after the reply: the pump is already running (see `open_query`'s "Attach
-/// race"), and a month of 1-minute bars pages through Alpaca's REST API for
-/// far longer than the attach takes, so the service is still there. Same
-/// request as [`open_query_streams_bars_then_reaps_its_service`].
+/// dropped before the sink would have passed. Same request as
+/// [`open_query_nobody_attaches_to_is_reaped_after_the_grace`].
 #[test]
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
 fn open_query_delivers_bars_to_a_subscriber_then_closes() {
@@ -522,23 +522,21 @@ fn open_query_delivers_bars_to_a_subscriber_then_closes() {
     let mut subscriber =
         datamancer::transport::DataSubscriber::open(&node, &name).expect("subscriber");
 
-    // Drain until the terminal control, then a little longer: a bar whose
-    // symbol announcement lands on a later poll is held and released then,
-    // so the last bars may follow `SessionClosing` out of the buffer.
+    // Drain to the end of the stream, which the reap closes.
     let deadline = Instant::now() + Duration::from_mins(1);
     let mut bars = 0u64;
     let mut closed = false;
-    let mut settle = 0;
-    while !closed || settle < 10 {
-        if closed {
-            settle += 1;
-        } else {
-            assert!(
-                Instant::now() < deadline,
-                "no SessionClosing within 60 s ({bars} bars so far)"
-            );
-        }
-        for event in subscriber.poll().expect("poll") {
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the stream did not end within 60 s ({bars} bars so far)"
+        );
+        let events = match subscriber.poll() {
+            Ok(events) => events,
+            Err(datamancer::transport::TransportError::ServiceClosed) => break,
+            Err(e) => panic!("poll: {e}"),
+        };
+        for event in events {
             match event {
                 MarketEvent::Bar(bar) => {
                     assert_eq!(bar.instrument.symbol(), "AAPL", "{bar:?}");
@@ -554,6 +552,7 @@ fn open_query_delivers_bars_to_a_subscriber_then_closes() {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert!(closed, "the stream ended without SessionClosing");
     assert!(bars > 0, "SessionClosing arrived before any bar");
     assert_eq!(
         subscriber.held_len(),
@@ -785,6 +784,53 @@ impl Conn {
             .unwrap_or_else(|e| panic!("not a data-service name: {service}: {e}"));
         datamancer::transport::DataSubscriber::open(node, &service_name).expect("subscriber")
     }
+}
+
+/// `open-query` for `symbol`'s trades over a fixed window.
+#[cfg(feature = "scripted-provider")]
+fn open_trade_query(conn: &mut Conn, symbol: &str) -> (u64, DataServiceName) {
+    let reply = conn.request(&format!(
+        r#"{{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"{symbol}","kind":"trade","from":1000000000,"to":2000000000}}"#
+    ));
+    assert_eq!(reply["ok"], true, "open-query rejected: {reply}");
+    let service = reply["service"].as_str().expect("service name");
+    let name = service
+        .parse()
+        .unwrap_or_else(|e| panic!("not a data-service name: {service}: {e}"));
+    (reply["query"].as_u64().expect("query id"), name)
+}
+
+/// Every trade price a query delivers, read to the end of its stream, which
+/// must arrive within 30 s and follow a terminal `SessionClosing`.
+#[cfg(feature = "scripted-provider")]
+fn drain_trade_query(subscriber: &mut DataSubscriber) -> Vec<f64> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut prices = Vec::new();
+    let mut closing = false;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the stream did not end within 30 s, after {} trades",
+            prices.len()
+        );
+        let events = match subscriber.poll() {
+            Ok(events) => events,
+            Err(TransportError::ServiceClosed) => break,
+            Err(e) => panic!("poll: {e}"),
+        };
+        for event in events {
+            assert!(!closing, "{event:?} after SessionClosing");
+            match event {
+                MarketEvent::Trade(t) => prices.push(t.price.to_f64()),
+                MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing => closing = true,
+                MarketEvent::Control(_) => {}
+                other => panic!("unexpected event on a trade query: {other:?}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(closing, "the stream ended without SessionClosing");
+    prices
 }
 
 #[cfg(feature = "scripted-provider")]
@@ -1190,6 +1236,142 @@ fn subscribe_refuses_an_unowned_id_and_a_disabled_provider() {
         ));
         assert_eq!(reply["ok"], false, "{reply}");
         assert_eq!(reply["code"], code, "{reply}");
+    }
+}
+
+/// A scripted daemon for the query tests: one query slot, a memory cache and
+/// no fetch delay.
+#[cfg(feature = "scripted-provider")]
+fn spawn_query_daemon(dir: &Path, prints: u32) -> Daemon {
+    spawn_scripted_daemon(
+        dir,
+        &format!("history_delay_ms = 0\nhistory_prints = {prints}\n"),
+        "[iceoryx2]\nmax_queries = 1\n\n[cache]\nbackend = \"memory\"\n",
+    )
+}
+
+/// The scripted provider's upstream history fetches so far.
+#[cfg(feature = "scripted-provider")]
+fn scripted_history_fetches(daemon: &Daemon) -> u64 {
+    let reply = round_trip(daemon.socket(), r#"{"op":"snapshot"}"#);
+    reply["snapshot"]["providers"]
+        .as_array()
+        .expect("providers array")
+        .iter()
+        .find(|provider| provider["provider"] == "scripted")
+        .unwrap_or_else(|| panic!("no scripted provider: {reply}"))["history_fetches"]
+        .as_u64()
+        .expect("history_fetches")
+}
+
+/// Warm the cache with a query of `prints` trades, then run it again with the
+/// attach delayed well past a cached read's end: every trade still arrives,
+/// then `SessionClosing`, then the end of the stream.
+#[cfg(feature = "scripted-provider")]
+fn assert_a_cached_query_survives_a_late_attach(prints: u32) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_query_daemon(dir.path(), prints);
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("node");
+    let mut conn = Conn::open(&daemon);
+    let expected: Vec<f64> = (1..=prints).map(f64::from).collect();
+
+    let (warm, service) = open_trade_query(&mut conn, "AAPL");
+    let mut subscriber = DataSubscriber::open(&node, &service).expect("subscriber");
+    assert_eq!(drain_trade_query(&mut subscriber), expected);
+    wait_until_reaped(&daemon, warm);
+    let fetches = scripted_history_fetches(&daemon);
+    assert!(fetches > 0, "the first query must reach the provider");
+
+    let (_, service) = open_trade_query(&mut conn, "AAPL");
+    std::thread::sleep(Duration::from_millis(300));
+    let mut subscriber = DataSubscriber::open(&node, &service).expect("subscriber");
+    assert_eq!(drain_trade_query(&mut subscriber), expected);
+    assert_eq!(
+        scripted_history_fetches(&daemon),
+        fetches,
+        "the window was not served from the cache"
+    );
+}
+
+/// More trades than the data service's history and subscriber buffer hold.
+#[cfg(feature = "scripted-provider")]
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_cached_query_is_held_for_a_late_attach() {
+    assert_a_cached_query_survives_a_late_attach(100);
+}
+
+/// Few enough trades that the whole query fits in one burst.
+#[cfg(feature = "scripted-provider")]
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_short_cached_query_is_held_for_a_late_attach() {
+    assert_a_cached_query_survives_a_late_attach(3);
+}
+
+/// A query nobody attaches to holds its slot for the grace alone: the cap
+/// refuses a second query meanwhile, the first is then reaped on its own with
+/// its service gone, so a late attach fails, and the slot serves a new query.
+#[cfg(feature = "scripted-provider")]
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_query_nobody_attaches_to_releases_its_slot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_query_daemon(dir.path(), 3);
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("node");
+    let mut conn = Conn::open(&daemon);
+
+    let (abandoned, service) = open_trade_query(&mut conn, "AAPL");
+    let refused = conn.request(
+        r#"{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade","from":1000000000,"to":2000000000}"#,
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "service_cap_exceeded", "{refused}");
+
+    wait_until_reaped(&daemon, abandoned);
+    assert!(
+        DataSubscriber::open(&node, &service).is_err(),
+        "attaching to a reaped query must fail"
+    );
+
+    let (_, service) = open_trade_query(&mut conn, "MSFT");
+    let mut subscriber = DataSubscriber::open(&node, &service).expect("subscriber");
+    assert_eq!(drain_trade_query(&mut subscriber), [1.0, 2.0, 3.0]);
+}
+
+/// A query waiting for its client does not hold up shutdown. The query is
+/// still in flight long after its fetch ended, and the daemon then exits well
+/// inside what is left of the grace.
+#[cfg(feature = "scripted-provider")]
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn shutdown_does_not_wait_for_a_query_to_be_attached() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut daemon = spawn_query_daemon(dir.path(), 3);
+    let mut conn = Conn::open(&daemon);
+    let (id, _) = open_trade_query(&mut conn, "AAPL");
+    std::thread::sleep(Duration::from_millis(300));
+    let listed = round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
+    assert!(
+        listed["queries"]
+            .as_array()
+            .expect("queries array")
+            .contains(&serde_json::json!(id)),
+        "the query must be waiting for its client: {listed}"
+    );
+
+    let requested = Instant::now();
+    assert_eq!(conn.request(r#"{"op":"shutdown"}"#)["ok"], true);
+    while daemon.guard.try_wait().expect("try_wait").is_none() {
+        assert!(
+            requested.elapsed() < Duration::from_secs(4),
+            "the daemon is still up"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

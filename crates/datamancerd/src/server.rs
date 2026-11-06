@@ -163,6 +163,14 @@ struct QueryEntry {
     service: String,
 }
 
+/// How long a query waits for its client to attach before it is reaped.
+#[cfg(not(windows))]
+const QUERY_ATTACH_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a waiting query checks for its client.
+#[cfg(not(windows))]
+const QUERY_ATTACH_POLL: Duration = Duration::from_millis(5);
+
 /// A command handed to the server actor by a control connection.
 enum ServerCommand {
     /// A parsed control request plus the channel to reply on.
@@ -897,12 +905,13 @@ impl Server {
             ServerCommand::QueryFinished { query } => {
                 if let Some(entry) = self.queries.remove(&query) {
                     tracing::debug!(query, service = %entry.service, "query completed");
-                    // The pump reports here on two paths: a clean drain (the
+                    // The pump reports here on three paths: a clean drain (the
                     // controller has already shut itself down, so this close is
-                    // a no-op) and a sink rejection mid-range (the fetch is
-                    // still paging). Only `close()` actually aborts that fetch
-                    // — dropping the handle would leave it burning provider
-                    // rate limit with nobody consuming it.
+                    // a no-op), a sink rejection mid-range and an attach grace
+                    // expiry (the fetch may still be paging). Only `close()`
+                    // actually aborts that fetch — dropping the handle would
+                    // leave it burning provider rate limit with nobody
+                    // consuming it.
                     close_query_session(entry.session);
                 }
             }
@@ -1090,12 +1099,9 @@ impl Server {
     ///
     /// # Attach race
     ///
-    /// The pump starts before this reply is written, so a query that finishes
-    /// almost immediately (empty range, fully cached) can reach the end of its
-    /// stream — and have the pump reap the entry and its service — before the
-    /// client has attached to the named service. That surfaces to the client
-    /// as an indistinguishable `ClientError::Transport`, not as an empty
-    /// result. This race is documented and accepted, not mitigated: see
+    /// The pump publishes nothing until the client has attached to the named
+    /// service. A query no client attaches to within [`QUERY_ATTACH_GRACE`]
+    /// is reaped unpublished, and holds its `max_queries` slot until then. See
     /// `Iceoryx2Client::query`'s "Attach race" for the client-side contract.
     #[cfg(not(windows))]
     async fn open_query(&mut self, spec: QuerySpec, cmd_tx: &mpsc::Sender<ServerCommand>) -> Reply {
@@ -1134,7 +1140,7 @@ impl Server {
             }
         };
         let service = sink.data_service_name().to_string();
-        let sink = Arc::new(sink) as Arc<dyn EventSink>;
+        let sink = Arc::new(sink);
         let stream = match session.take_events().await {
             Ok(stream) => stream,
             Err(e) => {
@@ -1416,14 +1422,27 @@ fn close_query_session(session: datamancer::Session) {
     });
 }
 
+/// Wait until `sink` has a subscriber; `false` if [`QUERY_ATTACH_GRACE`] passes
+/// first.
+#[cfg(not(windows))]
+async fn wait_for_subscriber(sink: &Iceoryx2DataSink) -> bool {
+    let deadline = tokio::time::Instant::now() + QUERY_ATTACH_GRACE;
+    while !sink.has_subscriber() {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(QUERY_ATTACH_POLL).await;
+    }
+    true
+}
+
 /// Pump a query's bounded stream into its own sink, then tell the actor to reap
 /// the entry. Unlike the client pump, this one **must** report its exit: a
 /// completed query has to release its data service without the consumer having
 /// to call `cancel-query`.
 ///
-/// Reaping happens immediately after the stream drains and flushes — see
-/// `open_query`'s "Attach race" for the known window this leaves for a very
-/// fast query to finish before the client attaches.
+/// Nothing is published before a subscriber attaches; see `open_query`'s
+/// "Attach race".
 ///
 /// # Why this stops at `SessionClosing` rather than reading to `None`
 ///
@@ -1438,11 +1457,17 @@ fn close_query_session(session: datamancer::Session) {
 #[cfg(not(windows))]
 fn spawn_query_pump(
     mut stream: datamancer::EventStream,
-    sink: Arc<dyn EventSink>,
+    sink: Arc<Iceoryx2DataSink>,
     query: QueryId,
     cmd_tx: mpsc::Sender<ServerCommand>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        if !wait_for_subscriber(&sink).await {
+            tracing::warn!(query, "no client attached to query; reaping it");
+            drop(stream);
+            let _ = cmd_tx.send(ServerCommand::QueryFinished { query }).await;
+            return;
+        }
         while let Some(ev) = stream.next().await {
             let terminal = matches!(
                 &ev,
