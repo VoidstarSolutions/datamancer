@@ -15,12 +15,19 @@ use std::time::Duration;
 /// retries) goes to the daemon's inherited stderr at `trace`, so a rejected
 /// open is diagnosable from the `--nocapture` output (#96). Set here once so
 /// every suite's daemon logs the same way.
+///
+/// The credential store is pinned to a `credentials.json` beside the config;
+/// the `ALPACA_*` env fallback still applies.
 pub fn daemon_command(config_path: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_datamancerd"));
     command
         .arg("--config")
         .arg(config_path)
-        .env("IOX2_LOG_LEVEL", "trace");
+        .env("IOX2_LOG_LEVEL", "trace")
+        .env(
+            "DATAMANCER_CREDENTIALS_FILE",
+            config_path.with_file_name("credentials.json"),
+        );
     command
 }
 
