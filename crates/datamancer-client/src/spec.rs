@@ -122,7 +122,13 @@ pub enum PersistenceCfg {
 /// the request frames, and serde documents that combination as unsupported
 /// (the attribute was silently inert via `flatten`). Unknown-key rejection
 /// is the daemon's job — the UDS surface enforces it explicitly server-side.
+///
+/// `#[non_exhaustive]`: build one with [`Self::new`] (from an
+/// [`Instrument`]) or [`Self::from_parts`] (from the wire selectors) and set
+/// the fields it should differ in, so a later wire field is an additive
+/// change for every client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SubscriptionSpec {
     pub provider: String,
     pub asset_class: AssetClassCfg,
@@ -170,6 +176,27 @@ impl SubscriptionSpec {
             backfill_from: None,
             persistence: PersistenceCfg::default(),
         })
+    }
+
+    /// Build a spec from the wire vocabulary itself, for a caller that holds
+    /// the selectors rather than an [`Instrument`] (a command line, a config
+    /// file). Infallible: the wire enums are already the closed set.
+    #[must_use]
+    pub fn from_parts(
+        provider: impl Into<String>,
+        asset_class: AssetClassCfg,
+        symbol: impl Into<String>,
+        kind: EventKindCfg,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            asset_class,
+            symbol: symbol.into(),
+            kind,
+            scope: ScopeCfg::default(),
+            backfill_from: None,
+            persistence: PersistenceCfg::default(),
+        }
     }
 
     /// Ask for history from `from` up to the live edge, seamed into the live
@@ -421,6 +448,26 @@ mod tests {
         );
         let back: SubscriptionSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, backfill);
+    }
+
+    /// The two constructors agree, so a caller holding wire selectors builds
+    /// the same spec as one holding an `Instrument`.
+    #[test]
+    fn from_parts_builds_the_same_spec_as_new() {
+        let instrument = Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        );
+        assert_eq!(
+            SubscriptionSpec::from_parts(
+                "alpaca",
+                AssetClassCfg::Equity,
+                "AAPL",
+                EventKindCfg::Trade
+            ),
+            SubscriptionSpec::new(&instrument, EventKind::Trade).unwrap()
+        );
     }
 
     /// The reply-side pair stays consistent: a stray `backfill_from` under

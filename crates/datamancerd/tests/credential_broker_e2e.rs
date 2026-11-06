@@ -148,15 +148,13 @@ async fn broker_provisions_credentials_and_provider_connects() {
     // 5. Subscribe BTC/USD trades; within a bounded wait, the provider
     //    transitions to Connected: the watch seeded None, set hot-applied,
     //    the streaming task connected with the brokered credentials.
-    let spec = SubscriptionSpec {
-        provider: "alpaca-crypto".to_string(),
-        asset_class: datamancer_client::spec::AssetClassCfg::Crypto,
-        symbol: "BTC/USD".to_string(),
-        kind: datamancer_client::spec::EventKindCfg::Trade,
-        scope: datamancer_client::spec::ScopeCfg::default(),
-        backfill_from: None,
-        persistence: datamancer_client::spec::PersistenceCfg::default(),
-    };
+    let btc_usd = datamancer_core::Instrument::new(
+        datamancer_core::ProviderId::from_static("alpaca-crypto"),
+        datamancer_core::AssetClass::Crypto,
+        "BTC/USD",
+    );
+    let spec = SubscriptionSpec::new(&btc_usd, datamancer_core::EventKind::Trade)
+        .expect("crypto is on the wire");
     handle.subscribe(&spec).await.expect("subscribe");
 
     let connect_deadline = Instant::now() + Duration::from_secs(20);

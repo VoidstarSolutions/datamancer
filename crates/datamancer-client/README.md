@@ -100,7 +100,8 @@ written before the socket closes).
 ### iceoryx2 (same host)
 
 ```rust,no_run
-use datamancer_client::{Client, spec::{AssetClassCfg, EventKindCfg, SubscriptionSpec}};
+use datamancer_client::{Client, spec::SubscriptionSpec};
+use datamancer_core::{AssetClass, EventKind, Instrument, ProviderId};
 use datamancer_client::iceoryx2::{Iceoryx2Client, Iceoryx2Config};
 use futures::StreamExt as _;
 use std::time::Duration;
@@ -114,16 +115,9 @@ let cfg = Iceoryx2Config {
 };
 let (mut client, mut events) = Iceoryx2Client::connect(cfg).await?;
 
+let btc_usd = Instrument::new(ProviderId::from_static("alpaca-crypto"), AssetClass::Crypto, "BTC/USD");
 client
-    .subscribe(&SubscriptionSpec {
-        provider: "alpaca-crypto".to_string(),
-        asset_class: AssetClassCfg::Crypto,
-        symbol: "BTC/USD".to_string(),
-        kind: EventKindCfg::Trade,
-        scope: Default::default(),
-        backfill_from: None,
-        persistence: Default::default(),
-    })
+    .subscribe(&SubscriptionSpec::new(&btc_usd, EventKind::Trade)?)
     .await?;
 
 while let Some(event) = events.next().await {
@@ -136,7 +130,8 @@ while let Some(event) = events.next().await {
 ### WebSocket (remote)
 
 ```rust,no_run
-use datamancer_client::{Client, spec::{AssetClassCfg, EventKindCfg, SubscriptionSpec}};
+use datamancer_client::{Client, spec::SubscriptionSpec};
+use datamancer_core::{AssetClass, EventKind, Instrument, ProviderId};
 use datamancer_client::ws::{WsClient, WsConfig};
 use futures::StreamExt as _;
 
@@ -148,16 +143,9 @@ let cfg = WsConfig {
 };
 let (mut client, mut events) = WsClient::connect(cfg).await?;
 
+let btc_usd = Instrument::new(ProviderId::from_static("alpaca-crypto"), AssetClass::Crypto, "BTC/USD");
 client
-    .subscribe(&SubscriptionSpec {
-        provider: "alpaca-crypto".to_string(),
-        asset_class: AssetClassCfg::Crypto,
-        symbol: "BTC/USD".to_string(),
-        kind: EventKindCfg::Trade,
-        scope: Default::default(),
-        backfill_from: None,
-        persistence: Default::default(),
-    })
+    .subscribe(&SubscriptionSpec::new(&btc_usd, EventKind::Trade)?)
     .await?;
 
 while let Some(event) = events.next().await {

@@ -109,7 +109,11 @@ pub enum Request {
 
 /// A control reply (one per line). `ok` discriminates success from error; the
 /// remaining fields are populated per op.
+///
+/// `#[non_exhaustive]`: built through its constructors, so a later per-op
+/// field is additive for every consumer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Reply {
     pub ok: bool,
     /// The per-client data-plane service name (on `open-client`).

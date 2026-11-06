@@ -1094,10 +1094,7 @@ impl ClientController {
             .dm
             .authoritative(instrument.clone(), kind, scope, options)
             .await?;
-        let outcome = SubscribeOutcome {
-            scope: auth.scope,
-            joined,
-        };
+        let outcome = SubscribeOutcome::new(auth.scope, joined);
         let provider = guard.provider().to_string();
         self.entries.insert(
             key.clone(),
@@ -1486,7 +1483,11 @@ pub struct ClientSession {
 /// What [`ClientSession::subscribe`] actually did: the shared authoritative
 /// session's scope, and whether this subscriber created that session or
 /// joined one another subscriber had already opened.
+///
+/// `#[non_exhaustive]`: built with [`Self::new`], so a later field is an
+/// additive change for every embedder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubscribeOutcome {
     /// The session's creation-time scope — the requested scope only when
     /// `joined` is `false`.
@@ -1496,6 +1497,15 @@ pub struct SubscribeOutcome {
     /// it missed, so a `backfill_from` in `scope` is the creator's coverage,
     /// not this subscriber's.
     pub joined: bool,
+}
+
+impl SubscribeOutcome {
+    /// The outcome of a subscribe that opened `scope` (`joined == false`) or
+    /// joined a session already open with it.
+    #[must_use]
+    pub const fn new(scope: Scope, joined: bool) -> Self {
+        Self { scope, joined }
+    }
 }
 
 impl ClientSession {

@@ -113,19 +113,21 @@ mod tests {
     use super::*;
 
     fn spec(scope: ScopeCfg, backfill_from: Option<datamancer::Timestamp>) -> SubscriptionSpec {
-        SubscriptionSpec {
-            provider: "alpaca".to_string(),
-            asset_class: datamancer_client::spec::AssetClassCfg::Equity,
-            symbol: "AAPL".to_string(),
-            kind: datamancer_client::spec::EventKindCfg::Trade,
-            scope,
-            backfill_from,
-            persistence: datamancer_client::spec::PersistenceCfg::None,
-        }
+        use datamancer::{AssetClass, EventKind, Instrument, ProviderId};
+        let instrument = Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        );
+        let mut spec =
+            SubscriptionSpec::new(&instrument, EventKind::Trade).expect("equity is on the wire");
+        spec.scope = scope;
+        spec.backfill_from = backfill_from;
+        spec
     }
 
     fn outcome(scope: Scope, joined: bool) -> SubscribeOutcome {
-        SubscribeOutcome { scope, joined }
+        SubscribeOutcome::new(scope, joined)
     }
 
     /// The `scope`/`backfill_from` pair must agree; a disagreeing pair is

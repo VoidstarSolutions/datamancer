@@ -70,7 +70,11 @@ impl WsRequest {
 }
 
 /// A WS control reply (one JSON text frame), echoing the request `id`.
+///
+/// `#[non_exhaustive]`: built through its constructors, so a later per-op
+/// field is additive for every consumer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WsReply {
     pub id: u64,
     pub ok: bool,
