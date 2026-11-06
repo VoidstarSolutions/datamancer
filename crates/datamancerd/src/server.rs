@@ -1344,13 +1344,19 @@ fn validate_query_open(
 /// disable the attribute), so compare the input object's keys against the keys
 /// the parsed request round-trips to. Any input key absent from the canonical
 /// form was silently ignored and is reported as an error.
+///
+/// A `null`-valued input key is an absent one, not an unknown one: an
+/// optional field the request parsed as `None` is skipped by the canonical
+/// form (`backfill_from` is `skip_serializing_if = "Option::is_none"`), and
+/// most non-Rust encoders spell an unset optional as an explicit `null`
+/// rather than omitting the key.
 fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(), String> {
     let input: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("invalid request: {e}"))?;
     let canonical = serde_json::to_value(request).map_err(|e| format!("invalid request: {e}"))?;
     if let (Some(input), Some(canonical)) = (input.as_object(), canonical.as_object()) {
-        for key in input.keys() {
-            if !canonical.contains_key(key) {
+        for (key, value) in input {
+            if !value.is_null() && !canonical.contains_key(key) {
                 return Err(format!("unknown field `{key}`"));
             }
         }
@@ -2161,6 +2167,22 @@ mod tests {
             reject_unknown_keys(line, &request).is_ok(),
             "omitted `settings` must round-trip to the canonical `\"settings\":null` form"
         );
+    }
+
+    /// An optional key sent as `null` (how most non-Rust encoders spell an
+    /// unset field) is absent, not unknown: the canonical form skips a `None`
+    /// `backfill_from`, so a bare key-set diff would refuse the request.
+    #[test]
+    fn reject_unknown_keys_treats_a_null_valued_key_as_absent() {
+        let line = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live","backfill_from":null}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        assert!(
+            reject_unknown_keys(line, &request).is_ok(),
+            "`backfill_from: null` is the absent form, not an unknown field"
+        );
+        let bogus = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","backfill_from":null,"bogus":1}"#;
+        let request: Request = serde_json::from_str(bogus).expect("parse");
+        assert!(reject_unknown_keys(bogus, &request).is_err());
     }
 
     #[test]
