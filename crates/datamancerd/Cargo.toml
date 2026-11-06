@@ -24,6 +24,10 @@ web-ui = [
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 # The remote WebSocket client surface (second transport worked example).
 ws = ["dep:tokio-tungstenite", "datamancer/transport-ws"]
+# The hermetic scripted test provider (`src/scripted.rs`, `[provider.scripted]`),
+# for the e2e suites. Off by default; its tests are `#[ignore]`d, and `e2e.yml`
+# is the one workflow that runs them.
+scripted-provider = []
 
 [dependencies]
 datamancer = { path = "../datamancer", version = "0.10.0", features = ["transport-iceoryx2"] }

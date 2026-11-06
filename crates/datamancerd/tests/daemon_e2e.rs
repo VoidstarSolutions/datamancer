@@ -6,7 +6,7 @@
 //! normal CI — run them explicitly:
 //!
 //! ```text
-//! cargo test -p datamancerd --test daemon_e2e -- --ignored
+//! cargo test -p datamancerd --all-features --test daemon_e2e -- --ignored
 //! ```
 //!
 //! The headline per-symbol-agreement and live-flow tests additionally need
@@ -692,4 +692,421 @@ fn dropping_the_control_connection_aborts_its_queries() {
         serde_json::json!([]),
         "EOF must reap the connection's queries: {listed}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hermetic tests against the scripted provider (feature `scripted-provider`)
+// ---------------------------------------------------------------------------
+
+/// Spawn a daemon whose only enabled provider is the scripted one, with the
+/// given `[provider.scripted]` knobs and further config sections.
+#[cfg(feature = "scripted-provider")]
+fn spawn_scripted_daemon(dir: &Path, scripted: &str, sections: &str) -> Daemon {
+    let lock = DAEMON_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let service_prefix = format!(
+        "datamancerd-e2e-{}-{}",
+        std::process::id(),
+        PREFIX_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let socket = dir.join("admin.sock");
+    let config_path = dir.join("datamancerd.toml");
+    let config = format!(
+        r#"
+[provider.scripted]
+{scripted}
+
+[server]
+admin_socket = "{}"
+service_prefix = "{service_prefix}"
+
+[diagnostics]
+publish_interval_ms = 200
+
+{sections}
+"#,
+        socket.display()
+    );
+    std::fs::write(&config_path, config).expect("write config");
+    let child = common::daemon_command(&config_path)
+        .spawn()
+        .expect("spawn datamancerd");
+    let daemon = Daemon {
+        guard: DaemonGuard::new(child, socket),
+        _lock: lock,
+        service_prefix,
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !daemon.socket().exists() {
+        assert!(Instant::now() < deadline, "daemon socket never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    daemon
+}
+
+/// A held control connection: `open-client` plus any number of further
+/// requests on the same line-oriented socket.
+#[cfg(feature = "scripted-provider")]
+struct Conn {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+#[cfg(feature = "scripted-provider")]
+impl Conn {
+    fn open(daemon: &Daemon) -> Self {
+        let stream = UnixStream::connect(daemon.socket()).expect("connect");
+        let writer = stream.try_clone().expect("clone");
+        let reader = BufReader::new(stream);
+        Self { writer, reader }
+    }
+
+    fn request(&mut self, line: &str) -> serde_json::Value {
+        self.writer.write_all(line.as_bytes()).expect("write");
+        self.writer.write_all(b"\n").expect("nl");
+        self.writer.flush().expect("flush");
+        let mut reply = String::new();
+        self.reader.read_line(&mut reply).expect("read reply");
+        serde_json::from_str(&reply).expect("parse reply")
+    }
+
+    /// `open-client` and attach a data-plane subscriber to the advertised
+    /// service.
+    fn open_client(
+        &mut self,
+        name: &str,
+        node: &iceoryx2::node::Node<ipc_threadsafe::Service>,
+    ) -> datamancer::transport::DataSubscriber {
+        let reply = self.request(&format!(r#"{{"op":"open-client","client":"{name}"}}"#));
+        assert_eq!(reply["ok"], true, "open-client rejected: {reply}");
+        let service = reply["service"].as_str().expect("service name");
+        let service_name: datamancer::transport::DataServiceName = service
+            .parse()
+            .unwrap_or_else(|e| panic!("not a data-service name: {service}: {e}"));
+        datamancer::transport::DataSubscriber::open(node, &service_name).expect("subscriber")
+    }
+}
+
+#[cfg(feature = "scripted-provider")]
+fn now_nanos() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("fits")
+}
+
+/// What one subscriber observed, in delivery order.
+#[cfg(feature = "scripted-provider")]
+#[derive(Debug, Clone, PartialEq)]
+enum Seen {
+    /// `(price, source_ts, seq)`.
+    Trade(f64, i64, u64),
+    Gap,
+}
+
+#[cfg(feature = "scripted-provider")]
+impl Seen {
+    fn is_gap(&self) -> bool {
+        matches!(self, Seen::Gap)
+    }
+}
+
+/// Poll until `want` data events (gaps count) have been seen or `budget`
+/// elapses.
+#[cfg(feature = "scripted-provider")]
+fn collect(
+    subscriber: &mut datamancer::transport::DataSubscriber,
+    want: usize,
+    budget: Duration,
+) -> Vec<Seen> {
+    let deadline = Instant::now() + budget;
+    let mut seen = Vec::new();
+    while seen.len() < want && Instant::now() < deadline {
+        for event in subscriber.poll().expect("poll") {
+            match event {
+                MarketEvent::Trade(t) => {
+                    seen.push(Seen::Trade(t.price.to_f64(), t.source_ts.0, t.seq.0));
+                }
+                MarketEvent::Control(c) => {
+                    if matches!(c.kind, ControlKind::Gap { .. }) {
+                        seen.push(Seen::Gap);
+                    }
+                }
+                other => panic!("unexpected event on a trade subscription: {other:?}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    seen
+}
+
+/// `subscribe` with `scope: live_backfill` against the scripted provider:
+/// the client sees the history, then the live prints that arrived during the
+/// backfill in arrival order, then the live tail, with one monotonic `seq`
+/// and no `Gap`; the reply carries the backfill scope, and a second client
+/// subscribing pure-live to the same pair is told the backfill scope.
+#[test]
+#[cfg(feature = "scripted-provider")]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "a handful of scripted prints; the indices are tiny"
+)]
+fn subscribe_live_backfill_serves_history_then_buffered_prints_then_live() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // 5 history prints after a 400 ms wait; a live print every 50 ms, so
+    // several land while the backfill is in flight and are buffered.
+    let daemon = spawn_scripted_daemon(
+        dir.path(),
+        "history_prints = 5\nhistory_delay_ms = 400\nlive_interval_ms = 50\n",
+        "",
+    );
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+
+    let mut first = Conn::open(&daemon);
+    let mut subscriber = first.open_client("backfill-1", &node);
+    let from = now_nanos() - 60_000_000_000;
+    let subscribed_at = now_nanos();
+    let reply = first.request(&format!(
+        r#"{{"op":"subscribe","client":"backfill-1","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live_backfill","backfill_from":{from}}}"#
+    ));
+    assert_eq!(reply["ok"], true, "subscribe rejected: {reply}");
+    assert_eq!(reply["scope"], "live_backfill", "{reply}");
+    assert_eq!(reply["backfill_from"], from, "{reply}");
+    assert!(
+        reply.get("joined").is_none(),
+        "the creator is not a joiner: {reply}"
+    );
+
+    // A second client, pure-live on the same pair, is told the actual scope.
+    let mut second = Conn::open(&daemon);
+    let _second_subscriber = second.open_client("live-2", &node);
+    let reply = second.request(
+        r#"{"op":"subscribe","client":"live-2","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade"}"#,
+    );
+    assert_eq!(reply["ok"], true, "second subscribe rejected: {reply}");
+    assert_eq!(reply["scope"], "live_backfill", "{reply}");
+    assert_eq!(reply["backfill_from"], from, "{reply}");
+    assert_eq!(reply["joined"], true, "the joiner is told so: {reply}");
+
+    // 5 history + at least 8 live prints (~400 ms of buffered prints plus a
+    // live tail).
+    let mut seen = collect(&mut subscriber, 5, Duration::from_secs(10));
+    let history_seen_at = now_nanos();
+    let rest = 13_usize.saturating_sub(seen.len());
+    seen.extend(collect(&mut subscriber, rest, Duration::from_secs(10)));
+    assert!(seen.len() >= 13, "too few events: {seen:?}");
+    assert!(
+        !seen.iter().any(Seen::is_gap),
+        "no Gap at a healthy seam: {seen:?}"
+    );
+
+    let trades: Vec<(f64, i64, u64)> = seen
+        .iter()
+        .map(|s| match s {
+            Seen::Trade(p, ts, seq) => (*p, *ts, *seq),
+            Seen::Gap => unreachable!(),
+        })
+        .collect();
+    // History first: prices 1..=5 at ascending source_ts inside the window.
+    for (i, (price, ts, seq)) in trades.iter().take(5).enumerate() {
+        assert!(
+            (price - (1.0 + i as f64)).abs() < 1e-9,
+            "history {i}: {trades:?}"
+        );
+        assert!(
+            *ts >= from && *ts < subscribed_at,
+            "history {i} ts: {trades:?}"
+        );
+        assert_eq!(*seq, i as u64, "history seq: {trades:?}");
+    }
+    // Then the live prints, in arrival order, seq continuing without a hole.
+    let live = &trades[5..];
+    assert!(
+        live[0].0 >= 100.0,
+        "live tail starts after history: {trades:?}"
+    );
+    for (i, (price, ts, seq)) in live.iter().enumerate() {
+        assert!(
+            (price - (100.0 + i as f64)).abs() < 1e-9,
+            "live {i}: {trades:?}"
+        );
+        assert!(
+            *ts >= subscribed_at,
+            "live {i} ts before subscribe: {trades:?}"
+        );
+        assert_eq!(*seq, 5 + i as u64, "live seq: {trades:?}");
+    }
+    assert!(
+        live[0].1 < history_seen_at,
+        "the first live print should be buffered behind the history: {trades:?}"
+    );
+
+    drop((subscriber, second, first, node));
+}
+
+/// `subscribe` pure-live: `latest` seeds the stream with the scripted print
+/// ahead of the live tail, and with it off the live tail comes first.
+#[test]
+#[cfg(feature = "scripted-provider")]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn subscribe_live_seeds_from_the_latest_knob() {
+    for (latest, first_price) in [(true, 999.0), (false, 100.0)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let daemon = spawn_scripted_daemon(
+            dir.path(),
+            &format!("latest = {latest}\nlive_interval_ms = 50\n"),
+            "",
+        );
+        let node = NodeBuilder::new()
+            .create::<ipc_threadsafe::Service>()
+            .expect("iceoryx2 node");
+        let mut conn = Conn::open(&daemon);
+        let mut subscriber = conn.open_client("seeded", &node);
+        let reply = conn.request(
+            r#"{"op":"subscribe","client":"seeded","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade"}"#,
+        );
+        assert_eq!(reply["ok"], true, "subscribe rejected: {reply}");
+        assert_eq!(reply["scope"], "live", "{reply}");
+
+        let seen = collect(&mut subscriber, 1, Duration::from_secs(10));
+        assert!(
+            matches!(seen.first(), Some(Seen::Trade(price, ..)) if (price - first_price).abs() < 1e-9),
+            "latest = {latest}: {seen:?}"
+        );
+    }
+}
+
+/// `subscribe` to an id no provider owns answers `unknown_provider`, and to a
+/// compiled-in provider with no config section, `provider_disabled`.
+#[test]
+#[cfg(feature = "scripted-provider")]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn subscribe_refuses_an_unowned_id_and_a_disabled_provider() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_scripted_daemon(dir.path(), "", "");
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::open(&daemon);
+    let _subscriber = conn.open_client("refused", &node);
+
+    for (provider, code) in [
+        ("nobody", "unknown_provider"),
+        ("alpaca", "provider_disabled"),
+    ] {
+        let reply = conn.request(&format!(
+            r#"{{"op":"subscribe","client":"refused","provider":"{provider}","asset_class":"equity","symbol":"AAPL","kind":"trade"}}"#
+        ));
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert_eq!(reply["code"], code, "{reply}");
+    }
+}
+
+/// The next trade on `events`, skipping controls.
+#[cfg(all(feature = "scripted-provider", feature = "ws"))]
+async fn next_trade(
+    events: &mut (impl futures::Stream<Item = MarketEvent> + Unpin),
+) -> datamancer::Trade {
+    use futures::StreamExt as _;
+
+    let trade = async {
+        loop {
+            match events.next().await.expect("stream ended") {
+                MarketEvent::Trade(trade) => break trade,
+                MarketEvent::Control(_) => {}
+                other => panic!("unexpected event on a trade subscription: {other:?}"),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), trade)
+        .await
+        .expect("no trade arrived")
+}
+
+/// A typed client connected to the scripted daemon's WS listener, once it is
+/// up.
+#[cfg(all(feature = "scripted-provider", feature = "ws"))]
+async fn connect_ws(
+    port: u16,
+) -> (
+    datamancer_client::ws::WsClient,
+    <datamancer_client::ws::WsClient as datamancer_client::Client>::Events,
+) {
+    use datamancer_client::Client as _;
+    use datamancer_client::ws::{WsClient, WsConfig};
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let config = WsConfig {
+            url: format!("ws://127.0.0.1:{port}/"),
+            auth_token: None,
+            event_buffer: 256,
+        };
+        match WsClient::connect(config).await {
+            Ok(connected) => return connected,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("ws never became ready: {e}"),
+        }
+    }
+}
+
+/// `subscribe` over WS against the scripted provider: the creator reads the
+/// backfill it opened, then its history and a live print under one contiguous
+/// `seq`; a pure-live joiner reads the session's scope and receives trades.
+#[tokio::test]
+#[cfg(all(feature = "scripted-provider", feature = "ws"))]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+async fn ws_subscribe_replies_with_the_scope_and_streams_history_then_live() {
+    use datamancer::{
+        AssetClass, EventKind, Instrument, LiveScope, ProviderId, Subscribed, Timestamp,
+    };
+    use datamancer_client::Client as _;
+    use datamancer_client::spec::SubscriptionSpec;
+
+    const PORT: u16 = 19023;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _daemon = spawn_scripted_daemon(
+        dir.path(),
+        "history_prints = 3\nhistory_delay_ms = 200\nlive_interval_ms = 50\n",
+        &format!("[ws]\nenabled = true\nbind = \"127.0.0.1\"\nport = {PORT}\n"),
+    );
+    let instrument = Instrument::new(
+        ProviderId::from_static("scripted"),
+        AssetClass::Equity,
+        "AAPL",
+    );
+    let spec = SubscriptionSpec::new(&instrument, EventKind::Trade).expect("spec");
+    let from = Timestamp(now_nanos() - 60_000_000_000);
+    let backfill = LiveScope::LiveBackfill { from };
+
+    let (mut creator, mut events) = connect_ws(PORT).await;
+    let created = creator
+        .subscribe(&spec.clone().with_backfill_from(from))
+        .await
+        .expect("subscribe");
+    assert_eq!(created, Subscribed::Created(backfill));
+
+    let (mut joiner, mut joiner_events) = connect_ws(PORT).await;
+    assert_eq!(
+        joiner.subscribe(&spec).await.expect("join"),
+        Subscribed::Joined { session: backfill }
+    );
+
+    for (seq, price) in [1.0, 2.0, 3.0, 100.0].into_iter().enumerate() {
+        let trade = next_trade(&mut events).await;
+        assert!((trade.price.to_f64() - price).abs() < 1e-9, "{trade:?}");
+        assert_eq!(trade.seq.0, seq as u64, "{trade:?}");
+    }
+    next_trade(&mut joiner_events).await;
 }

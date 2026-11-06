@@ -53,8 +53,8 @@ jobs:
       # Untimed: a cold cache (any lockfile change) must not spend a timed
       # step's budget on compilation.
       - name: build e2e suites
-        run: cargo test -p datamancerd --all-features --test daemon_e2e --test client_transport_e2e --no-run
-      # `--nocapture` on both suites: a test that wedges during panic unwind
+        run: cargo test -p datamancerd --all-features --test daemon_e2e --test client_transport_e2e --test health_observability_e2e --no-run
+      # `--nocapture` on every suite: a test that wedges during panic unwind
       # (issue #64 — the tokio runtime drop can block joining a still-running
       # spawn_blocking thread) never reaches libtest's final failure report,
       # which is the only place captured panic output is printed. Streaming
@@ -73,6 +73,13 @@ jobs:
         env:
           RUST_LOG: datamancerd=debug,datamancer=debug
         run: cargo test -p datamancerd --all-features --test client_transport_e2e -- --ignored --nocapture
+      # The health op, disabled-provider enrichment, hot enable and the push
+      # plane against the real daemon; single-threaded, as its header says.
+      - name: health observability e2e
+        timeout-minutes: 10
+        env:
+          RUST_LOG: datamancerd=debug,datamancer=debug
+        run: cargo test -p datamancerd --all-features --test health_observability_e2e -- --ignored --nocapture --test-threads=1
       # On failure, show what iceoryx2 state survived the run: its root
       # (`/tmp/iceoryx2/` is the 0.10 Linux default) and its shared-memory
       # segments. Lingering service or node entries point at a daemon that

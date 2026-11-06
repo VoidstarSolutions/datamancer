@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use std::collections::HashMap;
 
+#[cfg(feature = "scripted-provider")]
+use crate::scripted::ScriptedSettings;
 use datamancer::providers::{AccountType, AlpacaHistoryFeed};
 use datamancer::{
     Adjustment, CredentialsSource, Datamancer, Instrument, LiveScope, PersistenceOptions,
@@ -113,6 +115,50 @@ pub struct ProviderConfig {
     pub alpaca: Option<AlpacaSection>,
     #[serde(default)]
     pub alpaca_crypto: Option<AlpacaCryptoSection>,
+    /// The scripted test provider (feature `scripted-provider` only; a
+    /// daemon built without it rejects the section as unknown).
+    #[cfg(feature = "scripted-provider")]
+    #[serde(default)]
+    pub scripted: Option<ScriptedSection>,
+}
+
+/// Scripted test provider section (feature `scripted-provider`). Every
+/// knob defaults to [`ScriptedSettings::default`].
+#[cfg(feature = "scripted-provider")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptedSection {
+    /// Trades served per backfill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_prints: Option<u32>,
+    /// Milliseconds a history request waits before serving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_delay_ms: Option<u64>,
+    /// Milliseconds between live trades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_interval_ms: Option<u64>,
+    /// Whether `latest` returns a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<bool>,
+}
+
+#[cfg(feature = "scripted-provider")]
+impl ScriptedSection {
+    /// The provider settings these knobs select.
+    #[must_use]
+    pub fn settings(&self) -> ScriptedSettings {
+        let defaults = ScriptedSettings::default();
+        ScriptedSettings {
+            history_prints: self.history_prints.unwrap_or(defaults.history_prints),
+            history_delay: self
+                .history_delay_ms
+                .map_or(defaults.history_delay, std::time::Duration::from_millis),
+            live_interval: self
+                .live_interval_ms
+                .map_or(defaults.live_interval, std::time::Duration::from_millis),
+            latest: self.latest.unwrap_or(defaults.latest),
+        }
+    }
 }
 
 impl ProviderConfig {
@@ -121,6 +167,8 @@ impl ProviderConfig {
         match id {
             alpaca::PROVIDER_ID => self.alpaca.is_some(),
             alpaca_crypto::PROVIDER_ID => self.alpaca_crypto.is_some(),
+            #[cfg(feature = "scripted-provider")]
+            crate::scripted::PROVIDER_ID => self.scripted.is_some(),
             _ => false,
         }
     }
@@ -688,7 +736,14 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 /// enable/disable).
 #[must_use]
 pub fn compiled_provider_ids() -> Vec<&'static str> {
-    vec![alpaca::PROVIDER_ID, alpaca_crypto::PROVIDER_ID]
+    let ids = vec![alpaca::PROVIDER_ID, alpaca_crypto::PROVIDER_ID];
+    #[cfg(feature = "scripted-provider")]
+    let ids = {
+        let mut ids = ids;
+        ids.push(crate::scripted::PROVIDER_ID);
+        ids
+    };
+    ids
 }
 
 impl Config {
@@ -877,6 +932,11 @@ impl Config {
             ..Default::default()
         });
         builder = builder.provider(Box::new(provider));
+        #[cfg(feature = "scripted-provider")]
+        {
+            let provider = crate::scripted::ScriptedProvider::new(settings.scripted);
+            builder = builder.provider(Box::new(provider));
+        }
 
         if let Some(cache_cfg) = &self.cache {
             let cache = TursoCache::open(storage_to_cache_config(cache_cfg)?).await?;
