@@ -1511,10 +1511,14 @@ impl ClientSession {
     ///
     /// - [`Error::DuplicateSubscription`] — `(instrument, kind)` is already in
     ///   this client's set.
-    /// - [`Error::UnsupportedEventKind`] — no provider serves the pair on the
-    ///   surfaces the scope needs (live, plus history under backfill).
+    /// - [`Error::UnknownProvider`] — no registered provider has the
+    ///   instrument's [`provider`](Instrument::provider) id.
+    /// - [`Error::UnsupportedEventKind`] — that provider lacks a surface the
+    ///   scope needs (live, plus history under backfill).
     /// - [`Error::PersistenceRequired`] — `options` needs a cache or tap log
     ///   that is not configured, on a joiner as on a creator.
+    /// - [`Error::ProviderDisabled`] — the session's provider is disabled,
+    ///   whether this subscribe would create or join.
     /// - [`Error::BackfillFromNotInPast`] — this subscribe would create a
     ///   session whose backfill starts at or past the live edge. A joiner is
     ///   not checked.

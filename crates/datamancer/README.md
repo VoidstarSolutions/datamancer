@@ -120,6 +120,10 @@ a provider's per-message decode loop stays monomorphic behind its own concrete
 | `metrics()` | optional byte / rate-limit counters from inside the decode loop |
 | `enabled()` | whether a runtime settings source has this provider parked |
 
+Routing is exact: a session is served only by the registered provider whose `id()` is the
+instrument's `provider()`. An id no registered provider owns is `Error::UnknownProvider`,
+live or historical.
+
 `Surface::{Live, History}` is the axis that keeps the two data paths honest. They genuinely
 differ and neither contains the other — Alpaca's equity websocket streams only minute and
 daily bars while its REST endpoint serves five intervals. Collapsing them into one
@@ -235,8 +239,10 @@ year and later requesting ten years only ever fetches the missing nine.
 
 Coverage is recorded honestly: a range is "covered" only once its fetch
 completes. If a provider fetch fails partway, only the confirmed prefix is
-stored, an in-band `Control::Gap` marks the remainder, and a later request
-re-fetches what is still missing. An empty result over a successfully-fetched
+stored and an in-band `Control::Gap` marks the rest of that span. The read goes
+on through its range: cached spans are still served, and each later uncached
+span gets its own `Gap` with no further fetch, so the whole range is delivered
+or gapped. A later request re-fetches what is still missing. An empty result over a successfully-fetched
 range is legitimately covered (markets close; symbols have an inception date).
 
 ### Single-flight fetch

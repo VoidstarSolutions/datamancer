@@ -7,16 +7,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum Error {
-    /// A provider id referenced in configuration was not registered with this
-    /// datamancer instance.
+    /// A provider id, in configuration or on an instrument, is not registered
+    /// with this datamancer instance.
     #[error("unknown provider: {0}")]
     UnknownProvider(String),
 
-    /// The requested event kind is not supported by any registered provider
-    /// capable of serving the requested instrument.
-    #[error(
-        "no registered provider supports event kind {kind:?} for {instrument} on the {surface:?} surface"
-    )]
+    /// The provider an instrument names lacks a surface the request needs.
+    #[error("{instrument} is not served on the {surface:?} surface for event kind {kind:?}")]
     UnsupportedEventKind {
         kind: crate::EventKind,
         instrument: crate::Instrument,
@@ -75,6 +72,13 @@ pub enum Error {
     /// entries instead.
     #[error("provider {provider}: {message}")]
     Provider { provider: String, message: String },
+
+    /// The provider an instrument is addressed to is registered but disabled.
+    #[error("provider {provider} is disabled")]
+    ProviderDisabled {
+        /// The provider id.
+        provider: String,
+    },
 
     /// The provider cannot serve because it has no usable credentials: none
     /// are provisioned, or the ones it has were rejected. Retrying without new

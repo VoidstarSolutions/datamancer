@@ -115,6 +115,17 @@ pub struct ProviderConfig {
     pub alpaca_crypto: Option<AlpacaCryptoSection>,
 }
 
+impl ProviderConfig {
+    /// Whether the config has a section for the provider `id`.
+    pub(crate) fn enables(&self, id: &str) -> bool {
+        match id {
+            alpaca::PROVIDER_ID => self.alpaca.is_some(),
+            alpaca_crypto::PROVIDER_ID => self.alpaca_crypto.is_some(),
+            _ => false,
+        }
+    }
+}
+
 /// Alpaca equities provider section.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -729,7 +740,14 @@ impl Config {
                 )));
             }
         }
+        let compiled = compiled_provider_ids();
         for s in &self.startup_session {
+            if !compiled.contains(&s.provider.as_str()) {
+                return Err(DaemonError::ConfigInvalid(format!(
+                    "startup_session {} names provider {:?}, which is not one of {compiled:?}",
+                    s.symbol, s.provider
+                )));
+            }
             let options = persistence_options(s.persistence);
             if options.uses_cache() && self.cache.is_none() {
                 return Err(DaemonError::ConfigInvalid(format!(
@@ -1319,6 +1337,22 @@ backfill_from = "2200-01-01T00:00:00Z"
             DaemonError::ConfigInvalid(m) => {
                 assert!(m.contains("not before the live edge"), "{m}");
             }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_rejects_a_startup_session_naming_an_unknown_provider() {
+        let text = r#"
+[[startup_session]]
+provider = "alpaca_crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+"#;
+        let config = Config::parse(text).expect("parse");
+        match config.validate().expect_err("must reject") {
+            DaemonError::ConfigInvalid(m) => assert!(m.contains("alpaca_crypto"), "{m}"),
             other => panic!("wrong error: {other:?}"),
         }
     }

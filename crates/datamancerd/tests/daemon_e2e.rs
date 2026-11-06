@@ -580,14 +580,35 @@ fn open_query_rejects_an_inverted_range_and_an_unserved_pair() {
     assert_eq!(inverted["ok"], false);
     assert_eq!(inverted["code"], "bad_request");
 
-    // Alpaca's crypto provider reports `Surface::History => false`, so routing
-    // rejects the pair before any session opens.
+    // The equity provider serves no crypto, so routing rejects the pair before
+    // any session opens.
     let crypto = round_trip(
         daemon.socket(),
         r#"{"op":"open-query","provider":"alpaca","asset_class":"crypto","symbol":"BTC/USD","kind":"bar1d","from":100,"to":200}"#,
     );
     assert_eq!(crypto["ok"], false);
     assert_eq!(crypto["code"], "unsupported_event_kind");
+}
+
+/// `spawn_daemon` configures no `[cache]`, so its query policy degrades to none.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn open_query_on_a_disabled_provider_is_refused_at_open_without_a_cache() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_daemon(dir.path());
+
+    let removed = round_trip(
+        daemon.socket(),
+        r#"{"op":"remove-provider","provider":"alpaca"}"#,
+    );
+    assert_eq!(removed["ok"], true, "{removed}");
+
+    let reply = round_trip(
+        daemon.socket(),
+        r#"{"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":100,"to":200}"#,
+    );
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["code"], "provider_disabled", "{reply}");
 }
 
 #[test]

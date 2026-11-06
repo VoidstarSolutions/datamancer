@@ -381,9 +381,8 @@ impl Provider for AlpacaCryptoProvider {
         instrument: &Instrument,
         kind: EventKind,
     ) -> Result<Option<MarketEvent>> {
-        let rest = self.current_market_data().ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Market-data client not initialized (Alpaca credentials missing?)".to_string(),
+        let rest = self.current_market_data().ok_or_else(|| {
+            super::runtime::no_rest_client(PROVIDER_ID, self.enabled(), "Market-data")
         })?;
         let venue = self
             .cfg
@@ -410,9 +409,8 @@ impl Provider for AlpacaCryptoProvider {
     }
 
     async fn list_instruments(&self) -> Result<Vec<InstrumentEntry>> {
-        let trading = self.trading_client().ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        let trading = self.trading_client().ok_or_else(|| {
+            super::runtime::no_rest_client(PROVIDER_ID, self.enabled(), "Trading")
         })?;
         let assets = trading
             .list_assets()
@@ -428,9 +426,8 @@ impl Provider for AlpacaCryptoProvider {
     }
 
     async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
-        let trading = self.trading_client().ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        let trading = self.trading_client().ok_or_else(|| {
+            super::runtime::no_rest_client(PROVIDER_ID, self.enabled(), "Trading")
         })?;
         let asset = trading
             .get_asset(instrument.symbol())
@@ -874,7 +871,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
 /// Why the hub task is parked in [`wait_for_provisioning`], and so which
 /// error a subscribe/unsubscribe gets meanwhile: a credential park is
 /// `Error::Unauthenticated` (retrying cannot help; provisioning can), a
-/// disable is a plain provider error.
+/// disable is `Error::ProviderDisabled`.
 #[derive(Debug, Clone, Copy)]
 enum Park {
     Disabled,
@@ -883,22 +880,16 @@ enum Park {
 }
 
 impl Park {
-    fn reason(self) -> &'static str {
-        match self {
-            Self::Disabled => "provider disabled",
+    fn error(self) -> Error {
+        let provider = PROVIDER_ID.to_string();
+        let message = match self {
+            Self::Disabled => return Error::ProviderDisabled { provider },
             Self::MissingCredentials => "waiting for credentials",
             Self::RejectedCredentials => "waiting for new credentials after auth rejection",
-        }
-    }
-
-    fn error(self) -> Error {
-        let message = self.reason().to_string();
-        let provider = PROVIDER_ID.to_string();
-        match self {
-            Self::Disabled => Error::Provider { provider, message },
-            Self::MissingCredentials | Self::RejectedCredentials => {
-                Error::Unauthenticated { provider, message }
-            }
+        };
+        Error::Unauthenticated {
+            provider,
+            message: message.to_string(),
         }
     }
 }
@@ -1360,8 +1351,12 @@ mod tests {
             .subscribe(provider_instrument("BTC/USD"), EventKind::Trade)
             .await
             .expect_err("disabled provider must fail subscribes fast");
-        let msg = format!("{err}");
-        assert!(msg.contains("provider disabled"), "msg={msg:?}");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
+        let err = p
+            .list_instruments()
+            .await
+            .expect_err("a disabled provider has no REST client");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
         // `start_live` already returns `Box<dyn LiveHandle>`; `close` takes
         // `self: Box<Self>`, so call it directly on the box.
         handle.close().await.expect("close while parked");

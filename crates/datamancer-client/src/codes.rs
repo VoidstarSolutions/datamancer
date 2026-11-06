@@ -2,7 +2,7 @@
 //! an operator-facing contract; changing a string is a breaking change and is
 //! regression-guarded in tests.
 
-/// No registered provider supports the requested `(instrument, kind)`.
+/// The named provider does not serve the requested `(instrument, kind)`.
 pub const UNSUPPORTED_EVENT_KIND: &str = "unsupported_event_kind";
 /// The requested persistence preset requires a backend that is not
 /// configured.
@@ -25,6 +25,8 @@ pub const STORAGE: &str = "storage";
 pub const CONFIG: &str = "config";
 /// An I/O or provider-level library error.
 pub const PROVIDER: &str = "provider";
+/// The named provider is registered but disabled.
+pub const PROVIDER_DISABLED: &str = "provider_disabled";
 /// The named client is not connected/registered.
 pub const UNKNOWN_CLIENT: &str = "unknown_client";
 /// A client tried to `open-client` a name already in use.

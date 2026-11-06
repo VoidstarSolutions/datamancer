@@ -4,7 +4,20 @@
 //! parks), `Some(settings)` = enabled with those settings. `Static` is the
 //! embedder default: always enabled, settings fixed at construction.
 
+use datamancer_core::Error;
 use tokio::sync::watch;
+
+/// The error for a REST call with no client: [`Error::ProviderDisabled`] when
+/// the provider is disabled, else a missing-credentials [`Error::Provider`].
+pub(super) fn no_rest_client(provider: &str, enabled: bool, client: &str) -> Error {
+    let provider = provider.to_string();
+    if enabled {
+        let message = format!("{client} client not initialized (Alpaca credentials missing?)");
+        Error::Provider { provider, message }
+    } else {
+        Error::ProviderDisabled { provider }
+    }
+}
 
 /// Where a provider gets its runtime settings, resolved fresh at every
 /// (re)connect. `None` from a `Watch` source means the provider is disabled.

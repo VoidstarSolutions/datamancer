@@ -64,8 +64,9 @@ fn leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
 }
 
 /// Cold-classified leaves that differ between `baseline` (the boot-applied
-/// config) and `current`. Non-empty ⇒ a restart is required for `current`
-/// to fully apply.
+/// config) and `current`, plus each `always_on` startup session whose provider
+/// `baseline` lacks and `current` enables. Non-empty ⇒ a restart is required
+/// for `current` to fully apply.
 pub(crate) fn cold_divergence(baseline: &Config, current: &Config) -> Vec<String> {
     let a = serde_json::to_value(baseline).expect("Config serializes");
     let b = serde_json::to_value(current).expect("Config serializes");
@@ -76,6 +77,15 @@ pub(crate) fn cold_divergence(baseline: &Config, current: &Config) -> Vec<String
     paths.extend(more);
     paths.sort();
     paths.dedup();
+    let waiting_anchors = current
+        .startup_session
+        .iter()
+        .filter(|s| {
+            s.always_on
+                && !baseline.provider.enables(&s.provider)
+                && current.provider.enables(&s.provider)
+        })
+        .map(|s| format!("startup_session.{}", s.symbol));
     paths
         .into_iter()
         .filter(|p| {
@@ -83,6 +93,7 @@ pub(crate) fn cold_divergence(baseline: &Config, current: &Config) -> Vec<String
             let bv = lookup(&b, p);
             av != bv && classify(p) == Some(FieldClass::Cold)
         })
+        .chain(waiting_anchors)
         .collect()
 }
 
@@ -209,5 +220,34 @@ persistence = "none"
         cold_changed.session.resume_buffer_events = 42;
         let diverged = cold_divergence(&boot, &cold_changed);
         assert_eq!(diverged, vec!["session.resume_buffer_events".to_string()]);
+    }
+
+    #[test]
+    fn enabling_the_provider_of_a_skipped_anchor_needs_a_restart() {
+        let anchor = |always_on: bool| {
+            format!(
+                r#"
+[[startup_session]]
+provider = "alpaca"
+asset_class = "equity"
+symbol = "AAPL"
+kind = "trade"
+always_on = {always_on}
+"#
+            )
+        };
+        let boot = Config::parse(&anchor(true)).expect("parse");
+        let mut enabled = boot.clone();
+        enabled.provider = Config::parse(FULL).expect("parse").provider;
+        assert_eq!(
+            cold_divergence(&boot, &enabled),
+            vec!["startup_session.AAPL".to_string()]
+        );
+        assert!(cold_divergence(&enabled, &enabled).is_empty());
+
+        let refcounted = Config::parse(&anchor(false)).expect("parse");
+        let mut enabled = refcounted.clone();
+        enabled.provider = Config::parse(FULL).expect("parse").provider;
+        assert!(cold_divergence(&refcounted, &enabled).is_empty());
     }
 }
