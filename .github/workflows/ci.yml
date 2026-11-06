@@ -83,6 +83,23 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: tests (all features)
         run: cargo test --workspace --all-features
+      # The hermetic daemon e2e suite.
+      - name: scripted e2e
+        timeout-minutes: 10
+        run: |
+          # Every daemon test in the file is #[ignore]d and runs here,
+          # single-threaded; the one plain unit test runs in the step above.
+          expected=$(grep -c '^#\[ignore' crates/datamancerd/tests/scripted_e2e.rs || true)
+          t=$(mktemp -d)
+          cargo test -p datamancerd --all-features --test scripted_e2e -- --ignored --list | grep ': test$' | sort > "$t/ignored" || true
+          cargo test -p datamancerd --all-features --test scripted_e2e -- --list | grep ': test$' | sort > "$t/all" || true
+          found=$(wc -l < "$t/ignored")
+          unignored=$(comm -23 "$t/all" "$t/ignored")
+          if [ "$found" -eq 0 ] || [ "$found" -ne "$expected" ] || [ "$unignored" != "a_hermetic_command_pins_the_store_and_scrubs_the_env: test" ]; then
+            echo "scripted e2e: $expected #[ignore] attributes, $found ignored tests listed; not ignored: $unignored"
+            exit 1
+          fi
+          cargo test -p datamancerd --all-features --test scripted_e2e -- --ignored --test-threads=1
       # The iceoryx2 runtime tests, all #[ignore]d.
       - name: iceoryx2 transport runtime
         timeout-minutes: 10

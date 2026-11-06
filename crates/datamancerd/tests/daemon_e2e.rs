@@ -9,10 +9,9 @@
 //! cargo test -p datamancerd --test daemon_e2e -- --ignored
 //! ```
 //!
-//! The headline per-symbol-agreement and live-flow tests additionally need
-//! Alpaca credentials in the environment; they live here as `#[ignore]`d
-//! placeholders to be filled in once a hermetic replay provider is wired
-//! (roadmap RE-PLAN: `[provider.replay]`).
+//! The tests whose `#[ignore]` reason names Alpaca credentials read them from
+//! the environment. The hermetic tests against the scripted provider are in
+//! `scripted_e2e.rs`.
 
 // This suite talks to the daemon over a Unix-domain control socket and manages
 // the process POSIX-style; the Windows named-pipe harness port is Phase 5 (#29).
@@ -25,127 +24,32 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use common::DaemonGuard;
+use common::{Daemon, round_trip};
 use datamancer::{ControlKind, MarketEvent};
 use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 
-/// Makes every daemon's `service_prefix` unique (`<pid>-<n>`), so a reply's
-/// advertised service name identifies the daemon that sent it.
-static PREFIX_SEQ: AtomicU32 = AtomicU32::new(0);
-
-/// Serializes the whole suite: `datamancerd` takes a **global** single-instance
-/// lock (`<data dir>/datamancerd.lock`, one per user per host), so two daemons
-/// can never be up at once — under cargo's default parallelism every test but
-/// the lock winner would fail with "daemon socket never appeared". The lock is
-/// deliberately not scoped to a config file, so an isolated data dir per test
-/// is not an option; the tests take turns instead.
-static DAEMON_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// This suite's daemon: the shared [`DaemonGuard`] plus the suite lock and
-/// the prefix the daemon was configured with. A leaked daemon keeps holding
-/// the single-instance lock and makes every later run of this suite fail at
-/// `spawn_daemon`, which is why the stop lives in the guard's `Drop`.
-struct Daemon {
-    // Field order is drop order: stop the child before releasing the lock, or
-    // the next test races the dying daemon for the single-instance lock.
-    guard: DaemonGuard,
-    _lock: std::sync::MutexGuard<'static, ()>,
-    /// The `[server].service_prefix` this daemon was started with, for tests
-    /// that assert on a reply's full service name.
-    service_prefix: String,
-}
-
-impl Daemon {
-    /// The UDS control socket.
-    fn socket(&self) -> &Path {
-        self.guard.control_endpoint()
-    }
-}
-
-impl Daemon {
-    /// Simulate a crash: SIGKILL the daemon and reap it, so it never runs its
-    /// drain and its iceoryx2 node and per-client services stay registered
-    /// with a dead owner. Dropping the guard afterwards is a no-op on the
-    /// reaped child and releases the suite lock.
-    fn kill_abruptly(&mut self) {
-        self.guard.kill_abruptly();
-    }
-}
-
-/// Spawn the daemon with a memory-backed config and wait for its control
-/// socket to appear.
-fn spawn_daemon(dir: &Path) -> Daemon {
-    let service_prefix = format!(
-        "datamancerd-e2e-{}-{}",
-        std::process::id(),
-        PREFIX_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
-    spawn_daemon_with_prefix(dir, service_prefix)
-}
-
-/// [`spawn_daemon`] with an explicit `[server].service_prefix`, for a test
-/// that needs two daemons configured identically (the crash-restart case).
-fn spawn_daemon_with_prefix(dir: &Path, service_prefix: String) -> Daemon {
-    // Poisoning just means an earlier test panicked; its `Daemon` guard has
-    // already killed that daemon, so the lock is still meaningful.
-    let lock = DAEMON_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let socket = dir.join("admin.sock");
-    let config_path = dir.join("datamancerd.toml");
-    let config = format!(
-        r#"
+/// The real-provider sections every daemon of this suite runs with.
+const PROVIDERS: &str = r#"
 [provider.alpaca]
 account_type = "paper"
 
 [provider.alpaca_crypto]
 account_type = "paper"
 venue = "us"
+"#;
 
-[server]
-admin_socket = "{}"
-service_prefix = "{service_prefix}"
-
-[diagnostics]
-publish_interval_ms = 200
-"#,
-        socket.display()
-    );
-    std::fs::write(&config_path, config).expect("write config");
-
-    let child = common::daemon_command(&config_path)
-        .spawn()
-        .expect("spawn datamancerd");
-
-    let daemon = Daemon {
-        guard: DaemonGuard::new(child, socket),
-        _lock: lock,
-        service_prefix,
-    };
-
-    // Wait for the socket to appear (daemon bound).
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !daemon.socket().exists() {
-        assert!(Instant::now() < deadline, "daemon socket never appeared");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    daemon
+/// Spawn the daemon with both Alpaca providers and wait for its control
+/// socket to appear.
+fn spawn_daemon(dir: &Path) -> Daemon {
+    spawn_daemon_with_prefix(dir, common::unique_prefix())
 }
 
-/// Send one JSON line and read one JSON reply line.
-fn round_trip(socket: &Path, request: &str) -> serde_json::Value {
-    let stream = UnixStream::connect(socket).expect("connect socket");
-    let mut writer = stream.try_clone().expect("clone");
-    writer.write_all(request.as_bytes()).expect("write");
-    writer.write_all(b"\n").expect("write nl");
-    writer.flush().expect("flush");
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read reply");
-    serde_json::from_str(&line).expect("parse reply")
+/// [`spawn_daemon`] with an explicit `[server].service_prefix`, for a test
+/// that needs two daemons configured identically (the crash-restart case).
+fn spawn_daemon_with_prefix(dir: &Path, service_prefix: String) -> Daemon {
+    common::spawn_daemon(dir, service_prefix, PROVIDERS, "", common::daemon_command)
 }
 
 #[test]

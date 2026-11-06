@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use std::collections::HashMap;
 
+#[cfg(feature = "scripted-provider")]
+use crate::scripted::ScriptedSettings;
 use datamancer::providers::{AccountType, AlpacaHistoryFeed};
 use datamancer::{
     Adjustment, CredentialsSource, Datamancer, Instrument, LiveScope, PersistenceOptions,
@@ -115,6 +117,11 @@ pub struct ProviderConfig {
     pub alpaca: Option<AlpacaSection>,
     #[serde(default)]
     pub alpaca_crypto: Option<AlpacaCryptoSection>,
+    /// The scripted test provider (feature `scripted-provider` only; a
+    /// daemon built without it rejects the section as unknown).
+    #[cfg(feature = "scripted-provider")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scripted: Option<ScriptedSettings>,
 }
 
 /// Alpaca equities provider section.
@@ -683,7 +690,12 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 /// enable/disable).
 #[must_use]
 pub fn compiled_provider_ids() -> Vec<&'static str> {
-    vec![alpaca::PROVIDER_ID, alpaca_crypto::PROVIDER_ID]
+    vec![
+        alpaca::PROVIDER_ID,
+        alpaca_crypto::PROVIDER_ID,
+        #[cfg(feature = "scripted-provider")]
+        crate::scripted::PROVIDER_ID,
+    ]
 }
 
 impl Config {
@@ -774,6 +786,17 @@ impl Config {
                 tokio::sync::Semaphore::MAX_PERMITS
             )));
         }
+        #[cfg(feature = "scripted-provider")]
+        if self
+            .provider
+            .scripted
+            .as_ref()
+            .is_some_and(|s| s.live_interval_ms == 0)
+        {
+            return Err(DaemonError::ConfigInvalid(
+                "[provider.scripted].live_interval_ms must be greater than 0".to_string(),
+            ));
+        }
         if self.session.max_backfill_days == 0 {
             return Err(DaemonError::ConfigInvalid(
                 "[session].max_backfill_days must be greater than 0".to_string(),
@@ -850,13 +873,20 @@ impl Config {
     }
 
     /// The ids of the configured providers, as
-    /// [`configured_providers`](Self::configured_providers) lists them.
+    /// [`configured_providers`](Self::configured_providers) lists them, plus
+    /// the scripted test provider when its section is present (it needs no
+    /// credentials, so `configured_providers` omits it).
     #[must_use]
     pub fn provider_ids(&self) -> Vec<&'static str> {
-        self.configured_providers()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect()
+        let ids = self.configured_providers().into_iter().map(|(id, _)| id);
+        #[cfg(feature = "scripted-provider")]
+        let ids = ids.chain(
+            self.provider
+                .scripted
+                .is_some()
+                .then_some(crate::scripted::PROVIDER_ID),
+        );
+        ids.collect()
     }
 
     /// Build the full daemon runtime: construct every compiled-in provider
@@ -913,6 +943,11 @@ impl Config {
             ..Default::default()
         });
         builder = builder.provider(Box::new(provider));
+        #[cfg(feature = "scripted-provider")]
+        {
+            let provider = crate::scripted::ScriptedProvider::new(settings.scripted);
+            builder = builder.provider(Box::new(provider));
+        }
 
         if let Some(cache_cfg) = &self.cache {
             let cache = TursoCache::open(storage_to_cache_config(cache_cfg)?).await?;
@@ -1213,6 +1248,22 @@ account_type = "paper"
         config.validate().expect("zero providers must validate");
         let config = Config::parse("").expect("parse empty");
         config.validate().expect("empty config must validate");
+    }
+
+    #[cfg(feature = "scripted-provider")]
+    #[test]
+    fn live_interval_ms_zero_is_refused() {
+        let config = Config::parse("[provider.scripted]\nlive_interval_ms = 0\n").expect("parse");
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("live_interval_ms"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid for zero live_interval_ms, got {other:?}"),
+        }
+        Config::parse("[provider.scripted]\nlive_interval_ms = 1\n")
+            .expect("parse")
+            .validate()
+            .expect("a positive interval validates");
     }
 
     #[test]
