@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use datamancer_core::{
-    ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, MarketEvent,
-    Result, Seq, StreamConnection, SubscriptionRef, Timestamp,
+    ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, LiveScope,
+    MarketEvent, Result, Seq, StreamConnection, Subscribed, SubscriptionRef, Timestamp,
 };
 use futures::StreamExt as _;
 use tokio::sync::{mpsc, oneshot};
@@ -39,7 +39,7 @@ use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::session::{
-    ClientSessionRegistry, Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions, Scope,
+    ClientSessionRegistry, Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions,
     SessionCommand, default_buffer,
 };
 
@@ -69,7 +69,7 @@ pub(crate) struct AuthoritativeSession {
     /// The session's actual scope, shared across every referrer. A second opener
     /// attaches to this (its requested scope is not re-applied), so referrer
     /// handles must report *this*, not their own requested value.
-    pub(crate) scope: Scope,
+    pub(crate) scope: LiveScope,
     /// The session's current persistence options, shared across every referrer
     /// and the source of truth for the synchronous getter. Updated by
     /// [`Self::set_persistence`]; a second opener never re-applies its own
@@ -97,7 +97,7 @@ impl AuthoritativeSession {
         instrument: Instrument,
         kind: EventKind,
         provider_id: String,
-        scope: Scope,
+        scope: LiveScope,
         persistence: PersistenceOptions,
         cmd_tx: mpsc::Sender<SessionCommand>,
         remove_tx: mpsc::UnboundedSender<SubscriberId>,
@@ -213,6 +213,31 @@ impl SubscriberGuard {
 impl Drop for SubscriberGuard {
     fn drop(&mut self) {
         self.authoritative.remove_subscriber(self.id);
+    }
+}
+
+/// One subscriber registered on an [`AuthoritativeSession`].
+pub(crate) struct Attached {
+    pub(crate) session: Arc<AuthoritativeSession>,
+    pub(crate) guard: SubscriberGuard,
+    pub(crate) rx: mpsc::Receiver<MarketEvent>,
+    pub(crate) outcome: Subscribed,
+}
+
+impl Attached {
+    pub(crate) fn joined(
+        session: Arc<AuthoritativeSession>,
+        id: SubscriberId,
+        rx: mpsc::Receiver<MarketEvent>,
+    ) -> Self {
+        Self {
+            guard: SubscriberGuard::new(session.clone(), id),
+            rx,
+            outcome: Subscribed::Joined {
+                session: session.scope,
+            },
+            session,
+        }
     }
 }
 
@@ -947,9 +972,9 @@ enum ClientCommand {
     Subscribe {
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<Subscribed>>,
     },
     Unsubscribe {
         instrument: Instrument,
@@ -1074,26 +1099,16 @@ impl ClientController {
         &mut self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<()> {
+    ) -> Result<Subscribed> {
         let key = (instrument.clone(), kind);
         if self.entries.contains_key(&key) {
             return Err(Error::DuplicateSubscription { instrument, kind });
         }
-        // Phase 2: client subscriptions are pure-live. A shared authoritative
-        // session has one creation-time scope, so a per-client backfill /
-        // historical join would break the identical-`(seq, source_ts)`
-        // guarantee. Reject the unsupported variants with a clear error.
-        if !matches!(
-            scope,
-            Scope::Live {
-                backfill_from: None
-            }
-        ) {
-            return Err(Error::UnsupportedClientScope);
-        }
-        let (_auth, guard, rx) = self
+        let Attached {
+            guard, rx, outcome, ..
+        } = self
             .dm
             .authoritative(instrument.clone(), kind, scope, options)
             .await?;
@@ -1107,7 +1122,7 @@ impl ClientController {
         );
         self.streams.insert(key, substream(rx));
         self.sync_subscriptions();
-        Ok(())
+        Ok(outcome)
     }
 
     async fn unsubscribe(&mut self, instrument: Instrument, kind: EventKind) -> Result<()> {
@@ -1376,9 +1391,9 @@ impl ClientHandle {
         &self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<()> {
+    ) -> Result<Subscribed> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(ClientCommand::Subscribe {
@@ -1476,7 +1491,8 @@ pub(crate) fn spawn_client(
 ///
 /// Determinism is **per symbol only**: each instrument's substream is
 /// `seq`-monotonic (source-stamped); there is no cross-instrument ordering
-/// (arrival order). Subscriptions are pure-live in Phase 2.
+/// (arrival order). Subscriptions are unbounded: pure-live, or a backfill
+/// seamed into the live tail.
 pub struct ClientSession {
     handle: ClientHandle,
 }
@@ -1486,24 +1502,30 @@ impl ClientSession {
         Self { handle }
     }
 
-    /// Add a subscription to this client's set.
+    /// Add a subscription to this client's set and return what it opened.
+    ///
+    /// The pair's authoritative session is created with the first subscriber's
+    /// `scope` and every later subscriber joins it as is.
     ///
     /// # Errors
     ///
     /// - [`Error::DuplicateSubscription`] — `(instrument, kind)` is already in
     ///   this client's set.
-    /// - [`Error::UnsupportedClientScope`] — Phase 2 client subscriptions are
-    ///   pure-live; `Scope::Historical` and `Live { backfill_from: Some(_) }`
-    ///   are rejected.
-    /// - [`Error::UnsupportedEventKind`] — no provider serves the pair.
+    /// - [`Error::UnsupportedEventKind`] — no provider serves the pair on the
+    ///   surfaces the scope needs (live, plus history under backfill).
+    /// - [`Error::PersistenceRequired`] — `options` needs a cache or tap log
+    ///   that is not configured, on a joiner as on a creator.
+    /// - [`Error::BackfillFromNotInPast`] — this subscribe would create a
+    ///   session whose backfill starts at or past the live edge. A joiner is
+    ///   not checked.
     /// - [`Error::SessionClosed`] — the controller has shut down.
     pub async fn subscribe(
         &self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<()> {
+    ) -> Result<Subscribed> {
         self.handle
             .subscribe(instrument, kind, scope, options)
             .await

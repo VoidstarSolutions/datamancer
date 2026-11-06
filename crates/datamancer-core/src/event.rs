@@ -23,10 +23,10 @@ use crate::{Instrument, Price, Quantity};
 ///   authoritative stream observes the same `(seq, source_ts)` for each event.
 /// - **Controls occupy slots.** In-band [`Control`] events are stamped here too,
 ///   so they consume a `seq` slot like data events.
-/// - **Holes are real.** A consumer that misses events (resume-buffer eviction,
-///   late join) observes a real `seq` hole, surfaced in-band as
-///   [`ControlKind::Gap`]. The delivered stream is contiguous *only while
-///   nothing is lost*.
+/// - **Holes are real.** A consumer that loses data (a resume-buffer or
+///   backfill-seam overflow) observes a real `seq` hole, surfaced in-band as
+///   [`ControlKind::Gap`]. The delivered stream is contiguous *only while no
+///   data is lost*.
 /// - **`SYNTHETIC` is exempt.** [`Seq::SYNTHETIC`] tags out-of-band synthetic
 ///   control events and is exempt from per-symbol monotonicity.
 ///

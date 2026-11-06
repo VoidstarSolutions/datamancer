@@ -20,8 +20,8 @@
 use std::sync::Arc;
 
 use datamancer::{
-    AssetClass, ControlKind, Datamancer, EventKind, Instrument, MarketEvent, PersistenceOptions,
-    ProviderId, Scope,
+    AssetClass, ControlKind, Datamancer, EventKind, Instrument, LiveScope, MarketEvent,
+    PersistenceOptions, ProviderId,
     providers::{
         AccountType, AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoSettings,
         AlpacaCryptoVenue, SettingsSource,
@@ -60,9 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *sym,
                 ),
                 EventKind::Trade,
-                Scope::Live {
-                    backfill_from: None,
-                },
+                LiveScope::Live,
                 PersistenceOptions::none(),
             )
             .await?;

@@ -17,10 +17,9 @@ pub use datamancer_client::spec::SubscriptionSpec;
 pub fn error_code(err: &datamancer::Error) -> &'static str {
     use datamancer::Error;
     match err {
-        Error::LiveSessionConflict { .. } => codes::LIVE_SESSION_CONFLICT,
         Error::UnsupportedEventKind { .. } => codes::UNSUPPORTED_EVENT_KIND,
         Error::PersistenceRequired => codes::PERSISTENCE_REQUIRED,
-        Error::UnsupportedClientScope => codes::UNSUPPORTED_CLIENT_SCOPE,
+        Error::BackfillFromNotInPast { .. } => codes::BACKFILL_NOT_IN_PAST,
         Error::DuplicateSubscription { .. } => codes::DUPLICATE_SUBSCRIPTION,
         Error::NotSubscribed { .. } => codes::NOT_SUBSCRIBED,
         Error::UnknownProvider(_) => codes::UNKNOWN_PROVIDER,
@@ -54,13 +53,6 @@ mod tests {
         );
 
         assert_eq!(
-            error_code(&Error::LiveSessionConflict {
-                instrument: inst.clone(),
-                kind: EventKind::Trade,
-            }),
-            codes::LIVE_SESSION_CONFLICT
-        );
-        assert_eq!(
             error_code(&Error::UnsupportedEventKind {
                 instrument: inst.clone(),
                 kind: EventKind::Trade,
@@ -73,8 +65,11 @@ mod tests {
             codes::PERSISTENCE_REQUIRED
         );
         assert_eq!(
-            error_code(&Error::UnsupportedClientScope),
-            codes::UNSUPPORTED_CLIENT_SCOPE
+            error_code(&Error::BackfillFromNotInPast {
+                from: datamancer::Timestamp(2),
+                edge: datamancer::Timestamp(1),
+            }),
+            codes::BACKFILL_NOT_IN_PAST
         );
         assert_eq!(
             error_code(&Error::DuplicateSubscription {

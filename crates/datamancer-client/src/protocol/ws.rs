@@ -7,9 +7,10 @@
 //! replies on the shared socket. `open-client` is implicit on connect and has no
 //! request.
 
-use datamancer_core::SystemSnapshot;
+use datamancer_core::{Subscribed, SystemSnapshot};
 use serde::{Deserialize, Serialize};
 
+use super::SubscribedFields;
 use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
 
 /// A WS control request (one JSON text frame).
@@ -71,6 +72,7 @@ impl WsRequest {
 
 /// A WS control reply (one JSON text frame), echoing the request `id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WsReply {
     pub id: u64,
     pub ok: bool,
@@ -84,6 +86,9 @@ pub struct WsReply {
     pub instruments: Option<Vec<datamancer_core::InstrumentInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<datamancer_core::InstrumentEntry>>,
+    /// What the subscription opened (on `subscribe`).
+    #[serde(flatten)]
+    pub(crate) subscribed: SubscribedFields,
 }
 
 /// A server-initiated health push (the Windows same-host health plane — the
@@ -110,6 +115,7 @@ impl WsReply {
             snapshot: None,
             instruments: None,
             capabilities: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -123,6 +129,7 @@ impl WsReply {
             snapshot: None,
             instruments: None,
             capabilities: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -136,6 +143,7 @@ impl WsReply {
             snapshot: Some(snapshot),
             instruments: None,
             capabilities: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -149,6 +157,7 @@ impl WsReply {
             snapshot: None,
             instruments: Some(catalog),
             capabilities: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -162,6 +171,16 @@ impl WsReply {
             snapshot: None,
             instruments: None,
             capabilities: Some(entries),
+            subscribed: SubscribedFields::default(),
+        }
+    }
+
+    /// A successful `subscribe` reply.
+    #[must_use]
+    pub fn subscribed(id: u64, subscribed: Subscribed) -> Self {
+        Self {
+            subscribed: subscribed.into(),
+            ..Self::ok(id)
         }
     }
 }
@@ -170,6 +189,42 @@ impl WsReply {
 mod tests {
     use super::{WsHealthPush, WsReply, WsRequest};
     use crate::spec::EventKindCfg;
+    use datamancer_core::{LiveScope, Subscribed, Timestamp};
+
+    /// A subscribe reply carries what was opened, echoing the id.
+    #[test]
+    fn ws_subscribed_reply_round_trips_the_outcome() {
+        let backfill = LiveScope::LiveBackfill {
+            from: Timestamp(99),
+        };
+        let reply = WsReply::subscribed(4, Subscribed::Created(backfill));
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":4,"ok":true,"scope":"live_backfill","backfill_from":99}"#
+        );
+        let back: WsReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            Subscribed::from(back.subscribed),
+            Subscribed::Created(backfill)
+        );
+        let joined = Subscribed::Joined {
+            session: LiveScope::Live,
+        };
+        let json = serde_json::to_string(&WsReply::subscribed(5, joined)).unwrap();
+        assert_eq!(json, r#"{"id":5,"ok":true,"scope":"live","joined":true}"#);
+        let back: WsReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(Subscribed::from(back.subscribed), joined);
+    }
+
+    #[test]
+    fn a_ws_subscribe_reply_with_no_scope_reads_as_created_live() {
+        let reply: WsReply = serde_json::from_str(r#"{"id":4,"ok":true}"#).unwrap();
+        assert_eq!(
+            Subscribed::from(reply.subscribed),
+            Subscribed::Created(LiveScope::Live)
+        );
+    }
 
     #[test]
     fn ws_subscribe_parses_with_id_and_shared_spec() {

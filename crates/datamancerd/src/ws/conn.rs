@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use datamancer::traits::{EventSink, PublishOutcome};
 use datamancer::transport_ws::{WS_SUBPROTOCOL, WsDataSink, run_writer};
-use datamancer::{AssetClass, ClientSession, Datamancer, Instrument, ProviderId, Scope};
+use datamancer::{AssetClass, ClientSession, Datamancer, Instrument, ProviderId};
 use futures::StreamExt as _;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -261,19 +261,24 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// The `bad_request` answer to a frame that did not parse, under the frame's
+/// own `id` when it has one and 0 otherwise.
+fn invalid_frame_reply(line: &str, error: &serde_json::Error) -> WsReply {
+    #[derive(serde::Deserialize)]
+    struct FrameId {
+        id: u64,
+    }
+    let id = serde_json::from_str::<FrameId>(line).map_or(0, |frame| frame.id);
+    WsReply::error(id, codes::BAD_REQUEST, format!("invalid request: {error}"))
+}
+
 /// Dispatch one parsed control frame against the connection's session. Returns
 /// the reply plus whether the frame was a `close-client` (so the caller need not
 /// re-parse the line to decide on a graceful close).
 async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsReply, bool, bool) {
     let req = match serde_json::from_str::<WsRequest>(line) {
         Ok(req) => req,
-        Err(e) => {
-            return (
-                WsReply::error(0, codes::BAD_REQUEST, format!("invalid request: {e}")),
-                false,
-                false,
-            );
-        }
+        Err(e) => return (invalid_frame_reply(line, &e), false, false),
     };
     let id = req.id();
     let is_close_client = matches!(req, WsRequest::CloseClient { .. });
@@ -289,14 +294,12 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
                 .subscribe(
                     instrument,
                     spec.kind.into(),
-                    Scope::Live {
-                        backfill_from: None,
-                    },
+                    spec.scope,
                     crate::config::persistence_options(spec.persistence),
                 )
                 .await
             {
-                Ok(()) => WsReply::ok(id),
+                Ok(subscribed) => WsReply::subscribed(id, subscribed),
                 Err(e) => ws_reply_from_library_error(id, &e),
             }
         }
@@ -400,7 +403,40 @@ fn spawn_health_push(
 
 #[cfg(test)]
 mod tests {
-    use super::ct_eq;
+    use super::{WsReply, WsRequest, codes, ct_eq, invalid_frame_reply};
+
+    fn reply_to(line: &str) -> WsReply {
+        let error = serde_json::from_str::<WsRequest>(line).expect_err("must not parse");
+        invalid_frame_reply(line, &error)
+    }
+
+    const SUBSCRIBE: &str = r#""op":"subscribe","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade""#;
+
+    #[test]
+    fn a_disagreeing_scope_pair_is_answered_bad_request_under_its_own_id() {
+        for (fields, message) in [
+            (
+                r#""scope":"live_backfill""#,
+                "scope live_backfill requires backfill_from",
+            ),
+            (
+                r#""scope":"live","backfill_from":7"#,
+                "backfill_from requires scope live_backfill",
+            ),
+        ] {
+            let line = format!(r#"{{"id":7,{SUBSCRIBE},{fields}}}"#);
+            let reply = reply_to(&line);
+            assert_eq!(reply.id, 7);
+            assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
+            let detail = reply.message.expect("message");
+            assert!(detail.contains(message), "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_frame_with_no_readable_id_is_answered_under_id_zero() {
+        assert_eq!(reply_to("not json").id, 0);
+    }
 
     #[test]
     fn ct_eq_matches_only_identical_bytes() {

@@ -13,9 +13,9 @@ use datamancer::Surface;
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, DisconnectCause, EventKind,
-    GapSpan, HealthView, Instrument, LiveHandle, Liveness, MarketEvent, PersistenceOptions, Price,
-    Provider, ProviderId, ProviderSnapshot, ProviderState, Result, Scope, Seq, StreamConnection,
-    Timestamp, Trade,
+    GapSpan, HealthView, Instrument, LiveHandle, LiveScope, Liveness, MarketEvent,
+    PersistenceOptions, Price, Provider, ProviderId, ProviderSnapshot, ProviderState, Result,
+    Scope, Seq, StreamConnection, Timestamp, Trade,
 };
 use datamancer_core::{AuthoritativeSessionSnapshot, HistoryRequest};
 use futures::StreamExt;
@@ -1187,7 +1187,7 @@ async fn snapshot_reflects_authoritative_and_client_sessions() {
     c1.subscribe(
         inst("AAPL"),
         EventKind::Trade,
-        live(),
+        LiveScope::Live,
         PersistenceOptions::none(),
     )
     .await
@@ -1195,7 +1195,7 @@ async fn snapshot_reflects_authoritative_and_client_sessions() {
     c2.subscribe(
         inst("AAPL"),
         EventKind::Trade,
-        live(),
+        LiveScope::Live,
         PersistenceOptions::none(),
     )
     .await

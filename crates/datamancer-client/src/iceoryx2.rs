@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use datamancer_core::{
-    ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
+    ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, Subscribed,
+    SystemSnapshot,
 };
 use datamancer_transport_iceoryx2::{DataServiceName, DataSubscriber};
 use futures::Stream;
@@ -435,7 +436,10 @@ impl Client for Iceoryx2Client {
         ))
     }
 
-    async fn subscribe(&mut self, spec: &SubscriptionSpec) -> Result<(), ClientError<Self::Error>> {
+    async fn subscribe(
+        &mut self,
+        spec: &SubscriptionSpec,
+    ) -> Result<Subscribed, ClientError<Self::Error>> {
         let reply = self
             .control
             .request(&Request::Subscribe {
@@ -444,7 +448,7 @@ impl Client for Iceoryx2Client {
             })
             .await
             .map_err(ClientError::Transport)?;
-        check(reply).map(|_| ())
+        check(reply).map(|reply| reply.subscribed.into())
     }
 
     async fn unsubscribe(

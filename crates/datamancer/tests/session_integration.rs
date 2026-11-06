@@ -437,7 +437,7 @@ async fn second_live_open_shares_authoritative_session() {
 }
 
 #[tokio::test]
-async fn live_session_conflict_clears_when_first_is_dropped() {
+async fn a_live_pair_reopens_after_the_first_session_is_dropped() {
     let (provider, _ctrl) = FakeProvider::new("fake");
     let dm = Datamancer::builder()
         .provider_arc(provider)
@@ -472,7 +472,7 @@ async fn live_session_conflict_clears_when_first_is_dropped() {
 }
 
 #[tokio::test]
-async fn live_session_conflict_clears_when_first_is_closed() {
+async fn a_live_pair_reopens_after_the_first_session_is_closed() {
     let (provider, _ctrl) = FakeProvider::new("fake");
     let dm = Datamancer::builder()
         .provider_arc(provider)

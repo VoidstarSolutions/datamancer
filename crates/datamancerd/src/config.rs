@@ -17,8 +17,8 @@ use std::collections::HashMap;
 
 use datamancer::providers::{AccountType, AlpacaHistoryFeed};
 use datamancer::{
-    Adjustment, CredentialsSource, Datamancer, Instrument, PersistenceOptions, ProviderId, Scope,
-    Timestamp,
+    Adjustment, CredentialsSource, Datamancer, Instrument, LiveScope, PersistenceOptions,
+    ProviderId, Timestamp,
     providers::{
         AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue, AlpacaProvider,
         AlpacaProviderConfig, alpaca, alpaca_crypto,
@@ -498,7 +498,18 @@ pub struct StartupSession {
     pub always_on: bool,
 }
 
-pub use datamancer_client::spec::{AssetClassCfg, EventKindCfg, PersistenceCfg, ScopeCfg};
+pub use datamancer_client::spec::{AssetClassCfg, EventKindCfg, PersistenceCfg};
+
+/// Live-scope selector of a startup session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeCfg {
+    /// Purely from "now".
+    #[default]
+    Live,
+    /// History from `backfill_from`, seamed into the live tail.
+    LiveBackfill,
+}
 
 /// Map a persistence preset to the library [`PersistenceOptions`]. Lives here
 /// (not on the moved enum) because the target type is the orchestrator's.
@@ -545,18 +556,22 @@ impl StartupSession {
         )
     }
 
-    /// Resolve the [`Scope`], rejecting `live_backfill` without `backfill_from`
-    /// and an unparseable timestamp.
+    /// Resolve the [`LiveScope`], rejecting `live_backfill` without
+    /// `backfill_from`, `live` with one, and an unparseable timestamp.
     ///
     /// # Errors
     ///
     /// [`DaemonError::ConfigInvalid`] when `live_backfill` lacks a valid
-    /// `backfill_from`.
-    pub fn resolve_scope(&self) -> Result<Scope> {
+    /// `backfill_from`, or `live` has one.
+    pub fn resolve_scope(&self) -> Result<LiveScope> {
         match self.scope {
-            ScopeCfg::Live => Ok(Scope::Live {
-                backfill_from: None,
-            }),
+            ScopeCfg::Live if self.backfill_from.is_some() => {
+                Err(DaemonError::ConfigInvalid(format!(
+                    "startup_session {}/{} uses scope=live but has a backfill_from",
+                    self.symbol, self.provider
+                )))
+            }
+            ScopeCfg::Live => Ok(LiveScope::Live),
             ScopeCfg::LiveBackfill => {
                 let raw = self.backfill_from.as_deref().ok_or_else(|| {
                     DaemonError::ConfigInvalid(format!(
@@ -564,15 +579,13 @@ impl StartupSession {
                         self.symbol, self.provider
                     ))
                 })?;
-                let ts = parse_rfc3339_nanos(raw).ok_or_else(|| {
+                let from = parse_rfc3339_nanos(raw).ok_or_else(|| {
                     DaemonError::ConfigInvalid(format!(
                         "startup_session {} backfill_from {raw:?} is not an RFC3339 timestamp",
                         self.symbol
                     ))
                 })?;
-                Ok(Scope::Live {
-                    backfill_from: Some(ts),
-                })
+                Ok(LiveScope::LiveBackfill { from })
             }
         }
     }
@@ -730,8 +743,9 @@ impl Config {
                     s.symbol
                 )));
             }
-            // Surface a scope/backfill mismatch at validate time.
-            s.resolve_scope()?;
+            datamancer::check_backfill_start(s.resolve_scope()?).map_err(|e| {
+                DaemonError::ConfigInvalid(format!("startup_session {}: {e}", s.symbol))
+            })?;
         }
         // A zero publish interval would panic `tokio::time::interval`, which both
         // the iceoryx2 diagnostics ticker (unix) and the WS health-push task
@@ -1287,6 +1301,50 @@ persistence = "tap_only"
     }
 
     #[test]
+    fn config_rejects_a_startup_backfill_from_at_or_past_the_live_edge() {
+        let text = r#"
+[provider.alpaca_crypto]
+account_type = "paper"
+
+[[startup_session]]
+provider = "alpaca-crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+scope = "live_backfill"
+backfill_from = "2200-01-01T00:00:00Z"
+"#;
+        let config = Config::parse(text).expect("parse");
+        match config.validate().expect_err("must reject") {
+            DaemonError::ConfigInvalid(m) => {
+                assert!(m.contains("not before the live edge"), "{m}");
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_rejects_a_backfill_from_under_scope_live() {
+        let text = r#"
+[provider.alpaca_crypto]
+account_type = "paper"
+
+[[startup_session]]
+provider = "alpaca-crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+scope = "live"
+backfill_from = "2024-01-01T00:00:00Z"
+"#;
+        let config = Config::parse(text).expect("parse");
+        match config.validate().expect_err("must reject") {
+            DaemonError::ConfigInvalid(m) => assert!(m.contains("scope=live"), "{m}"),
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn config_rejects_live_backfill_without_from() {
         let text = r#"
 [provider.alpaca_crypto]
@@ -1370,16 +1428,13 @@ persistence = "none"
         let inst = s.instrument();
         assert_eq!(inst.symbol(), "BTC/USD");
         assert_eq!(inst.provider().as_str(), "alpaca-crypto");
-        let scope = s.resolve_scope().expect("scope");
-        match scope {
-            Scope::Live {
-                backfill_from: Some(ts),
-            } => {
-                // 2026-06-01T00:00:00Z in epoch nanos.
-                assert_eq!(ts.0, 1_780_272_000 * 1_000_000_000);
+        // 2026-06-01T00:00:00Z in epoch nanos.
+        assert_eq!(
+            s.resolve_scope().expect("scope"),
+            LiveScope::LiveBackfill {
+                from: Timestamp(1_780_272_000 * 1_000_000_000)
             }
-            other => panic!("wrong scope: {other:?}"),
-        }
+        );
     }
 
     #[test]
