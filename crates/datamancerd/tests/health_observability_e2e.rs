@@ -267,10 +267,7 @@ async fn health_reflects_disabled_enabled_and_pushes() {
 }
 
 /// Write a daemon config whose only provider is the scripted one (feature
-/// `scripted-provider`). The history delay is the same 400 ms the scripted
-/// `daemon_e2e` tests use: a query that completes before the client's
-/// data-plane subscriber attaches is reaped unseen (`open_query`'s
-/// documented attach race), so the fetch must outlast the attach.
+/// `scripted-provider`).
 #[cfg(feature = "scripted-provider")]
 fn write_config_scripted(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let socket = dir.join("control.sock");
@@ -318,10 +315,9 @@ fn scripted_instrument(symbol: &str) -> datamancer_core::Instrument {
     )
 }
 
-/// Run one history query through the facade up to its terminal
-/// `SessionClosing` (the query stream's end marker: a subscriber that reads
-/// on past it polls the reaped service forever) and return how many data
-/// events it delivered.
+/// Run one history query through the facade to the end of its stream, which
+/// must carry the terminal `SessionClosing`, and return how many data events
+/// it delivered.
 #[cfg(feature = "scripted-provider")]
 async fn drain_query(handle: &mut AppHandle, symbol: &str) -> usize {
     use datamancer_client::spec::QuerySpec;
@@ -336,19 +332,19 @@ async fn drain_query(handle: &mut AppHandle, symbol: &str) -> usize {
     .expect("equity is a wire asset class");
     let (_id, mut stream) = handle.query(&spec).await.expect("query accepted");
     let mut data = 0;
-    let drained = tokio::time::timeout(Duration::from_secs(10), async {
+    let mut closing = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(ev) = stream.next().await {
             match ev {
-                MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing => return true,
+                MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing => closing = true,
                 MarketEvent::Control(_) => {}
                 _ => data += 1,
             }
         }
-        false
     })
     .await
-    .expect("the query must reach SessionClosing within 10s");
-    assert!(drained, "the query stream ended without SessionClosing");
+    .expect("the query stream must end within 10s");
+    assert!(closing, "the query stream ended without SessionClosing");
     data
 }
 

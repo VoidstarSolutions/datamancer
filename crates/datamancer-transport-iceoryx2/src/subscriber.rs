@@ -88,10 +88,12 @@ mod runtime {
     use datamancer_core::MarketEvent;
     use iceoryx2::port::subscriber::Subscriber;
     use iceoryx2::prelude::{Node, ipc_threadsafe};
+    use iceoryx2::service::port_factory::{PortFactory as _, publish_subscribe::PortFactory};
 
     /// Live subscriber over a client's data + announcement services. Public so
     /// the Phase-5 fan-out node can reuse it.
     pub struct DataSubscriber {
+        data_service: PortFactory<ipc_threadsafe::Service, DataPayload, ()>,
         data: Subscriber<ipc_threadsafe::Service, DataPayload, ()>,
         announcements: Subscriber<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
         buffer: HoldBuffer,
@@ -107,21 +109,23 @@ mod runtime {
         ///
         /// # Errors
         ///
-        /// Returns [`TransportError::Service`] if either service or subscriber
-        /// port cannot be opened.
+        /// Returns [`TransportError::Service`] if either service does not
+        /// exist or a service or subscriber port cannot be opened, and
+        /// [`TransportError::StaleService`] if a service is marked for
+        /// destruction.
         pub fn open(node: &Node<ipc_threadsafe::Service>, name: &DataServiceName) -> Result<Self> {
             let (data_name, ann_name) = name.service_names();
 
             let data_service = node
                 .service_builder(&data_name)
                 .publish_subscribe::<DataPayload>()
-                .open_or_create()
-                .map_err(|e| crate::error::open_or_create_error(data_name.as_str(), e))?;
+                .open()
+                .map_err(|e| crate::error::open_error(data_name.as_str(), e))?;
             let ann_service = node
                 .service_builder(&ann_name)
                 .publish_subscribe::<SymbolAnnouncement>()
-                .open_or_create()
-                .map_err(|e| crate::error::open_or_create_error(ann_name.as_str(), e))?;
+                .open()
+                .map_err(|e| crate::error::open_error(ann_name.as_str(), e))?;
 
             let data = data_service
                 .subscriber_builder()
@@ -133,20 +137,33 @@ mod runtime {
                 .map_err(|e| TransportError::Service(format!("{e:?}")))?;
 
             Ok(Self {
+                data_service,
                 data,
                 announcements,
                 buffer: HoldBuffer::new(),
             })
         }
 
-        /// Drain all currently available announcements then all data samples,
-        /// returning the reconstructable logical events in arrival order.
-        /// Unresolved samples are held for a later call.
+        /// Drain all currently available data samples then all announcements,
+        /// returning the reconstructable logical events in arrival order. An
+        /// announcement is published before its first data sample, so reading
+        /// data first finds it. Unresolved samples are held for a later call.
         ///
         /// # Errors
         ///
-        /// Returns [`TransportError`] on an iceoryx2 receive failure.
+        /// Returns [`TransportError::ServiceClosed`] once the service has no
+        /// publisher and nothing is left to return, and another
+        /// [`TransportError`] on an iceoryx2 receive failure.
         pub fn poll(&mut self) -> Result<Vec<MarketEvent>> {
+            let closed = self.data_service.dynamic_config().number_of_publishers() == 0;
+            let mut samples = Vec::new();
+            while let Some(sample) = self
+                .data
+                .receive()
+                .map_err(|e| TransportError::Send(format!("{e:?}")))?
+            {
+                samples.push(*sample);
+            }
             let mut events = Vec::new();
             while let Some(sample) = self
                 .announcements
@@ -162,12 +179,11 @@ mod runtime {
                     .map_err(|e| TransportError::Interning(e.to_string()))?;
                 events.extend(resolved);
             }
-            while let Some(sample) = self
-                .data
-                .receive()
-                .map_err(|e| TransportError::Send(format!("{e:?}")))?
-            {
-                events.extend(self.buffer.offer(*sample));
+            for sample in samples {
+                events.extend(self.buffer.offer(sample));
+            }
+            if closed && events.is_empty() {
+                return Err(TransportError::ServiceClosed);
             }
             Ok(events)
         }
