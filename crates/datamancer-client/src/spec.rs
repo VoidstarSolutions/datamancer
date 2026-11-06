@@ -3,7 +3,6 @@
 //! `subscribe`/`unsubscribe` carry.
 
 use datamancer_core::{AssetClass, BarInterval, EventKind, Instrument, LiveScope, Timestamp};
-use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// The core value has no wire selector: the daemon's control vocabulary is a
@@ -105,7 +104,7 @@ pub enum PersistenceCfg {
 }
 
 /// One target `(instrument, kind)` plus per-request scope/persistence
-/// preferences. Used by both `subscribe` and the `open-client` seed list.
+/// preferences. Used by both `subscribe` and the `open-client` subscription list.
 ///
 /// No `deny_unknown_fields`: these structs are `#[serde(flatten)]`-ed into
 /// the request frames, and serde documents that combination as unsupported
@@ -118,8 +117,9 @@ pub struct SubscriptionSpec {
     pub asset_class: AssetClassCfg,
     pub symbol: String,
     pub kind: EventKindCfg,
-    /// The scope to open. A `scope` key absent from the wire means live; a
-    /// `scope` and `backfill_from` that disagree fail to parse.
+    /// The scope to open. A `scope` key absent from the wire means live, and
+    /// under live a `seed` absent or `null` means `true`; a `scope`,
+    /// `backfill_from` and non-null `seed` that disagree fail to parse.
     #[serde(flatten, deserialize_with = "live_scope_from_wire")]
     pub scope: LiveScope,
     #[serde(default)]
@@ -152,6 +152,16 @@ impl SubscriptionSpec {
         self.scope = LiveScope::LiveBackfill { from };
         self
     }
+
+    /// Decline the latest-value seed: see [`LiveScope::Live`]. A no-op on a
+    /// [`LiveScope::LiveBackfill`], which never seeds.
+    #[must_use]
+    pub fn without_seed(mut self) -> Self {
+        if let LiveScope::Live { seed } = &mut self.scope {
+            *seed = false;
+        }
+        self
+    }
 }
 
 #[derive(Deserialize)]
@@ -167,27 +177,43 @@ struct ScopeFields {
     scope: Option<ScopeName>,
     #[serde(default)]
     backfill_from: Option<Timestamp>,
+    #[serde(default)]
+    seed: Option<bool>,
+}
+
+impl ScopeFields {
+    fn live_scope<E: serde::de::Error>(self) -> Result<Option<LiveScope>, E> {
+        match (self.scope, self.backfill_from, self.seed) {
+            (None, None, None) => Ok(None),
+            (Some(ScopeName::Live), None, seed) => Ok(Some(LiveScope::Live {
+                seed: seed.unwrap_or(true),
+            })),
+            (Some(ScopeName::LiveBackfill), Some(from), None) => {
+                Ok(Some(LiveScope::LiveBackfill { from }))
+            }
+            (Some(ScopeName::LiveBackfill), Some(_), Some(_)) | (None, None, Some(_)) => {
+                Err(E::custom("seed requires scope live"))
+            }
+            (Some(ScopeName::LiveBackfill), None, _) => {
+                Err(E::custom("scope live_backfill requires backfill_from"))
+            }
+            (Some(ScopeName::Live) | None, Some(_), _) => {
+                Err(E::custom("backfill_from requires scope live_backfill"))
+            }
+        }
+    }
 }
 
 pub(crate) fn optional_live_scope_from_wire<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<LiveScope>, D::Error> {
-    let fields = ScopeFields::deserialize(deserializer)?;
-    match (fields.scope, fields.backfill_from) {
-        (None, None) => Ok(None),
-        (Some(ScopeName::Live), None) => Ok(Some(LiveScope::Live)),
-        (Some(ScopeName::LiveBackfill), Some(from)) => Ok(Some(LiveScope::LiveBackfill { from })),
-        (Some(ScopeName::LiveBackfill), None) => Err(D::Error::custom(
-            "scope live_backfill requires backfill_from",
-        )),
-        (Some(ScopeName::Live) | None, Some(_)) => Err(D::Error::custom(
-            "backfill_from requires scope live_backfill",
-        )),
-    }
+    ScopeFields::deserialize(deserializer)?.live_scope()
 }
 
 fn live_scope_from_wire<'de, D: Deserializer<'de>>(deserializer: D) -> Result<LiveScope, D::Error> {
-    optional_live_scope_from_wire(deserializer).map(Option::unwrap_or_default)
+    let mut fields = ScopeFields::deserialize(deserializer)?;
+    fields.scope.get_or_insert(ScopeName::Live);
+    fields.live_scope().map(Option::unwrap_or_default)
 }
 
 /// The `(provider, asset_class, symbol, kind)` tuple an `unsubscribe` names.
@@ -325,16 +351,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec, from_json);
-        assert_eq!(spec.scope, LiveScope::Live);
+        assert_eq!(spec.scope, LiveScope::default());
         assert_eq!(spec.persistence, PersistenceCfg::None);
 
         let unsub = UnsubscribeSpec::new(&instrument, EventKind::Trade).unwrap();
         assert_eq!(UnsubscribeSpec::from(spec), unsub);
     }
 
-    /// `backfill_from` is absent from a pure-live frame (an older daemon's
-    /// unknown-key rejection never sees it) and rides as a bare integer
-    /// timestamp under `live_backfill`.
+    /// `backfill_from` is absent from a pure-live frame and rides as a bare
+    /// integer timestamp under `live_backfill`.
     #[test]
     fn backfill_from_is_omitted_when_none_and_carried_under_live_backfill() {
         let instrument = Instrument::new(
@@ -371,16 +396,74 @@ mod tests {
 
     #[test]
     fn scope_fields_parse_to_one_live_scope() {
-        assert_eq!(parse_scope("").unwrap(), LiveScope::Live);
-        assert_eq!(parse_scope(r#","scope":"live""#).unwrap(), LiveScope::Live);
+        let seeded = LiveScope::default();
+        let unseeded = LiveScope::Live { seed: false };
+        assert_eq!(parse_scope("").unwrap(), seeded);
+        assert_eq!(parse_scope(r#","scope":"live""#).unwrap(), seeded);
         assert_eq!(
             parse_scope(r#","scope":"live","backfill_from":null"#).unwrap(),
-            LiveScope::Live
+            seeded
+        );
+        assert_eq!(parse_scope(r#","seed":null"#).unwrap(), seeded);
+        assert_eq!(
+            parse_scope(r#","scope":"live","seed":true"#).unwrap(),
+            seeded
+        );
+        assert_eq!(parse_scope(r#","seed":false"#).unwrap(), unseeded);
+        assert_eq!(
+            parse_scope(r#","scope":"live","seed":false"#).unwrap(),
+            unseeded
         );
         assert_eq!(
             parse_scope(r#","scope":"live_backfill","backfill_from":7"#).unwrap(),
             LiveScope::LiveBackfill { from: Timestamp(7) }
         );
+        assert_eq!(
+            parse_scope(r#","scope":"live_backfill","backfill_from":7,"seed":null"#).unwrap(),
+            LiveScope::LiveBackfill { from: Timestamp(7) }
+        );
+    }
+
+    #[test]
+    fn seed_is_always_on_a_live_frame_and_never_on_a_backfill_frame() {
+        let instrument = Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        );
+        let spec = SubscriptionSpec::new(&instrument, EventKind::Trade).unwrap();
+        let wire = serde_json::to_string(&spec).unwrap();
+        assert!(wire.contains(r#""scope":"live","seed":true"#), "{wire}");
+        let wire = serde_json::to_string(&spec.clone().without_seed()).unwrap();
+        assert!(wire.contains(r#""scope":"live","seed":false"#), "{wire}");
+        let wire = serde_json::to_string(&spec.with_backfill_from(Timestamp(7))).unwrap();
+        assert!(!wire.contains("seed"), "{wire}");
+    }
+
+    #[test]
+    fn with_backfill_from_and_without_seed_commute_on_a_backfill() {
+        let instrument = Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        );
+        let spec = SubscriptionSpec::new(&instrument, EventKind::Trade).unwrap();
+        let backfill = LiveScope::LiveBackfill { from: Timestamp(7) };
+        assert_eq!(
+            spec.clone()
+                .without_seed()
+                .with_backfill_from(Timestamp(7))
+                .scope,
+            backfill
+        );
+        assert_eq!(
+            spec.clone()
+                .with_backfill_from(Timestamp(7))
+                .without_seed()
+                .scope,
+            backfill
+        );
+        assert_eq!(spec.without_seed().scope, LiveScope::Live { seed: false });
     }
 
     #[test]
@@ -404,6 +487,13 @@ mod tests {
                 err.contains("backfill_from requires scope live_backfill"),
                 "{err}"
             );
+        }
+        for fields in [
+            r#","scope":"live_backfill","backfill_from":7,"seed":true"#,
+            r#","scope":"live_backfill","backfill_from":7,"seed":false"#,
+        ] {
+            let err = parse_scope(fields).unwrap_err().to_string();
+            assert!(err.contains("seed requires scope live"), "{err}");
         }
     }
 

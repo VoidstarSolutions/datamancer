@@ -121,9 +121,7 @@ fn assert_disabled(err: &Error, want: &str) {
     );
 }
 
-const LIVE: Scope = Scope::Live {
-    backfill_from: None,
-};
+const LIVE: Scope = Scope::live();
 
 /// An instrument whose id no test provider owns.
 fn unowned() -> Instrument {
@@ -149,9 +147,7 @@ async fn live_only_provider_serves_a_plain_live_session() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await;
@@ -182,9 +178,7 @@ async fn history_only_provider_is_rejected_for_live() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -201,9 +195,7 @@ async fn backfill_requires_both_surfaces() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::default(),
         )
         .await
@@ -221,9 +213,7 @@ async fn backfill_refuses_to_split_surfaces_across_providers() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::default(),
         )
         .await
@@ -245,9 +235,7 @@ async fn provider_serving_both_surfaces_satisfies_backfill() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::default(),
         )
         .await;
@@ -316,9 +304,7 @@ async fn instrument_provider_id_picks_among_overlapping_providers() {
                 "AAPL",
             ),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -375,7 +361,7 @@ async fn subscribe_to_an_id_no_provider_owns_is_an_unknown_provider() {
         .subscribe(
             unowned(),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::default(),
         )
         .await
@@ -397,9 +383,7 @@ async fn named_provider_that_cannot_serve_is_an_error_not_a_fallthrough() {
         .session(
             Instrument::new(ProviderId::from_static("named"), AssetClass::Equity, "AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -423,9 +407,7 @@ async fn disabled_named_provider_is_an_error_not_a_fallthrough() {
         .session(
             Instrument::new(ProviderId::from_static("named"), AssetClass::Equity, "AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -480,7 +462,7 @@ async fn joiner_on_a_disabled_provider_is_refused_like_a_creator() {
         .subscribe(
             instrument(),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::default(),
         )
         .await
@@ -492,7 +474,7 @@ async fn joiner_on_a_disabled_provider_is_refused_like_a_creator() {
         .subscribe(
             instrument(),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::default(),
         )
         .await
@@ -500,7 +482,7 @@ async fn joiner_on_a_disabled_provider_is_refused_like_a_creator() {
     assert_eq!(
         outcome,
         Subscribed::Joined {
-            session: LiveScope::Live
+            session: LiveScope::default()
         }
     );
     let _ = client.close().await;
@@ -518,9 +500,7 @@ async fn backfill_request_joins_a_pair_held_pure_live_by_a_live_only_provider() 
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -538,7 +518,7 @@ async fn backfill_request_joins_a_pair_held_pure_live_by_a_live_only_provider() 
     assert_eq!(
         outcome,
         Subscribed::Joined {
-            session: LiveScope::Live
+            session: LiveScope::default()
         }
     );
     let _ = client.close().await;

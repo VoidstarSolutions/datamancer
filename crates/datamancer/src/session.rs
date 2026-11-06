@@ -25,8 +25,8 @@
 //! it (or calling [`Session::close`]) tears the session down even while a
 //! stream is held. Historical sessions stay single-shot and fetch-anchored.
 //!
-//! `Scope::Live { backfill_from: Some(t) }` runs a real backfill over
-//! `[t, B)` (B = the wall-clock live edge at session start) through the
+//! [`Scope::live_backfill`] runs a real backfill over
+//! `[from, B)` (B = the wall-clock live edge at session start) through the
 //! historical read-through machinery, buffering live arrivals and splicing
 //! them in after the backfill output. A healthy seam emits no synthetic
 //! control; `Gap` appears only for real, known loss (fetch failure, buffer
@@ -77,21 +77,26 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// What data a session covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Scope {
     /// Bounded source-time range. The session's stream completes when `to`
     /// is reached.
     Historical { from: Timestamp, to: Timestamp },
-    /// Unbounded live subscription. With `backfill_from = Some(t)`, the
-    /// session fetches history from `t` up to the live edge and seams into
-    /// the live tail; with `None`, it starts purely from "now."
-    Live { backfill_from: Option<Timestamp> },
+    /// Unbounded live subscription.
+    Live(LiveScope),
 }
 
-impl From<LiveScope> for Scope {
-    fn from(scope: LiveScope) -> Self {
-        Self::Live {
-            backfill_from: scope.backfill_from(),
-        }
+impl Scope {
+    /// [`Scope::Live`] with the default [`LiveScope`].
+    #[must_use]
+    pub const fn live() -> Self {
+        Self::Live(LiveScope::Live { seed: true })
+    }
+
+    /// [`Scope::Live`] with [`LiveScope::LiveBackfill`] from `from`.
+    #[must_use]
+    pub const fn live_backfill(from: Timestamp) -> Self {
+        Self::Live(LiveScope::LiveBackfill { from })
     }
 }
 
@@ -322,13 +327,11 @@ impl Datamancer {
                     variant: SessionVariant::Historical(HistoricalSession { inner }),
                 })
             }
-            Scope::Live { backfill_from } => {
+            Scope::Live(scope) => {
                 // Live sessions are refcounted referrers onto the shared
                 // authoritative session: a second opener for the same pair shares
                 // it. The single-pair `Session` is implemented as a one-subscription
                 // client referrer.
-                let scope =
-                    backfill_from.map_or(LiveScope::Live, |from| LiveScope::LiveBackfill { from });
                 let Attached {
                     session: authoritative,
                     guard,
@@ -478,7 +481,7 @@ impl Datamancer {
         let inner = Arc::new(SessionInner {
             instrument: instrument.clone(),
             kind,
-            scope: scope.into(),
+            scope: Scope::Live(scope),
             events_holder: Mutex::new(None),
             persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
@@ -500,13 +503,11 @@ impl Datamancer {
             accounting: accounting.clone(),
             data_forwarded: false,
         };
-        let backfill_from = scope.backfill_from();
-        // Pure-live only: fire a non-gating "latest value" fetch concurrently
+        // A seeded session fires a non-gating "latest value" fetch concurrently
         // with the live connect. The result is injected as the first data event
         // (immediate UI feedback) unless a real live value wins the race, in
-        // which case run_live discards it. Backfill sessions already supply a
-        // first value, so they skip this.
-        let seed_rx = (backfill_from.is_none())
+        // which case run_live discards it.
+        let seed_rx = matches!(scope, LiveScope::Live { seed: true })
             .then(|| Self::spawn_latest_seed(provider.clone(), instrument.clone(), kind));
         // A failed open leaves no controller and no substream behind, so its
         // evidence is recorded on the provider here (`last_error`, and the
@@ -527,7 +528,7 @@ impl Datamancer {
         }
         tokio::spawn(controller.run_live(
             live,
-            backfill_from,
+            scope.backfill_from(),
             provider_rx,
             cmd_rx,
             remove_rx,
@@ -543,7 +544,7 @@ impl Datamancer {
         })
     }
 
-    /// Spawn the non-gating `Provider::latest` fetch for a pure-live session
+    /// Spawn the non-gating `Provider::latest` fetch for a seeded session
     /// and return the receiver half. Fires concurrently with the live connect;
     /// `run_live` injects the result as the first data event unless a real
     /// live value wins the race first.
@@ -1240,7 +1241,7 @@ impl Session {
     pub fn scope(&self) -> Scope {
         match &self.variant {
             SessionVariant::Historical(h) => h.inner.scope,
-            SessionVariant::Live(l) => l.authoritative.scope.into(),
+            SessionVariant::Live(l) => Scope::Live(l.authoritative.scope),
         }
     }
 }
@@ -2284,7 +2285,7 @@ impl Controller {
         ) {
             return;
         }
-        if !matches!(self.inner.scope, Scope::Live { .. }) {
+        if !matches!(self.inner.scope, Scope::Live(_)) {
             return;
         }
         let Some(log) = &self.tap_log else { return };

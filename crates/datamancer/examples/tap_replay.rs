@@ -115,9 +115,7 @@ async fn main() -> Result<()> {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await?;

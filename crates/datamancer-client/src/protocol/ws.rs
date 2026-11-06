@@ -209,12 +209,20 @@ mod tests {
             Subscribed::Created(backfill)
         );
         let joined = Subscribed::Joined {
-            session: LiveScope::Live,
+            session: LiveScope::default(),
         };
         let json = serde_json::to_string(&WsReply::subscribed(5, joined)).unwrap();
-        assert_eq!(json, r#"{"id":5,"ok":true,"scope":"live","joined":true}"#);
+        assert_eq!(
+            json,
+            r#"{"id":5,"ok":true,"scope":"live","seed":true,"joined":true}"#
+        );
         let back: WsReply = serde_json::from_str(&json).unwrap();
         assert_eq!(Subscribed::from(back.subscribed), joined);
+        let unseeded = Subscribed::Created(LiveScope::Live { seed: false });
+        let json = serde_json::to_string(&WsReply::subscribed(6, unseeded)).unwrap();
+        assert_eq!(json, r#"{"id":6,"ok":true,"scope":"live","seed":false}"#);
+        let back: WsReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(Subscribed::from(back.subscribed), unseeded);
     }
 
     #[test]
@@ -222,7 +230,7 @@ mod tests {
         let reply: WsReply = serde_json::from_str(r#"{"id":4,"ok":true}"#).unwrap();
         assert_eq!(
             Subscribed::from(reply.subscribed),
-            Subscribed::Created(LiveScope::Live)
+            Subscribed::Created(LiveScope::default())
         );
     }
 
@@ -235,6 +243,17 @@ mod tests {
                 assert_eq!(id, 7);
                 assert_eq!(spec.symbol, "BTC/USD");
                 assert_eq!(spec.kind, EventKindCfg::Trade);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ws_subscribe_accepts_seed_false() {
+        let line = r#"{"id":8,"op":"subscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","seed":false}"#;
+        match serde_json::from_str::<WsRequest>(line).expect("de") {
+            WsRequest::Subscribe { spec, .. } => {
+                assert_eq!(spec.scope, LiveScope::Live { seed: false });
             }
             other => panic!("wrong variant: {other:?}"),
         }

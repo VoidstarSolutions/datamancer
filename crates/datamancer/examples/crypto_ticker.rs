@@ -80,9 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         *sym,
                     ),
                     kind,
-                    Scope::Live {
-                        backfill_from: None,
-                    },
+                    Scope::live(),
                     PersistenceOptions::none(),
                 )
                 .await?;

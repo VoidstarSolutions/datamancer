@@ -630,7 +630,7 @@ impl StartupSession {
                     self.symbol, self.provider
                 )))
             }
-            ScopeCfg::Live => Ok(LiveScope::Live),
+            ScopeCfg::Live => Ok(LiveScope::default()),
             ScopeCfg::LiveBackfill => {
                 let raw = self.backfill_from.as_deref().ok_or_else(|| {
                     DaemonError::ConfigInvalid(format!(

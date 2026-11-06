@@ -423,6 +423,10 @@ mod tests {
                 r#""scope":"live","backfill_from":7"#,
                 "backfill_from requires scope live_backfill",
             ),
+            (
+                r#""scope":"live_backfill","backfill_from":7,"seed":false"#,
+                "seed requires scope live",
+            ),
         ] {
             let line = format!(r#"{{"id":7,{SUBSCRIBE},{fields}}}"#);
             let reply = reply_to(&line);

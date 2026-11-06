@@ -173,7 +173,9 @@ if let Some(from) = client.subscribe(&spec).await?.history_from() {
 }
 ```
 
-A subscribe reply with no `scope` reads as `Subscribed::Created(LiveScope::Live)`.
+`SubscriptionSpec::without_seed` declines the latest-value seed; `LiveScope::Live` says what a
+joiner observes. A subscribe reply with neither `scope` nor `seed` reads as
+`Subscribed::Created(LiveScope::default())`.
 
 When starting from discovery instead of a hand-written spec, use
 `SubscriptionSpec::new` to close the loop — it converts the core vocabulary

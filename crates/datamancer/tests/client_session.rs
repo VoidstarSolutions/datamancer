@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use datamancer::Surface;
 use datamancer::{
     AssetClass, ControlKind, Datamancer, EventKind, Instrument, LiveHandle, LiveScope, MarketEvent,
-    PersistenceOptions, Price, Provider, ProviderId, Result, Seq, Subscribed, Timestamp, Trade,
+    PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq, Subscribed, Timestamp,
+    Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -252,7 +253,7 @@ fn trade(symbol: &str, ts: i64) -> MarketEvent {
 }
 
 fn live() -> LiveScope {
-    LiveScope::Live
+    LiveScope::default()
 }
 
 async fn next_ev(stream: &mut datamancer::EventStream) -> MarketEvent {
@@ -1387,7 +1388,7 @@ async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            backfill.into(),
+            Scope::Live(backfill),
             PersistenceOptions::none(),
         )
         .await

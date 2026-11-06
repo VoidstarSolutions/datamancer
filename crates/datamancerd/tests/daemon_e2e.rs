@@ -884,6 +884,10 @@ fn subscribe_live_backfill_serves_history_then_buffered_prints_then_live() {
         reply.get("joined").is_none(),
         "the creator is not a joiner: {reply}"
     );
+    assert!(
+        reply.get("seed").is_none(),
+        "a backfill never seeds: {reply}"
+    );
 
     // A second client, pure-live on the same pair, is told the actual scope.
     let mut second = Conn::open(&daemon);
@@ -982,6 +986,87 @@ fn subscribe_live_seeds_from_the_latest_knob() {
             "latest = {latest}: {seen:?}"
         );
     }
+}
+
+/// `seed:false` opens a session with no data event ahead of the first live print,
+/// a joiner asking for the seed is told the session's choice, and an explicit
+/// `seed:true` on another pair delivers the latest value first.
+#[test]
+#[cfg(feature = "scripted-provider")]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn subscribe_seed_false_delivers_the_first_live_print_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_scripted_daemon(dir.path(), "latest = true\nlive_interval_ms = 300\n", "");
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+
+    let mut unseeded = Conn::open(&daemon);
+    let mut unseeded_sub = unseeded.open_client("unseeded", &node);
+    let reply = unseeded.request(
+        r#"{"op":"subscribe","client":"unseeded","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live","seed":false}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["scope"], "live", "{reply}");
+    assert_eq!(reply["seed"], false, "{reply}");
+
+    let mut joiner = Conn::open(&daemon);
+    let _joiner_sub = joiner.open_client("joiner", &node);
+    let reply = joiner.request(
+        r#"{"op":"subscribe","client":"joiner","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","seed":true}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["joined"], true, "{reply}");
+    assert_eq!(reply["seed"], false, "{reply}");
+
+    let seen = collect(&mut unseeded_sub, 1, Duration::from_secs(10));
+    assert!(
+        matches!(seen.first(), Some(Seen::Trade(price, _, 0)) if (price - 100.0).abs() < 1e-9),
+        "the first event must be the first live print: {seen:?}"
+    );
+
+    let mut seeded = Conn::open(&daemon);
+    let mut seeded_sub = seeded.open_client("seeded", &node);
+    let reply = seeded.request(
+        r#"{"op":"subscribe","client":"seeded","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade","seed":true}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["seed"], true, "{reply}");
+    let seen = collect(&mut seeded_sub, 2, Duration::from_secs(10));
+    assert!(seen.len() >= 2, "{seen:?}");
+    assert_eq!(seen[0], Seen::Trade(999.0, 1, 0), "seed first: {seen:?}");
+    assert!(
+        matches!(seen[1], Seen::Trade(price, _, 1) if (price - 100.0).abs() < 1e-9),
+        "then live: {seen:?}"
+    );
+}
+
+/// `seed:false` inside `open-client` reaches the session it creates: a joiner
+/// is told the session does not seed.
+#[test]
+#[cfg(feature = "scripted-provider")]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn open_client_subscriptions_carry_seed_false_to_the_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_scripted_daemon(dir.path(), "latest = true\nlive_interval_ms = 300\n", "");
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+
+    let mut opener = Conn::open(&daemon);
+    let reply = opener.request(
+        r#"{"op":"open-client","client":"opener","subscriptions":[{"provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","seed":false}]}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+
+    let mut joiner = Conn::open(&daemon);
+    let _joiner_sub = joiner.open_client("joiner", &node);
+    let reply = joiner.request(
+        r#"{"op":"subscribe","client":"joiner","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade"}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["joined"], true, "{reply}");
+    assert_eq!(reply["seed"], false, "{reply}");
 }
 
 /// `subscribe` to an id no provider owns answers `unknown_provider`, and to a

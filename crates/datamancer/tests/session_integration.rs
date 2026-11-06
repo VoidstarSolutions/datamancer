@@ -12,8 +12,8 @@ use datamancer::Surface;
 use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, EventKind, Instrument,
-    LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ReplayRequest,
-    Result, Scope, Seq, TapLog, Timestamp, Trade,
+    LiveHandle, LiveScope, MarketEvent, PersistenceOptions, Price, Provider, ProviderId,
+    ReplayRequest, Result, Scope, Seq, Subscribed, TapLog, Timestamp, Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -226,9 +226,7 @@ async fn live_session_assigns_monotonic_seq_and_passes_events_through() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -364,9 +362,7 @@ async fn persist_true_without_persistence_layer_errors() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::cached(),
         )
         .await
@@ -393,9 +389,7 @@ async fn second_live_open_shares_authoritative_session() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -404,9 +398,7 @@ async fn second_live_open_shares_authoritative_session() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -448,9 +440,7 @@ async fn a_live_pair_reopens_after_the_first_session_is_dropped() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -462,9 +452,7 @@ async fn a_live_pair_reopens_after_the_first_session_is_dropped() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -483,9 +471,7 @@ async fn a_live_pair_reopens_after_the_first_session_is_closed() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -496,9 +482,7 @@ async fn a_live_pair_reopens_after_the_first_session_is_closed() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -588,9 +572,7 @@ async fn historical_and_live_sessions_for_same_pair_coexist() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -609,9 +591,7 @@ async fn live_stream_retake_resumes_with_contiguous_seq() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -697,9 +677,7 @@ async fn take_events_twice_concurrently_errors() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -764,9 +742,7 @@ async fn live_session_tees_data_events_to_tap_log() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await
@@ -813,9 +789,7 @@ async fn tap_log_disabled_captures_nothing() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(), // write_tap_log off
         )
         .await
@@ -878,9 +852,7 @@ async fn dropping_the_session_ends_a_held_stream() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -919,9 +891,7 @@ async fn write_tap_log_without_a_log_is_rejected() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await
@@ -960,9 +930,7 @@ async fn seed_wins_when_no_live_data_yet() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1004,9 +972,7 @@ async fn connect_control_does_not_cancel_seed() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1069,9 +1035,7 @@ async fn seed_discarded_when_live_data_wins() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1110,9 +1074,7 @@ async fn no_seed_when_latest_returns_none() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1123,6 +1085,155 @@ async fn no_seed_when_latest_returns_none() {
     let first = stream.next().await.expect("live event");
     assert_eq!(trade_price(&first), 10.0);
     assert_eq!(first.seq(), Some(Seq(0))); // no seed consumed seq 0
+}
+
+const UNSEEDED: LiveScope = LiveScope::Live { seed: false };
+
+/// The next data event, skipping controls.
+async fn next_data(stream: &mut datamancer::EventStream) -> MarketEvent {
+    loop {
+        match stream.next().await.expect("event") {
+            MarketEvent::Control(_) => {}
+            data => break data,
+        }
+    }
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn unseeded_session_delivers_nothing_before_the_first_live_print() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live(UNSEEDED),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.scope(), Scope::Live(UNSEEDED));
+    let mut stream = session.take_events().await.expect("take events");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err(),
+        "an unseeded session must deliver nothing before the first live print"
+    );
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let first = stream.next().await.expect("live event");
+    assert_eq!(trade_price(&first), 10.0);
+    assert_eq!(first.seq(), Some(Seq(0)));
+    assert_eq!(ctrl.latest_calls().await, 0);
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn a_seeding_joiner_takes_an_unseeded_session_as_it_is() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let opener = dm.client_session();
+    let created = opener
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            UNSEEDED,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created, Subscribed::Created(UNSEEDED));
+    let joiner = dm.client_session();
+    let outcome = joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::default(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, Subscribed::Joined { session: UNSEEDED });
+
+    let mut stream = joiner.take_events().await.expect("take events");
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let first = next_data(&mut stream).await;
+    assert_eq!(trade_price(&first), 10.0, "no seed precedes the live print");
+    assert_eq!(first.seq(), Some(Seq(0)));
+    assert_eq!(ctrl.latest_calls().await, 0);
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn a_late_unseeded_joiner_on_a_seeding_session_starts_at_the_next_print() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let opener = dm.client_session();
+    opener
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::default(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut opener_stream = opener.take_events().await.expect("take events");
+    let seed = next_data(&mut opener_stream).await;
+    assert_eq!(trade_price(&seed), 999.0);
+
+    let joiner = dm.client_session();
+    let outcome = joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            UNSEEDED,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Subscribed::Joined {
+            session: LiveScope::default()
+        }
+    );
+
+    let mut stream = joiner.take_events().await.expect("take events");
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let first = next_data(&mut stream).await;
+    assert_eq!(trade_price(&first), 10.0);
+    assert_eq!(first.seq(), Some(Seq(1)));
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
 }
 
 #[tokio::test]
@@ -1139,9 +1250,7 @@ async fn no_seed_under_backfill() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(1)),
-            },
+            Scope::live_backfill(Timestamp(1)),
             PersistenceOptions::none(),
         )
         .await
@@ -1176,9 +1285,7 @@ async fn seed_is_teed_to_tap_log() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await
@@ -1261,9 +1368,7 @@ async fn seed_is_not_recorded_as_a_live_arrival() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1319,9 +1424,7 @@ async fn first_live_event_after_seed_sets_live_stats() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
