@@ -27,12 +27,12 @@ use datamancer::transport::{
     Iceoryx2HealthPublisher, ServicePrefix,
 };
 use datamancer::{
-    AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Session,
-    TapLog, traits::EventSink,
+    AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
+    Session, TapLog, traits::EventSink,
 };
-// Named only by the unix `open-client` and `open-query` arms.
+// Named only by the unix `open-client` arm.
 #[cfg(not(windows))]
-use datamancer::{LiveScope, Scope};
+use datamancer::LiveScope;
 // `Timestamp` only appears in `validate_query_open`'s signature and its
 // tests, both unix/macOS only — importing it unconditionally would be
 // `unused_imports` on Windows.
@@ -328,7 +328,7 @@ async fn open_anchor(
         .session(
             startup.instrument(),
             startup.kind.into(),
-            startup.resolve_scope()?.into(),
+            Scope::Live(startup.resolve_scope()?),
             crate::config::persistence_options(startup.persistence),
         )
         .await;
@@ -1041,7 +1041,7 @@ impl Server {
                 format!("service cap {} exceeded", self.max_clients),
             );
         }
-        if let Some(reply) = validate_seeds(&subscriptions) {
+        if let Some(reply) = validate_initial_subscriptions(&subscriptions) {
             return reply;
         }
 
@@ -1347,41 +1347,72 @@ fn validate_query_open(
     None
 }
 
-/// Validate all seeds before subscribing any.
+/// Validate every initial subscription before subscribing any.
 #[cfg(not(windows))]
-fn validate_seeds(seeds: &[SubscriptionSpec]) -> Option<Reply> {
-    seeds
+fn validate_initial_subscriptions(subscriptions: &[SubscriptionSpec]) -> Option<Reply> {
+    subscriptions
         .iter()
-        .find(|seed| seed.scope != LiveScope::Live)
-        .map(|seed| {
+        .find(|spec| !matches!(spec.scope, LiveScope::Live { .. }))
+        .map(|spec| {
             Reply::error(
                 codes::BAD_REQUEST,
                 format!(
-                    "open-client seed {} is not live; subscribe after opening to backfill",
-                    seed.symbol
+                    "open-client subscription {} is not live; subscribe after opening to backfill",
+                    spec.symbol
                 ),
             )
         })
 }
 
-/// Reject a control request that carries unknown top-level JSON keys. `serde`'s
+/// Reject a control request that carries unknown JSON keys, at its top level
+/// or in an `open-client` `subscriptions` element. `serde`'s
 /// `deny_unknown_fields` cannot cover `Request` directly (it is an
 /// internally-tagged enum, and `Subscribe` `#[serde(flatten)]`s its spec — both
 /// disable the attribute), so compare the input object's keys against the keys
 /// the parsed request round-trips to. Any input key absent from the canonical
-/// form was silently ignored and is reported as an error. `backfill_from` is
-/// the one declared key the canonical form can leave out, so on a `subscribe`
-/// a `null` there is an absent one.
+/// form was silently ignored and is reported as an error.
 fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(), String> {
     let input: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("invalid request: {e}"))?;
     let canonical = serde_json::to_value(request).map_err(|e| format!("invalid request: {e}"))?;
+    reject_unknown_object_keys(
+        &input,
+        &canonical,
+        matches!(request, Request::Subscribe { .. }),
+    )?;
+    if let Request::OpenClient { subscriptions, .. } = request
+        && let Some(elements) = input.get("subscriptions").and_then(|v| v.as_array())
+    {
+        for (element, spec) in elements.iter().zip(subscriptions) {
+            reject_spec_keys(element, spec)
+                .map_err(|detail| format!("subscriptions element {}: {detail}", spec.symbol))?;
+        }
+    }
+    Ok(())
+}
+
+/// Reject a JSON object that carries a key its parsed [`SubscriptionSpec`]
+/// does not declare.
+fn reject_spec_keys(
+    input: &serde_json::Value,
+    spec: &SubscriptionSpec,
+) -> std::result::Result<(), String> {
+    let canonical = serde_json::to_value(spec).map_err(|e| format!("invalid request: {e}"))?;
+    reject_unknown_object_keys(input, &canonical, true)
+}
+
+/// The first key of `input` that `canonical` lacks, as an error. With
+/// `spec`, the canonical form leaves out a `null` `backfill_from` and any
+/// `seed` but `false`, so neither is unknown.
+pub(crate) fn reject_unknown_object_keys(
+    input: &serde_json::Value,
+    canonical: &serde_json::Value,
+    spec: bool,
+) -> std::result::Result<(), String> {
     if let (Some(input), Some(canonical)) = (input.as_object(), canonical.as_object()) {
         for (key, value) in input {
-            let absent_backfill = value.is_null()
-                && key == "backfill_from"
-                && matches!(request, Request::Subscribe { .. });
-            if !absent_backfill && !canonical.contains_key(key) {
+            let elided = spec && (key == "seed" || (key == "backfill_from" && value.is_null()));
+            if !elided && !canonical.contains_key(key) {
                 return Err(format!("unknown field `{key}`"));
             }
         }
@@ -2292,6 +2323,10 @@ always_on = true
                 r#""scope":"live","backfill_from":7"#,
                 "backfill_from requires scope live_backfill",
             ),
+            (
+                r#""scope":"live_backfill","backfill_from":7,"seed":false"#,
+                "seed requires scope live",
+            ),
         ] {
             let line = format!(
                 r#"{{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade",{fields}}}"#
@@ -2404,15 +2439,16 @@ always_on = true
 
     #[cfg(not(windows))]
     #[test]
-    fn a_seed_that_is_not_live_is_refused() {
+    fn an_initial_subscription_that_is_not_live_is_refused() {
         let live: SubscriptionSpec = serde_json::from_str(
             r#"{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade"}"#,
         )
         .expect("parse");
-        assert!(validate_seeds(std::slice::from_ref(&live)).is_none());
+        let unseeded = live.clone().without_seed();
+        assert!(validate_initial_subscriptions(&[live.clone(), unseeded]).is_none());
 
         let backfill = live.clone().with_backfill_from(Timestamp(7));
-        let reply = validate_seeds(&[live, backfill]).expect("refused");
+        let reply = validate_initial_subscriptions(&[live, backfill]).expect("refused");
         assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
     }
 
@@ -2447,6 +2483,44 @@ always_on = true
             let request: Request = serde_json::from_str(line).expect("parse");
             assert!(reject_unknown_keys(line, &request).is_err(), "{line}");
         }
+    }
+
+    #[test]
+    fn reject_unknown_keys_accepts_seed_under_live_in_every_spelling() {
+        for seed in ["true", "false", "null"] {
+            let line = format!(
+                r#"{{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live","seed":{seed}}}"#
+            );
+            let request: Request = serde_json::from_str(&line).expect("parse");
+            assert!(reject_unknown_keys(&line, &request).is_ok(), "{line}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_subscriptions_element_is_refused() {
+        let element =
+            r#"{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade""#;
+        for (extra, ok) in [
+            ("", true),
+            (r#","seed":true"#, true),
+            (r#","seed":false"#, true),
+            (r#","backfill_from":null"#, true),
+            (r#","sed":false"#, false),
+        ] {
+            let line = format!(
+                r#"{{"op":"open-client","client":"exec-1","subscriptions":[{element}}},{element}{extra}}}]}}"#
+            );
+            let request: Request = serde_json::from_str(&line).expect("parse");
+            let result = reject_unknown_keys(&line, &request);
+            assert_eq!(result.is_ok(), ok, "{line}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn reject_unknown_keys_refuses_a_seed_off_a_subscribe() {
+        let line = r#"{"op":"ping","seed":true}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        assert!(reject_unknown_keys(line, &request).is_err());
     }
 
     #[test]

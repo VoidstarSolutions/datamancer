@@ -25,8 +25,8 @@
 //! it (or calling [`Session::close`]) tears the session down even while a
 //! stream is held. Historical sessions stay single-shot and fetch-anchored.
 //!
-//! `Scope::Live { backfill_from: Some(t) }` runs a real backfill over
-//! `[t, B)` (B = the wall-clock live edge at session start) through the
+//! [`Scope::live_backfill`] runs a real backfill over
+//! `[from, B)` (B = the wall-clock live edge at session start) through the
 //! historical read-through machinery, buffering live arrivals and splicing
 //! them in after the backfill output. A healthy seam emits no synthetic
 //! control; `Gap` appears only for real, known loss (fetch failure, buffer
@@ -80,43 +80,48 @@ use tokio::time::Instant;
 
 /// What data a session covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Scope {
     /// Bounded source-time range. The session's stream completes when `to`
     /// is reached.
     Historical { from: Timestamp, to: Timestamp },
-    /// Unbounded live subscription. With `backfill_from = Some(t)`, the
-    /// session fetches history from `t` up to the live edge and seams into
-    /// the live tail; with `None`, it starts purely from "now."
-    Live { backfill_from: Option<Timestamp> },
+    /// Unbounded live subscription.
+    Live(LiveScope),
 }
 
 impl Scope {
+    /// [`Scope::Live`] with [`LiveScope::DEFAULT`].
+    #[must_use]
+    pub const fn live() -> Self {
+        Self::Live(LiveScope::DEFAULT)
+    }
+
+    /// [`Scope::Live`] with [`LiveScope::unseeded`].
+    #[must_use]
+    pub const fn live_unseeded() -> Self {
+        Self::Live(LiveScope::unseeded())
+    }
+
+    /// [`Scope::Live`] with [`LiveScope::LiveBackfill`] from `from`.
+    #[must_use]
+    pub const fn live_backfill(from: Timestamp) -> Self {
+        Self::Live(LiveScope::backfill(from))
+    }
+
     /// The surfaces a session created with this scope fetches from.
     pub(crate) fn surfaces(&self) -> &'static [Surface] {
         match self {
             Self::Historical { .. } => &[Surface::History],
-            Self::Live {
-                backfill_from: None,
-            } => &[Surface::Live],
-            Self::Live {
-                backfill_from: Some(_),
-            } => &[Surface::Live, Surface::History],
+            Self::Live(LiveScope::LiveBackfill { .. }) => &[Surface::Live, Surface::History],
+            Self::Live(_) => &[Surface::Live],
         }
     }
 
     /// Where a live backfill starts; `None` for pure live and for history.
     fn backfill_from(&self) -> Option<Timestamp> {
         match self {
-            Self::Live { backfill_from } => *backfill_from,
+            Self::Live(scope) => scope.backfill_from(),
             Self::Historical { .. } => None,
-        }
-    }
-}
-
-impl From<LiveScope> for Scope {
-    fn from(scope: LiveScope) -> Self {
-        Self::Live {
-            backfill_from: scope.backfill_from(),
         }
     }
 }
@@ -155,11 +160,11 @@ pub(crate) enum Caller {
 /// | `false`      | `true`        | refresh   | ignore coverage, re-fetch range, overwrite  |
 ///
 /// `write_tap_log` is independent of scope mode above: when set on a live
-/// session, the data events it receives live are teed to the configured
-/// [`crate::TapLog`]. History a backfill replays is not. During a backfill,
-/// live arrivals reach the tap log at the seam; an arrival the seam ring
-/// evicts, or one still buffered when the session closes before the seam, is
-/// not logged and leaves no mark in the log.
+/// session, the data events it receives live, and its seed, are teed to the
+/// configured [`crate::TapLog`]. History a backfill replays is not. During a
+/// backfill, live arrivals reach the tap log at the seam; an arrival the seam
+/// ring evicts, or one still buffered when the session closes before the seam,
+/// is not logged and leaves no mark in the log.
 ///
 /// `#[non_exhaustive]`: later work (resume) adds axes additively. Construct via
 /// the presets and `with_tap_log`, or mutate the public fields on an owned value.
@@ -378,19 +383,18 @@ impl Datamancer {
                     accounting,
                     data_forwarded: false,
                     backfill_permits: None,
+                    seed_pending: false,
                 };
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
                 Ok(Session {
                     variant: SessionVariant::Historical(HistoricalSession { inner }),
                 })
             }
-            Scope::Live { backfill_from } => {
+            Scope::Live(scope) => {
                 // Live sessions are refcounted referrers onto the shared
                 // authoritative session: a second opener for the same pair shares
                 // it. The single-pair `Session` is implemented as a one-subscription
                 // client referrer.
-                let scope =
-                    backfill_from.map_or(LiveScope::Live, |from| LiveScope::LiveBackfill { from });
                 let Attached {
                     session: authoritative,
                     guard,
@@ -439,7 +443,10 @@ impl Datamancer {
             map.get(&(instrument.clone(), kind)).and_then(Weak::upgrade)
         };
         if let Some(existing) = existing {
-            match self.join(existing, scope.into(), options, caller).await {
+            match self
+                .join(existing, Scope::Live(scope), options, caller)
+                .await
+            {
                 // Admission never answers `SessionClosed`; it comes from
                 // `add_subscriber` alone, when the session tore down after the
                 // probe. Fall through to create, which claims the slot once
@@ -456,7 +463,7 @@ impl Datamancer {
             provider.as_ref(),
             &instrument,
             kind,
-            scope.into(),
+            Scope::Live(scope),
             options,
             Door::Create,
             caller,
@@ -484,7 +491,8 @@ impl Datamancer {
             Door::Join,
             caller,
         )?;
-        let subscriber = existing.add_subscriber().await?;
+        let seeded = !matches!(scope, Scope::Live(LiveScope::Live { seed: false, .. }));
+        let subscriber = existing.add_subscriber(seeded).await?;
         Ok(Attached::joined(existing, subscriber))
     }
 
@@ -614,7 +622,7 @@ impl Datamancer {
             }
         };
         if let Some(winner) = winner {
-            return self.join(winner, scope.into(), options, caller).await;
+            return self.join(winner, Scope::Live(scope), options, caller).await;
         }
 
         // Pre-seed the opener as the first fan-out subscriber *before* spawning
@@ -624,7 +632,7 @@ impl Datamancer {
         let first_id = authoritative.alloc_subscriber_id();
         let (first_tx, first_rx) = mpsc::channel::<MarketEvent>(default_buffer());
         let mut fanout = FanOut::new();
-        fanout.add(first_id, first_tx);
+        fanout.add(first_id, first_tx, false);
 
         // Lock released. Start the provider connection and spawn the controller.
         // On error, `authoritative` drops as we return and its `Drop` clears the
@@ -632,7 +640,7 @@ impl Datamancer {
         let inner = Arc::new(SessionInner {
             instrument: instrument.clone(),
             kind,
-            scope: scope.into(),
+            scope: Scope::Live(scope),
             events_holder: Mutex::new(None),
             persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
@@ -654,14 +662,13 @@ impl Datamancer {
             accounting: accounting.clone(),
             data_forwarded: false,
             backfill_permits: self.backfill_permits(caller),
+            seed_pending: false,
         };
-        let backfill_from = scope.backfill_from();
-        // Pure-live only: fire a non-gating "latest value" fetch concurrently
+        // A seeded session fires a non-gating "latest value" fetch concurrently
         // with the live connect. The result is injected as the first data event
         // (immediate UI feedback) unless a real live value wins the race, in
-        // which case run_live discards it. Backfill sessions already supply a
-        // first value, so they skip this.
-        let seed_rx = (backfill_from.is_none())
+        // which case run_live discards it.
+        let seed_rx = matches!(scope, LiveScope::Live { seed: true, .. })
             .then(|| Self::spawn_latest_seed(provider.clone(), instrument.clone(), kind));
         // A failed open leaves no controller and no substream behind, so its
         // evidence is recorded on the provider here (`last_error`, and the
@@ -682,7 +689,7 @@ impl Datamancer {
         }
         tokio::spawn(controller.run_live(
             live,
-            backfill_from,
+            scope.backfill_from(),
             provider_rx,
             cmd_rx,
             remove_rx,
@@ -698,7 +705,7 @@ impl Datamancer {
         })
     }
 
-    /// Spawn the non-gating `Provider::latest` fetch for a pure-live session
+    /// Spawn the non-gating `Provider::latest` fetch for a seeded session
     /// and return the receiver half. Fires concurrently with the live connect;
     /// `run_live` injects the result as the first data event unless a real
     /// live value wins the race first.
@@ -1381,7 +1388,7 @@ impl Session {
     pub fn scope(&self) -> Scope {
         match &self.variant {
             SessionVariant::Historical(h) => h.inner.scope,
-            SessionVariant::Live(l) => l.authoritative.scope.into(),
+            SessionVariant::Live(l) => Scope::Live(l.authoritative.scope),
         }
     }
 }
@@ -1422,9 +1429,19 @@ pub(crate) enum SessionCommand {
     AddSubscriber {
         id: SubscriberId,
         sender: mpsc::Sender<MarketEvent>,
-        /// Answers whether a backfill is running.
-        ack: oneshot::Sender<bool>,
+        /// The subscriber asked for the seed.
+        seeded: bool,
+        /// Answers what is in flight at the join.
+        ack: oneshot::Sender<JoinState>,
     },
+}
+
+/// What is in flight on a session when a subscriber joins it.
+pub(crate) struct JoinState {
+    /// A backfill is running.
+    pub(crate) backfill_in_flight: bool,
+    /// The latest-value seed has not settled.
+    pub(crate) seed_pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,6 +1538,10 @@ struct Controller {
     /// The permits a backfill waits for before it fetches history; `None` for
     /// no wait.
     backfill_permits: Option<Arc<Semaphore>>,
+    /// The seed has neither been delivered, resolved empty, nor been beaten
+    /// by a data event. An unseeded subscriber added meanwhile starts after
+    /// the seed's slot.
+    seed_pending: bool,
 }
 
 impl Controller {
@@ -2293,6 +2314,7 @@ impl Controller {
         mut seed_rx: Option<oneshot::Receiver<Option<MarketEvent>>>,
     ) {
         let live = Arc::new(Mutex::new(Some(live)));
+        self.seed_pending = seed_rx.is_some();
         // Seed the subscriber count from the pre-seeded first referrer so the
         // diagnostics snapshot reports a true count from the start.
         if let Some(fanout) = self.fanout.as_ref() {
@@ -2364,12 +2386,22 @@ impl Controller {
                         // as `Arrival::Seed`.
                         self.forward_with(seed, Arrival::Seed).await;
                     }
+                    self.settle_seed();
                     // else: a live data event already won, or
                     // Err(RecvError) / Ok(None) — nothing to seed.
                 }
             }
         }
         self.teardown_upstream(&live).await;
+    }
+
+    /// End the seed's pending window: every subscriber is passed what follows.
+    fn settle_seed(&mut self) {
+        if std::mem::take(&mut self.seed_pending)
+            && let Some(fanout) = self.fanout.as_mut()
+        {
+            fanout.seed_settled();
+        }
     }
 
     /// The refcounted-teardown trigger: a subscriber has been added and the
@@ -2516,6 +2548,9 @@ impl Controller {
             MarketEvent::Trade(_) | MarketEvent::Quote(_) | MarketEvent::Bar(_)
         ) {
             self.data_forwarded = true;
+            if arrival == Arrival::Live {
+                self.settle_seed();
+            }
         }
         // Throughput accounting: messages count as live-data throughput only on
         // the authoritative live path (fan-out present); gaps count regardless
@@ -2575,7 +2610,7 @@ impl Controller {
         ) {
             return;
         }
-        if !matches!(self.inner.scope, Scope::Live { .. }) {
+        if !matches!(self.inner.scope, Scope::Live(_)) {
             return;
         }
         let Some(log) = &self.tap_log else { return };
@@ -2598,16 +2633,26 @@ impl Controller {
                 let _ = ack.send(res);
                 true
             }
-            Some(SessionCommand::AddSubscriber { id, sender, ack }) => {
+            Some(SessionCommand::AddSubscriber {
+                id,
+                sender,
+                seeded,
+                ack,
+            }) => {
                 // A join cancelled while this command was queued has dropped its
                 // receiver; one cancelled after it is answered drops the answer.
                 // Neither may stay a referrer.
                 let open = !sender.is_closed();
+                let awaits_seed = !seeded && self.seed_pending;
                 if open && let Some(fanout) = self.fanout.as_mut() {
-                    fanout.add(id, sender);
+                    fanout.add(id, sender, awaits_seed);
                     self.stats.set_subscribers(fanout.subscriber_count());
                 }
-                if ack.send(self.stats.backfilling()).is_err() && open {
+                let state = JoinState {
+                    backfill_in_flight: self.stats.backfilling(),
+                    seed_pending: self.seed_pending,
+                };
+                if ack.send(state).is_err() && open {
                     self.remove_subscriber(id);
                 }
                 true

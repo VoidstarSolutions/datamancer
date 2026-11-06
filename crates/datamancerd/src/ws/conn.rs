@@ -272,13 +272,32 @@ fn invalid_frame_reply(line: &str, error: &serde_json::Error) -> WsReply {
     WsReply::error(id, codes::BAD_REQUEST, format!("invalid request: {error}"))
 }
 
+/// Parse one control frame, or the `bad_request` answer to it. A frame
+/// carrying a key its request does not declare is refused.
+fn parse_frame(line: &str) -> Result<WsRequest, Box<WsReply>> {
+    let req = serde_json::from_str::<WsRequest>(line)
+        .map_err(|e| Box::new(invalid_frame_reply(line, &e)))?;
+    let refused = |detail: String| Box::new(WsReply::error(req.id(), codes::BAD_REQUEST, detail));
+    let input: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| refused(format!("invalid request: {e}")))?;
+    let canonical =
+        serde_json::to_value(&req).map_err(|e| refused(format!("invalid request: {e}")))?;
+    crate::server::reject_unknown_object_keys(
+        &input,
+        &canonical,
+        matches!(req, WsRequest::Subscribe { .. }),
+    )
+    .map_err(refused)?;
+    Ok(req)
+}
+
 /// Dispatch one parsed control frame against the connection's session. Returns
 /// the reply plus whether the frame was a `close-client` (so the caller need not
 /// re-parse the line to decide on a graceful close).
 async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsReply, bool, bool) {
-    let req = match serde_json::from_str::<WsRequest>(line) {
+    let req = match parse_frame(line) {
         Ok(req) => req,
-        Err(e) => return (invalid_frame_reply(line, &e), false, false),
+        Err(reply) => return (*reply, false, false),
     };
     let id = req.id();
     let is_close_client = matches!(req, WsRequest::CloseClient { .. });
@@ -403,7 +422,7 @@ fn spawn_health_push(
 
 #[cfg(test)]
 mod tests {
-    use super::{WsReply, WsRequest, codes, ct_eq, invalid_frame_reply};
+    use super::{WsReply, WsRequest, codes, ct_eq, invalid_frame_reply, parse_frame};
 
     fn reply_to(line: &str) -> WsReply {
         let error = serde_json::from_str::<WsRequest>(line).expect_err("must not parse");
@@ -423,6 +442,10 @@ mod tests {
                 r#""scope":"live","backfill_from":7"#,
                 "backfill_from requires scope live_backfill",
             ),
+            (
+                r#""scope":"live_backfill","backfill_from":7,"seed":false"#,
+                "seed requires scope live",
+            ),
         ] {
             let line = format!(r#"{{"id":7,{SUBSCRIBE},{fields}}}"#);
             let reply = reply_to(&line);
@@ -430,6 +453,59 @@ mod tests {
             assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
             let detail = reply.message.expect("message");
             assert!(detail.contains(message), "{detail}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_on_a_ws_subscribe_is_refused() {
+        for (extra, ok) in [
+            ("", true),
+            (r#","seed":true"#, true),
+            (r#","seed":false"#, true),
+            (r#","backfill_from":null"#, true),
+            (r#","sed":false"#, false),
+        ] {
+            let line = format!(r#"{{"id":7,{SUBSCRIBE}{extra}}}"#);
+            match parse_frame(&line) {
+                Ok(_) => assert!(ok, "{line} must be refused"),
+                Err(reply) => {
+                    assert!(!ok, "{line}: {reply:?}");
+                    assert_eq!(reply.id, 7);
+                    assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_on_any_ws_request_is_refused() {
+        let unsubscribe = r#""op":"unsubscribe","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade""#;
+        for (fields, ok) in [
+            (unsubscribe.to_string(), true),
+            (format!(r#"{unsubscribe},"scope":"live_backfill""#), false),
+            (format!(r#"{unsubscribe},"symbl2":"MSFT""#), false),
+            (r#""op":"snapshot""#.to_string(), true),
+            (r#""op":"snapshot","verbose":true"#.to_string(), false),
+            (r#""op":"instruments""#.to_string(), true),
+            (
+                r#""op":"instruments","provider":"alpaca""#.to_string(),
+                true,
+            ),
+            (
+                r#""op":"capabilities","provider":"alpaca""#.to_string(),
+                true,
+            ),
+            (r#""op":"watch-health","every":5"#.to_string(), false),
+        ] {
+            let line = format!(r#"{{"id":7,{fields}}}"#);
+            match parse_frame(&line) {
+                Ok(_) => assert!(ok, "{line} must be refused"),
+                Err(reply) => {
+                    assert!(!ok, "{line}: {reply:?}");
+                    assert_eq!(reply.id, 7);
+                    assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
+                }
+            }
         }
     }
 

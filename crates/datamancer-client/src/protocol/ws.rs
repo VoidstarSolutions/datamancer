@@ -202,9 +202,7 @@ mod tests {
     /// A subscribe reply carries what was opened, echoing the id.
     #[test]
     fn ws_subscribed_reply_round_trips_the_outcome() {
-        let backfill = LiveScope::LiveBackfill {
-            from: Timestamp(99),
-        };
+        let backfill = LiveScope::backfill(Timestamp(99));
         let reply = WsReply::from_subscribed(4, Subscribed::created(backfill));
         let json = serde_json::to_string(&reply).unwrap();
         assert_eq!(
@@ -213,17 +211,25 @@ mod tests {
         );
         let back: WsReply = serde_json::from_str(&json).unwrap();
         assert_eq!(back.subscribed(), Subscribed::created(backfill));
-        let joined = Subscribed::joined(LiveScope::Live, false);
+        let joined = Subscribed::joined(LiveScope::default());
         let json = serde_json::to_string(&WsReply::from_subscribed(5, joined)).unwrap();
         assert_eq!(json, r#"{"id":5,"ok":true,"scope":"live","joined":true}"#);
         let back: WsReply = serde_json::from_str(&json).unwrap();
         assert_eq!(back.subscribed(), joined);
+        let unseeded = Subscribed::created(LiveScope::unseeded());
+        let json = serde_json::to_string(&WsReply::from_subscribed(6, unseeded)).unwrap();
+        assert_eq!(json, r#"{"id":6,"ok":true,"scope":"live","seed":false}"#);
+        let back: WsReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subscribed(), unseeded);
     }
 
     #[test]
     fn a_ws_subscribe_reply_with_no_scope_reads_as_created_live() {
         let reply: WsReply = serde_json::from_str(r#"{"id":4,"ok":true}"#).unwrap();
-        assert_eq!(reply.subscribed(), Subscribed::created(LiveScope::Live));
+        assert_eq!(
+            reply.subscribed(),
+            Subscribed::created(LiveScope::default())
+        );
     }
 
     #[test]
@@ -235,6 +241,17 @@ mod tests {
                 assert_eq!(id, 7);
                 assert_eq!(spec.symbol, "BTC/USD");
                 assert_eq!(spec.kind, EventKindCfg::Trade);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ws_subscribe_accepts_seed_false() {
+        let line = r#"{"id":8,"op":"subscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","seed":false}"#;
+        match serde_json::from_str::<WsRequest>(line).expect("de") {
+            WsRequest::Subscribe { spec, .. } => {
+                assert_eq!(spec.scope, LiveScope::unseeded());
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -341,8 +358,17 @@ mod tests {
     }
 
     #[test]
+    fn a_joiner_reply_carries_a_pending_seed() {
+        let pending = Subscribed::joined(LiveScope::default()).with_seed_pending();
+        let json = serde_json::to_string(&WsReply::from_subscribed(5, pending)).unwrap();
+        assert!(json.contains(r#""seed_pending":true"#), "{json}");
+        let back: WsReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subscribed(), pending);
+    }
+
+    #[test]
     fn a_joiner_reply_carries_a_backfill_in_flight() {
-        let in_flight = Subscribed::joined(LiveScope::Live, true);
+        let in_flight = Subscribed::joined(LiveScope::default()).with_backfill_in_flight();
         let json = serde_json::to_string(&WsReply::from_subscribed(5, in_flight)).unwrap();
         assert!(json.contains(r#""backfill_in_flight":true"#), "{json}");
         let back: WsReply = serde_json::from_str(&json).unwrap();

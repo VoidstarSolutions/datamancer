@@ -46,6 +46,15 @@ pub trait Client: Sized + Send {
     ) -> impl Future<Output = Result<(Self, Self::Events), ClientError<Self::Error>>> + Send;
 
     /// Add a subscription to this client's set and return what it opened.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::ScopeNotHonored`] for a session created with a scope
+    /// other than the one asked for, and [`ClientError::Transport`] for a
+    /// reply that cannot be read, each after a best-effort unsubscribe;
+    /// [`ClientError::Transport`] for a failed connection, with no
+    /// unsubscribe; [`ClientError::Control`] for a refusal. An implementation
+    /// of this trait makes these checks itself.
     fn subscribe(
         &mut self,
         spec: &SubscriptionSpec,

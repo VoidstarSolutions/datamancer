@@ -9,8 +9,7 @@ use datamancer_core::{LiveScope, Subscribed};
 use serde::{Deserialize, Serialize};
 
 /// The fields a `subscribe` reply adds to a control reply, in both framings.
-/// A reply with no `scope` reads as pure-live; a `scope` that disagrees with
-/// `backfill_from`, or is not one this client knows, fails to parse.
+/// An absent `scope` means live; the fields must agree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SubscribedFields {
     #[serde(flatten, deserialize_with = "LiveScope::deserialize_optional")]
@@ -19,6 +18,8 @@ pub(crate) struct SubscribedFields {
     joined: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     backfill_in_flight: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    seed_pending: bool,
 }
 
 impl From<Subscribed> for SubscribedFields {
@@ -33,6 +34,13 @@ impl From<Subscribed> for SubscribedFields {
                     ..
                 }
             ),
+            seed_pending: matches!(
+                subscribed,
+                Subscribed::Joined {
+                    seed_pending: true,
+                    ..
+                }
+            ),
         }
     }
 }
@@ -40,10 +48,16 @@ impl From<Subscribed> for SubscribedFields {
 impl From<&SubscribedFields> for Subscribed {
     fn from(fields: &SubscribedFields) -> Self {
         let session = fields.scope.unwrap_or_default();
-        if fields.joined {
-            Self::joined(session, fields.backfill_in_flight)
-        } else {
-            Self::created(session)
+        if !fields.joined {
+            return Self::created(session);
         }
+        let mut joined = Self::joined(session);
+        if fields.backfill_in_flight {
+            joined = joined.with_backfill_in_flight();
+        }
+        if fields.seed_pending {
+            joined = joined.with_seed_pending();
+        }
+        joined
     }
 }

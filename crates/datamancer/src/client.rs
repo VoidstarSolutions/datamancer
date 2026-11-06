@@ -132,9 +132,10 @@ impl AuthoritativeSession {
     }
 
     /// Register a new fan-out subscriber, returning its id and the receiver the
-    /// referrer drains. Fails with [`Error::SessionClosed`] if the controller
-    /// has already torn down.
-    pub(crate) async fn add_subscriber(&self) -> Result<NewSubscriber> {
+    /// referrer drains. An unseeded one that joins while the seed is pending
+    /// starts after the seed's slot. Fails with [`Error::SessionClosed`] if the
+    /// controller has already torn down.
+    pub(crate) async fn add_subscriber(&self, seeded: bool) -> Result<NewSubscriber> {
         let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::channel(default_buffer());
         let (ack, ack_rx) = oneshot::channel();
@@ -142,15 +143,17 @@ impl AuthoritativeSession {
             .send(SessionCommand::AddSubscriber {
                 id,
                 sender: tx,
+                seeded,
                 ack,
             })
             .await
             .map_err(|_| Error::SessionClosed)?;
-        let backfill_in_flight = ack_rx.await.map_err(|_| Error::SessionClosed)?;
+        let state = ack_rx.await.map_err(|_| Error::SessionClosed)?;
         Ok(NewSubscriber {
             id,
             rx,
-            backfill_in_flight,
+            backfill_in_flight: state.backfill_in_flight,
+            seed_pending: state.seed_pending,
         })
     }
 
@@ -240,6 +243,7 @@ pub(crate) struct NewSubscriber {
     pub(crate) id: SubscriberId,
     pub(crate) rx: mpsc::Receiver<MarketEvent>,
     pub(crate) backfill_in_flight: bool,
+    pub(crate) seed_pending: bool,
 }
 
 /// One subscriber registered on an [`AuthoritativeSession`].
@@ -252,10 +256,17 @@ pub(crate) struct Attached {
 
 impl Attached {
     pub(crate) fn joined(session: Arc<AuthoritativeSession>, subscriber: NewSubscriber) -> Self {
+        let mut outcome = Subscribed::joined(session.scope);
+        if subscriber.backfill_in_flight {
+            outcome = outcome.with_backfill_in_flight();
+        }
+        if subscriber.seed_pending {
+            outcome = outcome.with_seed_pending();
+        }
         Self {
             guard: SubscriberGuard::new(session.clone(), subscriber.id),
             rx: subscriber.rx,
-            outcome: Subscribed::joined(session.scope, subscriber.backfill_in_flight),
+            outcome,
             session,
         }
     }
@@ -647,6 +658,13 @@ struct Referrer {
     held_back: Duration,
     /// Its channel's free slots when the replay's current wait began.
     free_at_wait: usize,
+    /// This referrer joined unseeded while the seed was pending: it is passed
+    /// nothing until [`FanOut::seed_settled`].
+    awaits_seed: bool,
+    /// The [`FanOut::subscription_changes`] count replayed to it at its add.
+    subscription_changes: u64,
+    /// The [`FanOut::connection_changes`] count at its add.
+    connection_changes: u64,
 }
 
 impl Referrer {
@@ -660,6 +678,9 @@ impl Referrer {
             stalled: Duration::ZERO,
             held_back: Duration::ZERO,
             free_at_wait: 0,
+            awaits_seed: false,
+            subscription_changes: 0,
+            connection_changes: 0,
         }
     }
 
@@ -886,6 +907,13 @@ pub(crate) struct FanOut {
     /// source-stamped event), replayed to each new subscriber so a late join
     /// sees the subscription state without a fresh provider ack.
     last_subscription_changed: Option<MarketEvent>,
+    /// How many times [`Self::last_subscription_changed`] has been set.
+    subscription_changes: u64,
+    /// Last `ProviderConnected` or `ProviderDisconnected`, replayed at
+    /// [`Self::seed_settled`] to a referrer that waited through it.
+    last_connection: Option<MarketEvent>,
+    /// How many times [`Self::last_connection`] has been set.
+    connection_changes: u64,
     /// Set once the first subscriber is added. Distinguishes "never had a
     /// subscriber yet" (do not tear down) from "last subscriber left".
     had_subscriber: bool,
@@ -900,19 +928,65 @@ impl FanOut {
             pacers_changed: Arc::new(Notify::new()),
             room_at_wait: false,
             last_subscription_changed: None,
+            subscription_changes: 0,
+            last_connection: None,
+            connection_changes: 0,
             had_subscriber: false,
             owing: false,
         }
     }
 
-    pub(crate) fn add(&mut self, id: SubscriberId, sender: mpsc::Sender<MarketEvent>) {
+    /// Add a referrer, replaying the cached subscription state to it. One that
+    /// `awaits_seed` is passed nothing further until [`Self::seed_settled`]
+    /// replays what it missed of the subscription and connection state.
+    pub(crate) fn add(
+        &mut self,
+        id: SubscriberId,
+        sender: mpsc::Sender<MarketEvent>,
+        awaits_seed: bool,
+    ) {
         self.had_subscriber = true;
         // Replay the cached subscription state to the joiner (best-effort).
         if let Some(ev) = &self.last_subscription_changed {
             let _ = sender.try_send(ev.clone());
         }
-        self.subscribers.insert(id, Referrer::new(sender));
+        self.subscribers.insert(
+            id,
+            Referrer {
+                awaits_seed,
+                subscription_changes: self.subscription_changes,
+                connection_changes: self.connection_changes,
+                ..Referrer::new(sender)
+            },
+        );
         self.pacers_changed.notify_one();
+    }
+
+    /// The seed was delivered, resolved empty, or is about to be beaten by a
+    /// data event: every referrer is passed what follows. One that waited is
+    /// first passed the cached subscription state and connection state, each
+    /// if it changed while it waited, in `seq` order.
+    pub(crate) fn seed_settled(&mut self) {
+        for referrer in self.subscribers.values_mut() {
+            if !std::mem::take(&mut referrer.awaits_seed) {
+                continue;
+            }
+            let mut missed: Vec<&MarketEvent> = Vec::with_capacity(2);
+            if referrer.subscription_changes != self.subscription_changes
+                && let Some(ev) = &self.last_subscription_changed
+            {
+                missed.push(ev);
+            }
+            if referrer.connection_changes != self.connection_changes
+                && let Some(ev) = &self.last_connection
+            {
+                missed.push(ev);
+            }
+            missed.sort_by_key(|ev| ev.seq());
+            for ev in missed {
+                let _ = referrer.tx.try_send(ev.clone());
+            }
+        }
     }
 
     /// Charge `waited` to the referrers the last wait was blocked on and stop
@@ -1076,9 +1150,21 @@ impl FanOut {
         }) = ev
         {
             self.last_subscription_changed = Some(ev.clone());
+            self.subscription_changes += 1;
+        }
+        if let MarketEvent::Control(Control {
+            kind: ControlKind::ProviderConnected { .. } | ControlKind::ProviderDisconnected { .. },
+            ..
+        }) = ev
+        {
+            self.last_connection = Some(ev.clone());
+            self.connection_changes += 1;
         }
         let mut dead: Vec<SubscriberId> = Vec::new();
         for (id, r) in &mut self.subscribers {
+            if r.awaits_seed {
+                continue;
+            }
             // What a full channel left owed goes first. If the channel is still
             // full, this event is owed too, and nothing waits: neither a
             // co-subscriber nor the provider stalls on a slow referrer.
@@ -1720,9 +1806,9 @@ fn wall_clock_ts() -> Timestamp {
 // Client handle + public ClientSession
 // ---------------------------------------------------------------------------
 
-/// A seed subscription handed to [`spawn_client`]: the pair, its referrer guard,
-/// the authoritative substream receiver, and the provider id.
-type SeedSubscription = (
+/// An initial subscription handed to [`spawn_client`]: the pair, its referrer
+/// guard, the authoritative substream receiver, and the provider id.
+type InitialSubscription = (
     (Instrument, EventKind),
     SubscriberGuard,
     mpsc::Receiver<MarketEvent>,
@@ -1807,18 +1893,18 @@ impl ClientHandle {
     }
 }
 
-/// Spawn a [`ClientController`] with an optional seed subscription. The seed is
-/// used by the single-pair live [`crate::Session`] (which carries its own
+/// Spawn a [`ClientController`] with an optional initial subscription, used by
+/// the single-pair live [`crate::Session`] (which carries its own
 /// authoritative referrer); a bare [`ClientSession`] starts empty.
 pub(crate) fn spawn_client(
     dm: Datamancer,
     ring_capacity: usize,
-    seed: Option<SeedSubscription>,
+    initial: Option<InitialSubscription>,
 ) -> ClientHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(default_buffer());
     let mut entries = HashMap::new();
     let mut streams = StreamMap::new();
-    if let Some((key, guard, rx, provider)) = seed {
+    if let Some((key, guard, rx, provider)) = initial {
         entries.insert(
             key.clone(),
             SubEntry {
@@ -2189,7 +2275,7 @@ mod fanout_tests {
         // event becomes a per-instrument Gap, delivered ahead of resumed events.
         let mut fo = FanOut::new();
         let (tx, mut rx) = mpsc::channel(1);
-        fo.add(SubscriberId(1), tx);
+        fo.add(SubscriberId(1), tx, false);
 
         fo.fanout(&trade(100, 0)); // delivered; the single slot is now full
         fo.fanout(&trade(200, 1)); // channel full -> recorded as pending loss
@@ -2263,7 +2349,7 @@ mod fanout_tests {
             tx.try_send(trade(1, 0)).unwrap();
         }
         let mut fanout = FanOut::new();
-        fanout.add(SubscriberId(1), tx);
+        fanout.add(SubscriberId(1), tx, false);
         (fanout, rx)
     }
 
@@ -2435,7 +2521,7 @@ mod fanout_tests {
     async fn a_referrer_owed_a_gap_needs_room_for_two() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let mut fanout = FanOut::new();
-        fanout.add(SubscriberId(1), tx);
+        fanout.add(SubscriberId(1), tx, false);
         let trade = |ts| {
             datamancer_core::MarketEvent::Trade(datamancer_core::Trade {
                 instrument: datamancer_core::Instrument::new(
@@ -2499,8 +2585,8 @@ mod fanout_tests {
         let (room_tx, room_rx) = tokio::sync::mpsc::channel(1);
         full_tx.try_send(trade(1, 1)).unwrap();
         let mut fanout = FanOut::new();
-        fanout.add(SubscriberId(1), full_tx);
-        fanout.add(SubscriberId(2), room_tx);
+        fanout.add(SubscriberId(1), full_tx, false);
+        fanout.add(SubscriberId(2), room_tx, false);
         (fanout, full_rx, room_rx)
     }
 
@@ -2509,7 +2595,7 @@ mod fanout_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         tx.try_send(trade(1, 1)).unwrap();
         let mut fanout = FanOut::new();
-        fanout.add(SubscriberId(1), tx);
+        fanout.add(SubscriberId(1), tx, false);
         assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
         assert_eq!(
             timer(&mut fanout, Duration::from_secs(20)).await,
@@ -2534,11 +2620,11 @@ mod fanout_tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         tx.try_send(trade(1, 1)).unwrap();
         let mut fanout = FanOut::new();
-        fanout.add(SubscriberId(1), tx);
+        fanout.add(SubscriberId(1), tx, false);
         assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
         let (joiner, _joiner_rx) = tokio::sync::mpsc::channel(1);
         joiner.try_send(trade(1, 1)).unwrap();
-        fanout.add(SubscriberId(2), joiner);
+        fanout.add(SubscriberId(2), joiner, false);
         assert_eq!(
             timer(&mut fanout, Duration::from_secs(20)).await,
             Some(Duration::from_secs(10))
@@ -2557,8 +2643,8 @@ mod fanout_tests {
         full_tx.try_send(trade(1, 1)).unwrap();
         full_tx.try_send(trade(1, 1)).unwrap();
         let mut fanout = FanOut::new();
-        fanout.add(SubscriberId(1), full_tx);
-        fanout.add(SubscriberId(2), room_tx);
+        fanout.add(SubscriberId(1), full_tx, false);
+        fanout.add(SubscriberId(2), room_tx, false);
         assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
         assert!(
             fanout.next_wait(LIMIT, LIMIT).is_none(),
@@ -2576,8 +2662,8 @@ mod fanout_tests {
         first_tx.try_send(trade(1, 1)).unwrap();
         second_tx.try_send(trade(1, 1)).unwrap();
         let mut fanout = FanOut::new();
-        fanout.add(SubscriberId(1), first_tx);
-        fanout.add(SubscriberId(2), second_tx);
+        fanout.add(SubscriberId(1), first_tx, false);
+        fanout.add(SubscriberId(2), second_tx, false);
         let _ = fanout.pacers_changed.notified().now_or_never();
         let wait = fanout.next_wait(Duration::ZERO, LIMIT).expect("a wait");
         first_rx.recv().await;

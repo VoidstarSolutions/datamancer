@@ -155,6 +155,10 @@ fn subscribe_live_backfill_serves_history_then_buffered_prints_then_live() {
         reply.get("joined").is_none(),
         "the creator is not a joiner: {reply}"
     );
+    assert!(
+        reply.get("seed").is_none(),
+        "a backfill never seeds: {reply}"
+    );
 
     // A second client, pure-live on the same pair, is told the actual scope.
     let mut second = Conn::connect(daemon.socket());
@@ -255,6 +259,143 @@ fn subscribe_live_seeds_from_the_latest_knob() {
             "latest = {latest}: {seen:?}"
         );
     }
+}
+
+/// `seed:false` opens a session with no data event ahead of the first live print,
+/// a joiner asking for the seed is told the session's choice, and an explicit
+/// `seed:true` on another pair delivers the latest value first.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn subscribe_seed_false_delivers_the_first_live_print_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_scripted_daemon(dir.path(), "latest = true\nlive_interval_ms = 300\n", "");
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+
+    let mut unseeded = Conn::connect(daemon.socket());
+    let mut unseeded_sub = unseeded.open_client("unseeded", &node);
+    let reply = unseeded.request(
+        r#"{"op":"subscribe","client":"unseeded","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live","seed":false}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["scope"], "live", "{reply}");
+    assert_eq!(reply["seed"], false, "{reply}");
+
+    let mut joiner = Conn::connect(daemon.socket());
+    let _joiner_sub = joiner.open_client("joiner", &node);
+    let reply = joiner.request(
+        r#"{"op":"subscribe","client":"joiner","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","seed":true}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["joined"], true, "{reply}");
+    assert_eq!(reply["seed"], false, "{reply}");
+
+    let seen = collect(&mut unseeded_sub, 1, Duration::from_secs(10));
+    assert!(
+        matches!(seen.first(), Some(Seen::Trade(price, ..)) if (price - 100.0).abs() < 1e-9),
+        "the first event must be the first live print: {seen:?}"
+    );
+
+    let mut seeded = Conn::connect(daemon.socket());
+    let mut seeded_sub = seeded.open_client("seeded", &node);
+    let reply = seeded.request(
+        r#"{"op":"subscribe","client":"seeded","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade","seed":true}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert!(
+        reply.get("seed").is_none(),
+        "a seeded reply writes no seed: {reply}"
+    );
+    let seen = collect(&mut seeded_sub, 2, Duration::from_secs(10));
+    assert!(seen.len() >= 2, "{seen:?}");
+    // The provider's `ProviderConnected` holds a `seq` slot the data plane
+    // does not carry, so only the order is pinned.
+    let Seen::Trade(seed_price, seed_ts, seed_seq) = seen[0] else {
+        panic!("seed first: {seen:?}");
+    };
+    assert!(
+        (seed_price - 999.0).abs() < 1e-9 && seed_ts == 1,
+        "seed first: {seen:?}"
+    );
+    assert!(
+        matches!(seen[1], Seen::Trade(price, _, seq) if (price - 100.0).abs() < 1e-9 && seq > seed_seq),
+        "then live: {seen:?}"
+    );
+}
+
+/// A `seed:false` client joining an `always_on` seeding anchor before its seed
+/// is delivered gets no seed: its first event is a live print.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_seed_false_joiner_of_a_seeding_anchor_starts_at_a_live_print() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_scripted_daemon(
+        dir.path(),
+        "latest = true\nlatest_delay_ms = 5000\nlive_interval_ms = 8000\n",
+        "[[startup_session]]\nprovider = \"scripted\"\nasset_class = \"equity\"\nsymbol = \"AAPL\"\nkind = \"trade\"\nalways_on = true\n",
+    );
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+    let mut subscriber = conn.open_client("unseeded", &node);
+    let reply = conn.request(
+        r#"{"op":"subscribe","client":"unseeded","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","seed":false}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["joined"], true, "{reply}");
+    assert!(reply.get("seed").is_none(), "the anchor seeds: {reply}");
+
+    let seen = collect(&mut subscriber, 1, Duration::from_secs(20));
+    assert!(
+        matches!(seen.first(), Some(Seen::Trade(price, ..)) if *price >= 100.0 && (price - 999.0).abs() > 1e-9),
+        "the first event must be a live print, not the seed: {seen:?}"
+    );
+}
+
+/// `seed:false` inside `open-client` reaches the session it creates: the
+/// opener's first event is a live print, and a joiner is told the session does
+/// not seed.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn open_client_subscriptions_carry_seed_false_to_the_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_scripted_daemon(
+        dir.path(),
+        "latest = true\nlatest_delay_ms = 1000\nlive_interval_ms = 3000\n",
+        "",
+    );
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+
+    let mut opener = Conn::connect(daemon.socket());
+    let reply = opener.request(
+        r#"{"op":"open-client","client":"opener","subscriptions":[{"provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","seed":false}]}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    let service: datamancer::transport::DataServiceName = reply["service"]
+        .as_str()
+        .expect("service name")
+        .parse()
+        .expect("a data-service name");
+    let mut opener_sub =
+        datamancer::transport::DataSubscriber::open(&node, &service).expect("subscriber");
+    let seen = collect(&mut opener_sub, 1, Duration::from_secs(10));
+    assert!(
+        matches!(seen.first(), Some(Seen::Trade(price, ..)) if *price >= 100.0 && (price - 999.0).abs() > 1e-9),
+        "the opener's first event must be a live print, not the seed: {seen:?}"
+    );
+
+    let mut joiner = Conn::connect(daemon.socket());
+    let _joiner_sub = joiner.open_client("joiner", &node);
+    let reply = joiner.request(
+        r#"{"op":"subscribe","client":"joiner","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade"}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["joined"], true, "{reply}");
+    assert_eq!(reply["seed"], false, "{reply}");
 }
 
 /// `subscribe` to an id no provider owns answers `unknown_provider`, and to a
@@ -381,7 +522,7 @@ async fn ws_subscribe_replies_with_the_scope_and_streams_history_then_live() {
     );
     let spec = SubscriptionSpec::new(&instrument, EventKind::Trade).expect("spec");
     let from = Timestamp(now_nanos() - 60_000_000_000);
-    let backfill = LiveScope::LiveBackfill { from };
+    let backfill = LiveScope::backfill(from);
 
     let (mut creator, mut events) = connect_ws(PORT).await;
     let created = creator
@@ -393,7 +534,7 @@ async fn ws_subscribe_replies_with_the_scope_and_streams_history_then_live() {
     let (mut joiner, mut joiner_events) = connect_ws(PORT).await;
     assert_eq!(
         joiner.subscribe(&spec).await.expect("join"),
-        Subscribed::joined(backfill, true)
+        Subscribed::joined(backfill).with_backfill_in_flight()
     );
 
     // Slot 3 is the provider's `ProviderConnected`, which WS does not carry.

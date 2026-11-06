@@ -22,7 +22,7 @@ pub enum Request {
     /// Register a client and create its per-client data-plane service.
     OpenClient {
         client: String,
-        /// Live-only seeds, subscribed before the client opens.
+        /// Live-only subscriptions, made before the client opens.
         #[serde(default)]
         subscriptions: Vec<SubscriptionSpec>,
     },
@@ -380,7 +380,7 @@ mod tests {
                 asset_class: AssetClassCfg::Crypto,
                 symbol: "BTC/USD".to_string(),
                 kind: EventKindCfg::Trade,
-                scope: LiveScope::Live,
+                scope: LiveScope::default(),
                 persistence: PersistenceCfg::CachedWithTap,
             }],
         };
@@ -399,7 +399,7 @@ mod tests {
             panic!("wrong variant");
         };
         let from = Timestamp(1_704_067_200_000_000_000);
-        let backfill = LiveScope::LiveBackfill { from };
+        let backfill = LiveScope::backfill(from);
         assert_eq!(spec.scope, backfill);
 
         let reply = Reply::from_subscribed(Subscribed::created(backfill));
@@ -412,21 +412,93 @@ mod tests {
         assert_eq!(back.subscribed(), Subscribed::created(backfill));
         assert_eq!(
             serde_json::to_string(&Reply::from_subscribed(Subscribed::created(
-                LiveScope::Live
+                LiveScope::default()
             )))
             .expect("ser"),
             r#"{"ok":true,"scope":"live"}"#
         );
-        let joined = Subscribed::joined(LiveScope::Live, false);
+        let joined = Subscribed::joined(LiveScope::default());
         let json = serde_json::to_string(&Reply::from_subscribed(joined)).expect("ser");
         assert_eq!(json, r#"{"ok":true,"scope":"live","joined":true}"#);
         let back: Reply = serde_json::from_str(&json).expect("de");
         assert_eq!(back.subscribed(), joined);
+        let unseeded = Subscribed::created(LiveScope::unseeded());
+        let json = serde_json::to_string(&Reply::from_subscribed(unseeded)).expect("ser");
+        assert_eq!(json, r#"{"ok":true,"scope":"live","seed":false}"#);
+        let back: Reply = serde_json::from_str(&json).expect("de");
+        assert_eq!(back.subscribed(), unseeded);
+    }
+
+    fn aapl_subscribe(spec: impl FnOnce(SubscriptionSpec) -> SubscriptionSpec) -> String {
+        use datamancer_core::{AssetClass, EventKind, Instrument, ProviderId};
+        let aapl = Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        );
+        let spec = spec(SubscriptionSpec::new(&aapl, EventKind::Trade).unwrap());
+        serde_json::to_string(&Request::Subscribe {
+            client: "exec-1".to_string(),
+            spec,
+        })
+        .unwrap()
+    }
+
+    fn reply_for(scope: LiveScope) -> String {
+        serde_json::to_string(&Reply::from_subscribed(Subscribed::created(scope))).unwrap()
+    }
+
+    #[test]
+    fn a_seeded_live_scope_writes_no_seed_key() {
+        let request = aapl_subscribe(|spec| spec);
+        assert!(
+            request.contains(r#""scope":"live","persistence""#),
+            "{request}"
+        );
+        assert!(!request.contains("seed"), "{request}");
+        assert_eq!(
+            reply_for(LiveScope::default()),
+            r#"{"ok":true,"scope":"live"}"#
+        );
+    }
+
+    /// One rule on both sides of the wire: an absent `scope` means live,
+    /// whatever `seed` says.
+    #[test]
+    fn a_seed_with_no_scope_reads_as_live_both_ways() {
+        let unseeded = {
+            let line = aapl_subscribe(SubscriptionSpec::without_seed);
+            let Request::Subscribe { spec, .. } = serde_json::from_str(&line).unwrap() else {
+                panic!("wrong variant");
+            };
+            spec.scope
+        };
+        for (seed, scope) in [("false", unseeded), ("true", LiveScope::default())] {
+            let request = format!(
+                r#"{{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","seed":{seed}}}"#
+            );
+            let Request::Subscribe { spec, .. } = serde_json::from_str(&request).unwrap() else {
+                panic!("wrong variant");
+            };
+            assert_eq!(spec.scope, scope, "{request}");
+            let reply = format!(r#"{{"ok":true,"seed":{seed}}}"#);
+            let reply: Reply = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply.subscribed(), Subscribed::created(scope));
+        }
+    }
+
+    #[test]
+    fn a_joiner_reply_carries_a_pending_seed() {
+        let pending = Subscribed::joined(LiveScope::default()).with_seed_pending();
+        let json = serde_json::to_string(&Reply::from_subscribed(pending)).unwrap();
+        assert!(json.contains(r#""seed_pending":true"#), "{json}");
+        let back: Reply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subscribed(), pending);
     }
 
     #[test]
     fn a_joiner_reply_carries_a_backfill_in_flight() {
-        let in_flight = Subscribed::joined(LiveScope::Live, true);
+        let in_flight = Subscribed::joined(LiveScope::default()).with_backfill_in_flight();
         let json = serde_json::to_string(&Reply::from_subscribed(in_flight)).unwrap();
         assert!(json.contains(r#""backfill_in_flight":true"#), "{json}");
         let back: Reply = serde_json::from_str(&json).unwrap();
@@ -436,7 +508,10 @@ mod tests {
     #[test]
     fn a_subscribe_reply_with_no_scope_reads_as_created_live() {
         let reply: Reply = serde_json::from_str(r#"{"ok":true}"#).expect("de");
-        assert_eq!(reply.subscribed(), Subscribed::created(LiveScope::Live));
+        assert_eq!(
+            reply.subscribed(),
+            Subscribed::created(LiveScope::default())
+        );
         assert_eq!(
             serde_json::to_string(&Reply::ok()).expect("ser"),
             r#"{"ok":true}"#
@@ -449,6 +524,7 @@ mod tests {
             r#"{"ok":true,"scope":"live_backfill"}"#,
             r#"{"ok":true,"scope":"live","backfill_from":5}"#,
             r#"{"ok":true,"backfill_from":5}"#,
+            r#"{"ok":true,"scope":"live_backfill","backfill_from":5,"seed":true}"#,
             r#"{"ok":true,"scope":"warp"}"#,
         ] {
             assert!(serde_json::from_str::<Reply>(line).is_err(), "{line}");

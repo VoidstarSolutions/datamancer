@@ -318,7 +318,21 @@ impl Client for WsClient {
             id: self.next_id(),
             spec: spec.clone(),
         };
-        self.request(&req).await.map(|reply| reply.subscribed())
+        let subscribed = match self.request(&req).await {
+            Ok(reply) => reply.subscribed(),
+            // The daemon answered, but the reply cannot be read, so it may
+            // hold the subscription.
+            Err(e @ ClientError::Transport(WsClientError::Protocol(_))) => {
+                let _ = self.unsubscribe(&spec.clone().into()).await;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = spec.check_subscribed(&subscribed) {
+            let _ = self.unsubscribe(&spec.clone().into()).await;
+            return Err(e);
+        }
+        Ok(subscribed)
     }
 
     async fn unsubscribe(
@@ -416,6 +430,7 @@ mod tests {
     use datamancer_core::{LiveScope, MarketEvent, Price, Seq, Subscribed, Timestamp};
     use datamancer_transport_ws::to_wire;
     use futures::{SinkExt as _, StreamExt as _};
+    use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -503,7 +518,7 @@ mod tests {
             ws.send(Message::Text(
                 serde_json::to_string(&WsReply::from_subscribed(
                     id,
-                    Subscribed::created(LiveScope::Live),
+                    Subscribed::created(LiveScope::default()),
                 ))
                 .unwrap()
                 .into(),
@@ -521,10 +536,116 @@ mod tests {
         )
         .unwrap();
         let actual = client.subscribe(&spec).await.expect("subscribe acked");
-        assert_eq!(actual, Subscribed::created(LiveScope::Live));
+        assert_eq!(actual, Subscribed::created(LiveScope::default()));
 
         let ev = events.next().await.expect("one event");
         assert_eq!(ev, trade()); // timestamp triple verbatim, price intact
+    }
+
+    /// A fake daemon that answers one subscribe with `reply` and reports the
+    /// next frame the client sends, if any, within a second.
+    async fn answer_subscribe(
+        reply: Subscribed,
+    ) -> (String, tokio::sync::oneshot::Receiver<Option<WsRequest>>) {
+        answer_subscribe_with(move |id| {
+            serde_json::to_string(&WsReply::from_subscribed(id, reply)).unwrap()
+        })
+        .await
+    }
+
+    /// A fake daemon that answers a subscribe with `reply(id)`, then reports
+    /// the next request, if one comes within a second, and answers it ok.
+    async fn answer_subscribe_with(
+        reply: impl FnOnce(u64) -> String + Send + 'static,
+    ) -> (String, tokio::sync::oneshot::Receiver<Option<WsRequest>>) {
+        let (next_tx, next_rx) = tokio::sync::oneshot::channel();
+        let url = fake_server(move |mut ws| async move {
+            let Some(Ok(Message::Text(text))) = ws.next().await else {
+                panic!("expected subscribe frame")
+            };
+            let WsRequest::Subscribe { id, .. } = serde_json::from_str(&text).unwrap() else {
+                panic!("expected subscribe")
+            };
+            ws.send(Message::Text(reply(id).into())).await.unwrap();
+            let next = match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let request: WsRequest = serde_json::from_str(&text).unwrap();
+                    ws.send(Message::Text(
+                        serde_json::to_string(&WsReply::ok(request.id()))
+                            .unwrap()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                    Some(request)
+                }
+                _ => None,
+            };
+            let _ = next_tx.send(next);
+            let _ = ws.next().await;
+        })
+        .await;
+        (url, next_rx)
+    }
+
+    fn unseeded_spec() -> SubscriptionSpec {
+        serde_json::from_str::<SubscriptionSpec>(
+            r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+        )
+        .unwrap()
+        .without_seed()
+    }
+
+    #[tokio::test]
+    async fn a_created_reply_that_ignored_the_opt_out_is_an_error() {
+        let (url, next) = answer_subscribe(Subscribed::created(LiveScope::live())).await;
+        let (mut client, _events) = WsClient::connect(cfg(url)).await.expect("connect");
+        match client.subscribe(&unseeded_spec()).await {
+            Err(ClientError::ScopeNotHonored { asked, got }) => {
+                assert_eq!((asked, got), (LiveScope::unseeded(), LiveScope::live()));
+            }
+            other => panic!("expected ScopeNotHonored, got {other:?}"),
+        }
+        let next = next.await.unwrap();
+        assert!(
+            matches!(&next, Some(WsRequest::Unsubscribe { spec, .. }) if spec.symbol == "BTC/USD"),
+            "the client unsubscribes first: {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_an_unreadable_scope_unsubscribes_first() {
+        let (url, next) = answer_subscribe_with(|id| {
+            serde_json::to_string(&WsReply::from_subscribed(
+                id,
+                Subscribed::created(LiveScope::live()),
+            ))
+            .unwrap()
+            .replace(r#""scope":"live""#, r#""scope":"live_forever""#)
+        })
+        .await;
+        let (mut client, _events) = WsClient::connect(cfg(url)).await.expect("connect");
+        match client.subscribe(&unseeded_spec()).await {
+            Err(ClientError::Transport(super::WsClientError::Protocol(message))) => {
+                assert!(message.contains("unreadable reply"), "{message}");
+            }
+            other => panic!("expected an unreadable reply, got {other:?}"),
+        }
+        let next = next.await.unwrap();
+        assert!(
+            matches!(&next, Some(WsRequest::Unsubscribe { spec, .. }) if spec.symbol == "BTC/USD"),
+            "the client unsubscribes first: {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_joined_reply_may_differ_from_the_request() {
+        let joined = Subscribed::joined(LiveScope::live());
+        let (url, next) = answer_subscribe(joined).await;
+        let (mut client, _events) = WsClient::connect(cfg(url)).await.expect("connect");
+        assert_eq!(client.subscribe(&unseeded_spec()).await.unwrap(), joined);
+        drop(client);
+        assert!(next.await.unwrap().is_none(), "no unsubscribe on a join");
     }
 
     #[tokio::test]
@@ -644,7 +765,7 @@ mod tests {
             ws.send(Message::Text(
                 serde_json::to_string(&WsReply::from_subscribed(
                     req.id(),
-                    Subscribed::created(LiveScope::Live),
+                    Subscribed::created(LiveScope::default()),
                 ))
                 .unwrap()
                 .into(),

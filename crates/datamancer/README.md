@@ -71,12 +71,16 @@ let dm = Datamancer::builder().provider_arc(provider).build()?;
 let backtest = dm.session(instrument.clone(), kind, Scope::Historical { from, to },
                           PersistenceOptions::cached()).await?;
 
-// pure live, from "now"
-let live = dm.session(instrument.clone(), kind, Scope::Live { backfill_from: None },
-                      PersistenceOptions::cached_with_tap()).await?;
+// pure live, from "now", the provider's latest value first
+let live = dm.session(instrument.clone(), kind, Scope::live(),
+                      PersistenceOptions::cached().with_tap_log(true)).await?;
+
+// pure live with no data event ahead of the first live print
+let bare = dm.session(instrument.clone(), kind, Scope::live_unseeded(),
+                      PersistenceOptions::none()).await?;
 
 // stitched: backfill from `t` to the live edge, then seam into the live tail
-let warm_start = dm.session(instrument, kind, Scope::Live { backfill_from: Some(t) },
+let warm_start = dm.session(instrument, kind, Scope::live_backfill(t),
                             PersistenceOptions::cached()).await?;
 ```
 
@@ -145,11 +149,13 @@ client.subscribe(aapl.clone(), EventKind::Trade, scope, options).await?;
 client.subscribe(aapl, EventKind::Quote, scope, options).await?;
 ```
 
-`scope` is a `LiveScope`: `Live`, or `LiveBackfill { from }`, a backfill from `from` to the live
-edge seamed ahead of the live tail. The session subscribes upstream first, buffers live arrivals
-while the backfill runs, and delivers the history, then those arrivals in arrival order, then the
-live tail, with a `Gap` only for real loss (a failed fetch, a buffer overflow bounded by the
-resume buffer's setting, or a consumer that stops pacing the replay). Three rules pace the replay:
+`scope` is a `LiveScope`: `LiveScope::live()`, the default, which delivers the provider's latest
+value before the first live print; `LiveScope::unseeded()`, which does not; or
+`LiveScope::backfill(from)`, a backfill from `from` to the live edge seamed ahead of the live tail.
+The session subscribes upstream first, buffers live arrivals while the backfill runs, and delivers
+the history, then those arrivals in arrival order, then the live tail, with a `Gap` only for real
+loss (a failed fetch, a buffer overflow bounded by the resume buffer's setting, or a consumer that
+stops pacing the replay). Three rules pace the replay:
 
 1. The history and the buffered arrivals are sent only when every pacing subscriber has room. The
    session keeps taking commands and live arrivals meanwhile.
@@ -297,20 +303,20 @@ in that buffer, outside the setting (up to 64; past that, the oldest goes), so a
 overflow never takes the subscription state from the stream or from a later
 joiner's replay.
 
-`Scope::Live { backfill_from: Some(t) }` stitches history ahead of the live
-tail: the window `[t, live-edge)` is served through the historical
-read-through path (cache + provider gap-fetch, honoring the session's
-`read_cache`/`write_cache` axes) while live arrivals buffer; the seam drains
-in arrival order. Coverage for the segment touching the live edge is claimed
-conservatively (history endpoints lag the live feed), so a later request
-re-fetches the sliver instead of permanently masking it. The live edge is the
-local wall clock read after `LiveHandle::subscribe` returns, and nothing dedupes
-at the seam: an event between the start of live delivery and that reading can
-arrive on both sides, and with clock skew, a lagging history endpoint or a
-provider that returns before the venue acknowledges the pair, events can be
-missing. None of these is known loss, so none is a `Gap`; a `Gap` reports a
-failed fetch, a buffer overflow or a subscriber that stops pacing the replay.
-The tap log captures only the live tail — backfill data belongs to the cache.
+`Scope::live_backfill(t)` stitches history ahead of the live tail: the window
+`[t, live-edge)` is served through the historical read-through path (cache +
+provider gap-fetch, honoring the session's `read_cache`/`write_cache` axes)
+while live arrivals buffer; the seam drains in arrival order. Coverage for the
+segment touching the live edge is claimed conservatively (history endpoints lag
+the live feed), so a later request re-fetches the sliver instead of permanently
+masking it. The live edge is the local wall clock read after
+`LiveHandle::subscribe` returns, and nothing dedupes at the seam: an event
+between the start of live delivery and that reading can arrive on both sides,
+and with clock skew, a lagging history endpoint or a provider that returns
+before the venue acknowledges the pair, events can be missing. None of these is
+known loss, so none is a `Gap`; a `Gap` reports a failed fetch, a buffer
+overflow or a subscriber that stops pacing the replay. The tap log captures only
+the live tail — backfill data belongs to the cache.
 
 See `examples/resume.rs` for a runnable, credential-free demo.
 

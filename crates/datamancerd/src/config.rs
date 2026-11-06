@@ -520,6 +520,10 @@ pub struct StartupSession {
     pub scope: ScopeName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_from: Option<String>,
+    /// Under `live`, `false` opens the session with no latest-value seed;
+    /// absent means `true`. Refused under `live_backfill`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<bool>,
     #[serde(default)]
     pub persistence: PersistenceCfg,
     /// `true` holds the anchor for the process lifetime regardless of clients;
@@ -576,12 +580,13 @@ impl StartupSession {
     }
 
     /// Resolve the [`LiveScope`], rejecting `live_backfill` without
-    /// `backfill_from`, `live` with one, and an unparseable timestamp.
+    /// `backfill_from` or with a `seed`, `live` with a `backfill_from`, and an
+    /// unparseable timestamp.
     ///
     /// # Errors
     ///
     /// [`DaemonError::ConfigInvalid`] when `live_backfill` lacks a valid
-    /// `backfill_from`, or `live` has one.
+    /// `backfill_from` or has a `seed`, or `live` has a `backfill_from`.
     pub fn resolve_scope(&self) -> Result<LiveScope> {
         let backfill_from = self
             .backfill_from
@@ -595,7 +600,7 @@ impl StartupSession {
                 })
             })
             .transpose()?;
-        LiveScope::from_parts(self.scope, backfill_from).map_err(|e| {
+        LiveScope::from_parts(self.scope, backfill_from, self.seed).map_err(|e| {
             DaemonError::ConfigInvalid(format!(
                 "startup_session {}/{}: {e}",
                 self.symbol, self.provider
@@ -1520,6 +1525,49 @@ backfill_from = "2024-01-01T00:00:00Z"
     }
 
     #[test]
+    fn a_startup_session_can_opt_out_of_the_seed() {
+        let session = |seed: &str| {
+            let text = format!(
+                "[provider.alpaca_crypto]\naccount_type = \"paper\"\n\n\
+                 [[startup_session]]\nprovider = \"alpaca-crypto\"\nasset_class = \"crypto\"\n\
+                 symbol = \"BTC/USD\"\nkind = \"trade\"\n{seed}"
+            );
+            let config = Config::parse(&text).expect("parse");
+            config.validate().expect("valid");
+            config.startup_session[0].resolve_scope().expect("scope")
+        };
+        assert_eq!(session("seed = false\n"), LiveScope::unseeded());
+        assert_eq!(
+            session("scope = \"live\"\nseed = false\n"),
+            LiveScope::unseeded()
+        );
+        assert_eq!(session("seed = true\n"), LiveScope::live());
+        assert_eq!(session(""), LiveScope::live());
+    }
+
+    #[test]
+    fn seed_under_live_backfill_is_refused_in_config() {
+        let text = r#"
+[provider.alpaca_crypto]
+account_type = "paper"
+
+[[startup_session]]
+provider = "alpaca-crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+scope = "live_backfill"
+backfill_from = "2024-01-01T00:00:00Z"
+seed = false
+"#;
+        let config = Config::parse(text).expect("parse");
+        match config.validate().expect_err("must reject") {
+            DaemonError::ConfigInvalid(m) => assert!(m.contains("seed requires scope live"), "{m}"),
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn config_rejects_live_backfill_without_from() {
         let text = r#"
 [provider.alpaca_crypto]
@@ -1606,9 +1654,7 @@ persistence = "none"
         // 2026-06-01T00:00:00Z in epoch nanos.
         assert_eq!(
             s.resolve_scope().expect("scope"),
-            LiveScope::LiveBackfill {
-                from: Timestamp(1_780_272_000 * 1_000_000_000)
-            }
+            LiveScope::backfill(Timestamp(1_780_272_000 * 1_000_000_000))
         );
     }
 

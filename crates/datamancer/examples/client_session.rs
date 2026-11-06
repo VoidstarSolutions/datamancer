@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *sym,
                 ),
                 EventKind::Trade,
-                LiveScope::Live,
+                LiveScope::default(),
                 PersistenceOptions::none(),
             )
             .await?;
