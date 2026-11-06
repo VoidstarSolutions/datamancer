@@ -6,7 +6,7 @@
 //! (`captured_at`, `last_rx_ts`, `latency_ns`) — observability only, never
 //! engine logic.
 //!
-//! Schema 3 judges health on evidence, not silence. `Stale` is a soft error
+//! The schema judges health on evidence, not silence. `Stale` is a soft error
 //! (the substream is down on a fault — its own disconnect, not a deliberate
 //! disable and not a provider-wide error, which is the provider's `detail`);
 //! `Quiet` is healthy and listening with nothing arriving; `AwaitingData` is
@@ -21,6 +21,10 @@
 //! Known blind spot: a socket that stays open and goes silent produces no
 //! disconnect control, so it reads `Quiet`, not `Stale`, until the provider
 //! detects it (no liveness probe exists at the provider boundary yet).
+//!
+//! Per-surface health: [`ProviderHealth::surfaces`] reports the `history` and
+//! `live` surfaces apart, each as the [`crate::SurfaceOutcome`] of its last
+//! concluded attempt.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,8 +32,8 @@ use crate::{
     event::{DisconnectCause, EventKind, GapSpan, Timestamp},
     instrument::{Instrument, ProviderId},
     snapshot::{
-        AuthoritativeSessionSnapshot, ConnectionState, ProviderSnapshot, StreamConnection,
-        SystemSnapshot,
+        AuthoritativeSessionSnapshot, ConnectionState, ProviderSnapshot, ProviderSurfaces,
+        StreamConnection, SystemSnapshot,
     },
 };
 
@@ -75,6 +79,11 @@ pub struct ProviderHealth {
     /// Human-renderable detail (e.g. the provider's last error). Free text,
     /// non-contractual.
     pub detail: Option<String>,
+    /// The provider's surfaces judged apart. `state` is the live connection's
+    /// judgment, not a roll-up of these. A view from a daemon that predates
+    /// the field reads [`crate::SurfaceOutcome::Unknown`] on both.
+    #[serde(default)]
+    pub surfaces: ProviderSurfaces,
 }
 
 /// Provider connection state, app-facing.
@@ -208,6 +217,7 @@ impl HealthView {
                 provider: p.provider.clone(),
                 state: provider_state(p),
                 detail: p.last_error.clone(),
+                surfaces: p.surfaces.clone(),
             })
             .collect();
         let streams = snapshot
@@ -306,8 +316,8 @@ mod tests {
     use super::{HealthView, Liveness, ProviderState};
     use crate::{
         AssetClass, AuthoritativeSessionSnapshot, CacheSnapshot, ConnectionState, DisconnectCause,
-        EventKind, GapSpan, Instrument, ProviderId, ProviderSnapshot, StreamConnection,
-        SystemSnapshot, Timestamp,
+        EventKind, GapSpan, Instrument, ProviderId, ProviderSnapshot, ProviderSurfaces,
+        StreamConnection, SurfaceOutcome, SystemSnapshot, Timestamp,
     };
 
     fn provider_snapshot(state: ConnectionState, last_error: Option<&str>) -> ProviderSnapshot {
@@ -785,6 +795,124 @@ mod tests {
             .unwrap(),
             r#"{"down":{"since":7,"cause":"unauthenticated"}}"#
         );
+    }
+
+    // --- per-surface health --------------------------------------------------
+
+    fn ok(at: i64) -> SurfaceOutcome {
+        SurfaceOutcome::Ok { at: Timestamp(at) }
+    }
+
+    fn failing(at: i64, error: &str) -> SurfaceOutcome {
+        SurfaceOutcome::Failing {
+            at: Timestamp(at),
+            error: error.to_string(),
+        }
+    }
+
+    fn surfaces(history: SurfaceOutcome, live: SurfaceOutcome) -> ProviderSurfaces {
+        ProviderSurfaces { history, live }
+    }
+
+    #[test]
+    fn the_view_carries_each_surface_outcome_unchanged() {
+        let expected = surfaces(failing(NOW - 2 * SEC, "HTTP 401"), ok(NOW - 9 * SEC));
+        let snap = snapshot(
+            vec![
+                provider_snapshot(ConnectionState::Connected, None).with_surfaces(expected.clone()),
+            ],
+            vec![],
+            NOW,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
+        assert_eq!(view.providers[0].surfaces, expected);
+    }
+
+    #[test]
+    fn surfaces_are_independent_of_the_provider_state() {
+        // Disabled, Idle and Unauthenticated providers still report their
+        // surfaces from evidence alone; nothing is masked or rolled up.
+        let expected = surfaces(failing(NOW, "fetch failed"), ok(NOW));
+        for (connection, enabled, active) in [
+            (ConnectionState::Unknown, false, 0),
+            (ConnectionState::Connected, true, 0),
+            (ConnectionState::Unauthenticated, true, 1),
+        ] {
+            let snap = snapshot(
+                vec![
+                    provider_snapshot(connection, Some("detail"))
+                        .with_enabled(enabled)
+                        .with_active_subscriptions(active)
+                        .with_surfaces(expected.clone()),
+                ],
+                vec![],
+                NOW,
+            );
+            let p =
+                &HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS).providers[0];
+            assert_eq!(p.surfaces, expected, "{p:?}");
+            assert_eq!(p.detail.as_deref(), Some("detail"), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn surface_wire_golden() {
+        for (outcome, json) in [
+            (
+                failing(5, "boom"),
+                r#"{"state":"failing","at":5,"error":"boom"}"#,
+            ),
+            (ok(1), r#"{"state":"ok","at":1}"#),
+            (SurfaceOutcome::Unknown, r#"{"state":"unknown"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&outcome).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<SurfaceOutcome>(json).unwrap(),
+                outcome
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&surfaces(ok(1), SurfaceOutcome::Unknown)).unwrap(),
+            r#"{"history":{"state":"ok","at":1},"live":{"state":"unknown"}}"#
+        );
+    }
+
+    #[test]
+    fn a_surface_state_from_a_newer_daemon_reads_unknown() {
+        assert_eq!(
+            serde_json::from_str::<SurfaceOutcome>(r#"{"state":"degraded","at":5}"#).unwrap(),
+            SurfaceOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn a_surface_outcome_missing_its_fields_is_refused() {
+        for json in [r#"{"state":"ok"}"#, r#"{"state":"failing","at":5}"#] {
+            assert!(
+                serde_json::from_str::<SurfaceOutcome>(json).is_err(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_view_without_surfaces_reads_both_unknown() {
+        let snap = snapshot(
+            vec![provider_snapshot(ConnectionState::Connected, None)],
+            vec![stream_snapshot(Some(50))],
+            1_000,
+        );
+        let view = HealthView::from_snapshot(&snap, HealthView::DEFAULT_QUIET_AFTER_NS);
+        let mut value = serde_json::to_value(&view).unwrap();
+        value["providers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("surfaces")
+            .expect("the current view carries surfaces");
+        let back: HealthView = serde_json::from_value(value).unwrap();
+        assert_eq!(back.providers[0].surfaces, ProviderSurfaces::default());
+        assert_eq!(back.providers[0].state, view.providers[0].state);
+        assert_eq!(back.streams, view.streams);
     }
 
     #[test]

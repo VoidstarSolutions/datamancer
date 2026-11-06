@@ -140,6 +140,9 @@ pub struct ScriptedSection {
     /// Whether `latest` returns a value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest: Option<bool>,
+    /// The symbol whose history requests fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_symbol: Option<String>,
 }
 
 #[cfg(feature = "scripted-provider")]
@@ -157,6 +160,7 @@ impl ScriptedSection {
                 .live_interval_ms
                 .map_or(defaults.live_interval, std::time::Duration::from_millis),
             latest: self.latest.unwrap_or(defaults.latest),
+            failing_symbol: self.failing_symbol.clone(),
         }
     }
 }

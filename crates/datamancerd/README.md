@@ -190,9 +190,11 @@ A daemon built with the off-by-default `scripted-provider` feature also has
 `[provider.scripted]`, a deterministic test provider (`src/scripted.rs`) that
 serves scripted trades on both surfaces, for instruments naming `scripted`
 only, with no network or credentials. Its knobs are `history_prints`,
-`history_delay_ms`, `live_interval_ms` and `latest`. The hermetic tests in
-`tests/daemon_e2e.rs` use it for the backfill seam and the latest-value seed. A
-daemon built without the feature rejects the section as unknown.
+`history_delay_ms`, `live_interval_ms`, `latest` and `failing_symbol` (history
+requests for that symbol fail). The hermetic tests in `tests/daemon_e2e.rs` and
+`tests/health_observability_e2e.rs` use it for the backfill seam, the
+latest-value seed and the surface health. A daemon built without the feature
+rejects the section as unknown.
 
 Validation fails fast on the remaining cross-section invariants:
 a startup session naming a provider this binary lacks is refused; one using a
@@ -610,6 +612,42 @@ is no WS equivalent; WS consumers reduce their own `snapshot` reply
 client-side. `AppHandle::health()` sends this op rather than reducing
 `snapshot` itself, so the `HealthView.schema_version` field is the daemon's,
 not a client-side guess.
+
+Each provider entry also carries `surfaces`: `history` and `live`, each the
+outcome of the last concluded attempt on it, tagged by `state`:
+
+| `state` | Fields | Meaning |
+|---|---|---|
+| `unknown` | none | No attempt has concluded. A state this build does not know reads the same. |
+| `ok` | `at` | The last attempt succeeded, at that wall-clock time. |
+| `failing` | `at`, `error` | The last attempt ended in `error`; the next success clears it. |
+
+`history` is recorded where the daemon joins every `fetch_history` call (queries
+and backfills alike); a fetch refused because the provider is disabled is not an
+attempt and leaves it untouched. `live` follows the open outcomes (an accepted subscribe, a
+refused one, a failed start) and the in-band connect/disconnect controls. Every
+disconnect but a deliberate disable moves it, so a provider's own hot-apply drop
+(a credential rotation, a settings change) reads `failing` until its reconnect
+lands, as the provider `state` reads `disconnected` for the same moment. The
+disable itself is not an attempt and leaves it untouched, and a provider error
+frame stays on `detail`. Nothing is inferred from silence: an unused surface is
+`unknown`, never `ok`.
+
+Surfaces are per provider, not per symbol, and report the last attempt by any
+session: a symbol that keeps failing alternates `failing` and `ok` as other
+symbols succeed. A view from a daemon that predates the field reads both
+`unknown`.
+
+```jsonc
+"providers": [{
+  "provider": "alpaca", "state": "connected",
+  "detail": "HTTP 401 from the history endpoint",
+  "surfaces": {
+    "history": {"state": "failing", "at": 1762380000000000000, "error": "HTTP 401 from the history endpoint"},
+    "live":    {"state": "ok",      "at": 1762379990000000000}
+  }
+}]
+```
 
 ### `datamancer/health` push plane (iceoryx2)
 

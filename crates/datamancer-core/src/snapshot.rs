@@ -130,12 +130,57 @@ pub struct ProviderSnapshot {
     /// on frames that predate the field.
     #[serde(default)]
     pub active_subscriptions: u32,
+    /// The last concluded attempt on each of this provider's surfaces;
+    /// [`SurfaceOutcome::Unknown`] on frames that predate the field.
+    #[serde(default)]
+    pub surfaces: ProviderSurfaces,
 }
 
 /// Old-frame default for [`ProviderSnapshot::enabled`]: pre-cycle-4 frames
 /// have no `enabled` key at all, and those providers were always enabled.
 fn default_true() -> bool {
     true
+}
+
+/// A provider's `history` surface ([`crate::Provider::fetch_history`]) and
+/// `live` surface ([`crate::Provider::start_live`],
+/// [`crate::LiveHandle::subscribe`] and the in-band connect/disconnect
+/// controls), each judged on its own evidence. Both are per provider, not per
+/// symbol: a surface reports the last attempt by any session.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSurfaces {
+    /// The last concluded [`crate::Provider::fetch_history`] call; a fetch
+    /// refused because the provider is disabled is not an attempt.
+    pub history: SurfaceOutcome,
+    /// The last concluded attempt on the connect path; a deliberate disable
+    /// is not an attempt.
+    pub live: SurfaceOutcome,
+}
+
+/// The last concluded attempt on one surface. Timestamps are wall-clock
+/// (observability only, like [`SystemSnapshot::captured_at`]).
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SurfaceOutcome {
+    /// The last attempt succeeded.
+    Ok {
+        /// When that attempt concluded.
+        at: Timestamp,
+    },
+    /// The last attempt ended in an error; the next success clears it.
+    Failing {
+        /// When that attempt concluded.
+        at: Timestamp,
+        /// The error it ended in.
+        error: String,
+    },
+    /// No attempt has concluded: never used, the first attempt is in flight,
+    /// or a state this build does not know.
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 /// The cache catalog plus an optional whole-store footprint.
@@ -313,6 +358,7 @@ impl ProviderSnapshot {
             last_error,
             enabled: true,
             active_subscriptions: 0,
+            surfaces: ProviderSurfaces::default(),
         }
     }
 
@@ -321,6 +367,17 @@ impl ProviderSnapshot {
     #[must_use]
     pub fn with_active_subscriptions(mut self, active: u32) -> Self {
         self.active_subscriptions = active;
+        self
+    }
+
+    /// Set the last concluded attempt on each surface.
+    ///
+    /// # Arguments
+    ///
+    /// * `surfaces` - the [`ProviderSurfaces`] outcomes for this provider.
+    #[must_use]
+    pub fn with_surfaces(mut self, surfaces: ProviderSurfaces) -> Self {
+        self.surfaces = surfaces;
         self
     }
 
@@ -463,8 +520,8 @@ impl ClientSessionSnapshot {
 mod tests {
     use super::{
         AuthoritativeSessionSnapshot, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
-        ConnectionState, ProviderSnapshot, ResumeBufferSnapshot, StreamConnection, SubscriptionRef,
-        SystemSnapshot,
+        ConnectionState, ProviderSnapshot, ProviderSurfaces, ResumeBufferSnapshot,
+        StreamConnection, SubscriptionRef, SurfaceOutcome, SystemSnapshot,
     };
     use crate::{
         Adjustment, AssetClass, BarInterval, CacheCatalogEntry, DisconnectCause, EventKind,
@@ -511,6 +568,7 @@ mod tests {
             None,
         );
         assert!(p.enabled); // default: enabled (embedder Static sources)
+        assert_eq!(p.surfaces, ProviderSurfaces::default());
         assert!(!p.with_enabled(false).enabled);
     }
 
@@ -535,6 +593,13 @@ mod tests {
                 last_error: Some("boom".to_string()),
                 enabled: false,
                 active_subscriptions: 3,
+                surfaces: ProviderSurfaces {
+                    history: SurfaceOutcome::Failing {
+                        at: Timestamp(40),
+                        error: "HTTP 401".to_string(),
+                    },
+                    live: SurfaceOutcome::Ok { at: Timestamp(41) },
+                },
             }],
             cache: CacheSnapshot {
                 entries: vec![
@@ -614,6 +679,8 @@ mod tests {
         }"#;
         let p: ProviderSnapshot = serde_json::from_str(old).unwrap();
         assert!(p.enabled);
+        // Likewise `surfaces`: absent means no evidence on either.
+        assert_eq!(p.surfaces, ProviderSurfaces::default());
     }
 
     #[test]
