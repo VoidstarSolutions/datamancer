@@ -16,8 +16,9 @@ use datamancer::{Scope, SubscribeOutcome, Timestamp};
 use datamancer_client::spec::{ScopeCfg, Subscribed};
 
 /// The wall clock as a [`Timestamp`]: the live edge a backfill would end at
-/// if it started now. `requested_scope` takes it as an argument so the
-/// boundary is testable.
+/// if it started now. The `[[startup_session]]` check at boot compares a
+/// configured `backfill_from` against it; a subscribe is checked by the
+/// library itself ([`datamancer::Error::BackfillFromNotInPast`]).
 #[must_use]
 pub fn live_edge_now() -> Timestamp {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,24 +32,20 @@ pub fn live_edge_now() -> Timestamp {
 /// `backfill_from` pair must agree, the same rule `[[startup_session]]`
 /// enforces at boot: `live_backfill` needs a `backfill_from`, and a
 /// `backfill_from` under `live` is refused rather than ignored, so a request
-/// can never be silently downgraded to pure-live (#89). A `backfill_from` at
-/// or past `now` is refused too: the library would run no backfill for it
-/// (nothing lies in `[from, now)`) while the reply still said
-/// `live_backfill`. The error is the `bad_request` message.
+/// can never be silently downgraded to pure-live (#89). Whether the start
+/// lies before the live edge is the library's rule, not the daemon's: the
+/// subscribe answers [`datamancer::Error::BackfillFromNotInPast`], which
+/// [`error_code`] maps to `bad_request`. The error here is the `bad_request`
+/// message for a disagreeing pair.
 ///
 /// # Errors
 ///
-/// A `bad_request` message when the pair disagrees or the start is not in
-/// the past.
-pub fn requested_scope(spec: &SubscriptionSpec, now: Timestamp) -> Result<Scope, String> {
+/// A `bad_request` message when the pair disagrees.
+pub fn requested_scope(spec: &SubscriptionSpec) -> Result<Scope, String> {
     match (spec.scope, spec.backfill_from) {
         (ScopeCfg::Live, None) => Ok(Scope::Live {
             backfill_from: None,
         }),
-        (ScopeCfg::LiveBackfill, Some(from)) if from >= now => Err(format!(
-            "backfill_from {} is not before the live edge {}; nothing to backfill",
-            from.0, now.0
-        )),
         (ScopeCfg::LiveBackfill, Some(from)) => Ok(Scope::Live {
             backfill_from: Some(from),
         }),
@@ -89,6 +86,9 @@ pub fn error_code(err: &datamancer::Error) -> &'static str {
         Error::UnsupportedEventKind { .. } => codes::UNSUPPORTED_EVENT_KIND,
         Error::PersistenceRequired => codes::PERSISTENCE_REQUIRED,
         Error::UnsupportedClientScope => codes::UNSUPPORTED_CLIENT_SCOPE,
+        // The request itself is malformed (a backfill with nothing to fetch),
+        // the same answer the daemon gives a disagreeing scope pair.
+        Error::BackfillFromNotInPast { .. } => codes::BAD_REQUEST,
         Error::DuplicateSubscription { .. } => codes::DUPLICATE_SUBSCRIPTION,
         Error::NotSubscribed { .. } => codes::NOT_SUBSCRIBED,
         Error::UnknownProvider(_) => codes::UNKNOWN_PROVIDER,
@@ -124,8 +124,6 @@ mod tests {
         }
     }
 
-    const NOW: Timestamp = Timestamp(1_000);
-
     fn outcome(scope: Scope, joined: bool) -> SubscribeOutcome {
         SubscribeOutcome { scope, joined }
     }
@@ -135,42 +133,21 @@ mod tests {
     #[test]
     fn requested_scope_requires_the_pair_to_agree() {
         assert_eq!(
-            requested_scope(&spec(ScopeCfg::Live, None), NOW),
+            requested_scope(&spec(ScopeCfg::Live, None)),
             Ok(Scope::Live {
                 backfill_from: None
             })
         );
         assert_eq!(
-            requested_scope(&spec(ScopeCfg::LiveBackfill, Some(Timestamp(7))), NOW),
+            requested_scope(&spec(ScopeCfg::LiveBackfill, Some(Timestamp(7)))),
             Ok(Scope::Live {
                 backfill_from: Some(Timestamp(7))
             })
         );
-        let missing = requested_scope(&spec(ScopeCfg::LiveBackfill, None), NOW).unwrap_err();
+        let missing = requested_scope(&spec(ScopeCfg::LiveBackfill, None)).unwrap_err();
         assert!(missing.contains("requires backfill_from"), "{missing}");
-        let stray = requested_scope(&spec(ScopeCfg::Live, Some(Timestamp(7))), NOW).unwrap_err();
+        let stray = requested_scope(&spec(ScopeCfg::Live, Some(Timestamp(7)))).unwrap_err();
         assert!(stray.contains("requires scope live_backfill"), "{stray}");
-    }
-
-    /// A `backfill_from` at or past the live edge would run no backfill while
-    /// the reply still claimed one; it is refused instead.
-    #[test]
-    fn requested_scope_refuses_a_backfill_from_at_or_past_now() {
-        let at_now = requested_scope(&spec(ScopeCfg::LiveBackfill, Some(NOW)), NOW).unwrap_err();
-        assert!(at_now.contains("not before the live edge"), "{at_now}");
-        let future = requested_scope(
-            &spec(ScopeCfg::LiveBackfill, Some(Timestamp(NOW.0 + 1))),
-            NOW,
-        )
-        .unwrap_err();
-        assert!(future.contains("not before the live edge"), "{future}");
-        assert!(
-            requested_scope(
-                &spec(ScopeCfg::LiveBackfill, Some(Timestamp(NOW.0 - 1))),
-                NOW
-            )
-            .is_ok()
-        );
     }
 
     #[test]
@@ -226,6 +203,14 @@ mod tests {
         assert_eq!(
             error_code(&Error::UnsupportedClientScope),
             codes::UNSUPPORTED_CLIENT_SCOPE
+        );
+        assert_eq!(
+            error_code(&Error::BackfillFromNotInPast {
+                from: datamancer::Timestamp(2),
+                edge: datamancer::Timestamp(1),
+            }),
+            codes::BAD_REQUEST,
+            "a backfill with nothing to fetch is a malformed request"
         );
         assert_eq!(
             error_code(&Error::DuplicateSubscription {

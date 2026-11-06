@@ -730,8 +730,22 @@ impl Config {
                     s.symbol
                 )));
             }
-            // Surface a scope/backfill mismatch at validate time.
-            s.resolve_scope()?;
+            // Surface a scope/backfill mismatch at validate time, and a
+            // backfill with nothing to fetch: the library refuses a start at
+            // or past the live edge when the anchor opens, so say so here,
+            // before the daemon has started anything.
+            if let Scope::Live {
+                backfill_from: Some(from),
+            } = s.resolve_scope()?
+            {
+                let edge = crate::control::live_edge_now();
+                if from >= edge {
+                    return Err(DaemonError::ConfigInvalid(format!(
+                        "startup_session {} backfill_from {} is not before the live edge {}; nothing to backfill",
+                        s.symbol, from.0, edge.0
+                    )));
+                }
+            }
         }
         // A zero publish interval would panic `tokio::time::interval`, which both
         // the iceoryx2 diagnostics ticker (unix) and the WS health-push task
@@ -1303,6 +1317,33 @@ scope = "live_backfill"
         let err = config.validate().expect_err("must reject");
         match err {
             DaemonError::ConfigInvalid(m) => assert!(m.contains("backfill_from"), "{m}"),
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    /// A startup backfill that would start at or past the live edge has
+    /// nothing to fetch; the library refuses it when the anchor opens, so the
+    /// config says so first.
+    #[test]
+    fn config_rejects_a_startup_backfill_from_at_or_past_the_live_edge() {
+        let text = r#"
+[provider.alpaca_crypto]
+account_type = "paper"
+
+[[startup_session]]
+provider = "alpaca-crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+scope = "live_backfill"
+backfill_from = "2200-01-01T00:00:00Z"
+"#;
+        let config = Config::parse(text).expect("parse");
+        let err = config.validate().expect_err("must reject");
+        match err {
+            DaemonError::ConfigInvalid(m) => {
+                assert!(m.contains("not before the live edge"), "{m}");
+            }
             other => panic!("wrong error: {other:?}"),
         }
     }

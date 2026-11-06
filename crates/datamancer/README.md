@@ -146,8 +146,10 @@ live edge seamed ahead of the live tail (history, then the live prints buffered 
 backfill in arrival order, then live; one `Gap` only for real loss). `subscribe` returns the scope
 **actually** opened: the pair's authoritative session is created with its first subscriber's
 scope and later subscribers join it as is, so a backfill request on a pair another consumer
-already holds pure-live comes back pure-live, and vice versa. A bounded `Scope::Historical` is a
-`Session` concern and is rejected here.
+already holds pure-live comes back pure-live, and vice versa. A backfill that would *create* the
+session with a `backfill_from` at or past the live edge is refused (`Error::BackfillFromNotInPast`):
+nothing lies in that window, so opening it would report a backfill that never ran. A bounded
+`Scope::Historical` is a `Session` concern and is rejected here.
 
 Subscriptions accumulate; the client session's multiplexed stream **interleaves** everything that has been requested — per-symbol deterministic (`(instrument, seq)`, source-stamped within each instrument), arrival-order across symbols, never globally merge-sorted. Each `(instrument, kind)` pair is backed by a refcounted shared **authoritative session**, so two consumers of the same pair observe identical `(seq, source_ts)`. Adding the same instrument with a new event kind extends the subscription set rather than duplicating it.
 

@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse, Request as HsRequest, Response as HsResponse,
 };
 
-use crate::control::{actual_scope, codes, live_edge_now, requested_scope};
+use crate::control::{actual_scope, codes, requested_scope};
 use crate::ws::protocol::ws_reply_from_library_error;
 use crate::ws::{WsHealthPush, WsReply, WsRequest};
 
@@ -285,7 +285,7 @@ async fn dispatch(session: &ClientSession, dm: &Datamancer, line: &str) -> (WsRe
                 spec.asset_class.into(),
                 spec.symbol.clone(),
             );
-            let scope = match requested_scope(&spec, live_edge_now()) {
+            let scope = match requested_scope(&spec) {
                 Ok(scope) => scope,
                 Err(message) => {
                     return (

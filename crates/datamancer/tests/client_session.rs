@@ -1106,3 +1106,87 @@ async fn client_subscribe_rejects_duplicate_pair() {
     }
     let _ = client.close().await;
 }
+
+/// The wall clock in epoch nanoseconds, for a `backfill_from` that is
+/// certainly not in the past.
+fn now_nanos() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("fits")
+}
+
+/// A backfill that would start at or past the live edge has nothing to fetch:
+/// creating a session with it is refused rather than opened as a backfill that
+/// never runs while the outcome still says `live_backfill`. The rule is the
+/// library's, on both consumer handles. A joiner is not checked: it takes the
+/// scope the pair already has.
+#[tokio::test]
+async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let future = Timestamp(now_nanos() + 3_600_000_000_000);
+    let backfill = Scope::Live {
+        backfill_from: Some(future),
+    };
+
+    let client = dm.client_session();
+    let err = client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            backfill,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, datamancer::Error::BackfillFromNotInPast { from, .. } if from == future),
+        "{err:?}"
+    );
+    match dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            backfill,
+            PersistenceOptions::none(),
+        )
+        .await
+    {
+        Err(datamancer::Error::BackfillFromNotInPast { from, .. }) => assert_eq!(from, future),
+        Err(other) => panic!("the single-pair handle follows the same rule: {other:?}"),
+        Ok(_) => panic!("the single-pair handle must refuse the empty window"),
+    }
+
+    // A pair another subscriber holds pure-live is joined as is; the start
+    // this subscriber asked for never applies, so it is not checked.
+    client
+        .subscribe(
+            inst("MSFT"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let other = dm.client_session();
+    let outcome = other
+        .subscribe(
+            inst("MSFT"),
+            EventKind::Trade,
+            backfill,
+            PersistenceOptions::none(),
+        )
+        .await
+        .expect("joins the pure-live session");
+    assert!(outcome.joined, "{outcome:?}");
+    assert_eq!(outcome.scope, live(), "{outcome:?}");
+    let _ = other.close().await;
+    let _ = client.close().await;
+}

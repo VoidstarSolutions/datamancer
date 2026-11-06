@@ -178,7 +178,9 @@ configured, and providers are enabled at runtime via the config service's
 restarting). Validation fails fast on the remaining cross-section invariants:
 a startup session using a cache preset requires `[cache]`; one writing the
 tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
-`backfill_from`.
+`backfill_from` that lies before the live edge (the library refuses a backfill
+with nothing to fetch when the anchor opens; the config check just says so
+before anything starts).
 
 `[session] query_persistence` is the daemon's single cache policy for every
 `open-query` — queries carry no per-request persistence selector on the wire.
@@ -473,8 +475,10 @@ for the creator): its stream begins where it joined, no history is replayed
 for it and no `Gap` marks what it missed, so a `backfill_from` on a joined
 reply is the creator's coverage, not the joiner's; a consumer that needs its
 own history on a joined pair fetches it with `open-query`. A `backfill_from`
-at or past the live edge is `bad_request` (there is nothing to backfill, and
-the reply would otherwise claim a backfill that never ran). The seed
+at or past the live edge is `bad_request`: the library refuses to create a
+session with nothing to backfill (the reply would otherwise claim a backfill
+that never ran), and the daemon maps that refusal to the same code as a
+disagreeing scope pair. The seed
 subscriptions of `open-client` are validated together before any of them
 subscribes, follow the same rules, and are not echoed (that reply names the
 service).

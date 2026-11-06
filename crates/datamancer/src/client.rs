@@ -1525,6 +1525,10 @@ impl ClientSession {
     ///   range has no live tail and stays a [`crate::Session`] concern.
     /// - [`Error::UnsupportedEventKind`] — no provider serves the pair on the
     ///   surfaces the scope needs (live, plus history under backfill).
+    /// - [`Error::BackfillFromNotInPast`] — this subscriber would create the
+    ///   session with a backfill starting at or past the live edge, which
+    ///   has nothing to fetch. A joiner is not checked: it takes the scope
+    ///   the pair already has.
     /// - [`Error::SessionClosed`] — the controller has shut down.
     pub async fn subscribe(
         &self,

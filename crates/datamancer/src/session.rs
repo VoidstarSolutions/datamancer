@@ -255,6 +255,9 @@ impl Datamancer {
     ///   the same pair are stateless reads and run concurrently).
     /// - [`Error::PersistenceRequired`] — `options` requires a cache but no
     ///   [`HistoricalCache`] is configured.
+    /// - [`Error::BackfillFromNotInPast`] — a live backfill that would start
+    ///   at or past the live edge; there is nothing to backfill, so it is
+    ///   refused rather than opened as a backfill that never runs.
     ///
     /// # Panics
     ///
@@ -385,6 +388,22 @@ impl Datamancer {
         {
             let guard = SubscriberGuard::new(existing.clone(), id);
             return Ok((existing, guard, rx, true));
+        }
+
+        // The create path opens the session with *this* subscriber's scope,
+        // so the scope is checked here and not for a joiner above (a joiner
+        // takes the creator's scope as is). A backfill that would start at or
+        // past the live edge has nothing to fetch; it is refused rather than
+        // opened as a backfill that never runs while the outcome still says
+        // `live_backfill`.
+        if let Scope::Live {
+            backfill_from: Some(from),
+        } = scope
+        {
+            let edge = wall_clock_ts();
+            if from >= edge {
+                return Err(Error::BackfillFromNotInPast { from, edge });
+            }
         }
 
         self.create_authoritative(provider, instrument, kind, scope, options, key)
@@ -1921,6 +1940,9 @@ impl Controller {
     ) -> bool {
         let edge = wall_clock_ts();
         if from >= edge {
+            // `Datamancer::authoritative` refused this start at open; it can
+            // recur only if the clock stepped backwards since. The window is
+            // empty, so there is nothing to fetch and nothing was lost.
             return true;
         }
         // Guard clears `backfilling` on every exit path (both early `return`s

@@ -68,6 +68,18 @@ pub enum Error {
     #[error("client subscriptions are unbounded; a historical scope is unsupported")]
     UnsupportedClientScope,
 
+    /// A live backfill was asked to start at or past the live edge. Nothing
+    /// lies in `[from, edge)`, so the session would run no backfill while
+    /// still reporting a backfill scope; it is refused at open instead. Ask
+    /// for pure-live, or for a `backfill_from` in the past.
+    #[error("backfill_from {from:?} is not before the live edge {edge:?}; nothing to backfill")]
+    BackfillFromNotInPast {
+        /// The requested backfill start.
+        from: crate::Timestamp,
+        /// The live edge the request was checked against.
+        edge: crate::Timestamp,
+    },
+
     /// The session's event stream has already been taken and is still live.
     /// After the previous `EventStream` is dropped, `take_events` can be called
     /// again.
