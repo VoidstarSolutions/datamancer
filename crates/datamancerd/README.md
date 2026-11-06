@@ -38,6 +38,10 @@ cargo test -p datamancerd --test daemon_e2e -- --ignored
 cargo test -p datamancerd --all-features --test scripted_e2e -- --ignored --test-threads=1
 ```
 
+On macOS a freshly built binary run by hand prompts for access to any Keychain
+entry; set `DATAMANCER_CREDENTIALS_FILE` to a file path to keep a throwaway
+daemon's credentials there instead.
+
 Provider credentials are **not** in the config. They live in the daemon-owned
 credential store, provisioned over the control socket with `set-credentials`
 (see [Credentials](#credentials)). The `account_type` selects the paper vs.
