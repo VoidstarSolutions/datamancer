@@ -35,9 +35,9 @@ pub trait Provider: Send + Sync + 'static {
     fn id(&self) -> &str;
 
     /// Whether this provider can serve `kind` for `instrument` on `surface`.
-    /// Datamancer uses this when routing subscriptions across multiple
-    /// registered providers; a provider that doesn't know the instrument should
-    /// return `false` rather than fail later.
+    /// Datamancer asks the provider an instrument names; a provider that
+    /// doesn't know the instrument should return `false` rather than fail
+    /// later.
     ///
     /// Answer each [`Surface`] independently — they are not required to agree,
     /// and neither contains the other. A `true` for [`Surface::History`] is a
@@ -46,6 +46,9 @@ pub trait Provider: Send + Sync + 'static {
     /// answer for a surface you have not wired: an over-promise routes a
     /// request here that then fails at network time, and an under-promise makes
     /// datamancer reject a request you could have served.
+    ///
+    /// Answer the same whether or not [`Self::enabled`]: routing asks that
+    /// separately.
     fn supports(&self, instrument: &Instrument, kind: EventKind, surface: Surface) -> bool;
 
     /// Open a live session against this provider.
@@ -60,6 +63,10 @@ pub trait Provider: Send + Sync + 'static {
     /// Fetch a bounded historical range, pushing events into `sink` in
     /// source-timestamp order. Returns once the range is exhausted; pagination
     /// and rate-limit handling are the provider's responsibility.
+    ///
+    /// A disabled provider refuses with
+    /// [`Error::ProviderDisabled`](crate::Error::ProviderDisabled), never an
+    /// empty `Ok`: an `Ok` records the range as covered.
     async fn fetch_history(
         &self,
         request: HistoryRequest,

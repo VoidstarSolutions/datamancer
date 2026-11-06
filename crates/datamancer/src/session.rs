@@ -193,10 +193,6 @@ struct DatamancerInner {
     providers: Vec<Arc<dyn Provider>>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
-    /// Per-instrument provider pinning. When a session is opened for an
-    /// instrument that appears here, the named provider is preferred over
-    /// the first-supports-it match.
-    instrument_provider: Vec<(Instrument, String)>,
     /// Live-session registry: at most one live session may be active per
     /// `(instrument, kind)` pair. Each live `Session` holds an `Arc` to a
     /// [`RegistrySentinel`]; the map keeps a `Weak` so a stale entry can be
@@ -256,8 +252,15 @@ impl Datamancer {
     /// # Errors
     ///
     /// Fail-fast on:
-    /// - [`Error::UnsupportedEventKind`] — no registered provider serves
-    ///   `(instrument, kind)`.
+    /// - [`Error::UnknownProvider`] — no registered provider has the
+    ///   instrument's [`provider`](Instrument::provider) id.
+    /// - [`Error::UnsupportedEventKind`] — that provider lacks a surface the
+    ///   scope needs.
+    /// - [`Error::ProviderDisabled`] — a live scope's provider is disabled, or
+    ///   a historical scope's provider is disabled and `options` does not read
+    ///   the cache. A historical scope that reads the cache opens anyway:
+    ///   cached spans are served, every uncached span reports as a `Gap`, and
+    ///   the refused fetch reports once in the stream.
     /// - [`Error::PersistenceRequired`] — `options` needs a cache or tap log
     ///   that is not configured.
     /// - [`Error::BackfillFromNotInPast`] — a live backfill would start at or
@@ -281,6 +284,11 @@ impl Datamancer {
                 // (concurrent reads for the same pair run independently) and keep
                 // the single-consumer controller verbatim.
                 let provider = self.route(&instrument, kind, &[Surface::History])?;
+                if !options.read_cache && !provider.enabled() {
+                    return Err(Error::ProviderDisabled {
+                        provider: provider.id().to_string(),
+                    });
+                }
                 let accounting = self.inner.accounting_for(provider.id());
                 let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(8);
                 let (events_tx, events_rx) = mpsc::channel::<MarketEvent>(default_buffer());
@@ -361,18 +369,8 @@ impl Datamancer {
     ) -> Result<Attached> {
         self.check_persistence(options)?;
 
-        // A backfilling live session seams a historical fetch into the live
-        // tail, so it needs both surfaces from the one provider that will serve
-        // the whole substream.
-        let surfaces: &[Surface] = if scope.backfill_from().is_some() {
-            &[Surface::Live, Surface::History]
-        } else {
-            &[Surface::Live]
-        };
-        let provider = self.route(&instrument, kind, surfaces)?;
         let key = (instrument.clone(), kind);
 
-        // Probe under the lock; if a live session exists, try to share it.
         let existing = {
             let map = self
                 .inner
@@ -381,14 +379,30 @@ impl Datamancer {
                 .expect("live-session registry mutex poisoned");
             map.get(&key).and_then(Weak::upgrade)
         };
-        if let Some(existing) = existing
-            && let Ok((id, rx)) = existing.add_subscriber().await
-        {
-            return Ok(Attached::joined(existing, id, rx));
+        if let Some(existing) = existing {
+            let parked = self
+                .inner
+                .providers
+                .iter()
+                .any(|p| p.id() == existing.provider_id && !p.enabled());
+            if parked {
+                return Err(Error::ProviderDisabled {
+                    provider: existing.provider_id.clone(),
+                });
+            }
+            if let Ok((id, rx)) = existing.add_subscriber().await {
+                return Ok(Attached::joined(existing, id, rx));
+            }
         }
 
-        // A joiner takes the session's scope, so only the creator is checked.
         check_backfill_start(scope)?;
+
+        let surfaces: &[Surface] = if scope.backfill_from().is_some() {
+            &[Surface::Live, Surface::History]
+        } else {
+            &[Surface::Live]
+        };
+        let provider = self.route(&instrument, kind, surfaces)?;
 
         self.create_authoritative(provider, instrument, kind, scope, options, key)
             .await
@@ -871,69 +885,43 @@ impl Datamancer {
             .ok_or_else(|| Error::UnknownProvider(id.to_string()))
     }
 
-    /// Pick the provider for `(instrument, kind)` that serves **every** surface
-    /// in `surfaces`: an explicit `instrument_provider` pin if one exists, else
-    /// the **first** registered provider whose `supports()` matches. Load-bearing
-    /// precondition: no two registered providers may claim the same
-    /// (asset-class, kind) space, since an unpinned instrument in that overlap
-    /// silently routes to whichever was registered first — overlapping providers
-    /// require instrument→provider pinning to disambiguate.
+    /// The provider [`Instrument::provider`] names, serving `(instrument, kind)`
+    /// on **every** surface in `surfaces`.
     ///
-    /// `surfaces` carries more than one entry for a backfilling live session,
-    /// which needs history *and* live from a **single** provider. Satisfying the
-    /// two halves from different providers would splice two upstreams into one
-    /// `(instrument, seq)` substream at the historical→live seam, breaking the
-    /// per-symbol determinism the ordering model rests on — so this requires one
-    /// provider to answer for all of them rather than routing each separately.
+    /// [`Error::UnknownProvider`] when no registered provider has that id,
+    /// [`Error::ProviderDisabled`] when it is disabled and `surfaces` holds
+    /// [`Surface::Live`], [`Error::UnsupportedEventKind`] when it lacks a
+    /// surface.
     fn route(
         &self,
         instrument: &Instrument,
         kind: EventKind,
         surfaces: &[Surface],
     ) -> Result<Arc<dyn Provider>> {
-        let pinned = self
+        let id = instrument.provider().as_str();
+        let provider = self
             .inner
-            .instrument_provider
+            .providers
             .iter()
-            .find(|(i, _)| i == instrument)
-            .map(|(_, p)| p.as_str());
-
-        let serves_all =
-            |p: &Arc<dyn Provider>| surfaces.iter().all(|s| p.supports(instrument, kind, *s));
-
-        let candidate = if let Some(id) = pinned {
-            self.inner
-                .providers
-                .iter()
-                .find(|p| p.id() == id && serves_all(p))
-        } else {
-            self.inner.providers.iter().find(|p| serves_all(p))
-        };
-
-        candidate.cloned().ok_or_else(|| {
-            // Report the first surface no provider could serve, so a failed
-            // backfill names the missing half instead of the whole request.
-            let missing = surfaces
-                .iter()
-                .copied()
-                .find(|s| {
-                    !self
-                        .inner
-                        .providers
-                        .iter()
-                        .any(|p| p.supports(instrument, kind, *s))
-                })
-                // Every surface is served by *some* provider, but no single one
-                // serves all — the split-across-providers case a backfilling
-                // session cannot use. Name the first requested surface.
-                .or_else(|| surfaces.first().copied())
-                .unwrap_or(Surface::Live);
-            Error::UnsupportedEventKind {
+            .find(|p| p.id() == id)
+            .ok_or_else(|| Error::UnknownProvider(id.to_string()))?;
+        if surfaces.contains(&Surface::Live) && !provider.enabled() {
+            return Err(Error::ProviderDisabled {
+                provider: id.to_string(),
+            });
+        }
+        match surfaces
+            .iter()
+            .copied()
+            .find(|s| !provider.supports(instrument, kind, *s))
+        {
+            None => Ok(provider.clone()),
+            Some(surface) => Err(Error::UnsupportedEventKind {
                 kind,
                 instrument: instrument.clone(),
-                surface: missing,
-            }
-        })
+                surface,
+            }),
+        }
     }
 }
 
@@ -946,7 +934,6 @@ pub struct DatamancerBuilder {
     providers: Vec<Arc<dyn Provider>>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
-    instrument_provider: Vec<(Instrument, String)>,
     resume_buffer_events: Option<usize>,
     /// Corporate-action adjustment mode. `Adjustment`'s `Default` is `All`, so
     /// `DatamancerBuilder::default()` already yields fully-adjusted bars; call
@@ -968,15 +955,6 @@ impl DatamancerBuilder {
     #[must_use]
     pub fn provider_arc(mut self, p: Arc<dyn Provider>) -> Self {
         self.providers.push(p);
-        self
-    }
-
-    /// Pin `instrument` to a specific provider id. When more than one
-    /// registered provider supports the pair, the pinned one wins.
-    #[must_use]
-    pub fn pin(mut self, instrument: Instrument, provider_id: impl Into<String>) -> Self {
-        self.instrument_provider
-            .push((instrument, provider_id.into()));
         self
     }
 
@@ -1063,7 +1041,6 @@ impl DatamancerBuilder {
                 providers: self.providers,
                 tap_log: self.tap_log,
                 historical_cache: self.historical_cache,
-                instrument_provider: self.instrument_provider,
                 live_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 resume_buffer_events: self
                     .resume_buffer_events
@@ -1605,9 +1582,11 @@ impl Controller {
     /// `write_cache`, stored back). With a `BackfillSide`, live arrivals are
     /// teed + buffered concurrently, the segment touching `edge` gets a
     /// conservative coverage claim (history endpoints lag the live feed), and
-    /// a failed fetch gaps through to `edge`. On a gap-fetch failure only the
-    /// confirmed prefix is claimed, an in-band `Gap` is emitted for the
-    /// remainder, and the remaining segments are abandoned.
+    /// a failed fetch gaps through to `edge` and abandons the remaining
+    /// segments. Without one, covered segments after a failed fetch still
+    /// replay and later gap segments report a `Gap` unfetched, so the whole
+    /// range is delivered or gapped. Either way only the confirmed prefix of
+    /// the failed segment is claimed.
     #[allow(
         clippy::too_many_lines,
         reason = "linear per-segment dispatch kept inline; extraction would obscure the covered/gap handling symmetry"
@@ -1627,6 +1606,7 @@ impl Controller {
             None => (None, None, None),
         };
 
+        let mut fetch_failed = false;
         for seg in segments {
             match seg {
                 Segment::Covered { from: f, to: t } => {
@@ -1694,6 +1674,10 @@ impl Controller {
                     }
                 }
                 Segment::Gap { from: f, to: t } => {
+                    if fetch_failed {
+                        self.emit_gap(f, f, t).await;
+                        continue;
+                    }
                     let (tx, mut rx) = mpsc::channel::<MarketEvent>(default_buffer());
                     let provider = self.provider.clone();
                     let request = HistoryRequest {
@@ -1818,7 +1802,10 @@ impl Controller {
                         if let Some(message) = fetch_error {
                             self.emit_provider_error(confirmed_to, message).await;
                         }
-                        break;
+                        if edge.is_some() {
+                            break;
+                        }
+                        fetch_failed = true;
                     }
                 }
             }
@@ -1831,8 +1818,9 @@ impl Controller {
     /// streams them in order: covered segments replay from the cache, gap
     /// segments fetch from the provider -- forwarded to the consumer and, when
     /// `write_cache`, stored back. On a gap-fetch failure, only the confirmed
-    /// prefix is claimed, an in-band `Gap` is emitted for the remainder, and
-    /// the remaining segments are abandoned.
+    /// prefix is claimed and an in-band `Gap` covers the rest of that segment;
+    /// later covered segments still replay and later gap segments report a
+    /// `Gap` without a fetch.
     async fn run_historical_cached(
         &mut self,
         from: Timestamp,
@@ -2404,8 +2392,8 @@ enum Segment {
 /// Outcome of streaming a planned segment sequence.
 #[derive(Debug, PartialEq, Eq)]
 enum SegmentOutcome {
-    /// Every segment streamed, or a failed gap-fetch was gapped and the
-    /// remaining segments abandoned — the scope's normal continuation applies.
+    /// Every segment streamed or gapped, or a backfill's failed fetch gapped
+    /// through to the edge — the scope's normal continuation applies.
     Done,
     /// A Close command or Session drop ended the controller mid-stream.
     /// `shutdown()` has already run on this path — callers must not call it
@@ -2617,6 +2605,7 @@ fn data_source_ts(ev: &MarketEvent) -> Option<Timestamp> {
 fn provider_error_message(e: &Error) -> String {
     match e {
         Error::Provider { message, .. } => message.clone(),
+        Error::ProviderDisabled { .. } => "provider disabled".to_string(),
         Error::Unauthenticated { message, .. } => format!("unauthenticated: {message}"),
         other => other.to_string(),
     }

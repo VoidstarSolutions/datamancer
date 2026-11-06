@@ -319,6 +319,34 @@ fn host_global_open_error(what: &str, e: &datamancer::transport::TransportError)
     }
 }
 
+/// Open an `always_on` anchor, or `None` when its provider is disabled.
+async fn open_anchor(
+    dm: &Datamancer,
+    startup: &crate::config::StartupSession,
+) -> Result<Option<Session>> {
+    let opened = dm
+        .session(
+            startup.instrument(),
+            startup.kind.into(),
+            startup.resolve_scope()?.into(),
+            crate::config::persistence_options(startup.persistence),
+        )
+        .await;
+    match opened {
+        Ok(session) => Ok(Some(session)),
+        Err(datamancer::Error::ProviderDisabled { provider }) => {
+            tracing::warn!(
+                %provider,
+                symbol = %startup.symbol,
+                kind = ?startup.kind,
+                "skipping always_on startup session: its provider is disabled; restart after enabling it"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Server {
     /// Build the daemon from a validated [`Config`]: assemble the
     /// [`Datamancer`], create the one process-wide iceoryx2 node, and open the
@@ -396,17 +424,10 @@ impl Server {
                 );
                 continue;
             }
-            let scope = s.resolve_scope()?;
-            let session = dm
-                .session(
-                    s.instrument(),
-                    s.kind.into(),
-                    scope.into(),
-                    crate::config::persistence_options(s.persistence),
-                )
-                .await?;
-            tracing::info!(symbol = %s.symbol, "anchored always_on startup session");
-            anchors.push(session);
+            if let Some(session) = open_anchor(&dm, s).await? {
+                tracing::info!(symbol = %s.symbol, "anchored always_on startup session");
+                anchors.push(session);
+            }
         }
 
         Ok(Self {
@@ -2083,6 +2104,40 @@ mod tests {
             config_hub,
         ));
         (client, task, cmd_rx, dir)
+    }
+
+    #[tokio::test]
+    async fn an_anchor_on_a_disabled_provider_is_skipped_and_any_other_failure_aborts() {
+        let config = Config::parse(
+            r#"
+[[startup_session]]
+provider = "alpaca"
+asset_class = "equity"
+symbol = "AAPL"
+kind = "trade"
+always_on = true
+"#,
+        )
+        .expect("a compiled provider with no section passes validation");
+        let mut startup = config.startup_session[0].clone();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_hub, settings) =
+            crate::config_hub::ConfigHub::bootstrap(config.clone(), dir.path().join("config.toml"));
+        let dm = config
+            .build_runtime(&std::collections::HashMap::new(), settings)
+            .await
+            .expect("runtime")
+            .datamancer;
+
+        assert!(
+            open_anchor(&dm, &startup)
+                .await
+                .expect("a disabled provider does not abort boot")
+                .is_none()
+        );
+
+        startup.persistence = crate::config::PersistenceCfg::Cached;
+        assert!(open_anchor(&dm, &startup).await.is_err());
     }
 
     #[tokio::test]

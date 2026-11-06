@@ -484,13 +484,16 @@ impl Provider for AlpacaProvider {
         }
         match surface {
             // The equity websocket streams trades, quotes, and only minute and
-            // daily bars.
-            Surface::Live => match kind {
-                EventKind::Trade
-                | EventKind::Quote
-                | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
-                EventKind::Bar(_) => false,
-            },
+            // daily bars, all decoded as equities.
+            Surface::Live => {
+                instrument.asset_class() == AssetClass::Equity
+                    && match kind {
+                        EventKind::Trade
+                        | EventKind::Quote
+                        | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
+                        EventKind::Bar(_) => false,
+                    }
+            }
             // The REST bar surface is wider than the streamed one: `stock_bars`
             // accepts every interval `fetch_history_via` maps except one-second,
             // which has no endpoint. Keep this in step with that match — an
@@ -520,10 +523,7 @@ impl Provider for AlpacaProvider {
         let rest = self
             .rest_clients()
             .market_data
-            .ok_or_else(|| Error::Provider {
-                provider: PROVIDER_ID.to_string(),
-                message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
-            })?;
+            .ok_or_else(|| super::runtime::no_rest_client(PROVIDER_ID, self.enabled(), "REST"))?;
         // The REST client above is `None` whenever the settings are, so a
         // missing value here is unreachable; fall back to the default rule
         // rather than fail a fetch the client would otherwise serve.
@@ -549,10 +549,7 @@ impl Provider for AlpacaProvider {
         let rest = self
             .rest_clients()
             .market_data
-            .ok_or_else(|| Error::Provider {
-                provider: PROVIDER_ID.to_string(),
-                message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
-            })?;
+            .ok_or_else(|| super::runtime::no_rest_client(PROVIDER_ID, self.enabled(), "REST"))?;
         let snap = rest
             .stock_snapshot(instrument.symbol())
             .feed(feed)
@@ -566,9 +563,8 @@ impl Provider for AlpacaProvider {
     }
 
     async fn list_instruments(&self) -> Result<Vec<InstrumentEntry>> {
-        let trading = self.rest_clients().trading.ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        let trading = self.rest_clients().trading.ok_or_else(|| {
+            super::runtime::no_rest_client(PROVIDER_ID, self.enabled(), "Trading")
         })?;
         // Filter at the API edge: status=Active + class=UsEquity is what
         // Alpaca's `/v2/assets` understands; we still re-filter on
@@ -588,9 +584,8 @@ impl Provider for AlpacaProvider {
     }
 
     async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
-        let trading = self.rest_clients().trading.ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
+        let trading = self.rest_clients().trading.ok_or_else(|| {
+            super::runtime::no_rest_client(PROVIDER_ID, self.enabled(), "Trading")
         })?;
         let asset = trading
             .get_asset(instrument.symbol())
@@ -1102,7 +1097,7 @@ async fn run_hub_task(cfg: AlpacaProviderConfig, mut cmd_rx: mpsc::Receiver<HubC
 /// Why the hub task is parked in [`wait_for_provisioning`], and so which
 /// error a subscribe/unsubscribe gets meanwhile: a credential park is
 /// `Error::Unauthenticated` (retrying cannot help; provisioning can), a
-/// disable is a plain provider error.
+/// disable is `Error::ProviderDisabled`.
 #[derive(Debug, Clone, Copy)]
 enum Park {
     Disabled,
@@ -1111,22 +1106,16 @@ enum Park {
 }
 
 impl Park {
-    fn reason(self) -> &'static str {
-        match self {
-            Self::Disabled => "provider disabled",
+    fn error(self) -> Error {
+        let provider = PROVIDER_ID.to_string();
+        let message = match self {
+            Self::Disabled => return Error::ProviderDisabled { provider },
             Self::MissingCredentials => "waiting for credentials",
             Self::RejectedCredentials => "waiting for new credentials after auth rejection",
-        }
-    }
-
-    fn error(self) -> Error {
-        let message = self.reason().to_string();
-        let provider = PROVIDER_ID.to_string();
-        match self {
-            Self::Disabled => Error::Provider { provider, message },
-            Self::MissingCredentials | Self::RejectedCredentials => {
-                Error::Unauthenticated { provider, message }
-            }
+        };
+        Error::Unauthenticated {
+            provider,
+            message: message.to_string(),
         }
     }
 }
@@ -1964,6 +1953,14 @@ mod tests {
     }
 
     #[test]
+    fn an_etf_is_history_only_because_live_decodes_as_equity() {
+        let p = AlpacaProvider::new(AlpacaProviderConfig::default());
+        let etf = Instrument::new(ProviderId::from_static(PROVIDER_ID), AssetClass::Etf, "SPY");
+        assert!(!p.supports(&etf, EventKind::Trade, Surface::Live));
+        assert!(p.supports(&etf, EventKind::Trade, Surface::History));
+    }
+
+    #[test]
     fn provider_supports_live_kinds() {
         let p = AlpacaProvider::new(AlpacaProviderConfig::default());
         let inst = provider_instrument("AAPL");
@@ -2036,8 +2033,12 @@ mod tests {
             .subscribe(provider_instrument("AAPL"), EventKind::Trade)
             .await
             .expect_err("disabled provider must fail subscribes fast");
-        let msg = format!("{err}");
-        assert!(msg.contains("provider disabled"), "msg={msg:?}");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
+        let err = p
+            .list_instruments()
+            .await
+            .expect_err("a disabled provider has no REST client");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
         // `start_live` already returns `Box<dyn LiveHandle>`; `close` takes
         // `self: Box<Self>`, so call it directly on the box.
         handle.close().await.expect("close while parked");
@@ -2293,7 +2294,7 @@ mod tests {
                 .subscribe(provider_instrument(symbol), EventKind::Trade)
                 .await
                 .expect_err("parked hub fails subscribes fast");
-            assert!(format!("{err}").contains("provider disabled"), "{err}");
+            assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
         }
 
         let task = p.take_hub_task().expect("the hub was spawned");

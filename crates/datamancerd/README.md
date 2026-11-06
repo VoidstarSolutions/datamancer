@@ -176,7 +176,8 @@ Compiled-in providers start disabled: the daemon boots with zero providers
 configured, and providers are enabled at runtime via the config service's
 `configure-provider` op (or by uncommenting a `[provider.*]` section and
 restarting). Validation fails fast on the remaining cross-section invariants:
-a startup session using a cache preset requires `[cache]`; one writing the
+a startup session naming a provider this binary lacks is refused; one using a
+cache preset requires `[cache]`; one writing the
 tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
 `backfill_from` before the live edge, and `scope = live` refuses one.
 
@@ -242,6 +243,12 @@ of client presence, so the authoritative stream keeps running and recording
 across client churn. Other startup sessions are refcount-driven: with the shared
 authoritative registry they come up on first client subscribe and tear down at
 the last referrer.
+
+An `always_on` session whose provider is disabled, because the config has no
+section for it, is skipped at boot with a warning naming the session, and the
+daemon boots without it. Enabling the provider later does not open it; that
+takes a restart, and `get-config` reports `restart_required` until then. Any
+other failure to open one aborts boot.
 
 ## Web introspection surface (feature `web-ui`)
 
@@ -458,6 +465,8 @@ One JSON object per line; one reply line per request.
 
 `subscribe` opens an unbounded subscription:
 
+- `provider` is a provider id, and only that provider serves the subscription.
+  An id no provider owns is `unknown_provider`, here and on `open-query`.
 - `scope` is `live` (the default) or `live_backfill`.
 - `backfill_from` (epoch nanoseconds, inclusive) is required under
   `live_backfill` and refused under `live`; either disagreement is
@@ -489,12 +498,14 @@ A query that runs to completion ends with a terminal `SessionClosing` control
 on its data stream and the daemon reaps the entry (and the service) on its
 own — no `cancel-query` needed. A provider fetch failure is emitted
 in-band by the library, but the iceoryx2 data plane **suppresses
-connection-scoped controls** (`ProviderError`/`ProviderDisconnected`), so
-what a consumer observes is an empty or truncated stream ending in the
-terminal `SessionClosing` — on the data plane alone, indistinguishable
-from a legitimately empty range. Check the daemon log or the diagnostics
-plane to tell them apart (per-query error surfacing is a follow-up); a
-failure is never a control-socket error after the reply. `cancel-query`
+connection-scoped controls** (`ProviderError`/`ProviderDisconnected`). Under
+a query policy that uses the cache, a `Gap` rides the data plane with the span
+each failed or skipped fetch left unserved, ahead of the terminal
+`SessionClosing`. Otherwise no `Gap` is emitted: a consumer observes an
+empty or truncated stream ending in the terminal `SessionClosing`, on the data
+plane alone indistinguishable from a legitimately empty range. Check the daemon
+log or the diagnostics plane to tell them apart (per-query error surfacing is a
+follow-up); a failure is never a control-socket error after the reply. `cancel-query`
 aborts an in-flight
 query and releases its service early; a stale/finished/unknown id answers
 `unknown_query`. Two things implicitly cancel every query a connection opened:
@@ -621,7 +632,10 @@ gating, classification, and semantics.
 Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 (`unsupported_event_kind`, `persistence_required`,
 `backfill_not_in_past`, `duplicate_subscription`, `not_subscribed`,
-`unknown_provider`, `unknown_client`, `duplicate_client`,
+`unknown_provider`, `provider_disabled` (from `subscribe`, creating or joining,
+`open-client` seeds, `open-query` under a policy that does not read the cache,
+`instruments` filtered to that provider, and `capabilities`), `unknown_client`,
+`duplicate_client`,
 `service_cap_exceeded`, `bad_request`, `shutting_down`,
 `credentials_missing`, `credential_backend_unavailable`, `permission_denied`,
 `unknown_config_field`, `unknown_query` (`cancel-query` named an id that is
