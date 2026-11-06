@@ -25,12 +25,12 @@
 //! it (or calling [`Session::close`]) tears the session down even while a
 //! stream is held. Historical sessions stay single-shot and fetch-anchored.
 //!
-//! [`Scope::live_backfill`] runs a real backfill over
-//! `[from, B)` (B = the wall-clock live edge at session start) through the
+//! [`Scope::live_backfill`] runs a real backfill over `[from, B)` through the
 //! historical read-through machinery, buffering live arrivals and splicing
-//! them in after the backfill output. A healthy seam emits no synthetic
-//! control; `Gap` appears only for real, known loss (fetch failure, buffer
-//! overflow).
+//! them in after the backfill output. `B` is the local wall clock sampled once
+//! the provider confirmed the live subscription. A healthy seam emits no
+//! synthetic control; `Gap` appears only for real, known loss (fetch failure,
+//! buffer overflow).
 //!
 //! Recording (write-through to persistence) is a separate axis. It defaults
 //! to whatever was passed at construction and can be toggled at runtime via
@@ -522,21 +522,22 @@ impl Datamancer {
             }
         };
         accounting.record_subscribe();
-        if let Err(e) = live.subscribe(instrument, kind).await {
+        if let Err(e) = live.subscribe(instrument.clone(), kind).await {
             accounting.record_open_failure(&e, wall_clock_ts());
             return Err(e);
         }
-        accounting.record_live_outcome(SurfaceOutcome::Ok {
-            at: wall_clock_ts(),
-        });
-        tokio::spawn(controller.run_live(
-            live,
-            scope.backfill_from(),
-            provider_rx,
-            cmd_rx,
-            remove_rx,
-            seed_rx,
-        ));
+        let live_edge = wall_clock_ts();
+        accounting.record_live_outcome(SurfaceOutcome::Ok { at: live_edge });
+        let backfill = match BackfillWindow::of(scope, live_edge) {
+            Ok(backfill) => backfill,
+            Err(e) => {
+                accounting.record_unsubscribe();
+                let _ = live.unsubscribe(instrument, kind).await;
+                let _ = live.close().await;
+                return Err(e);
+            }
+        };
+        tokio::spawn(controller.run_live(live, backfill, provider_rx, cmd_rx, remove_rx, seed_rx));
 
         let guard = SubscriberGuard::new(authoritative.clone(), first_id);
         Ok(Attached {
@@ -1902,22 +1903,19 @@ impl Controller {
         self.finish_historical(cmd_rx).await;
     }
 
-    /// Phases 1–2 of a stitched live session: plan `[from, B)` exactly like
-    /// the historical read-through path (whole-range gap when there is no
-    /// cache or `read_cache` is off), stream the segments while buffering
-    /// live arrivals, then drain the buffer at the seam. Returns `false`
-    /// when the controller must exit (Close command / Session dropped).
+    /// Phases 1–2 of a stitched live session: plan `window` exactly like the
+    /// historical read-through path (whole-range gap when there is no cache or
+    /// `read_cache` is off), stream the segments while buffering live arrivals,
+    /// then drain the buffer at the seam. Returns `false` when the controller
+    /// must exit (Close command / Session dropped).
     async fn run_backfill(
         &mut self,
-        from: Timestamp,
+        window: BackfillWindow,
         provider_rx: &mut mpsc::Receiver<MarketEvent>,
         cmd_rx: &mut mpsc::Receiver<SessionCommand>,
         remove_rx: &mut mpsc::UnboundedReceiver<SubscriberId>,
     ) -> bool {
-        let edge = wall_clock_ts();
-        if from >= edge {
-            return true;
-        }
+        let BackfillWindow { from, edge } = window;
         // Guard clears `backfilling` on every exit path (both early `return`s
         // below and the fall-through after the seam flush), so a panic or a
         // future added exit can't leave the flag stuck `true`.
@@ -1994,14 +1992,15 @@ impl Controller {
     }
 
     /// Live scope (authoritative): subscribe (already done by the caller), run
-    /// any creation-time backfill, then drain provider events through the
-    /// seq/forward/fan-out pipeline. Honors `AddSubscriber`/`SetPersistence`
-    /// commands and subscriber removals; tears the upstream connection down when
-    /// the fan-out empties (the last referrer left).
+    /// any creation-time `backfill`, then drain provider events through the
+    /// seq/forward/fan-out pipeline.
+    /// Honors `AddSubscriber`/`SetPersistence` commands and subscriber
+    /// removals; tears the upstream connection down when the fan-out empties
+    /// (the last referrer left).
     async fn run_live(
         mut self,
         live: Box<dyn LiveHandle>,
-        backfill_from: Option<Timestamp>,
+        backfill: Option<BackfillWindow>,
         mut provider_rx: mpsc::Receiver<MarketEvent>,
         mut cmd_rx: mpsc::Receiver<SessionCommand>,
         mut remove_rx: mpsc::UnboundedReceiver<SubscriberId>,
@@ -2013,9 +2012,9 @@ impl Controller {
         if let Some(fanout) = self.fanout.as_ref() {
             self.stats.set_subscribers(fanout.subscriber_count());
         }
-        if let Some(from) = backfill_from
+        if let Some(window) = backfill
             && !self
-                .run_backfill(from, &mut provider_rx, &mut cmd_rx, &mut remove_rx)
+                .run_backfill(window, &mut provider_rx, &mut cmd_rx, &mut remove_rx)
                 .await
         {
             self.teardown_upstream(&live).await;
@@ -2448,8 +2447,9 @@ struct BackfillSide<'a> {
     /// backfill aborts rather than running to the seam (which would burn
     /// provider quota and delay shutdown on a large range).
     remove_rx: &'a mut mpsc::UnboundedReceiver<SubscriberId>,
-    /// The live boundary `B`: the gap segment touching it gets a
-    /// conservative coverage claim, and a failed fetch gaps through to it.
+    /// The live boundary `B`, sampled once the provider confirmed the live
+    /// subscription: the gap segment touching it gets a conservative coverage
+    /// claim, and a failed fetch gaps through to it.
     edge: Timestamp,
 }
 
@@ -2678,13 +2678,26 @@ fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
 ///
 /// [`Error::BackfillFromNotInPast`] when it starts at or past the live edge.
 pub fn check_backfill_start(scope: LiveScope) -> Result<()> {
-    if let Some(from) = scope.backfill_from() {
-        let edge = wall_clock_ts();
+    BackfillWindow::of(scope, wall_clock_ts()).map(|_| ())
+}
+
+/// A backfill's non-empty history range `[from, edge)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackfillWindow {
+    from: Timestamp,
+    edge: Timestamp,
+}
+
+impl BackfillWindow {
+    fn of(scope: LiveScope, edge: Timestamp) -> Result<Option<Self>> {
+        let Some(from) = scope.backfill_from() else {
+            return Ok(None);
+        };
         if from >= edge {
             return Err(Error::BackfillFromNotInPast { from, edge });
         }
+        Ok(Some(Self { from, edge }))
     }
-    Ok(())
 }
 
 fn check_persistence(
@@ -3126,5 +3139,32 @@ mod conclude_fetch_tests {
             accounting.surfaces().history,
             SurfaceOutcome::Failing { error, .. } if error.starts_with("fetch task panicked")
         ));
+    }
+}
+
+#[cfg(test)]
+mod backfill_window_tests {
+    use super::*;
+
+    #[test]
+    fn a_window_needs_its_start_before_the_edge() {
+        let backfill = |from| LiveScope::LiveBackfill {
+            from: Timestamp(from),
+        };
+        assert_eq!(
+            BackfillWindow::of(backfill(4), Timestamp(5)).unwrap(),
+            Some(BackfillWindow {
+                from: Timestamp(4),
+                edge: Timestamp(5),
+            })
+        );
+        assert!(matches!(
+            BackfillWindow::of(backfill(5), Timestamp(5)),
+            Err(Error::BackfillFromNotInPast { .. })
+        ));
+        assert_eq!(
+            BackfillWindow::of(LiveScope::default(), Timestamp(5)).unwrap(),
+            None
+        );
     }
 }

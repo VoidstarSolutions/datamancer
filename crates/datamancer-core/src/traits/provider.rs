@@ -212,9 +212,17 @@ pub trait ProviderMetrics: Send + Sync {
 /// a single underlying connection.
 #[async_trait]
 pub trait LiveHandle: Send + Sync {
-    /// Activate `(instrument, kind)` against the live session. Should return
-    /// once the provider has acknowledged the change (or surfaces the result
-    /// via a `ControlKind::SubscriptionChanged` entry on the event sink).
+    /// Activate `(instrument, kind)` against the live session. Return `Ok`
+    /// only once the subscription is active upstream, that is, once every
+    /// event the venue produces for the pair from now on reaches the sink:
+    /// a provider that opens its connection lazily on the first subscribe
+    /// connects, authenticates and has the server acknowledge the pair
+    /// before returning. A backfilling session fixes its history window's
+    /// upper edge the moment this returns, so a return ahead of the
+    /// acknowledgement would leave the span up to the acknowledgement
+    /// covered by neither surface. A `ControlKind::SubscriptionChanged`
+    /// entry on the sink is the in-band notification of the same change,
+    /// not a substitute for returning after it.
     async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()>;
 
     /// Deactivate `(instrument, kind)`. Symmetric with `subscribe`.
