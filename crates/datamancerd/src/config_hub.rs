@@ -31,6 +31,8 @@ pub(crate) const REDACTED_SECRET: &str = "<redacted>";
 pub(crate) struct ProviderSettingsSources {
     pub alpaca: SettingsSource<AlpacaSettings>,
     pub alpaca_crypto: SettingsSource<AlpacaCryptoSettings>,
+    #[cfg(feature = "scripted-provider")]
+    pub scripted: SettingsSource<crate::scripted::ScriptedSettings>,
 }
 
 struct HubState {
@@ -48,6 +50,8 @@ pub(crate) struct ConfigHub {
     state: tokio::sync::Mutex<HubState>,
     alpaca_tx: watch::Sender<Option<AlpacaSettings>>,
     alpaca_crypto_tx: watch::Sender<Option<AlpacaCryptoSettings>>,
+    #[cfg(feature = "scripted-provider")]
+    scripted_tx: watch::Sender<Option<crate::scripted::ScriptedSettings>>,
 }
 
 fn alpaca_settings(section: &AlpacaSection) -> AlpacaSettings {
@@ -78,18 +82,30 @@ impl ConfigHub {
                 .as_ref()
                 .map(alpaca_crypto_settings),
         );
+        #[cfg(feature = "scripted-provider")]
+        let (scripted_tx, scripted_rx) = watch::channel(
+            config
+                .provider
+                .scripted
+                .as_ref()
+                .map(crate::config::ScriptedSection::settings),
+        );
         let hub = Self {
             path,
             boot: config.clone(),
             state: tokio::sync::Mutex::new(HubState { current: config }),
             alpaca_tx,
             alpaca_crypto_tx: crypto_tx,
+            #[cfg(feature = "scripted-provider")]
+            scripted_tx,
         };
         (
             Arc::new(hub),
             ProviderSettingsSources {
                 alpaca: SettingsSource::Watch(alpaca_rx),
                 alpaca_crypto: SettingsSource::Watch(crypto_rx),
+                #[cfg(feature = "scripted-provider")]
+                scripted: SettingsSource::Watch(scripted_rx),
             },
         )
     }
@@ -149,6 +165,13 @@ impl ConfigHub {
                     Err(e) => return settings_error(&e),
                 }
             }
+            #[cfg(feature = "scripted-provider")]
+            crate::scripted::PROVIDER_ID => {
+                match serde_json::from_value::<crate::config::ScriptedSection>(settings) {
+                    Ok(section) => candidate.provider.scripted = Some(section),
+                    Err(e) => return settings_error(&e),
+                }
+            }
             _ => return unknown_provider(provider),
         }
         match self.persist(&mut state, candidate).await {
@@ -169,6 +192,8 @@ impl ConfigHub {
         match provider {
             alpaca::PROVIDER_ID => candidate.provider.alpaca = None,
             alpaca_crypto::PROVIDER_ID => candidate.provider.alpaca_crypto = None,
+            #[cfg(feature = "scripted-provider")]
+            crate::scripted::PROVIDER_ID => candidate.provider.scripted = None,
             _ => return unknown_provider(provider),
         }
         match self.persist(&mut state, candidate).await {
@@ -253,6 +278,17 @@ impl ConfigHub {
             .map(alpaca_crypto_settings);
         if *self.alpaca_crypto_tx.borrow() != crypto {
             self.alpaca_crypto_tx.send_replace(crypto);
+        }
+        #[cfg(feature = "scripted-provider")]
+        {
+            let scripted = current
+                .provider
+                .scripted
+                .as_ref()
+                .map(crate::config::ScriptedSection::settings);
+            if *self.scripted_tx.borrow() != scripted {
+                self.scripted_tx.send_replace(scripted);
+            }
         }
     }
 }

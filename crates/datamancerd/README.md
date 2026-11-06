@@ -33,7 +33,7 @@ and the loss contract per transport.
 ```bash
 cargo run -p datamancerd -- --config datamancerd.toml
 # end-to-end tests need a live iceoryx2 runtime and are #[ignore]d:
-cargo test -p datamancerd --test daemon_e2e -- --ignored
+cargo test -p datamancerd --all-features --test daemon_e2e -- --ignored
 ```
 
 Provider credentials are **not** in the config. They live in the daemon-owned
@@ -175,7 +175,17 @@ format = "text"                   # text | json
 Compiled-in providers start disabled: the daemon boots with zero providers
 configured, and providers are enabled at runtime via the config service's
 `configure-provider` op (or by uncommenting a `[provider.*]` section and
-restarting). Validation fails fast on the remaining cross-section invariants:
+restarting).
+
+A daemon built with the off-by-default `scripted-provider` feature also has
+`[provider.scripted]`, a deterministic test provider (`src/scripted.rs`) that
+serves scripted trades on both surfaces, for instruments naming `scripted`
+only, with no network or credentials. Its knobs are `history_prints`,
+`history_delay_ms`, `live_interval_ms` and `latest`. The hermetic tests in
+`tests/daemon_e2e.rs` use it for the backfill seam and the latest-value seed. A
+daemon built without the feature rejects the section as unknown.
+
+Validation fails fast on the remaining cross-section invariants:
 a startup session naming a provider this binary lacks is refused; one using a
 cache preset requires `[cache]`; one writing the
 tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
@@ -759,7 +769,7 @@ writes the hub's view of the config back to disk and clobbers the hand edit
   unless its `[provider.*]` section is present; a scaffolded/empty config
   enables nothing, so a fresh boot with zero provider sections is a valid,
   well-defined state (`get-config` returns a fixed-key `provider` table with
-  both provider ids present and `null` values, e.g.
+  every compiled-in provider's section key present and `null` values, e.g.
   `"provider":{"alpaca":null,"alpaca_crypto":null}`).
   `configure-provider` enables a provider at runtime; uncommenting the
   section and restarting does the same thing at boot.
