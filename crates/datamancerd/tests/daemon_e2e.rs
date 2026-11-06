@@ -9,10 +9,9 @@
 //! cargo test -p datamancerd --all-features --test daemon_e2e -- --ignored
 //! ```
 //!
-//! The headline per-symbol-agreement and live-flow tests additionally need
-//! Alpaca credentials in the environment; they live here as `#[ignore]`d
-//! placeholders to be filled in once a hermetic replay provider is wired
-//! (roadmap RE-PLAN: `[provider.replay]`).
+//! The tests that hit real Alpaca additionally need paper credentials in the
+//! environment; the hermetic ones at the bottom of this file run against the
+//! scripted provider (feature `scripted-provider`) and need nothing.
 
 // This suite talks to the daemon over a Unix-domain control socket and manages
 // the process POSIX-style; the Windows named-pipe harness port is Phase 5 (#29).

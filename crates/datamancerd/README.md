@@ -36,6 +36,15 @@ cargo run -p datamancerd -- --config datamancerd.toml
 cargo test -p datamancerd --all-features --test daemon_e2e -- --ignored
 ```
 
+Every e2e suite pins its daemon's credential store to a file beside its config
+(`DATAMANCER_CREDENTIALS_FILE`), so credentials in the OS keychain are
+invisible to a daemon under test. The suites that need real
+Alpaca data (their `#[ignore]` reasons say so) read the paper pair from the
+environment: export `ALPACA_PAPER_API_KEY_ID` and
+`ALPACA_PAPER_API_SECRET_KEY`. On macOS a freshly built binary run by hand
+prompts for access to any Keychain entry; the same variable skips the prompt
+for a throwaway daemon.
+
 Provider credentials are **not** in the config. They live in the daemon-owned
 credential store, provisioned over the control socket with `set-credentials`
 (see [Credentials](#credentials)). The `account_type` selects the paper vs.

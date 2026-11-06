@@ -7,8 +7,10 @@
 //! ```
 //!
 //! They exercise wiring (handshake/auth, snapshot reply + id echo, subscribe
-//! reply + id echo, teardown), not live market data. The spawned daemon is the
-//! binary built WITH the `ws` feature, so it runs the ws listener.
+//! reply + id echo, teardown), not live market data. The tests that subscribe
+//! need `ALPACA_PAPER_API_KEY_ID` / `ALPACA_PAPER_API_SECRET_KEY` in the
+//! environment (each test's `#[ignore]` reason says which). The spawned daemon
+//! is the binary built WITH the `ws` feature, so it runs the ws listener.
 //!
 //! **Windows note:** on Windows the daemon boots **WS-only** (no iceoryx2 node),
 //! so `windows_ws_only_boot_smoke` needs no iceoryx2 runtime — it is the
@@ -86,6 +88,7 @@ port = {port}
     Command::new(bin)
         .arg("--config")
         .arg(&config_path)
+        .env("DATAMANCER_CREDENTIALS_FILE", dir.join("credentials.json"))
         .spawn()
         .expect("spawn datamancerd")
 }
@@ -145,7 +148,7 @@ where
 }
 
 #[tokio::test]
-#[ignore = "spawns the binary; needs a live iceoryx2 runtime; run with --ignored"]
+#[ignore = "spawns the binary; needs a live iceoryx2 runtime and Alpaca paper credentials in the environment; run with --ignored"]
 async fn subscribe_reply_echoes_id_and_snapshot_returns() {
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -196,7 +199,7 @@ async fn subscribe_reply_echoes_id_and_snapshot_returns() {
 // which also keeps the ws_e2e binary compiling on Windows (no `libc::kill`).
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "spawns the binary; needs a live iceoryx2 runtime; run with --ignored"]
+#[ignore = "spawns the binary; needs a live iceoryx2 runtime and Alpaca paper credentials in the environment; run with --ignored"]
 async fn graceful_shutdown_closes_live_connection() {
     let _guard = DAEMON_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -437,7 +440,7 @@ async fn correct_bearer_token_is_accepted() {
 /// quiet or light feed, so it never false-fails, and fails only if events were
 /// actively flowing AND the connection did not tear down.
 #[tokio::test]
-#[ignore = "spawns the binary; needs a live iceoryx2 runtime + live market activity; run with --ignored"]
+#[ignore = "spawns the binary; needs a live iceoryx2 runtime, Alpaca paper credentials in the environment and live market activity; run with --ignored"]
 async fn slow_consumer_overrun_tears_down_connection() {
     // A single lone trade does NOT prove the feed is producing fast enough to
     // overrun the depth-1 channel + tiny rcvbuf; require a small sustained burst
@@ -604,6 +607,10 @@ publish_interval_ms = 200
     let mut child = Command::new(bin)
         .arg("--config")
         .arg(&config_path)
+        .env(
+            "DATAMANCER_CREDENTIALS_FILE",
+            dir.path().join("credentials.json"),
+        )
         .spawn()
         .expect("spawn datamancerd (WS-only boot on Windows)");
 
