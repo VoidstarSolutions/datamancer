@@ -30,7 +30,10 @@
 //! historical read-through machinery, buffering live arrivals and splicing
 //! them in after the backfill output. A healthy seam emits no synthetic
 //! control; `Gap` appears only for real, known loss (fetch failure, buffer
-//! overflow).
+//! overflow). The buffered arrivals are bounded like the resume buffer, and
+//! an overflow leaves the same mark: one `Gap` at the evicted span, and the
+//! evicted events' `seq` slots stay empty, so the hole is real for every
+//! consumer of the symbol.
 //!
 //! Recording (write-through to persistence) is a separate axis. It defaults
 //! to whatever was passed at construction and can be toggled at runtime via
@@ -1421,11 +1424,20 @@ impl Controller {
     /// receipt) means an event the ring evicted is never teed — correct, since
     /// it is not delivered either: it is reported as the `Gap` above, so the tap
     /// log stays a faithful record of the delivered live tail.
+    ///
+    /// The evicted events were never stamped, but in canonical order they sat
+    /// between the history and the survivors, so their slots are consumed all
+    /// the same: the `Gap` takes the first and the counter skips the rest.
+    /// The survivors then show the hole a resume-buffer overflow would leave
+    /// (where the evicted events were stamped at push), so "a `Gap` is a real
+    /// `seq` hole" holds for both rings.
     async fn flush_backfill_pending(&mut self, ring: EventRing) {
+        let evicted = ring.evicted();
         let (dropped, _dropped_first_seq, events) = ring.into_parts();
         if let Some(span) = dropped {
             self.emit_gap(span.from_source_ts, span.from_source_ts, span.to_source_ts)
                 .await;
+            self.skip_slots(u64::try_from(evicted.saturating_sub(1)).unwrap_or(u64::MAX));
         }
         for ev in events {
             self.forward(ev).await;
@@ -2147,11 +2159,20 @@ impl Controller {
         }
     }
 
-    /// Assign the next source `seq`, advancing the single-writer counter. The
-    /// one site that touches `next_seq`, so `seq` is stamped exactly once per
-    /// event, in this authoritative session's canonical delivery order.
+    /// Assign the next source `seq`, advancing the single-writer counter, so
+    /// `seq` is stamped exactly once per event, in this authoritative
+    /// session's canonical delivery order. With [`Self::skip_slots`] the only
+    /// site that moves `next_seq`.
     fn stamp(&mut self, ev: MarketEvent) -> MarketEvent {
         let seq = Seq(self.next_seq);
+        self.skip_slots(1);
+        stamp_seq(ev, seq)
+    }
+
+    /// Advance the source counter by `n` without stamping anything: the slots
+    /// of events that were lost before they could be stamped (a seam-ring
+    /// overflow), so the hole they leave is as real as a resume-buffer one.
+    fn skip_slots(&mut self, n: u64) {
         // `Seq(u64::MAX)` is reserved as `Seq::SYNTHETIC` and must never be
         // handed to a real event, so the source counter stamps only in
         // `[0, u64::MAX - 1]`. `saturating_add` was wrong here: it caps *at*
@@ -2162,10 +2183,9 @@ impl Controller {
         // synthetic sentinel.
         self.next_seq = self
             .next_seq
-            .checked_add(1)
-            .filter(|&n| n != u64::MAX)
+            .checked_add(n)
+            .filter(|&next| next != u64::MAX)
             .expect("per-symbol source seq exhausted the Seq::SYNTHETIC reservation");
-        stamp_seq(ev, seq)
     }
 
     /// Hand a fully-formed event to the sink; on rejection (consumer dropped
@@ -2522,6 +2542,10 @@ struct EventRing {
     /// the first eviction. `None` until an eviction occurs. Read only on the
     /// resume path, whose events are stamped at push.
     dropped_first_seq: Option<Seq>,
+    /// How many events this ring evicted, every variant counted. Read on the
+    /// seam path, whose events are stamped at the flush: the evicted ones
+    /// consumed no `seq` at push, so the flush skips this many slots.
+    evicted: usize,
 }
 
 impl EventRing {
@@ -2531,6 +2555,7 @@ impl EventRing {
             buf: std::collections::VecDeque::new(),
             dropped: None,
             dropped_first_seq: None,
+            evicted: 0,
         }
     }
 
@@ -2538,9 +2563,15 @@ impl EventRing {
         if self.buf.len() == self.capacity
             && let Some(evicted) = self.buf.pop_front()
         {
+            self.evicted += 1;
             self.note_drop(&evicted);
         }
         self.buf.push_back(ev);
+    }
+
+    /// Events evicted so far, every variant counted.
+    fn evicted(&self) -> usize {
+        self.evicted
     }
 
     /// Extend the dropped span over an evicted event. Data events count via
@@ -2816,6 +2847,7 @@ mod event_ring_tests {
         for ts in [100, 200, 300, 400] {
             ring.push(trade(ts));
         }
+        assert_eq!(ring.evicted(), 2, "every eviction is counted");
         let (dropped, _first, events) = ring.into_parts();
         // 100 and 200 evicted; half-open span keeps 200 inside.
         let span = dropped.expect("overflow must record a span");

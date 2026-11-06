@@ -269,7 +269,10 @@ in-band `Control::Gap` reports exactly the evicted span before the survivors
 flow. `seq` is stamped once at the source (not per-consumer), so survivors keep
 their original `seq` and an evicted event is a reported gap **and** a real `seq`
 hole at the evicted span — the delivered stream is contiguous only while
-nothing is lost.
+nothing is lost. The live arrivals buffered during a backfill are bounded by the
+same setting and overflow the same way: one `Gap` right after the history names
+the evicted span, and the evicted prints' `seq` slots stay empty ahead of the
+survivors, so a seam overflow is the same real hole a resume-buffer overflow is.
 
 `Scope::Live { backfill_from: Some(t) }` stitches history ahead of the live
 tail: the window `[t, live-edge)` is served through the historical

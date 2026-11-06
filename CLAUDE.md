@@ -98,10 +98,12 @@ These are load-bearing design rules — violating them breaks downstream consume
     ordering field**, per-symbol only (there is no cross-instrument order; the
     multiplex key is `(instrument, seq)` — true fan-out lands in Phase 2). Live:
     arrival order. Historical fetch: source-timestamp order. Controls occupy
-    `seq` slots. Holes are **real**: evicted/late-join events are numbered, so a
-    resume-buffer overflow is a real `seq` hole, surfaced in-band as
-    `Control::Gap` at the evicted span; the delivered stream is contiguous only
-    while nothing is lost. The tap log persists this source `seq`
+    `seq` slots. Holes are **real**: an evicted event consumes its slot whether
+    it was stamped at push (the resume buffer) or would have been stamped at
+    the seam (a backfill's pending ring, whose flush skips the evicted slots),
+    so an overflow is a real `seq` hole, surfaced in-band as `Control::Gap` at
+    the evicted span; the delivered stream is contiguous only while nothing is
+    lost. The tap log persists this source `seq`
     verbatim (it no longer mints its own), so tap-log replay reproduces the
     delivered stream's `seq`. `Seq::SYNTHETIC = Seq(u64::MAX)` tags out-of-band
     synthetic controls and is exempt from per-symbol monotonicity.
