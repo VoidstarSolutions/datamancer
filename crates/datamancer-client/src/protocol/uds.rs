@@ -9,10 +9,11 @@
 //! Access control is filesystem permissions on the socket path only. This is
 //! **not** a network-safe surface.
 
-use datamancer_core::{HealthView, SystemSnapshot, Timestamp};
+use datamancer_core::{HealthView, Subscribed, SystemSnapshot};
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{QueryId, QuerySpec, ScopeCfg, Subscribed, SubscriptionSpec, UnsubscribeSpec};
+use super::SubscribedFields;
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 /// A control request (one per line).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub enum Request {
     /// Register a client and create its per-client data-plane service.
     OpenClient {
         client: String,
+        /// Live-only seeds, subscribed before the client opens.
         #[serde(default)]
         subscriptions: Vec<SubscriptionSpec>,
     },
@@ -109,9 +111,6 @@ pub enum Request {
 
 /// A control reply (one per line). `ok` discriminates success from error; the
 /// remaining fields are populated per op.
-///
-/// `#[non_exhaustive]`: built through its constructors, so a later per-op
-/// field is additive for every consumer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Reply {
@@ -165,20 +164,9 @@ pub struct Reply {
     /// The app-facing health view (on `health`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthView>,
-    /// The scope the subscription actually opened (on `subscribe`): the
-    /// shared authoritative session's creation-time scope, which may differ
-    /// from the requested one when another client opened the pair first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<ScopeCfg>,
-    /// The actual backfill start (on `subscribe`, when `scope` is
-    /// `live_backfill`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backfill_from: Option<Timestamp>,
-    /// `true` when the subscribe joined a session another subscriber opened
-    /// (on `subscribe`; absent means this subscribe created it). See
-    /// [`Subscribed::joined`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub joined: Option<bool>,
+    /// What the subscription opened (on `subscribe`).
+    #[serde(flatten)]
+    pub(crate) subscribed: SubscribedFields,
 }
 
 impl Reply {
@@ -203,9 +191,7 @@ impl Reply {
             restart_required: None,
             applied: None,
             health: None,
-            scope: None,
-            backfill_from: None,
-            joined: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -314,9 +300,7 @@ impl Reply {
             restart_required: None,
             applied: None,
             health: None,
-            scope: None,
-            backfill_from: None,
-            joined: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -349,32 +333,21 @@ impl Reply {
         }
     }
 
-    /// A successful `subscribe` reply carrying the actual scope.
+    /// A successful `subscribe` reply.
     #[must_use]
-    pub fn subscribed(actual: Subscribed) -> Self {
+    pub fn subscribed(subscribed: Subscribed) -> Self {
         Self {
-            scope: Some(actual.scope),
-            backfill_from: actual.backfill_from,
-            joined: actual.joined.then_some(true),
+            subscribed: subscribed.into(),
             ..Self::ok()
         }
-    }
-
-    /// The actual scope a successful `subscribe` reply carries, or `None`
-    /// when the reply has no `scope` (an error reply, or any other op) or
-    /// an inconsistent one (`live_backfill` without `backfill_from`).
-    #[must_use]
-    pub fn subscribed_scope(&self) -> Option<Subscribed> {
-        self.scope.and_then(|scope| {
-            Subscribed::from_wire(scope, self.backfill_from, self.joined.unwrap_or(false))
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{AssetClassCfg, EventKindCfg, PersistenceCfg, ScopeCfg};
+    use crate::spec::{AssetClassCfg, EventKindCfg, PersistenceCfg};
+    use datamancer_core::{LiveScope, Timestamp};
 
     #[test]
     fn control_protocol_roundtrip_open_client() {
@@ -385,8 +358,7 @@ mod tests {
                 asset_class: AssetClassCfg::Crypto,
                 symbol: "BTC/USD".to_string(),
                 kind: EventKindCfg::Trade,
-                scope: ScopeCfg::Live,
-                backfill_from: None,
+                scope: LiveScope::Live,
                 persistence: PersistenceCfg::CachedWithTap,
             }],
         };
@@ -404,15 +376,11 @@ mod tests {
         let Request::Subscribe { spec, .. } = req else {
             panic!("wrong variant");
         };
-        assert_eq!(spec.scope, ScopeCfg::LiveBackfill);
-        assert_eq!(
-            spec.backfill_from,
-            Some(Timestamp(1_704_067_200_000_000_000))
-        );
+        let from = Timestamp(1_704_067_200_000_000_000);
+        let backfill = LiveScope::LiveBackfill { from };
+        assert_eq!(spec.scope, backfill);
 
-        let reply = Reply::subscribed(Subscribed::live_backfill(Timestamp(
-            1_704_067_200_000_000_000,
-        )));
+        let reply = Reply::subscribed(Subscribed::Created(backfill));
         let json = serde_json::to_string(&reply).expect("ser");
         assert_eq!(
             json,
@@ -420,26 +388,46 @@ mod tests {
         );
         let back: Reply = serde_json::from_str(&json).expect("de");
         assert_eq!(
-            back.subscribed_scope(),
-            Some(Subscribed::live_backfill(Timestamp(
-                1_704_067_200_000_000_000
-            )))
+            Subscribed::from(back.subscribed),
+            Subscribed::Created(backfill)
         );
-        assert_eq!(Reply::ok().subscribed_scope(), None);
         assert_eq!(
-            serde_json::to_string(&Reply::subscribed(Subscribed::live())).expect("ser"),
+            serde_json::to_string(&Reply::subscribed(Subscribed::Created(LiveScope::Live)))
+                .expect("ser"),
             r#"{"ok":true,"scope":"live"}"#
         );
-        // A joiner's reply says so; a creator's omits the flag.
-        let joined = Reply::subscribed(Subscribed::live().with_joined(true));
-        let json = serde_json::to_string(&joined).expect("ser");
+        let joined = Subscribed::Joined {
+            session: LiveScope::Live,
+        };
+        let json = serde_json::to_string(&Reply::subscribed(joined)).expect("ser");
         assert_eq!(json, r#"{"ok":true,"scope":"live","joined":true}"#);
         let back: Reply = serde_json::from_str(&json).expect("de");
-        assert!(back.subscribed_scope().expect("scope").joined);
-        // An inconsistent wire pair is not a scope.
-        let bad: Reply =
-            serde_json::from_str(r#"{"ok":true,"scope":"live_backfill"}"#).expect("de");
-        assert_eq!(bad.subscribed_scope(), None);
+        assert_eq!(Subscribed::from(back.subscribed), joined);
+    }
+
+    #[test]
+    fn a_subscribe_reply_with_no_scope_reads_as_created_live() {
+        let reply: Reply = serde_json::from_str(r#"{"ok":true}"#).expect("de");
+        assert_eq!(
+            Subscribed::from(reply.subscribed),
+            Subscribed::Created(LiveScope::Live)
+        );
+        assert_eq!(
+            serde_json::to_string(&Reply::ok()).expect("ser"),
+            r#"{"ok":true}"#
+        );
+    }
+
+    #[test]
+    fn a_malformed_subscribe_reply_fails_to_parse() {
+        for line in [
+            r#"{"ok":true,"scope":"live_backfill"}"#,
+            r#"{"ok":true,"scope":"live","backfill_from":5}"#,
+            r#"{"ok":true,"backfill_from":5}"#,
+            r#"{"ok":true,"scope":"warp"}"#,
+        ] {
+            assert!(serde_json::from_str::<Reply>(line).is_err(), "{line}");
+        }
     }
 
     #[test]

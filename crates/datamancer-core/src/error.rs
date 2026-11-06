@@ -27,15 +27,6 @@ pub enum Error {
         surface: crate::Surface,
     },
 
-    /// A live session for `(instrument, kind)` is already active. Datamancer
-    /// enforces at most one concurrent live session per pair; close the
-    /// existing session before opening another.
-    #[error("a live session for {kind:?} on {instrument} is already active")]
-    LiveSessionConflict {
-        instrument: crate::Instrument,
-        kind: crate::EventKind,
-    },
-
     /// The requested session configuration requires a persistence layer
     /// (`HistoricalCache` and/or `TapLog`) but none is configured on the
     /// `Datamancer` instance.
@@ -61,17 +52,9 @@ pub enum Error {
         kind: crate::EventKind,
     },
 
-    /// A client subscription requested a bounded historical scope. Client
-    /// subscriptions are unbounded (pure-live, or a backfill seamed into the
-    /// live tail); a bounded range has no live tail to join and stays a
-    /// single-pair session concern.
-    #[error("client subscriptions are unbounded; a historical scope is unsupported")]
-    UnsupportedClientScope,
-
     /// A live backfill was asked to start at or past the live edge. Nothing
-    /// lies in `[from, edge)`, so the session would run no backfill while
-    /// still reporting a backfill scope; it is refused at open instead. Ask
-    /// for pure-live, or for a `backfill_from` in the past.
+    /// lies in `[from, edge)`, so it is refused rather than opened as a
+    /// backfill that never runs. Ask for pure-live, or for a start in the past.
     #[error("backfill_from {from:?} is not before the live edge {edge:?}; nothing to backfill")]
     BackfillFromNotInPast {
         /// The requested backfill start.

@@ -1,11 +1,13 @@
 //! The generic client-transport trait: one multiplexed consumer handle,
 //! transport chosen at compile time.
 
-use datamancer_core::{InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
+use datamancer_core::{
+    InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, Subscribed, SystemSnapshot,
+};
 use futures::Stream;
 
 use crate::error::ClientError;
-use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 /// A connected datamancerd client, generic over transport.
 ///
@@ -43,12 +45,7 @@ pub trait Client: Sized + Send {
         cfg: Self::Config,
     ) -> impl Future<Output = Result<(Self, Self::Events), ClientError<Self::Error>>> + Send;
 
-    /// Add a subscription to this client's set. Returns the scope the daemon
-    /// actually opened: the pair's shared authoritative session is created
-    /// with the first subscriber's scope and later subscribers join it as is,
-    /// so a `live_backfill` request can come back `live` (and vice versa),
-    /// and a joiner (`Subscribed::joined`) gets no history of its own. Read
-    /// the result, not the request, to know what precedes the live tail.
+    /// Add a subscription to this client's set and return what it opened.
     fn subscribe(
         &mut self,
         spec: &SubscriptionSpec,
@@ -133,9 +130,9 @@ pub trait Client: Sized + Send {
 mod tests {
     use super::Client;
     use crate::error::ClientError;
-    use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
+    use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
     use datamancer_core::{
-        InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
+        InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, Subscribed, SystemSnapshot,
     };
     use futures::stream::{self, Empty};
 
@@ -159,7 +156,7 @@ mod tests {
             &mut self,
             spec: &SubscriptionSpec,
         ) -> Result<Subscribed, ClientError<Self::Error>> {
-            Ok(Subscribed::from_wire(spec.scope, spec.backfill_from, false).expect("live"))
+            Ok(Subscribed::Created(spec.scope))
         }
         async fn unsubscribe(
             &mut self,

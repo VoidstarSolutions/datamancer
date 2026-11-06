@@ -51,7 +51,7 @@ whole finite kind space, which is what makes per-instrument capability discovery
 Every data variant carries three timestamp/identifier fields, with distinct roles that should not be conflated:
 
 - **`source_ts`** — the timestamp the provider reported for the event. Source of truth for "when did this happen in the market" and the **only** timestamp engine logic should reason about. Sourced verbatim from provider data; never assigned by datamancer.
-- **`seq: u64`** — a per-symbol ordering number stamped **once at the source** of the authoritative per-`(instrument, kind)` stream, in canonical delivery order, before any sink — so it is identical across all consumers of that symbol (not a per-consumer poll artifact). **The sole ordering field** for the stream, and per-symbol only (there is no cross-instrument order; the multiplex key is `(instrument, seq)`). Live mode stamps `seq` in arrival order, so replaying a symbol's substream in `seq` order reproduces that substream exactly (per-symbol; not the cross-symbol interleave of the multiplexed stream). Historical fetch stamps `seq` in source-timestamp order during fetch, so `seq` order matches market order. The delivered stream is contiguous *only while nothing is lost*: a consumer that loses events (a resume-buffer or backfill-seam overflow) sees a real `seq` hole, surfaced in-band as a `Control::Gap`. A late joiner has lost nothing: its substream begins where it joined, at the session's current `seq`, and no `Gap` marks what preceded it (`SubscribeOutcome::joined`, and `joined` on the daemon's reply, say that it joined).
+- **`seq: u64`** — a per-symbol ordering number stamped **once at the source** of the authoritative per-`(instrument, kind)` stream, in canonical delivery order, before any sink — so it is identical across all consumers of that symbol (not a per-consumer poll artifact). **The sole ordering field** for the stream, and per-symbol only (there is no cross-instrument order; the multiplex key is `(instrument, seq)`). Live mode stamps `seq` in arrival order, so replaying a symbol's substream in `seq` order reproduces that substream exactly (per-symbol; not the cross-symbol interleave of the multiplexed stream). Historical fetch stamps `seq` in source-timestamp order during fetch, so `seq` order matches market order. The delivered stream is contiguous *only while no data is lost*: a consumer that loses data (a resume-buffer or backfill-seam overflow) sees a real `seq` hole, surfaced in-band as a `Control::Gap`. A late joiner has lost nothing: `Subscribed` says what its stream carries.
 - **`rx_ts`** — wall-clock at the moment the bytes were received from the provider, captured pre-parse. **Observability only.** Used for measuring provider-to-engine latency (`rx_ts - source_ts`), correlating engine state with external wall-clock events (logs, traces, debugger sessions), and operational monitoring. **Engine decision logic must never depend on `rx_ts`** — doing so re-introduces wall-clock as a determinism hazard. For replay-from-historical-fetch, where there is no live arrival to record, `rx_ts` collapses to `source_ts`.
 
 `Control` events ride the same stream as data events because connectivity changes are part of the session's truth: a gap can invalidate downstream signals, and forcing consumers to acknowledge it in-band is safer than offering it as a separate stream they may forget to subscribe to.
@@ -141,15 +141,15 @@ client.subscribe(aapl.clone(), EventKind::Trade, scope, options).await?;
 client.subscribe(aapl, EventKind::Quote, scope, options).await?;
 ```
 
-`scope` is `Scope::Live`: pure-live, or with `backfill_from: Some(t)` a backfill from `t` to the
-live edge seamed ahead of the live tail (history, then the live prints buffered during the
-backfill in arrival order, then live; one `Gap` only for real loss). `subscribe` returns the scope
-**actually** opened: the pair's authoritative session is created with its first subscriber's
-scope and later subscribers join it as is, so a backfill request on a pair another consumer
-already holds pure-live comes back pure-live, and vice versa. A backfill that would *create* the
-session with a `backfill_from` at or past the live edge is refused (`Error::BackfillFromNotInPast`):
-nothing lies in that window, so opening it would report a backfill that never ran. A bounded
-`Scope::Historical` is a `Session` concern and is rejected here.
+`scope` is a `LiveScope`: `Live`, or `LiveBackfill { from }`, a backfill from `from` to the live
+edge seamed ahead of the live tail. The session subscribes upstream first, buffers live arrivals
+while the backfill runs, and delivers the history, then those arrivals in arrival order, then the
+live tail, with one `Gap` only for real loss (a failed fetch, or a buffer overflow bounded by the
+resume buffer's setting). `subscribe` returns a `Subscribed`: the pair's authoritative session is
+created with its first subscriber's scope and later subscribers join it as is.
+`Subscribed::history_from` gives the start of the history this subscriber created, and the type's
+docs say what a joiner receives. A start at or past the live edge is
+`Error::BackfillFromNotInPast`. Bounded ranges are a `Session` concern (`Scope::Historical`).
 
 Subscriptions accumulate; the client session's multiplexed stream **interleaves** everything that has been requested — per-symbol deterministic (`(instrument, seq)`, source-stamped within each instrument), arrival-order across symbols, never globally merge-sorted. Each `(instrument, kind)` pair is backed by a refcounted shared **authoritative session**, so two consumers of the same pair observe identical `(seq, source_ts)`. Adding the same instrument with a new event kind extends the subscription set rather than duplicating it.
 
@@ -269,7 +269,7 @@ in-band `Control::Gap` reports exactly the evicted span before the survivors
 flow. `seq` is stamped once at the source (not per-consumer), so survivors keep
 their original `seq` and an evicted event is a reported gap **and** a real `seq`
 hole at the evicted span — the delivered stream is contiguous only while
-nothing is lost. The live arrivals buffered during a backfill are bounded by the
+no data is lost. The live arrivals buffered during a backfill are bounded by the
 same setting and overflow the same way: one `Gap` right after the history names
 the evicted span, and the evicted prints' `seq` slots stay empty ahead of the
 survivors, so a seam overflow is the same real hole a resume-buffer overflow is.

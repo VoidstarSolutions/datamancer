@@ -35,25 +35,26 @@ pub mod providers;
 mod session;
 pub mod storage;
 
-pub use client_session::{ClientSession, SubscribeOutcome};
+pub use client_session::ClientSession;
 pub use datamancer_core::traits;
 pub use datamancer_core::{
     Adjustment, AssetClass, AuthoritativeSessionSnapshot, Bar, BarInterval, CacheCatalogEntry,
     CacheCoverage, CacheKey, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
     ConnectionState, Control, ControlKind, DaemonHealth, DisconnectCause, Error, EventKind,
     GapSpan, HealthView, HistoricalCache, HistoryRequest, Instrument, InstrumentCapabilities,
-    InstrumentEntry, InstrumentInfo, LatencySummary, LiveHandle, Liveness, MarketEvent, Price,
-    Provider, ProviderHealth, ProviderId, ProviderMetrics, ProviderSnapshot, ProviderState,
+    InstrumentEntry, InstrumentInfo, LatencySummary, LiveHandle, LiveScope, Liveness, MarketEvent,
+    Price, Provider, ProviderHealth, ProviderId, ProviderMetrics, ProviderSnapshot, ProviderState,
     Quantity, Quote, ReplayRequest, ReplaySource, Result, ResumeBufferSnapshot, Seq,
-    StreamConnection, StreamHealth, SubscriptionRef, Surface, SystemSnapshot, TapLog, Timestamp,
-    Trade,
+    StreamConnection, StreamHealth, Subscribed, SubscriptionRef, Surface, SystemSnapshot, TapLog,
+    Timestamp, Trade,
 };
 #[cfg(feature = "provider-alpaca")]
 pub use providers::{
     AlpacaCredentials, AlpacaCryptoSettings, AlpacaSettings, CredentialsSource, SettingsSource,
 };
 pub use session::{
-    Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,
+    Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope,
+    Session, check_backfill_start,
 };
 
 /// iceoryx2 zero-copy transport (data + diagnostics planes), gated behind the

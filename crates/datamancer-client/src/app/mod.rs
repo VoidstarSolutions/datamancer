@@ -39,7 +39,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use datamancer_core::{
-    HealthView, InstrumentEntry, InstrumentInfo, ProviderCredentials, ProviderId, SystemSnapshot,
+    HealthView, InstrumentEntry, InstrumentInfo, ProviderCredentials, ProviderId, Subscribed,
+    SystemSnapshot,
 };
 
 use crate::Client as _;
@@ -47,7 +48,7 @@ use crate::error::ClientError;
 #[cfg(not(windows))]
 use crate::iceoryx2::{Iceoryx2Client, Iceoryx2ClientError, Iceoryx2Config};
 use crate::protocol::uds::{Reply, Request};
-use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 // Windows hybrid: admin ops ride the owner-DACL named pipe, the data plane
 // rides WS-loopback (iceoryx2 shm is not viable on Windows — Phase 4). Unix is

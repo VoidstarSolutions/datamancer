@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use datamancer_core::{
-    HealthView, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
+    HealthView, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, Subscribed,
+    SystemSnapshot,
 };
 use datamancer_transport_ws::{EventFrame, WS_SUBPROTOCOL, from_wire};
 use futures::stream::{SplitSink, SplitStream};
@@ -24,7 +25,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::protocol::ws::{WsHealthPush, WsReply, WsRequest};
-use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 /// Connection parameters for [`WsClient`].
 #[derive(Debug, Clone)]
@@ -75,7 +76,7 @@ type WriteHalf = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 /// would `rx.await` forever, since nothing will ever clear its entry again.
 #[derive(Default)]
 struct PendingTable {
-    map: HashMap<u64, oneshot::Sender<WsReply>>,
+    map: HashMap<u64, oneshot::Sender<Result<WsReply, String>>>,
     closed: bool,
 }
 
@@ -136,7 +137,7 @@ async fn run_reader(
                     .map
                     .remove(&reply.id)
                 {
-                    let _ = tx.send(reply);
+                    let _ = tx.send(Ok(reply));
                 }
             }
             Ok(Inbound::Health(push)) => {
@@ -146,9 +147,9 @@ async fn run_reader(
                 // way the event stream deliberately does.
                 let _ = health.try_send(push.view);
             }
-            // Unknown frame shape: a newer daemon speaking a newer wire.
-            // Skipping (rather than erroring) keeps old clients readable.
-            Err(_) => {}
+            // Unknown frame shape: skipped, so old clients stay readable,
+            // unless it is the reply a request is waiting on.
+            Err(_) => fail_unreadable_reply(&text, &pending),
         }
     }
     // Socket gone: fail every pending request, latch `closed` so any request
@@ -158,6 +159,26 @@ async fn run_reader(
     let mut table = pending.lock().expect("pending poisoned");
     table.closed = true;
     table.map.clear();
+}
+
+/// Fail the request an unreadable reply answers, so its caller gets an error
+/// instead of waiting on a reply that has already arrived.
+fn fail_unreadable_reply(text: &str, pending: &Pending) {
+    let Err(error) = serde_json::from_str::<WsReply>(text) else {
+        return;
+    };
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    if frame.get("ok").is_none() {
+        return;
+    }
+    let Some(id) = frame.get("id").and_then(serde_json::Value::as_u64) else {
+        return;
+    };
+    if let Some(tx) = pending.lock().expect("pending poisoned").map.remove(&id) {
+        let _ = tx.send(Err(format!("unreadable reply: {error}")));
+    }
 }
 
 impl WsClient {
@@ -194,7 +215,8 @@ impl WsClient {
         }
         let reply = rx
             .await
-            .map_err(|_| ClientError::Transport(WsClientError::ConnectionClosed))?;
+            .map_err(|_| ClientError::Transport(WsClientError::ConnectionClosed))?
+            .map_err(|message| ClientError::Transport(WsClientError::Protocol(message)))?;
         if reply.ok {
             Ok(reply)
         } else {
@@ -296,12 +318,9 @@ impl Client for WsClient {
             id: self.next_id(),
             spec: spec.clone(),
         };
-        let reply = self.request(&req).await?;
-        reply.subscribed_scope().ok_or_else(|| {
-            ClientError::Transport(WsClientError::Protocol(
-                "ok subscribe reply missing the actual scope".to_string(),
-            ))
-        })
+        self.request(&req)
+            .await
+            .map(|reply| reply.subscribed.into())
     }
 
     async fn unsubscribe(
@@ -391,12 +410,12 @@ impl Client for WsClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{WsClient, WsConfig};
+    use super::{WsClient, WsClientError, WsConfig};
     use crate::client::Client;
     use crate::error::ClientError;
     use crate::protocol::ws::{WsReply, WsRequest};
-    use crate::spec::{Subscribed, SubscriptionSpec};
-    use datamancer_core::{MarketEvent, Price, Seq, Timestamp};
+    use crate::spec::SubscriptionSpec;
+    use datamancer_core::{LiveScope, MarketEvent, Price, Seq, Subscribed, Timestamp};
     use datamancer_transport_ws::to_wire;
     use futures::{SinkExt as _, StreamExt as _};
     use tokio::net::TcpListener;
@@ -484,9 +503,12 @@ mod tests {
                 .await
                 .unwrap();
             ws.send(Message::Text(
-                serde_json::to_string(&WsReply::subscribed(id, Subscribed::live()))
-                    .unwrap()
-                    .into(),
+                serde_json::to_string(&WsReply::subscribed(
+                    id,
+                    Subscribed::Created(LiveScope::Live),
+                ))
+                .unwrap()
+                .into(),
             ))
             .await
             .unwrap();
@@ -501,7 +523,7 @@ mod tests {
         )
         .unwrap();
         let actual = client.subscribe(&spec).await.expect("subscribe acked");
-        assert_eq!(actual, Subscribed::live());
+        assert_eq!(actual, Subscribed::Created(LiveScope::Live));
 
         let ev = events.next().await.expect("one event");
         assert_eq!(ev, trade()); // timestamp triple verbatim, price intact
@@ -622,9 +644,12 @@ mod tests {
                 .await
                 .unwrap();
             ws.send(Message::Text(
-                serde_json::to_string(&WsReply::subscribed(req.id(), Subscribed::live()))
-                    .unwrap()
-                    .into(),
+                serde_json::to_string(&WsReply::subscribed(
+                    req.id(),
+                    Subscribed::Created(LiveScope::Live),
+                ))
+                .unwrap()
+                .into(),
             ))
             .await
             .unwrap();
@@ -658,6 +683,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unreadable_reply_fails_its_request() {
+        let url = fake_server(|mut ws| async move {
+            let Some(Ok(Message::Text(text))) = ws.next().await else {
+                panic!("expected frame")
+            };
+            let req: WsRequest = serde_json::from_str(&text).unwrap();
+            let reply = format!(r#"{{"id":{},"ok":true,"scope":"live_backfill"}}"#, req.id());
+            ws.send(Message::Text(reply.into())).await.unwrap();
+            let _ = ws.next().await;
+        })
+        .await;
+
+        let (mut client, _events) = WsClient::connect(cfg(url)).await.expect("connect");
+        let spec: SubscriptionSpec = serde_json::from_str(
+            r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+        )
+        .unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.subscribe(&spec))
+                .await
+                .expect("an unreadable reply must not hang the request");
+        assert!(
+            matches!(
+                outcome,
+                Err(ClientError::Transport(WsClientError::Protocol(_)))
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn close_sends_close_client_and_awaits_ack() {
         let url = fake_server(|mut ws| async move {
             let Some(Ok(Message::Text(text))) = ws.next().await else {
@@ -666,7 +722,7 @@ mod tests {
             let req: WsRequest = serde_json::from_str(&text).unwrap();
             assert!(matches!(req, WsRequest::CloseClient { .. }));
             ws.send(Message::Text(
-                serde_json::to_string(&WsReply::subscribed(req.id(), Subscribed::live()))
+                serde_json::to_string(&WsReply::ok(req.id()))
                     .unwrap()
                     .into(),
             ))
@@ -799,7 +855,7 @@ mod tests {
         // Simulate what `request()` does when it finds `closed` already set:
         // it must return `ConnectionClosed` and must NOT insert.
         let id = 1;
-        let (tx, rx) = tokio::sync::oneshot::channel::<WsReply>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<WsReply, String>>();
         let mut tx = Some(tx);
         let registered = {
             let mut table = pending.lock().unwrap();

@@ -178,9 +178,7 @@ configured, and providers are enabled at runtime via the config service's
 restarting). Validation fails fast on the remaining cross-section invariants:
 a startup session using a cache preset requires `[cache]`; one writing the
 tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
-`backfill_from` that lies before the live edge (the library refuses a backfill
-with nothing to fetch when the anchor opens; the config check just says so
-before anything starts).
+`backfill_from` before the live edge, and `scope = live` refuses one.
 
 `[session] query_persistence` is the daemon's single cache policy for every
 `open-query` — queries carry no per-request persistence selector on the wire.
@@ -458,30 +456,26 @@ One JSON object per line; one reply line per request.
   -> {"ok":true,"health":{ /* HealthView, schema_version 3, daemon-stamped */ }}
 ```
 
-`subscribe` opens an unbounded subscription. `scope` is `live` (purely from
-"now") or `live_backfill`, which fetches history from `backfill_from`
-(epoch nanoseconds, inclusive) up to the live edge and seams it into the
-live tail: the daemon subscribes first, buffers live arrivals while the
-backfill runs, flushes them after it in arrival order, and emits an in-band
-`Gap` only for real loss (a failed fetch, or a buffer overflow bounded by
-`[session] resume_buffer_events`). The two fields must agree: `live_backfill`
-without `backfill_from`, or `backfill_from` under `live`, is `bad_request`.
-Each `(instrument, kind)` pair is served by one shared authoritative session
-whose scope is fixed by whichever subscriber created it, and every later
-subscriber joins it as is — so the reply's `scope`/`backfill_from` carry the
-scope **actually** opened, which is the requested one only when this
-subscribe created the session. A joiner's reply says `"joined":true` (absent
-for the creator): its stream begins where it joined, no history is replayed
-for it and no `Gap` marks what it missed, so a `backfill_from` on a joined
-reply is the creator's coverage, not the joiner's; a consumer that needs its
-own history on a joined pair fetches it with `open-query`. A `backfill_from`
-at or past the live edge is `bad_request`: the library refuses to create a
-session with nothing to backfill (the reply would otherwise claim a backfill
-that never ran), and the daemon maps that refusal to the same code as a
-disagreeing scope pair. The seed
-subscriptions of `open-client` are validated together before any of them
-subscribes, follow the same rules, and are not echoed (that reply names the
-service).
+`subscribe` opens an unbounded subscription:
+
+- `scope` is `live` (the default) or `live_backfill`.
+- `backfill_from` (epoch nanoseconds, inclusive) is required under
+  `live_backfill` and refused under `live`; either disagreement is
+  `bad_request`.
+- A `backfill_from` at or past the live edge is `backfill_not_in_past`.
+- The reply's `scope` and `backfill_from` are the scope of the pair's shared
+  session, fixed by the subscriber that created it.
+- `"joined":true` marks a subscriber that joined an open session; the creator's
+  reply omits it. A joiner's stream begins where it joined, with no `Gap` for
+  what it missed; a backfill still running reaches it from that point on. A
+  joiner that needs its own history uses `open-query`.
+
+`open-client` seeds follow the same rules and are live-only: any other scope
+is `bad_request`, checked for all seeds before any subscribes. A client that
+wants a backfill subscribes after opening.
+
+How a backfill seams into the live tail is in the
+[library README](../datamancer/README.md#subscriptions).
 
 `open-query` opens a **bounded historical query** over
 `from..to` (inclusive `from`, `to >= from` or `bad_request`) — **ungated**,
@@ -625,8 +619,8 @@ config-service ops (spec cycle 3); see the dedicated section below for
 gating, classification, and semantics.
 
 Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
-(`live_session_conflict`, `unsupported_event_kind`, `persistence_required`,
-`unsupported_client_scope`, `duplicate_subscription`, `not_subscribed`,
+(`unsupported_event_kind`, `persistence_required`,
+`backfill_not_in_past`, `duplicate_subscription`, `not_subscribed`,
 `unknown_provider`, `unknown_client`, `duplicate_client`,
 `service_cap_exceeded`, `bad_request`, `shutting_down`,
 `credentials_missing`, `credential_backend_unavailable`, `permission_denied`,

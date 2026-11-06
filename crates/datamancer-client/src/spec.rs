@@ -2,8 +2,9 @@
 //! `Cfg` selectors and the `(instrument, kind)` + scope/persistence spec that
 //! `subscribe`/`unsubscribe` carry.
 
-use datamancer_core::{AssetClass, BarInterval, EventKind, Instrument, Timestamp};
-use serde::{Deserialize, Serialize};
+use datamancer_core::{AssetClass, BarInterval, EventKind, Instrument, LiveScope, Timestamp};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// The core value has no wire selector: the daemon's control vocabulary is a
 /// closed set that can lag `datamancer-core`'s `#[non_exhaustive]` enums
@@ -90,18 +91,6 @@ impl From<EventKind> for EventKindCfg {
     }
 }
 
-/// Live-scope selector, shared by startup sessions and `subscribe`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScopeCfg {
-    /// Purely from "now".
-    #[default]
-    Live,
-    /// History from a `backfill_from` timestamp up to the live edge, then the
-    /// live tail.
-    LiveBackfill,
-}
-
 /// Persistence-preset selector for a startup session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -122,11 +111,6 @@ pub enum PersistenceCfg {
 /// the request frames, and serde documents that combination as unsupported
 /// (the attribute was silently inert via `flatten`). Unknown-key rejection
 /// is the daemon's job — the UDS surface enforces it explicitly server-side.
-///
-/// `#[non_exhaustive]`: build one with [`Self::new`] (from an
-/// [`Instrument`]) or [`Self::from_parts`] (from the wire selectors) and set
-/// the fields it should differ in, so a later wire field is an additive
-/// change for every client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SubscriptionSpec {
@@ -134,25 +118,10 @@ pub struct SubscriptionSpec {
     pub asset_class: AssetClassCfg,
     pub symbol: String,
     pub kind: EventKindCfg,
-    /// Scope preference. `live` starts purely from "now"; `live_backfill`
-    /// fetches history from [`Self::backfill_from`] up to the live edge and
-    /// seams it into the live tail (the daemon owns the seam: live arrivals
-    /// are buffered during the backfill and flushed after it, with an in-band
-    /// `Gap` only for real loss).
-    ///
-    /// The `(instrument, kind)` pair is backed by one shared authoritative
-    /// session whose scope is fixed when it is created, so a later subscriber
-    /// joins that session whatever it asked for. On such a conflict the reply
-    /// returns the *actual* scope rather than erroring — read `scope` and
-    /// `backfill_from` on the reply, not the request.
-    #[serde(default)]
-    pub scope: ScopeCfg,
-    /// Inclusive source-time start of the backfill. Required when `scope` is
-    /// `live_backfill` and rejected (`bad_request`) otherwise, so a request can
-    /// never be silently downgraded to pure-live. Absent on the wire when
-    /// `None`, which keeps older clients' frames valid.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backfill_from: Option<Timestamp>,
+    /// The scope to open. A `scope` key absent from the wire means live; a
+    /// `scope` and `backfill_from` that disagree fail to parse.
+    #[serde(flatten, deserialize_with = "live_scope_from_wire")]
+    pub scope: LiveScope,
     #[serde(default)]
     pub persistence: PersistenceCfg,
 }
@@ -172,111 +141,53 @@ impl SubscriptionSpec {
             asset_class: instrument.asset_class().try_into()?,
             symbol: instrument.symbol().to_string(),
             kind: kind.into(),
-            scope: ScopeCfg::default(),
-            backfill_from: None,
+            scope: LiveScope::default(),
             persistence: PersistenceCfg::default(),
         })
     }
 
-    /// Build a spec from the wire vocabulary itself, for a caller that holds
-    /// the selectors rather than an [`Instrument`] (a command line, a config
-    /// file). Infallible: the wire enums are already the closed set.
-    #[must_use]
-    pub fn from_parts(
-        provider: impl Into<String>,
-        asset_class: AssetClassCfg,
-        symbol: impl Into<String>,
-        kind: EventKindCfg,
-    ) -> Self {
-        Self {
-            provider: provider.into(),
-            asset_class,
-            symbol: symbol.into(),
-            kind,
-            scope: ScopeCfg::default(),
-            backfill_from: None,
-            persistence: PersistenceCfg::default(),
-        }
-    }
-
-    /// Ask for history from `from` up to the live edge, seamed into the live
-    /// tail: sets `scope` to [`ScopeCfg::LiveBackfill`] and `backfill_from`
-    /// together, so the pair can never disagree.
+    /// Ask for history from `from`: see [`LiveScope::LiveBackfill`].
     #[must_use]
     pub fn with_backfill_from(mut self, from: Timestamp) -> Self {
-        self.scope = ScopeCfg::LiveBackfill;
-        self.backfill_from = Some(from);
+        self.scope = LiveScope::LiveBackfill { from };
         self
     }
 }
 
-/// The scope a `subscribe` actually opened, echoed in the reply: the shared
-/// authoritative session's creation-time scope, which is the requested one
-/// only when this subscriber created the session. Read this, not the request,
-/// to learn whether history will precede the live tail — and read `joined`
-/// to learn whether it will precede *this* stream at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct Subscribed {
-    /// The actual scope.
-    pub scope: ScopeCfg,
-    /// The actual backfill start; `Some` exactly when `scope` is
-    /// [`ScopeCfg::LiveBackfill`].
-    pub backfill_from: Option<Timestamp>,
-    /// `true` when this subscribe joined a session another subscriber had
-    /// already opened. A joiner's stream begins where it joined: no history
-    /// is replayed for it and no `Gap` marks what it missed, so under
-    /// `live_backfill` the `backfill_from` describes the session creator's
-    /// coverage, not this subscriber's. A consumer that needs its own
-    /// history on a joined pair fetches it itself (`open-query`).
-    pub joined: bool,
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScopeName {
+    Live,
+    LiveBackfill,
 }
 
-impl Subscribed {
-    /// Pure-live, opened by this subscriber.
-    #[must_use]
-    pub const fn live() -> Self {
-        Self {
-            scope: ScopeCfg::Live,
-            backfill_from: None,
-            joined: false,
-        }
-    }
+#[derive(Deserialize)]
+struct ScopeFields {
+    #[serde(default)]
+    scope: Option<ScopeName>,
+    #[serde(default)]
+    backfill_from: Option<Timestamp>,
+}
 
-    /// Backfill from `from`, opened by this subscriber.
-    #[must_use]
-    pub const fn live_backfill(from: Timestamp) -> Self {
-        Self {
-            scope: ScopeCfg::LiveBackfill,
-            backfill_from: Some(from),
-            joined: false,
-        }
+pub(crate) fn optional_live_scope_from_wire<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<LiveScope>, D::Error> {
+    let fields = ScopeFields::deserialize(deserializer)?;
+    match (fields.scope, fields.backfill_from) {
+        (None, None) => Ok(None),
+        (Some(ScopeName::Live), None) => Ok(Some(LiveScope::Live)),
+        (Some(ScopeName::LiveBackfill), Some(from)) => Ok(Some(LiveScope::LiveBackfill { from })),
+        (Some(ScopeName::LiveBackfill), None) => Err(D::Error::custom(
+            "scope live_backfill requires backfill_from",
+        )),
+        (Some(ScopeName::Live) | None, Some(_)) => Err(D::Error::custom(
+            "backfill_from requires scope live_backfill",
+        )),
     }
+}
 
-    /// Mark whether the session was joined rather than created.
-    #[must_use]
-    pub const fn with_joined(mut self, joined: bool) -> Self {
-        self.joined = joined;
-        self
-    }
-
-    /// Rebuild from reply fields. `None` when the wire is inconsistent
-    /// (`live_backfill` without a `backfill_from`), which a client reports
-    /// as a protocol error rather than guessing.
-    #[must_use]
-    pub fn from_wire(
-        scope: ScopeCfg,
-        backfill_from: Option<Timestamp>,
-        joined: bool,
-    ) -> Option<Self> {
-        match (scope, backfill_from) {
-            (ScopeCfg::Live, _) => Some(Self::live().with_joined(joined)),
-            (ScopeCfg::LiveBackfill, Some(from)) => {
-                Some(Self::live_backfill(from).with_joined(joined))
-            }
-            (ScopeCfg::LiveBackfill, None) => None,
-        }
-    }
+fn live_scope_from_wire<'de, D: Deserializer<'de>>(deserializer: D) -> Result<LiveScope, D::Error> {
+    optional_live_scope_from_wire(deserializer).map(Option::unwrap_or_default)
 }
 
 /// The `(provider, asset_class, symbol, kind)` tuple an `unsubscribe` names.
@@ -374,11 +285,8 @@ impl QuerySpec {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AssetClassCfg, EventKindCfg, PersistenceCfg, ScopeCfg, Subscribed, SubscriptionSpec,
-        UnsubscribeSpec,
-    };
-    use datamancer_core::{AssetClass, EventKind, Instrument, ProviderId, Timestamp};
+    use super::{AssetClassCfg, EventKindCfg, PersistenceCfg, SubscriptionSpec, UnsubscribeSpec};
+    use datamancer_core::{AssetClass, EventKind, Instrument, LiveScope, ProviderId, Timestamp};
 
     /// The Cfg→core→Cfg round trip is the identity over the full kind space:
     /// the wire vocabulary covers exactly `EventKind::enumerate`.
@@ -417,8 +325,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec, from_json);
-        assert_eq!(spec.scope, ScopeCfg::Live);
-        assert_eq!(spec.backfill_from, None);
+        assert_eq!(spec.scope, LiveScope::Live);
         assert_eq!(spec.persistence, PersistenceCfg::None);
 
         let unsub = UnsubscribeSpec::new(&instrument, EventKind::Trade).unwrap();
@@ -440,7 +347,12 @@ mod tests {
         assert!(!json.contains("backfill_from"), "{json}");
 
         let backfill = live.clone().with_backfill_from(Timestamp(1_000));
-        assert_eq!(backfill.scope, ScopeCfg::LiveBackfill);
+        assert_eq!(
+            backfill.scope,
+            LiveScope::LiveBackfill {
+                from: Timestamp(1_000)
+            }
+        );
         let json = serde_json::to_string(&backfill).unwrap();
         assert_eq!(
             json,
@@ -450,44 +362,49 @@ mod tests {
         assert_eq!(back, backfill);
     }
 
-    /// The two constructors agree, so a caller holding wire selectors builds
-    /// the same spec as one holding an `Instrument`.
+    fn parse_scope(fields: &str) -> Result<LiveScope, serde_json::Error> {
+        let frame = format!(
+            r#"{{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade"{fields}}}"#
+        );
+        serde_json::from_str::<SubscriptionSpec>(&frame).map(|spec| spec.scope)
+    }
+
     #[test]
-    fn from_parts_builds_the_same_spec_as_new() {
-        let instrument = Instrument::new(
-            ProviderId::from_static("alpaca"),
-            AssetClass::Equity,
-            "AAPL",
+    fn scope_fields_parse_to_one_live_scope() {
+        assert_eq!(parse_scope("").unwrap(), LiveScope::Live);
+        assert_eq!(parse_scope(r#","scope":"live""#).unwrap(), LiveScope::Live);
+        assert_eq!(
+            parse_scope(r#","scope":"live","backfill_from":null"#).unwrap(),
+            LiveScope::Live
         );
         assert_eq!(
-            SubscriptionSpec::from_parts(
-                "alpaca",
-                AssetClassCfg::Equity,
-                "AAPL",
-                EventKindCfg::Trade
-            ),
-            SubscriptionSpec::new(&instrument, EventKind::Trade).unwrap()
+            parse_scope(r#","scope":"live_backfill","backfill_from":7"#).unwrap(),
+            LiveScope::LiveBackfill { from: Timestamp(7) }
         );
     }
 
-    /// The reply-side pair stays consistent: a stray `backfill_from` under
-    /// `live` is dropped, and `live_backfill` without one is not a value at
-    /// all.
     #[test]
-    fn subscribed_from_wire_keeps_the_pair_consistent() {
-        let live = Subscribed::from_wire(ScopeCfg::Live, Some(Timestamp(5)), false).unwrap();
-        assert_eq!(live, Subscribed::live());
-        let backfill =
-            Subscribed::from_wire(ScopeCfg::LiveBackfill, Some(Timestamp(5)), true).unwrap();
-        assert_eq!(
-            backfill,
-            Subscribed::live_backfill(Timestamp(5)).with_joined(true)
-        );
-        assert!(backfill.joined);
-        assert_eq!(
-            Subscribed::from_wire(ScopeCfg::LiveBackfill, None, false),
-            None
-        );
+    fn a_disagreeing_scope_pair_does_not_parse() {
+        for fields in [
+            r#","scope":"live_backfill""#,
+            r#","scope":"live_backfill","backfill_from":null"#,
+        ] {
+            let err = parse_scope(fields).unwrap_err().to_string();
+            assert!(
+                err.contains("scope live_backfill requires backfill_from"),
+                "{err}"
+            );
+        }
+        for fields in [
+            r#","scope":"live","backfill_from":7"#,
+            r#","backfill_from":7"#,
+        ] {
+            let err = parse_scope(fields).unwrap_err().to_string();
+            assert!(
+                err.contains("backfill_from requires scope live_backfill"),
+                "{err}"
+            );
+        }
     }
 
     mod query_spec_tests {

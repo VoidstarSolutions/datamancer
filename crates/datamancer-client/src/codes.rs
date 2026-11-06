@@ -2,17 +2,13 @@
 //! an operator-facing contract; changing a string is a breaking change and is
 //! regression-guarded in tests.
 
-/// A live session for the pair is already active and cannot be shared as
-/// requested.
-pub const LIVE_SESSION_CONFLICT: &str = "live_session_conflict";
 /// No registered provider supports the requested `(instrument, kind)`.
 pub const UNSUPPORTED_EVENT_KIND: &str = "unsupported_event_kind";
 /// The requested persistence preset requires a backend that is not
 /// configured.
 pub const PERSISTENCE_REQUIRED: &str = "persistence_required";
-/// A client subscription requested an unsupported scope (a bounded
-/// historical range; client subscriptions are unbounded).
-pub const UNSUPPORTED_CLIENT_SCOPE: &str = "unsupported_client_scope";
+/// A live backfill would start at or past the live edge.
+pub const BACKFILL_NOT_IN_PAST: &str = "backfill_not_in_past";
 /// The client already holds a subscription for this pair.
 pub const DUPLICATE_SUBSCRIPTION: &str = "duplicate_subscription";
 /// The client is not subscribed to this pair.

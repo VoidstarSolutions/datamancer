@@ -26,15 +26,13 @@ use datamancer::transport::{
     BootScopedPrefix, DataServiceName, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher,
     Iceoryx2HealthPublisher, ServicePrefix,
 };
-// `Scope` is named only by the unix `open_query` arm (`Scope::Historical`);
-// the subscribe paths resolve theirs through `control::requested_scope`, so
-// on Windows the import would be unused.
-#[cfg(not(windows))]
-use datamancer::Scope;
 use datamancer::{
     AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Session,
     TapLog, traits::EventSink,
 };
+// Named only by the unix `open-client` and `open-query` arms.
+#[cfg(not(windows))]
+use datamancer::{LiveScope, Scope};
 // `Timestamp` only appears in `validate_query_open`'s signature and its
 // tests, both unix/macOS only — importing it unconditionally would be
 // `unused_imports` on Windows.
@@ -65,10 +63,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
-use crate::control::{
-    Reply, Request, SubscriptionSpec, actual_scope, codes, reply_from_library_error,
-    requested_scope,
-};
+use crate::control::{Reply, Request, SubscriptionSpec, codes, reply_from_library_error};
 use crate::credentials::CredentialHub;
 // Unix gates each privileged op on the peer uid; Windows uses the pipe's
 // owner-only DACL (connect-time), so this helper is Unix-only.
@@ -406,7 +401,7 @@ impl Server {
                 .session(
                     s.instrument(),
                     s.kind.into(),
-                    scope,
+                    scope.into(),
                     crate::config::persistence_options(s.persistence),
                 )
                 .await?;
@@ -1016,6 +1011,9 @@ impl Server {
                 format!("service cap {} exceeded", self.max_clients),
             );
         }
+        if let Some(reply) = validate_seeds(&subscriptions) {
+            return reply;
+        }
 
         let id = self.next_client_id;
         let name = DataServiceName::new(&self.service_prefix, id);
@@ -1028,28 +1026,14 @@ impl Server {
         let service = sink.data_service_name().to_string();
         let sink = Arc::new(sink) as Arc<dyn EventSink>;
 
-        // Validate every seed spec before any of them subscribes, so a bad
-        // spec rejects the whole request instead of leaving earlier seeds
-        // subscribed on a client that then fails to open.
-        let mut seeds = Vec::with_capacity(subscriptions.len());
-        for spec in subscriptions {
-            match requested_scope(&spec) {
-                Ok(scope) => seeds.push((spec, scope)),
-                Err(message) => return Reply::error(codes::BAD_REQUEST, message),
-            }
-        }
-
         let session = self.dm.client_session();
-        // Apply seed subscriptions before taking the stream. Their actual
-        // scopes are not echoed (the reply names the service); a client that
-        // needs them subscribes after opening.
-        for (spec, scope) in seeds {
+        for spec in subscriptions {
             let instrument = spec_instrument(&spec);
             if let Err(e) = session
                 .subscribe(
                     instrument,
                     spec.kind.into(),
-                    scope,
+                    spec.scope,
                     crate::config::persistence_options(spec.persistence),
                 )
                 .await
@@ -1243,20 +1227,16 @@ impl Server {
             return Reply::error(codes::SESSION_CLOSED, "client session is closing");
         };
         let instrument = spec_instrument(&spec);
-        let scope = match requested_scope(&spec) {
-            Ok(scope) => scope,
-            Err(message) => return Reply::error(codes::BAD_REQUEST, message),
-        };
         match session
             .subscribe(
                 instrument,
                 spec.kind.into(),
-                scope,
+                spec.scope,
                 crate::config::persistence_options(spec.persistence),
             )
             .await
         {
-            Ok(actual) => Reply::subscribed(actual_scope(actual)),
+            Ok(subscribed) => Reply::subscribed(subscribed),
             Err(e) => reply_from_library_error(&e),
         }
     }
@@ -1337,18 +1317,30 @@ fn validate_query_open(
     None
 }
 
+/// Validate all seeds before subscribing any.
+#[cfg(not(windows))]
+fn validate_seeds(seeds: &[SubscriptionSpec]) -> Option<Reply> {
+    seeds
+        .iter()
+        .find(|seed| seed.scope != LiveScope::Live)
+        .map(|seed| {
+            Reply::error(
+                codes::BAD_REQUEST,
+                format!(
+                    "open-client seed {} is not live; subscribe after opening to backfill",
+                    seed.symbol
+                ),
+            )
+        })
+}
+
 /// Reject a control request that carries unknown top-level JSON keys. `serde`'s
 /// `deny_unknown_fields` cannot cover `Request` directly (it is an
 /// internally-tagged enum, and `Subscribe` `#[serde(flatten)]`s its spec — both
 /// disable the attribute), so compare the input object's keys against the keys
 /// the parsed request round-trips to. Any input key absent from the canonical
-/// form was silently ignored and is reported as an error.
-///
-/// A `null`-valued input key is an absent one, not an unknown one: an
-/// optional field the request parsed as `None` is skipped by the canonical
-/// form (`backfill_from` is `skip_serializing_if = "Option::is_none"`), and
-/// most non-Rust encoders spell an unset optional as an explicit `null`
-/// rather than omitting the key.
+/// form was silently ignored and is reported as an error. A `null`-valued key
+/// is an absent one.
 fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(), String> {
     let input: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("invalid request: {e}"))?;
@@ -2057,6 +2049,85 @@ mod tests {
         assert!(!privileged_op_permitted(None, 501));
     }
 
+    /// Serve one in-memory connection.
+    fn spawn_connection(
+        privileged: bool,
+    ) -> (
+        tokio::io::DuplexStream,
+        JoinHandle<()>,
+        mpsc::Receiver<ServerCommand>,
+        tempfile::TempDir,
+    ) {
+        let dm = Datamancer::builder()
+            .build()
+            .expect("build provider-less datamancer");
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ServerCommand>(4);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = datamancer_credentials::CredentialStore::with_backend(Box::new(
+            datamancer_credentials::FileBackend::new(dir.path().join("creds.json")),
+        ));
+        let (hub, _sources) = CredentialHub::with_store(store, &["alpaca"]);
+        let (config_hub, _settings) = crate::config_hub::ConfigHub::bootstrap(
+            Config::parse("").expect("empty config parses to defaults"),
+            dir.path().join("config.toml"),
+        );
+        let (client, server) = tokio::io::duplex(8192);
+        let (s_read, s_write) = tokio::io::split(server);
+        let task = tokio::spawn(serve_connection(
+            s_read,
+            s_write,
+            privileged,
+            cmd_tx,
+            dm,
+            Arc::new(hub),
+            config_hub,
+        ));
+        (client, task, cmd_rx, dir)
+    }
+
+    #[tokio::test]
+    async fn serve_connection_answers_a_disagreeing_scope_pair_bad_request() {
+        let (client, task, mut cmd_rx, _dir) = spawn_connection(true);
+        let (c_read, mut c_write) = tokio::io::split(client);
+        let mut replies = BufReader::new(c_read).lines();
+
+        for (fields, message) in [
+            (
+                r#""scope":"live_backfill""#,
+                "scope live_backfill requires backfill_from",
+            ),
+            (
+                r#""scope":"live","backfill_from":7"#,
+                "backfill_from requires scope live_backfill",
+            ),
+        ] {
+            let line = format!(
+                r#"{{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade",{fields}}}"#
+            );
+            c_write
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write request");
+            let reply = tokio::time::timeout(Duration::from_secs(5), replies.next_line())
+                .await
+                .expect("a refused pair is answered")
+                .expect("read reply")
+                .expect("reply line present");
+            let reply: Reply = serde_json::from_str(&reply).expect("parse reply");
+            assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
+            let detail = reply.message.expect("message");
+            assert!(detail.contains(message), "{detail}");
+        }
+
+        drop(c_write);
+        drop(replies);
+        task.await.expect("serve_connection task joins");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a frame that does not parse never reaches the actor"
+        );
+    }
+
     /// The `privileged == false` denial **wiring** (not just the predicate).
     /// `privileged_gate_requires_exact_uid_match` above proves the decision
     /// function; this proves `serve_connection` actually *honours* it — a gated
@@ -2068,38 +2139,9 @@ mod tests {
     /// the daemon's own uid, so this is the only coverage of the deny arm).
     #[tokio::test]
     async fn serve_connection_denies_gated_ops_when_unprivileged() {
-        // Minimal deps: on the denial path `serve_connection` returns before
-        // `dm` / `hub` / `config_hub` / `cmd_tx` are ever touched — but the
-        // signature still requires them. A provider-less datamancer is cheap and
-        // never connects to anything.
-        let dm = Datamancer::builder()
-            .build()
-            .expect("build provider-less datamancer");
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(4);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = datamancer_credentials::CredentialStore::with_backend(Box::new(
-            datamancer_credentials::FileBackend::new(dir.path().join("creds.json")),
-        ));
-        let (hub, _sources) = CredentialHub::with_store(store, &["alpaca"]);
-        let (config_hub, _settings) = crate::config_hub::ConfigHub::bootstrap(
-            Config::parse("").expect("empty config parses to defaults"),
-            dir.path().join("config.toml"),
-        );
-
-        // In-memory duplex: the `server` half feeds `serve_connection`; we drive
-        // the `client` half. Bounded reads are unnecessary — `serve_connection`
-        // replies synchronously per line and we close the stream to end it.
-        let (client, server) = tokio::io::duplex(8192);
-        let (s_read, s_write) = tokio::io::split(server);
-        let task = tokio::spawn(serve_connection(
-            s_read,
-            s_write,
-            false, // unprivileged peer
-            cmd_tx,
-            dm,
-            Arc::new(hub),
-            config_hub,
-        ));
+        // Bounded reads are unnecessary: `serve_connection` replies
+        // synchronously per line and we close the stream to end it.
+        let (client, task, mut cmd_rx, _dir) = spawn_connection(false);
 
         let (c_read, mut c_write) = tokio::io::split(client);
         let mut replies = BufReader::new(c_read).lines();
@@ -2168,9 +2210,27 @@ mod tests {
         );
     }
 
-    /// An optional key sent as `null` (how most non-Rust encoders spell an
-    /// unset field) is absent, not unknown: the canonical form skips a `None`
-    /// `backfill_from`, so a bare key-set diff would refuse the request.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_seed_that_is_not_live_is_refused() {
+        let live: SubscriptionSpec = serde_json::from_str(
+            r#"{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade"}"#,
+        )
+        .expect("parse");
+        assert!(validate_seeds(std::slice::from_ref(&live)).is_none());
+
+        let backfill = live.clone().with_backfill_from(Timestamp(7));
+        let reply = validate_seeds(&[live, backfill]).expect("refused");
+        assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
+    }
+
+    #[test]
+    fn reject_unknown_keys_accepts_a_live_backfill_frame() {
+        let line = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live_backfill","backfill_from":7}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        assert!(reject_unknown_keys(line, &request).is_ok());
+    }
+
     #[test]
     fn reject_unknown_keys_treats_a_null_valued_key_as_absent() {
         let line = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live","backfill_from":null}"#;

@@ -7,10 +7,11 @@
 //! replies on the shared socket. `open-client` is implicit on connect and has no
 //! request.
 
-use datamancer_core::{SystemSnapshot, Timestamp};
+use datamancer_core::{Subscribed, SystemSnapshot};
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{ScopeCfg, Subscribed, SubscriptionSpec, UnsubscribeSpec};
+use super::SubscribedFields;
+use crate::spec::{SubscriptionSpec, UnsubscribeSpec};
 
 /// A WS control request (one JSON text frame).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,9 +71,6 @@ impl WsRequest {
 }
 
 /// A WS control reply (one JSON text frame), echoing the request `id`.
-///
-/// `#[non_exhaustive]`: built through its constructors, so a later per-op
-/// field is additive for every consumer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct WsReply {
@@ -88,19 +86,9 @@ pub struct WsReply {
     pub instruments: Option<Vec<datamancer_core::InstrumentInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<datamancer_core::InstrumentEntry>>,
-    /// The scope the subscription actually opened (on `subscribe`); see the
-    /// UDS [`Reply::scope`](crate::protocol::uds::Reply::scope).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<ScopeCfg>,
-    /// The actual backfill start (on `subscribe`, when `scope` is
-    /// `live_backfill`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backfill_from: Option<Timestamp>,
-    /// `true` when the subscribe joined a session another subscriber opened
-    /// (on `subscribe`; absent means this subscribe created it). See
-    /// [`Subscribed::joined`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub joined: Option<bool>,
+    /// What the subscription opened (on `subscribe`).
+    #[serde(flatten)]
+    pub(crate) subscribed: SubscribedFields,
 }
 
 /// A server-initiated health push (the Windows same-host health plane — the
@@ -127,9 +115,7 @@ impl WsReply {
             snapshot: None,
             instruments: None,
             capabilities: None,
-            scope: None,
-            backfill_from: None,
-            joined: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -143,9 +129,7 @@ impl WsReply {
             snapshot: None,
             instruments: None,
             capabilities: None,
-            scope: None,
-            backfill_from: None,
-            joined: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -159,9 +143,7 @@ impl WsReply {
             snapshot: Some(snapshot),
             instruments: None,
             capabilities: None,
-            scope: None,
-            backfill_from: None,
-            joined: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -175,9 +157,7 @@ impl WsReply {
             snapshot: None,
             instruments: Some(catalog),
             capabilities: None,
-            scope: None,
-            backfill_from: None,
-            joined: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -191,44 +171,33 @@ impl WsReply {
             snapshot: None,
             instruments: None,
             capabilities: Some(entries),
-            scope: None,
-            backfill_from: None,
-            joined: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
-    /// A successful `subscribe` reply carrying the actual scope.
+    /// A successful `subscribe` reply.
     #[must_use]
-    pub fn subscribed(id: u64, actual: Subscribed) -> Self {
+    pub fn subscribed(id: u64, subscribed: Subscribed) -> Self {
         Self {
-            scope: Some(actual.scope),
-            backfill_from: actual.backfill_from,
-            joined: actual.joined.then_some(true),
+            subscribed: subscribed.into(),
             ..Self::ok(id)
         }
-    }
-
-    /// The actual scope a successful `subscribe` reply carries, or `None`
-    /// when the reply has no `scope` (an error reply, or any other op) or
-    /// an inconsistent one (`live_backfill` without `backfill_from`).
-    #[must_use]
-    pub fn subscribed_scope(&self) -> Option<Subscribed> {
-        self.scope.and_then(|scope| {
-            Subscribed::from_wire(scope, self.backfill_from, self.joined.unwrap_or(false))
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{WsHealthPush, WsReply, WsRequest};
-    use crate::spec::{EventKindCfg, Subscribed};
-    use datamancer_core::Timestamp;
+    use crate::spec::EventKindCfg;
+    use datamancer_core::{LiveScope, Subscribed, Timestamp};
 
-    /// A subscribe reply carries the actual scope, echoing the id.
+    /// A subscribe reply carries what was opened, echoing the id.
     #[test]
-    fn ws_subscribed_reply_round_trips_the_actual_scope() {
-        let reply = WsReply::subscribed(4, Subscribed::live_backfill(Timestamp(99)));
+    fn ws_subscribed_reply_round_trips_the_outcome() {
+        let backfill = LiveScope::LiveBackfill {
+            from: Timestamp(99),
+        };
+        let reply = WsReply::subscribed(4, Subscribed::Created(backfill));
         let json = serde_json::to_string(&reply).unwrap();
         assert_eq!(
             json,
@@ -236,15 +205,25 @@ mod tests {
         );
         let back: WsReply = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            back.subscribed_scope(),
-            Some(Subscribed::live_backfill(Timestamp(99)))
+            Subscribed::from(back.subscribed),
+            Subscribed::Created(backfill)
         );
-        assert_eq!(WsReply::ok(4).subscribed_scope(), None);
-        let joined = WsReply::subscribed(5, Subscribed::live().with_joined(true));
-        let json = serde_json::to_string(&joined).unwrap();
+        let joined = Subscribed::Joined {
+            session: LiveScope::Live,
+        };
+        let json = serde_json::to_string(&WsReply::subscribed(5, joined)).unwrap();
         assert_eq!(json, r#"{"id":5,"ok":true,"scope":"live","joined":true}"#);
         let back: WsReply = serde_json::from_str(&json).unwrap();
-        assert!(back.subscribed_scope().unwrap().joined);
+        assert_eq!(Subscribed::from(back.subscribed), joined);
+    }
+
+    #[test]
+    fn a_ws_subscribe_reply_with_no_scope_reads_as_created_live() {
+        let reply: WsReply = serde_json::from_str(r#"{"id":4,"ok":true}"#).unwrap();
+        assert_eq!(
+            Subscribed::from(reply.subscribed),
+            Subscribed::Created(LiveScope::Live)
+        );
     }
 
     #[test]

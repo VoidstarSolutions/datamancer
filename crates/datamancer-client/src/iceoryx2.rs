@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use datamancer_core::{
-    ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
+    ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, Subscribed,
+    SystemSnapshot,
 };
 use datamancer_transport_iceoryx2::{DataServiceName, DataSubscriber};
 use futures::Stream;
@@ -34,7 +35,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::client::Client;
 use crate::error::ClientError;
 use crate::protocol::uds::{Reply, Request};
-use crate::spec::{QueryId, QuerySpec, Subscribed, SubscriptionSpec, UnsubscribeSpec};
+use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 /// Connection parameters for [`Iceoryx2Client`].
 #[derive(Debug, Clone)]
@@ -447,11 +448,7 @@ impl Client for Iceoryx2Client {
             })
             .await
             .map_err(ClientError::Transport)?;
-        check(reply)?.subscribed_scope().ok_or_else(|| {
-            ClientError::Transport(Iceoryx2ClientError::Protocol(
-                "ok subscribe reply missing the actual scope".to_string(),
-            ))
-        })
+        check(reply).map(|reply| reply.subscribed.into())
     }
 
     async fn unsubscribe(
