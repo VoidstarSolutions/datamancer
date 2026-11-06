@@ -505,7 +505,7 @@ mod tests {
             ws.send(Message::Text(
                 serde_json::to_string(&WsReply::subscribed(
                     id,
-                    Subscribed::Created(LiveScope::Live),
+                    Subscribed::Created(LiveScope::default()),
                 ))
                 .unwrap()
                 .into(),
@@ -523,7 +523,7 @@ mod tests {
         )
         .unwrap();
         let actual = client.subscribe(&spec).await.expect("subscribe acked");
-        assert_eq!(actual, Subscribed::Created(LiveScope::Live));
+        assert_eq!(actual, Subscribed::Created(LiveScope::default()));
 
         let ev = events.next().await.expect("one event");
         assert_eq!(ev, trade()); // timestamp triple verbatim, price intact
@@ -646,7 +646,7 @@ mod tests {
             ws.send(Message::Text(
                 serde_json::to_string(&WsReply::subscribed(
                     req.id(),
-                    Subscribed::Created(LiveScope::Live),
+                    Subscribed::Created(LiveScope::default()),
                 ))
                 .unwrap()
                 .into(),

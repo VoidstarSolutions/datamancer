@@ -46,9 +46,7 @@ async fn live_test_feed_yields_an_event() {
                 "FAKEPACA",
             ),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -99,9 +97,7 @@ async fn live_test_feed_delivers_a_trade() {
                 "FAKEPACA",
             ),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -259,16 +255,7 @@ async fn two_live_sessions_share_one_stream_connection() {
             "FAKEPACA",
         )
     };
-    let open = |kind| {
-        dm.session(
-            fakepaca(),
-            kind,
-            Scope::Live {
-                backfill_from: None,
-            },
-            PersistenceOptions::none(),
-        )
-    };
+    let open = |kind| dm.session(fakepaca(), kind, Scope::live(), PersistenceOptions::none());
     let trades = open(EventKind::Trade).await.expect("trade session open");
     let quotes = open(EventKind::Quote).await.expect("quote session open");
     let mut trade_stream = trades.take_events().await.unwrap();

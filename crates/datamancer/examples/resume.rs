@@ -127,9 +127,7 @@ async fn main() -> Result<()> {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::cached(),
         )
         .await?;

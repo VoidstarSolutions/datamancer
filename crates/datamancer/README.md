@@ -71,12 +71,16 @@ let dm = Datamancer::builder().provider_arc(provider).build()?;
 let backtest = dm.session(instrument.clone(), kind, Scope::Historical { from, to },
                           PersistenceOptions::cached()).await?;
 
-// pure live, from "now"
-let live = dm.session(instrument.clone(), kind, Scope::Live { backfill_from: None },
+// pure live, from "now", the provider's latest value first
+let live = dm.session(instrument.clone(), kind, Scope::live(),
                       PersistenceOptions::cached_with_tap()).await?;
 
+// pure live with no data event ahead of the first live print
+let bare = dm.session(instrument.clone(), kind, Scope::Live(LiveScope::Live { seed: false }),
+                      PersistenceOptions::none()).await?;
+
 // stitched: backfill from `t` to the live edge, then seam into the live tail
-let warm_start = dm.session(instrument, kind, Scope::Live { backfill_from: Some(t) },
+let warm_start = dm.session(instrument, kind, Scope::live_backfill(t),
                             PersistenceOptions::cached()).await?;
 ```
 
@@ -145,8 +149,10 @@ client.subscribe(aapl.clone(), EventKind::Trade, scope, options).await?;
 client.subscribe(aapl, EventKind::Quote, scope, options).await?;
 ```
 
-`scope` is a `LiveScope`: `Live`, or `LiveBackfill { from }`, a backfill from `from` to the live
-edge seamed ahead of the live tail. The session subscribes upstream first, buffers live arrivals
+`scope` is a `LiveScope`: `Live { seed }`, where `seed` delivers the provider's latest value before
+the first live print (`LiveScope::default()` seeds), or `LiveBackfill { from }`, a backfill from
+`from` to the live edge seamed ahead of the live tail. The session subscribes upstream first,
+buffers live arrivals
 while the backfill runs, and delivers the history, then those arrivals in arrival order, then the
 live tail, with one `Gap` only for real loss (a failed fetch, or a buffer overflow bounded by the
 resume buffer's setting). `subscribe` returns a `Subscribed`: the pair's authoritative session is
@@ -280,7 +286,7 @@ same setting and overflow the same way: one `Gap` right after the history names
 the evicted span, and the evicted prints' `seq` slots stay empty ahead of the
 survivors, so a seam overflow is the same real hole a resume-buffer overflow is.
 
-`Scope::Live { backfill_from: Some(t) }` stitches history ahead of the live
+`Scope::live_backfill(t)` stitches history ahead of the live
 tail: the window `[t, live-edge)` is served through the historical
 read-through path (cache + provider gap-fetch, honoring the session's
 `read_cache`/`write_cache` axes) while live arrivals buffer; the seam drains

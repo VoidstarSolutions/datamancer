@@ -9,8 +9,10 @@ use datamancer_core::{LiveScope, Subscribed};
 use serde::{Deserialize, Serialize};
 
 /// The fields a `subscribe` reply adds to a control reply, in both framings.
-/// A reply with no `scope` reads as pure-live; a `scope` that disagrees with
-/// `backfill_from`, or is not one this client knows, fails to parse.
+/// A reply with no `scope` and no `seed` reads as [`LiveScope::default`], and
+/// one with no `seed` under `live` as seeded; a `seed` with no `scope`, a
+/// `scope` that disagrees with `backfill_from` or `seed`, or one this client
+/// does not know, fails to parse.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SubscribedFields {
     #[serde(

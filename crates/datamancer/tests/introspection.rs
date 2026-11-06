@@ -56,9 +56,7 @@ fn trade(symbol: &str, source_ts: i64, rx_ts: i64) -> MarketEvent {
 }
 
 fn live() -> Scope {
-    Scope::Live {
-        backfill_from: None,
-    }
+    Scope::live()
 }
 
 fn provider_snap(snap: &datamancer_core::SystemSnapshot, id: &str) -> ProviderSnapshot {
@@ -671,9 +669,7 @@ async fn snapshot_until(
 }
 
 fn backfilled() -> Scope {
-    Scope::Live {
-        backfill_from: Some(Timestamp(0)),
-    }
+    Scope::live_backfill(Timestamp(0))
 }
 
 #[tokio::test]
@@ -1187,7 +1183,7 @@ async fn snapshot_reflects_authoritative_and_client_sessions() {
     c1.subscribe(
         inst("AAPL"),
         EventKind::Trade,
-        LiveScope::Live,
+        LiveScope::default(),
         PersistenceOptions::none(),
     )
     .await
@@ -1195,7 +1191,7 @@ async fn snapshot_reflects_authoritative_and_client_sessions() {
     c2.subscribe(
         inst("AAPL"),
         EventKind::Trade,
-        LiveScope::Live,
+        LiveScope::default(),
         PersistenceOptions::none(),
     )
     .await
@@ -1370,9 +1366,7 @@ async fn snapshot_reflects_backfilling_flag_while_seam_pending() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await

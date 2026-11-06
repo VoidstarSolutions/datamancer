@@ -435,7 +435,9 @@ One JSON object per line; one reply line per request.
 {"op":"open-client","client":"exec-1","subscriptions":[ /* SubscriptionSpec… */ ]}
   -> {"ok":true,"service":"datamancerd/1729600000-4321/v3/data/0"}
 {"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
-  -> {"ok":true,"scope":"live"}
+  -> {"ok":true,"scope":"live","seed":true}
+{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live","seed":false}
+  -> {"ok":true,"scope":"live","seed":false}
 {"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":1704067200000000000,"persistence":"cached"}
   -> {"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000}
 {"op":"subscribe","client":"exec-2","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m"}
@@ -481,17 +483,32 @@ One JSON object per line; one reply line per request.
 - `backfill_from` (epoch nanoseconds, inclusive) is required under
   `live_backfill` and refused under `live`; either disagreement is
   `bad_request`.
+- `seed` (default `true`; `null` is the default) applies under `live`: `true`
+  delivers the provider's latest value as the first data event, if the provider
+  has one and no live print arrives first, and `false` delivers no data event
+  before the first live print. Under `live_backfill`, which never seeds, a
+  non-null `seed` is `bad_request` and `null` reads as absent.
 - A `backfill_from` at or past the live edge is `backfill_not_in_past`.
-- The reply's `scope` and `backfill_from` are the scope of the pair's shared
-  session, fixed by the subscriber that created it.
+- The reply's `scope`, `seed` and `backfill_from` are the scope of the pair's
+  shared session, fixed by the subscriber that created it. `seed` is always on a
+  `live` reply and never on a `live_backfill` one, and it reports that choice,
+  not whether a seed reached this subscriber. An `always_on` `[[startup_session]]`
+  under `live` seeds, and for its pair is that creator unless it was skipped
+  (see Lifecycle anchors); for a skipped one, or any other startup session, the
+  first client to subscribe decides.
 - `"joined":true` marks a subscriber that joined an open session; the creator's
   reply omits it. A joiner's stream begins where it joined, with no `Gap` for
   what it missed; a backfill still running reaches it from that point on. A
-  joiner that needs its own history uses `open-query`.
+  joiner that needs its own history uses `open-query`. On a seeding session, a
+  joiner of either `seed` receives the seed if it joined before the seed was
+  delivered, and otherwise starts at the next live print; on an unseeded session
+  it receives none.
 
-`open-client` seeds follow the same rules and are live-only: any other scope
-is `bad_request`, checked for all seeds before any subscribes. A client that
-wants a backfill subscribes after opening.
+The `subscriptions` of `open-client` follow the same rules and are live-only:
+`seed` is honoured and any other scope is `bad_request`, checked for all of them
+before any subscribes. A client that wants a backfill subscribes after opening.
+Unknown keys are refused only at the top level of a control frame: inside these
+`subscriptions`, and on WS, they are ignored, so a misspelled `seed` there seeds.
 
 How a backfill seams into the live tail is in the
 [library README](../datamancer/README.md#subscriptions).
@@ -643,9 +660,9 @@ Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 (`unsupported_event_kind`, `persistence_required`,
 `backfill_not_in_past`, `duplicate_subscription`, `not_subscribed`,
 `unknown_provider`, `provider_disabled` (from `subscribe`, creating or joining,
-`open-client` seeds, `open-query` under a policy that does not read the cache,
-`instruments` filtered to that provider, and `capabilities`), `unknown_client`,
-`duplicate_client`,
+`open-client` subscriptions, `open-query` under a policy that does not read the
+cache, `instruments` filtered to that provider, and `capabilities`),
+`unknown_client`, `duplicate_client`,
 `service_cap_exceeded`, `bad_request`, `shutting_down`,
 `credentials_missing`, `credential_backend_unavailable`, `permission_denied`,
 `unknown_config_field`, `unknown_query` (`cancel-query` named an id that is
@@ -887,7 +904,7 @@ connection identifies the client):
 
 ```jsonc
 {"id":1,"op":"subscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
-  -> {"id":1,"ok":true,"scope":"live"}
+  -> {"id":1,"ok":true,"scope":"live","seed":true}
 {"id":2,"op":"snapshot"}
   -> {"id":2,"ok":true,"snapshot":{ /* SystemSnapshot */ }}
 {"id":3,"op":"unsubscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}

@@ -5,13 +5,24 @@ use serde::Serialize;
 use crate::Timestamp;
 
 /// What a live subscription covers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum LiveScope {
     /// Purely from "now".
-    #[default]
-    Live,
+    Live {
+        /// Deliver the provider's latest value as the first data event.
+        /// `true` promises an attempt, not a value: the provider may have
+        /// none, and a live print that arrives first discards it.
+        ///
+        /// Fixed by whoever creates the session; a joiner takes the session
+        /// as it is, whatever it asked for. On a seeding session, a joiner of
+        /// either `seed` receives the seed if it joined before the seed was
+        /// delivered, and otherwise starts at the next live print. On an
+        /// unseeded session, a joiner receives no seed. [`Subscribed`] reports
+        /// the session's choice, not whether a seed reached this subscriber.
+        seed: bool,
+    },
     /// History from `from` up to the live edge, then the live arrivals
     /// buffered during the backfill, then the live tail. `from` must precede
     /// the live edge: see [`Error::BackfillFromNotInPast`](crate::Error::BackfillFromNotInPast).
@@ -22,12 +33,19 @@ pub enum LiveScope {
     },
 }
 
+impl Default for LiveScope {
+    /// [`LiveScope::Live`], seeded.
+    fn default() -> Self {
+        Self::Live { seed: true }
+    }
+}
+
 impl LiveScope {
     /// The start of the backfill, if this scope has one.
     #[must_use]
     pub const fn backfill_from(&self) -> Option<Timestamp> {
         match self {
-            Self::Live => None,
+            Self::Live { .. } => None,
             Self::LiveBackfill { from } => Some(*from),
         }
     }
@@ -82,8 +100,12 @@ mod tests {
     #[test]
     fn live_scope_keeps_its_wire_shape() {
         assert_eq!(
-            serde_json::to_string(&LiveScope::Live).unwrap(),
-            r#"{"scope":"live"}"#
+            serde_json::to_string(&LiveScope::default()).unwrap(),
+            r#"{"scope":"live","seed":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&LiveScope::Live { seed: false }).unwrap(),
+            r#"{"scope":"live","seed":false}"#
         );
         let backfill = LiveScope::LiveBackfill { from: Timestamp(9) };
         let json = serde_json::to_string(&backfill).unwrap();
@@ -97,7 +119,10 @@ mod tests {
             Subscribed::Created(backfill).history_from(),
             Some(Timestamp(9))
         );
-        assert_eq!(Subscribed::Created(LiveScope::Live).history_from(), None);
+        assert_eq!(
+            Subscribed::Created(LiveScope::default()).history_from(),
+            None
+        );
         let joined = Subscribed::Joined { session: backfill };
         assert_eq!(joined.history_from(), None);
         assert_eq!(joined.session_scope(), backfill);

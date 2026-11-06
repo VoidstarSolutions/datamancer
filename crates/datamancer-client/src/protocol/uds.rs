@@ -22,7 +22,7 @@ pub enum Request {
     /// Register a client and create its per-client data-plane service.
     OpenClient {
         client: String,
-        /// Live-only seeds, subscribed before the client opens.
+        /// Live-only subscriptions, made before the client opens.
         #[serde(default)]
         subscriptions: Vec<SubscriptionSpec>,
     },
@@ -358,7 +358,7 @@ mod tests {
                 asset_class: AssetClassCfg::Crypto,
                 symbol: "BTC/USD".to_string(),
                 kind: EventKindCfg::Trade,
-                scope: LiveScope::Live,
+                scope: LiveScope::default(),
                 persistence: PersistenceCfg::CachedWithTap,
             }],
         };
@@ -392,17 +392,27 @@ mod tests {
             Subscribed::Created(backfill)
         );
         assert_eq!(
-            serde_json::to_string(&Reply::subscribed(Subscribed::Created(LiveScope::Live)))
-                .expect("ser"),
-            r#"{"ok":true,"scope":"live"}"#
+            serde_json::to_string(&Reply::subscribed(
+                Subscribed::Created(LiveScope::default())
+            ))
+            .expect("ser"),
+            r#"{"ok":true,"scope":"live","seed":true}"#
         );
         let joined = Subscribed::Joined {
-            session: LiveScope::Live,
+            session: LiveScope::default(),
         };
         let json = serde_json::to_string(&Reply::subscribed(joined)).expect("ser");
-        assert_eq!(json, r#"{"ok":true,"scope":"live","joined":true}"#);
+        assert_eq!(
+            json,
+            r#"{"ok":true,"scope":"live","seed":true,"joined":true}"#
+        );
         let back: Reply = serde_json::from_str(&json).expect("de");
         assert_eq!(Subscribed::from(back.subscribed), joined);
+        let unseeded = Subscribed::Created(LiveScope::Live { seed: false });
+        let json = serde_json::to_string(&Reply::subscribed(unseeded)).expect("ser");
+        assert_eq!(json, r#"{"ok":true,"scope":"live","seed":false}"#);
+        let back: Reply = serde_json::from_str(&json).expect("de");
+        assert_eq!(Subscribed::from(back.subscribed), unseeded);
     }
 
     #[test]
@@ -410,7 +420,7 @@ mod tests {
         let reply: Reply = serde_json::from_str(r#"{"ok":true}"#).expect("de");
         assert_eq!(
             Subscribed::from(reply.subscribed),
-            Subscribed::Created(LiveScope::Live)
+            Subscribed::Created(LiveScope::default())
         );
         assert_eq!(
             serde_json::to_string(&Reply::ok()).expect("ser"),
@@ -424,6 +434,9 @@ mod tests {
             r#"{"ok":true,"scope":"live_backfill"}"#,
             r#"{"ok":true,"scope":"live","backfill_from":5}"#,
             r#"{"ok":true,"backfill_from":5}"#,
+            r#"{"ok":true,"seed":false}"#,
+            r#"{"ok":true,"seed":true}"#,
+            r#"{"ok":true,"scope":"live_backfill","backfill_from":5,"seed":true}"#,
             r#"{"ok":true,"scope":"warp"}"#,
         ] {
             assert!(serde_json::from_str::<Reply>(line).is_err(), "{line}");

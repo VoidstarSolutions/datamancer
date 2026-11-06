@@ -27,12 +27,12 @@ use datamancer::transport::{
     Iceoryx2HealthPublisher, ServicePrefix,
 };
 use datamancer::{
-    AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Session,
-    TapLog, traits::EventSink,
+    AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
+    Session, TapLog, traits::EventSink,
 };
-// Named only by the unix `open-client` and `open-query` arms.
+// Named only by the unix `open-client` arm.
 #[cfg(not(windows))]
-use datamancer::{LiveScope, Scope};
+use datamancer::LiveScope;
 // `Timestamp` only appears in `validate_query_open`'s signature and its
 // tests, both unix/macOS only — importing it unconditionally would be
 // `unused_imports` on Windows.
@@ -328,7 +328,7 @@ async fn open_anchor(
         .session(
             startup.instrument(),
             startup.kind.into(),
-            startup.resolve_scope()?.into(),
+            Scope::Live(startup.resolve_scope()?),
             crate::config::persistence_options(startup.persistence),
         )
         .await;
@@ -1032,7 +1032,7 @@ impl Server {
                 format!("service cap {} exceeded", self.max_clients),
             );
         }
-        if let Some(reply) = validate_seeds(&subscriptions) {
+        if let Some(reply) = validate_initial_subscriptions(&subscriptions) {
             return reply;
         }
 
@@ -1338,18 +1338,18 @@ fn validate_query_open(
     None
 }
 
-/// Validate all seeds before subscribing any.
+/// Validate every initial subscription before subscribing any.
 #[cfg(not(windows))]
-fn validate_seeds(seeds: &[SubscriptionSpec]) -> Option<Reply> {
-    seeds
+fn validate_initial_subscriptions(subscriptions: &[SubscriptionSpec]) -> Option<Reply> {
+    subscriptions
         .iter()
-        .find(|seed| seed.scope != LiveScope::Live)
-        .map(|seed| {
+        .find(|spec| !matches!(spec.scope, LiveScope::Live { .. }))
+        .map(|spec| {
             Reply::error(
                 codes::BAD_REQUEST,
                 format!(
-                    "open-client seed {} is not live; subscribe after opening to backfill",
-                    seed.symbol
+                    "open-client subscription {} is not live; subscribe after opening to backfill",
+                    spec.symbol
                 ),
             )
         })
@@ -2155,6 +2155,10 @@ always_on = true
                 r#""scope":"live","backfill_from":7"#,
                 "backfill_from requires scope live_backfill",
             ),
+            (
+                r#""scope":"live_backfill","backfill_from":7,"seed":false"#,
+                "seed requires scope live",
+            ),
         ] {
             let line = format!(
                 r#"{{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade",{fields}}}"#
@@ -2267,15 +2271,16 @@ always_on = true
 
     #[cfg(not(windows))]
     #[test]
-    fn a_seed_that_is_not_live_is_refused() {
+    fn an_initial_subscription_that_is_not_live_is_refused() {
         let live: SubscriptionSpec = serde_json::from_str(
             r#"{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade"}"#,
         )
         .expect("parse");
-        assert!(validate_seeds(std::slice::from_ref(&live)).is_none());
+        let unseeded = live.clone().without_seed();
+        assert!(validate_initial_subscriptions(&[live.clone(), unseeded]).is_none());
 
         let backfill = live.clone().with_backfill_from(Timestamp(7));
-        let reply = validate_seeds(&[live, backfill]).expect("refused");
+        let reply = validate_initial_subscriptions(&[live, backfill]).expect("refused");
         assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
     }
 
@@ -2297,6 +2302,17 @@ always_on = true
         let bogus = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","backfill_from":null,"bogus":1}"#;
         let request: Request = serde_json::from_str(bogus).expect("parse");
         assert!(reject_unknown_keys(bogus, &request).is_err());
+    }
+
+    #[test]
+    fn reject_unknown_keys_accepts_seed_under_live_in_every_spelling() {
+        for seed in ["true", "false", "null"] {
+            let line = format!(
+                r#"{{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live","seed":{seed}}}"#
+            );
+            let request: Request = serde_json::from_str(&line).expect("parse");
+            assert!(reject_unknown_keys(&line, &request).is_ok(), "{line}");
+        }
     }
 
     #[test]
