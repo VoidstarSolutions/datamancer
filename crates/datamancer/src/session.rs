@@ -1140,9 +1140,9 @@ impl Session {
     /// [`ControlKind::Gap`] reports anything the buffer had to evict, then
     /// the buffered events flow, then live continues. Events still sitting
     /// undelivered in a dropped stream's channel are lost without a gap
-    /// (bounded by the channel buffer); they are never `seq`-stamped, so the
-    /// delivered stream stays contiguous. Drain before dropping if you need
-    /// every event, or record via the tap log.
+    /// (bounded by the channel buffer), so the next stream goes on past their
+    /// `seq` slots. Drain before dropping if you need every event, or record
+    /// via the tap log.
     ///
     /// **Historical scope — single-shot.** The first call returns the
     /// stream; subsequent calls error.
@@ -1412,11 +1412,17 @@ impl Controller {
     /// receipt) means an event the ring evicted is never teed — correct, since
     /// it is not delivered either: it is reported as the `Gap` above, so the tap
     /// log stays a faithful record of the delivered live tail.
+    ///
+    /// The `Gap` takes the first lost event's slot and the rest stay empty. A
+    /// provider control the ring evicted past its cap has no span to report and
+    /// takes no slot.
     async fn flush_backfill_pending(&mut self, ring: EventRing) {
+        let lost = ring.lost();
         let (dropped, _dropped_first_seq, events) = ring.into_parts();
         if let Some(span) = dropped {
             self.emit_gap(span.from_source_ts, span.from_source_ts, span.to_source_ts)
                 .await;
+            self.skip_slots(u64::try_from(lost.saturating_sub(1)).unwrap_or(u64::MAX));
         }
         for ev in events {
             self.forward(ev).await;
@@ -1978,7 +1984,7 @@ impl Controller {
         };
         let segments = tile(from, edge, &gaps);
 
-        let mut pending = EventRing::new(self.ring_capacity);
+        let mut pending = EventRing::seam(self.ring_capacity);
         // The live lifecycle anchor is the subscriber refcount. Thread the real
         // removal channel through so a referrer that leaves mid-backfill is
         // observed immediately and, when the last one goes, the backfill aborts
@@ -2138,11 +2144,20 @@ impl Controller {
         }
     }
 
-    /// Assign the next source `seq`, advancing the single-writer counter. The
-    /// one site that touches `next_seq`, so `seq` is stamped exactly once per
-    /// event, in this authoritative session's canonical delivery order.
+    /// Assign the next source `seq`, advancing the single-writer counter, so
+    /// `seq` is stamped exactly once per event, in this authoritative
+    /// session's canonical delivery order. With [`Self::skip_slots`] the only
+    /// site that moves `next_seq`.
     fn stamp(&mut self, ev: MarketEvent) -> MarketEvent {
         let seq = Seq(self.next_seq);
+        self.skip_slots(1);
+        stamp_seq(ev, seq)
+    }
+
+    /// Advance the source counter by `n` without stamping anything: the slots
+    /// of events that were lost before they could be stamped (a seam-ring
+    /// overflow), so the hole they leave is as real as a resume-buffer one.
+    fn skip_slots(&mut self, n: u64) {
         // `Seq(u64::MAX)` is reserved as `Seq::SYNTHETIC` and must never be
         // handed to a real event, so the source counter stamps only in
         // `[0, u64::MAX - 1]`. `saturating_add` was wrong here: it caps *at*
@@ -2153,10 +2168,9 @@ impl Controller {
         // synthetic sentinel.
         self.next_seq = self
             .next_seq
-            .checked_add(1)
-            .filter(|&n| n != u64::MAX)
+            .checked_add(n)
+            .filter(|&next| next != u64::MAX)
             .expect("per-symbol source seq exhausted the Seq::SYNTHETIC reservation");
-        stamp_seq(ev, seq)
     }
 
     /// Hand a fully-formed event to the sink; on rejection (consumer dropped
@@ -2506,33 +2520,88 @@ fn tile(from: Timestamp, to: Timestamp, gaps: &[datamancer_core::GapSpan]) -> Ve
 /// eviction (`pop_front`) guarantees the first eviction is the lowest `seq`, so
 /// that is where the hole starts. The backfill `pending` ring pushes unstamped
 /// events and never consults `dropped_first_seq`.
+///
+/// The pending ring ([`EventRing::seam`]) evicts data and `Gap`s only. The
+/// provider's other controls (connect, subscription state, errors) stay, outside
+/// `capacity`, so an overflow cannot take the session's subscription state from
+/// its subscribers; past [`SEAM_CONTROL_CAP`] of them, the oldest goes.
 struct EventRing {
     capacity: usize,
     buf: std::collections::VecDeque<MarketEvent>,
+    /// Keep provider controls out of the eviction of data (the pending ring).
+    keep_controls: bool,
+    /// Kept provider controls in `buf`.
+    controls: usize,
     dropped: Option<GapSpan>,
     /// `seq` of the first event this ring evicted (the hole start), set once on
     /// the first eviction. `None` until an eviction occurs. Read only on the
     /// resume path, whose events are stamped at push.
     dropped_first_seq: Option<Seq>,
+    /// How many evicted events `dropped` covers: data and `Gap`s, no other
+    /// control. Read on the seam path, whose events are stamped at the flush:
+    /// the evicted ones consumed no `seq` at push, so the flush skips their
+    /// slots.
+    lost: usize,
 }
+
+/// Provider controls a pending ring keeps past its capacity.
+const SEAM_CONTROL_CAP: usize = 64;
 
 impl EventRing {
     fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
             buf: std::collections::VecDeque::new(),
+            keep_controls: false,
+            controls: 0,
             dropped: None,
             dropped_first_seq: None,
+            lost: 0,
         }
     }
 
+    /// A backfill's pending ring: like [`Self::new`], but it keeps the
+    /// provider's controls.
+    fn seam(capacity: usize) -> Self {
+        Self {
+            keep_controls: true,
+            ..Self::new(capacity)
+        }
+    }
+
+    /// Whether this ring keeps `ev` out of the eviction of data.
+    fn keeps(&self, ev: &MarketEvent) -> bool {
+        self.keep_controls
+            && matches!(ev, MarketEvent::Control(c) if !matches!(c.kind, ControlKind::Gap { .. }))
+    }
+
+    /// Buffer `ev`, evicting the oldest data event or `Gap` when full. A kept
+    /// control evicts only the oldest kept control, past [`SEAM_CONTROL_CAP`].
     fn push(&mut self, ev: MarketEvent) {
-        if self.buf.len() == self.capacity
-            && let Some(evicted) = self.buf.pop_front()
+        if self.keeps(&ev) {
+            self.buf.push_back(ev);
+            self.controls += 1;
+            if self.controls > SEAM_CONTROL_CAP
+                && let Some(at) = self.buf.iter().position(|e| self.keeps(e))
+                && let Some(old) = self.buf.remove(at)
+            {
+                self.controls -= 1;
+                self.note_drop(&old);
+            }
+            return;
+        }
+        if self.buf.len() - self.controls == self.capacity
+            && let Some(at) = self.buf.iter().position(|e| !self.keeps(e))
+            && let Some(evicted) = self.buf.remove(at)
         {
             self.note_drop(&evicted);
         }
         self.buf.push_back(ev);
+    }
+
+    /// Evicted events the dropped span covers.
+    fn lost(&self) -> usize {
+        self.lost
     }
 
     /// Extend the dropped span over an evicted event. Data events count via
@@ -2560,6 +2629,7 @@ impl EventRing {
             let Some(ts) = data_source_ts(ev) else { return };
             (ts, Timestamp(ts.0.saturating_add(1)))
         };
+        self.lost += 1;
         match &mut self.dropped {
             Some(span) => {
                 span.from_source_ts = span.from_source_ts.min(from);
@@ -2834,6 +2904,7 @@ mod event_ring_tests {
         for ts in [100, 200, 300, 400] {
             ring.push(trade(ts));
         }
+        assert_eq!(ring.lost(), 2, "every evicted print is counted");
         let (dropped, _first, events) = ring.into_parts();
         // 100 and 200 evicted; half-open span keeps 200 inside.
         let span = dropped.expect("overflow must record a span");
@@ -2896,6 +2967,38 @@ mod event_ring_tests {
         assert_eq!(span.from_source_ts.0, 100);
         assert_eq!(span.to_source_ts.0, 301);
         assert_eq!(tss(&events), vec![400]);
+    }
+
+    #[test]
+    fn a_seam_ring_evicts_data_and_keeps_provider_controls() {
+        let mut ring = EventRing::seam(2);
+        ring.push(control(1));
+        for ts in [100, 200, 300] {
+            ring.push(trade(ts));
+        }
+        ring.push(gap_control(2, 400, 401));
+        assert_eq!(ring.lost(), 2, "prints 100 and 200 went");
+        let (dropped, _first, events) = ring.into_parts();
+        let span = dropped.expect("span");
+        assert_eq!((span.from_source_ts.0, span.to_source_ts.0), (100, 201));
+        assert_eq!(tss(&events), vec![1, 300, 2]);
+    }
+
+    #[test]
+    fn a_seam_ring_keeps_the_newest_provider_controls_past_its_cap() {
+        use super::SEAM_CONTROL_CAP;
+        let mut ring = EventRing::seam(1);
+        let cap = i64::try_from(SEAM_CONTROL_CAP).expect("small");
+        for ts in 0..=cap {
+            ring.push(control(ts));
+        }
+        ring.push(trade(1000));
+        assert_eq!(ring.lost(), 0, "an evicted control is no loss");
+        let (dropped, _first, events) = ring.into_parts();
+        assert!(dropped.is_none());
+        let mut expected: Vec<i64> = (1..=cap).collect();
+        expected.push(1000);
+        assert_eq!(tss(&events), expected, "the oldest control went");
     }
 
     #[test]

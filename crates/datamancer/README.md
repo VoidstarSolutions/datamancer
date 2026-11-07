@@ -51,7 +51,7 @@ whole finite kind space, which is what makes per-instrument capability discovery
 Every data variant carries three timestamp/identifier fields, with distinct roles that should not be conflated:
 
 - **`source_ts`** — the timestamp the provider reported for the event. Source of truth for "when did this happen in the market" and the **only** timestamp engine logic should reason about. Sourced verbatim from provider data; never assigned by datamancer.
-- **`seq: u64`** — a per-symbol ordering number stamped **once at the source** of the authoritative per-`(instrument, kind)` stream, in canonical delivery order, before any sink — so it is identical across all consumers of that symbol (not a per-consumer poll artifact). **The sole ordering field** for the stream, and per-symbol only (there is no cross-instrument order; the multiplex key is `(instrument, seq)`). Live mode stamps `seq` in arrival order, so replaying a symbol's substream in `seq` order reproduces that substream exactly (per-symbol; not the cross-symbol interleave of the multiplexed stream). Historical fetch stamps `seq` in source-timestamp order during fetch, so `seq` order matches market order. The delivered stream is contiguous *only while no data is lost*: a consumer that loses data (a resume-buffer overflow) sees a real `seq` hole, surfaced in-band as a `Control::Gap`. A late joiner has lost nothing: `Subscribed` says what its stream carries.
+- **`seq: u64`** — a per-symbol ordering number stamped **once at the source** of the authoritative per-`(instrument, kind)` stream, in canonical delivery order, before any sink — so it is identical across all consumers of that symbol (not a per-consumer poll artifact). **The sole ordering field** for the stream, and per-symbol only (there is no cross-instrument order; the multiplex key is `(instrument, seq)`). Live mode stamps `seq` in arrival order, so replaying a symbol's substream in `seq` order reproduces that substream exactly (per-symbol; not the cross-symbol interleave of the multiplexed stream). Historical fetch stamps `seq` in source-timestamp order during fetch, so `seq` order matches market order. The delivered stream is contiguous *only while no data is lost*: a consumer that loses data (a resume-buffer or backfill-seam overflow) sees a real `seq` hole, surfaced in-band as a `Control::Gap`. A late joiner has lost nothing: `Subscribed` says what its stream carries.
 - **`rx_ts`** — wall-clock at the moment the bytes were received from the provider, captured pre-parse. **Observability only.** Used for measuring provider-to-engine latency (`rx_ts - source_ts`), correlating engine state with external wall-clock events (logs, traces, debugger sessions), and operational monitoring. **Engine decision logic must never depend on `rx_ts`** — doing so re-introduces wall-clock as a determinism hazard. For replay-from-historical-fetch, where there is no live arrival to record, `rx_ts` collapses to `source_ts`.
 
 `Control` events ride the same stream as data events because connectivity changes are part of the session's truth: a gap can invalidate downstream signals, and forcing consumers to acknowledge it in-band is safer than offering it as a separate stream they may forget to subscribe to.
@@ -270,7 +270,13 @@ in-band `Control::Gap` reports exactly the evicted span before the survivors
 flow. `seq` is stamped once at the source (not per-consumer), so survivors keep
 their original `seq` and an evicted event is a reported gap **and** a real `seq`
 hole at the evicted span — the delivered stream is contiguous only while
-no data is lost.
+no data is lost. The live arrivals buffered during a backfill are bounded by the
+same setting and overflow the same way: one `Gap` right after the history names
+the evicted span, and the evicted prints' `seq` slots stay empty ahead of the
+survivors, so a seam overflow is the same real hole a resume-buffer overflow is.
+The provider's controls stay in that buffer, outside the setting (up to 64; past
+that, the oldest goes), so an overflow never takes the subscription state from
+the stream or from a later joiner's replay.
 
 `Scope::Live { backfill_from: Some(t) }` stitches history ahead of the live
 tail: the window `[t, live-edge)` is served through the historical

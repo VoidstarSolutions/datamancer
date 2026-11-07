@@ -21,18 +21,19 @@ lifecycle, and a control surface — **no** new ordering, transport, or event se
 ## Core design rule: per-symbol determinism
 
 Ordering is **per symbol only**. Each instrument's substream is a source-stamped,
-within-instrument total order — the key is `(instrument, seq)`. Across instruments the
-multiplexed stream *interleaves* in arrival order; it does **not** compute a global,
-cross-symbol order, and a globally merge-sorted stream is an explicit non-goal. Two
-consumers of the same instrument observe byte-identical `(seq, source_ts)` because they
-share one authoritative per-`(instrument, kind)` session.
+within-instrument total order per data kind — the key is `(instrument, kind, seq)`, so
+a symbol's trades and quotes count separately. Across instruments the multiplexed
+stream *interleaves* in arrival order; it does **not** compute a global, cross-symbol
+order, and a globally merge-sorted stream is an explicit non-goal. Two consumers of the
+same instrument observe byte-identical `(seq, source_ts)` because they share one
+authoritative per-`(instrument, kind)` session.
 
 Every data event carries three distinct timestamp/identity fields:
 
 | Field | Role |
 | --- | --- |
 | `source_ts` | provider-reported market time — the **only** field engine logic should reason about |
-| `seq: u64` | per-symbol ordering, stamped **once at the source**; the sole ordering field, identical across consumers |
+| `seq: u64` | per-`(instrument, kind)` ordering, stamped **once at the source**; the sole ordering field, identical across consumers |
 | `rx_ts` | wall-clock at byte receipt — **observability only**, never feeds engine logic |
 
 Loss is never silent: an evicted or missed span is surfaced in-band as `Control::Gap`, so

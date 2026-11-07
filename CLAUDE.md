@@ -87,25 +87,31 @@ Because the version is unchanged in every PR, `semver-checks.sh` does not requir
 These are load-bearing design rules — violating them breaks downstream consumers in subtle ways. The crate README (`crates/datamancer/README.md`) is the authoritative design doc; read it before changing public API.
 
 - **Source-agnostic output.** All provider-specific concerns stay inside `datamancer`. Once an event leaves the crate it must be indistinguishable across providers.
-- **Multiplexed stream, per-symbol determinism (not global merge).** A `ClientSession` is the primary consumer handle: it holds a mutable `(instrument, kind)` subscription set and presents **one multiplexed stream** over it. The ordering key is `(instrument, seq)` — monotonic *within* each instrument (source-stamped), arrival-order *across* instruments. It **interleaves**, it does not merge-sort, and there is no cross-symbol/global order (the never-realized global-merge model is an explicit non-goal). Per-instrument demux is a consumer concern. The single-pair `Session` is the one-subscription case (its live path is a referrer onto the same shared authoritative session that backs `ClientSession`). A second live open for a pair **shares** the authoritative session rather than conflicting.
+- **Multiplexed stream, per-symbol determinism (not global merge).** A `ClientSession` is the primary consumer handle: it holds a mutable `(instrument, kind)` subscription set and presents **one multiplexed stream** over it. The ordering key is `(instrument, kind, seq)` — monotonic *within* each `(instrument, kind)` pair (source-stamped), arrival-order *across* instruments. It **interleaves**, it does not merge-sort, and there is no cross-symbol/global order (the never-realized global-merge model is an explicit non-goal). Per-instrument demux is a consumer concern. The single-pair `Session` is the one-subscription case (its live path is a referrer onto the same shared authoritative session that backs `ClientSession`). A second live open for a pair **shares** the authoritative session rather than conflicting.
 - **Three timestamp fields, distinct roles** (on every data event):
   - `source_ts` — provider-reported market time. **Only** field engine logic should reason about. Never assigned by datamancer.
-  - `seq: u64` — **per-symbol** ordering field, stamped **once at the source**
+  - `seq: u64` — **per-`(instrument, kind)`** ordering field, stamped **once at the source**
     of the authoritative per-`(instrument, kind)` session by a single-writer
     controller counter, in canonical delivery order, before any sink (Phase 1:
     `stamp → tee → emit`). Identical across all consumers of that symbol — it is
     a property of the shared stream, not of per-consumer poll timing. **The sole
-    ordering field**, per-symbol only (there is no cross-instrument order; the
-    multiplex key is `(instrument, seq)` — true fan-out lands in Phase 2). Live:
+    ordering field**, per `(instrument, kind)` only (there is no order across
+    pairs; the multiplex key is `(instrument, kind, seq)` — true fan-out lands
+    in Phase 2). Live:
     arrival order. Historical fetch: source-timestamp order. Controls occupy
-    `seq` slots. Holes are **real**: evicted events are numbered, so a
-    resume-buffer overflow is a real `seq` hole, surfaced in-band as
+    `seq` slots. Holes are **real**: an evicted data event consumes its slot
+    whether it was stamped at push (the resume buffer) or would have been
+    stamped at the seam (a backfill's pending ring, whose flush skips the
+    evicted slots), so an overflow is a real `seq` hole, surfaced in-band as
     `Control::Gap` at the evicted span; the delivered stream is contiguous only
-    while no data is lost. A late joiner has lost nothing: `Subscribed` says
-    what its stream carries. The tap log persists this source `seq`
-    verbatim (it no longer mints its own), so tap-log replay reproduces the
-    delivered stream's `seq`. `Seq::SYNTHETIC = Seq(u64::MAX)` tags out-of-band
-    synthetic controls and is exempt from per-symbol monotonicity.
+    while no data is lost. The pending ring evicts data and `Gap`s only: the
+    provider's other controls stay (past 64 of them, the oldest goes) and an
+    evicted control leaves no hole. A late joiner has lost nothing:
+    `Subscribed` says what its stream carries. The tap log persists this
+    source `seq` verbatim (it no longer mints its own), so tap-log replay
+    reproduces the delivered stream's `seq`. `Seq::SYNTHETIC = Seq(u64::MAX)`
+    tags out-of-band synthetic controls and is exempt from per-symbol
+    monotonicity.
   - `rx_ts` — wall-clock at byte receipt. **Observability only.** Engine decision logic must never depend on it (re-introduces wall-clock non-determinism). Collapses to `source_ts` in pure-historical replay.
 - **`Control` events ride the data stream.** Connectivity changes, gaps, subscription state — all in-band, not a side channel.
 - **No timestamp re-sort.** Events emit in arrival order, not re-sorted by `source_ts`. Consumers needing strict timestamp ordering buffer themselves.

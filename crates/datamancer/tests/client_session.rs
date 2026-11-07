@@ -1091,6 +1091,139 @@ async fn client_subscribe_with_backfill_serves_history_then_buffered_then_live()
     let _ = client.close().await;
 }
 
+/// A backfill whose seam ring overflows reports the loss the way a resume
+/// buffer does: one `Gap` right after the history, spanning the evicted
+/// prints, and the evicted prints' `seq` slots left empty ahead of the
+/// survivors, which follow in arrival order. The seam is the library's, so
+/// its overflow is proved here rather than through a spawned daemon.
+#[tokio::test]
+async fn client_subscribe_with_backfill_leaves_a_real_hole_when_the_seam_ring_overflows() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1), trade("AAPL", 2)])
+        .await;
+    ctrl.gate_history(gate.clone()).await;
+    // The seam ring is bounded like the resume buffer.
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(4)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+
+    // Six prints land while the history is still gated; a ring of four
+    // evicts the oldest two (100 and 200).
+    for ts in [100, 200, 300, 400, 500, 600] {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.notify_one();
+
+    // History, the Gap, the four survivors: seven events in delivery order.
+    let mut seen = Vec::new();
+    while seen.len() < 7 {
+        seen.push(next_ev(&mut stream).await);
+    }
+    let describe = |ev: &MarketEvent| match ev {
+        MarketEvent::Trade(t) => format!("trade ts={} seq={}", t.source_ts.0, t.seq.0),
+        MarketEvent::Control(c) => format!("control {:?} seq={}", c.kind, c.seq.0),
+        other => format!("{other:?}"),
+    };
+    let listing: Vec<String> = seen.iter().map(describe).collect();
+    let trade_at = |i: usize| match &seen[i] {
+        MarketEvent::Trade(t) => (t.source_ts.0, t.seq.0),
+        other => panic!("expected a trade at {i}, got {other:?}: {listing:?}"),
+    };
+    assert_eq!(trade_at(0), (1, 0), "{listing:?}");
+    assert_eq!(trade_at(1), (2, 1), "{listing:?}");
+    match &seen[2] {
+        MarketEvent::Control(c) => match &c.kind {
+            ControlKind::Gap { span, .. } => {
+                assert_eq!(
+                    c.seq.0, 2,
+                    "the Gap takes the first evicted print's slot: {listing:?}"
+                );
+                assert_eq!(span.from_source_ts.0, 100, "{listing:?}");
+                assert_eq!(span.to_source_ts.0, 201, "{listing:?}");
+            }
+            other => panic!("expected a Gap, got {other:?}: {listing:?}"),
+        },
+        other => panic!("expected the Gap after the history, got {other:?}: {listing:?}"),
+    }
+    // Slot 3 belonged to the second evicted print and stays empty: the hole
+    // is real, as after a resume-buffer overflow.
+    assert_eq!(
+        (3..7).map(trade_at).collect::<Vec<_>>(),
+        vec![(300, 4), (400, 5), (500, 6), (600, 7)],
+        "the survivors follow the hole in arrival order: {listing:?}"
+    );
+    let _ = client.close().await;
+}
+
+/// A hole's size is the data lost. The provider's controls stay in the ring
+/// and keep their slots after the hole.
+#[tokio::test]
+async fn a_seam_overflow_of_prints_leaves_a_hole_for_the_prints_only() {
+    let (provider, ctrl) = FakeProvider::new("fake", true);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1), trade("AAPL", 2)])
+        .await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(4)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+
+    // Prints 100 and 200 are evicted; the two leading controls stay.
+    for ts in [100, 200, 300, 400, 500, 600] {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.notify_one();
+
+    let mut trades = Vec::new();
+    let mut gap_seq = None;
+    while trades.len() < 6 {
+        match next_ev(&mut stream).await {
+            MarketEvent::Trade(t) => trades.push((t.source_ts.0, t.seq.0)),
+            MarketEvent::Control(c) if matches!(c.kind, ControlKind::Gap { .. }) => {
+                gap_seq = Some(c.seq.0);
+            }
+            MarketEvent::Control(_) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!(gap_seq, Some(2), "{trades:?}");
+    assert_eq!(
+        trades,
+        vec![(1, 0), (2, 1), (300, 6), (400, 7), (500, 8), (600, 9)],
+        "the Gap takes slot 2, slot 3 stays empty, the controls take 4 and 5"
+    );
+    let _ = client.close().await;
+}
+
 fn trades_from(first: i64, count: i64) -> Vec<MarketEvent> {
     (first..first + count).map(|ts| trade("AAPL", ts)).collect()
 }
@@ -1139,6 +1272,89 @@ async fn a_joiner_after_the_backfill_hears_none_is_in_flight() {
         .unwrap();
     assert_eq!(joined, Subscribed::joined(backfill, false));
     let _ = creator.close().await;
+}
+
+/// The seam ring keeps the provider's controls when its prints overflow it: the
+/// stream still carries the session's `SubscriptionChanged`, a joiner after
+/// the backfill gets it replayed, and the controls cost no print its place.
+#[tokio::test]
+async fn a_seam_overflow_keeps_the_subscription_state_for_every_subscriber() {
+    let (provider, ctrl) = FakeProvider::new("fake", true);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1), trade("AAPL", 2)])
+        .await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(4)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+
+    // The connect and subscription controls lead the ring; four prints fill
+    // it and a fifth evicts print 100, not a control.
+    for ts in [100, 200, 300, 400, 500] {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.notify_one();
+
+    let mut trades = Vec::new();
+    let mut subscription_seq = None;
+    while trades.len() < 6 {
+        match next_ev(&mut stream).await {
+            MarketEvent::Trade(t) => trades.push((t.source_ts.0, t.seq.0)),
+            MarketEvent::Control(c) => {
+                if matches!(
+                    c.kind,
+                    ControlKind::SubscriptionChanged { active: true, .. }
+                ) {
+                    subscription_seq = Some(c.seq.0);
+                }
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!(subscription_seq, Some(4), "{trades:?}");
+    assert_eq!(
+        trades,
+        vec![(1, 0), (2, 1), (200, 5), (300, 6), (400, 7), (500, 8)],
+        "the Gap takes slot 2, the connect 3, the subscription 4"
+    );
+
+    let joiner = dm.client_session();
+    joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut replayed = joiner.take_events().await.unwrap();
+    match next_ev(&mut replayed).await {
+        MarketEvent::Control(c) => assert!(
+            matches!(
+                c.kind,
+                ControlKind::SubscriptionChanged { active: true, .. }
+            ),
+            "{c:?}"
+        ),
+        other => panic!("expected the replayed subscription state, got {other:?}"),
+    }
+    let _ = joiner.close().await;
+    let _ = client.close().await;
 }
 
 /// Options no backend can serve are refused whether the subscribe creates the

@@ -61,7 +61,8 @@ pub use crate::pipe_control::PipeControlError;
 use crate::ws::{WsClient, WsConfig};
 
 /// The multiplexed event stream (same contract as the underlying
-/// [`crate::Client`] impl: `(instrument, seq)`-ordered, loss never silent).
+/// [`crate::Client`] impl: `(instrument, kind, seq)`-ordered, loss never
+/// silent).
 #[cfg(not(windows))]
 pub type AppEvents = <Iceoryx2Client as crate::Client>::Events;
 #[cfg(windows)]

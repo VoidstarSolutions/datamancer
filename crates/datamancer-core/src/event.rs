@@ -8,26 +8,45 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Instrument, Price, Quantity};
 
-/// A per-symbol ordering identifier stamped **once at the source** of an
-/// authoritative per-`(instrument, kind)` session, in that session's canonical
+/// A per-`(instrument, kind)` ordering identifier stamped **once at the
+/// source** of that pair's authoritative session, in the session's canonical
 /// delivery order, before any sink.
 ///
 /// **The sole ordering field for the stream.** Invariants:
 ///
-/// - **Per-symbol, not global.** `seq` orders one symbol's stream; there is no
-///   cross-instrument order. The multiplex ordering key is `(instrument, seq)`.
+/// - **Per `(instrument, kind)`, not global.** `seq` orders one pair's stream;
+///   there is no order across pairs. The multiplex ordering key is
+///   `(instrument, kind, seq)`. A [`ControlKind::Gap`] names the instrument
+///   only, so with two kinds on one instrument it does not say which kind.
 /// - **Stamped at the source.** The authoritative controller assigns `seq` once,
 ///   in delivery order, before the event reaches any sink — so it is a property
 ///   of the shared stream, not of a particular consumer's poll timing.
-/// - **Identical across a symbol's consumers.** Every consumer of one symbol's
+/// - **Identical across a pair's consumers.** Every consumer of one pair's
 ///   authoritative stream observes the same `(seq, source_ts)` for each event.
 /// - **Controls occupy slots.** In-band [`Control`] events are stamped here too,
 ///   so they consume a `seq` slot like data events.
-/// - **Holes are real.** A consumer that loses data (a resume-buffer overflow)
-///   observes a real `seq` hole, surfaced in-band as [`ControlKind::Gap`]. The
-///   delivered stream is contiguous *only while no data is lost*.
+/// - **Holes are real.** A consumer that loses data (a resume-buffer or
+///   backfill-seam overflow) observes a real `seq` hole, surfaced in-band as
+///   [`ControlKind::Gap`]. In a client session's stream as the session
+///   delivers it, a hole with no `Gap` is one of these, and only the first
+///   two are loss:
+///   - events still unread in a stream's channel when its consumer drops it
+///     are gone, and the next stream goes on past their slots;
+///   - with two kinds on one instrument, what a detached client's resume
+///     buffer evicted of both folds into one `Gap` at the first evicted slot,
+///     and the other kind's hole has no `Gap` at its slot;
+///   - a connection control (`ProviderConnected`, `ProviderDisconnected`,
+///     `ProviderError`) the client has already delivered for that provider,
+///     on another instrument or earlier, is dropped and its slot stays empty;
+///   - a connection control or `SubscriptionChanged` that a detached client's
+///     resume buffer evicted is gone and its slot stays empty, with no `Gap`
+///     since no data was lost; the diagnostics plane still carries the
+///     provider's connection and the subscription state;
+///   - a joiner's stream opens with the session's last active
+///     `SubscriptionChanged`, replayed with its original `seq`, and goes on
+///     from the session's current `seq`.
 /// - **`SYNTHETIC` is exempt.** [`Seq::SYNTHETIC`] tags out-of-band synthetic
-///   control events and is exempt from per-symbol monotonicity.
+///   control events and is exempt from per-`(instrument, kind)` monotonicity.
 ///
 /// In a live session `seq` is assigned in arrival order; for historical fetch
 /// it is assigned in source-timestamp order during fetch, so `seq` order
@@ -42,7 +61,7 @@ impl Seq {
     /// outside the source counter). `Seq(u64::MAX)` is **reserved**: the source
     /// counter stamps only in `[0, u64::MAX - 1]` and treats the reservation
     /// boundary as counter exhaustion, so this value never collides with a
-    /// stamped event. It is exempt from per-symbol monotonicity.
+    /// stamped event. It is exempt from per-`(instrument, kind)` monotonicity.
     pub const SYNTHETIC: Seq = Seq(u64::MAX);
 }
 
@@ -138,7 +157,8 @@ impl Surface {
 ///
 /// - `source_ts` — when the event happened in the market. The **only**
 ///   timestamp engine logic should reason about.
-/// - `seq` — datamancer's per-symbol, source-stamped ordering field.
+/// - `seq` — datamancer's per-`(instrument, kind)`, source-stamped ordering
+///   field.
 /// - `rx_ts` — wall-clock at byte receipt. **Observability only.** Engine
 ///   decision logic must never depend on `rx_ts`. For replay-from-historical,
 ///   `rx_ts` collapses to `source_ts`.
@@ -265,7 +285,9 @@ pub enum ControlKind {
         active: bool,
     },
     /// Datamancer detected a gap in a provider's stream (sequence break,
-    /// dropped messages, or a reconnect with missed window).
+    /// dropped messages, or a reconnect with missed window). It names the
+    /// instrument only, so with two kinds on one instrument it does not say
+    /// which kind.
     Gap {
         provider: String,
         instrument: Instrument,

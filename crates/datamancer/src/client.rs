@@ -11,9 +11,11 @@
 //! # Ordering
 //!
 //! The multiplex **interleaves** — it does not merge-sort. The ordering key is
-//! `(instrument, seq)`: monotonic *within* each instrument (source-stamped, from
-//! Phase 1), arrival-order across instruments. There is no cross-symbol order to
-//! compute, which is what makes the interleave cheap.
+//! `(instrument, kind, seq)`: monotonic *within* each `(instrument, kind)` pair
+//! (source-stamped, from Phase 1), arrival-order across pairs. There is no
+//! cross-pair order to compute, which is what makes the interleave cheap. A
+//! `Gap` names the instrument only, so with two kinds on one instrument it does
+//! not say which kind.
 //!
 //! # Lifecycle
 //!
@@ -1567,7 +1569,9 @@ impl ClientSession {
     /// Take the multiplexed event stream. Multi-shot: dropping the stream
     /// detaches the consumer (events buffer into the per-client resume ring); a
     /// later call re-attaches, first surfacing one `Gap` per affected instrument
-    /// for anything the buffer evicted.
+    /// for anything the buffer evicted. Events still unread in a dropped
+    /// stream's channel are lost with no `Gap`, and the next stream goes on
+    /// past their `seq` slots: drain before dropping to keep them.
     ///
     /// # Errors
     ///

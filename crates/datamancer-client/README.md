@@ -18,7 +18,7 @@ Every implementation upholds the same contract (from the doc comment on
 [`Client`] in `src/client.rs`):
 
 - **One connection = one client = one multiplexed stream**, ordered by
-  `(instrument, seq)`; per-instrument demux is the consumer's concern.
+  `(instrument, kind, seq)`; per-instrument demux is the consumer's concern.
 - The timestamp triple (`source_ts`, `seq`, `rx_ts`) crosses verbatim;
   `rx_ts` is observability-only and never synthesized client-side.
 - Control rejections surface as `ClientError::Control` with the stable

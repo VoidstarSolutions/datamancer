@@ -14,7 +14,7 @@ use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 /// # Contract (upheld by every implementation)
 ///
 /// - **One connection = one client = one multiplexed stream**, ordered by
-///   `(instrument, seq)`; per-instrument demux is the consumer's concern.
+///   `(instrument, kind, seq)`; per-instrument demux is the consumer's concern.
 /// - The timestamp triple (`source_ts`, `seq`, `rx_ts`) crosses verbatim;
 ///   `rx_ts` is observability-only and never synthesized client-side.
 /// - Control rejections surface as [`ClientError::Control`] with the stable
