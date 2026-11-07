@@ -119,6 +119,8 @@ function render(cfg) {
     + `<fieldset><legend>session</legend>`
       + L('resume_buffer_events', NUM('sess-buffer', cfg.session.resume_buffer_events))
       + L('adjustment', SEL('sess-adjust', ['raw','split','dividend','spin_off','all'], cfg.session.adjustment))
+      + L('query_persistence', SEL('sess-query', ['none','cached','cached_with_tap','read_only','refresh','tap_only'], cfg.session.query_persistence))
+      + L('max_backfill_days', NUM('sess-backfill', cfg.session.max_backfill_days))
     + `</fieldset>`
     + `<fieldset><legend>server</legend>`
       + L('admin_socket', TXT('srv-socket', cfg.server.admin_socket))
@@ -163,7 +165,8 @@ function collect() {
   for (const key of ['cache','tap_log']) {
     if (chk(`${key}-on`)) cfg[key] = { backend: val(`${key}-backend`), path: opt(val(`${key}-path`)) };
   }
-  cfg.session = { resume_buffer_events: num('sess-buffer'), adjustment: val('sess-adjust') };
+  cfg.session = { resume_buffer_events: num('sess-buffer'), adjustment: val('sess-adjust'),
+    query_persistence: val('sess-query'), max_backfill_days: num('sess-backfill') };
   cfg.server = { admin_socket: val('srv-socket'), service_prefix: val('srv-prefix'), shutdown_timeout_secs: num('srv-timeout') };
   cfg.diagnostics = { publish_interval_ms: num('diag-live'), cache_catalog_interval_ms: num('diag-catalog') };
   cfg.iceoryx2 = { max_clients: num('iox-clients') };

@@ -12,6 +12,7 @@
 //! section, etc.); `Config::into_datamancer` builds the live [`Datamancer`].
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use std::collections::HashMap;
 
@@ -230,6 +231,9 @@ pub struct SessionConfig {
     /// of them.
     #[serde(default = "default_query_persistence")]
     pub query_persistence: PersistenceCfg,
+    /// How many days back a client's `live_backfill` may start.
+    #[serde(default = "default_max_backfill_days")]
+    pub max_backfill_days: u32,
 }
 
 impl Default for SessionConfig {
@@ -238,8 +242,13 @@ impl Default for SessionConfig {
             resume_buffer_events: default_resume_buffer(),
             adjustment: AdjustmentCfg::default(),
             query_persistence: default_query_persistence(),
+            max_backfill_days: default_max_backfill_days(),
         }
     }
+}
+
+const fn default_max_backfill_days() -> u32 {
+    7
 }
 
 const fn default_resume_buffer() -> usize {
@@ -729,6 +738,11 @@ impl Config {
             }
             s.resolve_scope()?;
         }
+        if self.session.max_backfill_days == 0 {
+            return Err(DaemonError::ConfigInvalid(
+                "[session].max_backfill_days must be greater than 0".to_string(),
+            ));
+        }
         // A zero publish interval would panic `tokio::time::interval`, which both
         // the iceoryx2 diagnostics ticker (unix) and the WS health-push task
         // (`ws/conn.rs`) construct from it — reject it up front rather than
@@ -817,6 +831,9 @@ impl Config {
     ) -> Result<BuiltRuntime> {
         let mut builder = Datamancer::builder()
             .resume_buffer_events(self.session.resume_buffer_events)
+            .max_client_backfill(Duration::from_secs(
+                u64::from(self.session.max_backfill_days) * 86_400,
+            ))
             .adjustment(self.session.adjustment.into());
 
         // Cycle 3: every compiled-in provider is constructed and registered,
@@ -1300,6 +1317,14 @@ backfill_from = "2200-01-01T00:00:00Z"
         config
             .validate()
             .expect("the anchor's open checks the start");
+    }
+
+    #[test]
+    fn max_backfill_days_defaults_to_a_week_and_refuses_zero() {
+        let mut config = Config::parse("").expect("parse");
+        assert_eq!(config.session.max_backfill_days, 7);
+        config.session.max_backfill_days = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -1274,6 +1274,58 @@ async fn a_joiner_after_the_backfill_hears_none_is_in_flight() {
     let _ = creator.close().await;
 }
 
+/// A client's backfill older than the limit is refused whether it would create
+/// the session or join it, and a `Session` is not limited.
+#[tokio::test]
+async fn a_client_backfill_past_the_limit_is_refused() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 1)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .max_client_backfill(Duration::from_hours(1))
+        .build()
+        .unwrap();
+    let none = PersistenceOptions::none();
+    let too_old = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let refused = |outcome: Result<Subscribed>| {
+        assert!(
+            matches!(outcome, Err(datamancer::Error::BackfillTooOld { .. })),
+            "{outcome:?}"
+        );
+    };
+    let client = dm.client_session();
+    refused(
+        client
+            .subscribe(inst("AAPL"), EventKind::Trade, too_old, none)
+            .await,
+    );
+
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+    .unwrap();
+    let recent = LiveScope::LiveBackfill {
+        from: Timestamp(now - 1_000_000_000),
+    };
+    client
+        .subscribe(inst("AAPL"), EventKind::Trade, recent, none)
+        .await
+        .expect("inside the limit");
+    refused(
+        dm.client_session()
+            .subscribe(inst("AAPL"), EventKind::Trade, too_old, none)
+            .await,
+    );
+    let _ = client.close().await;
+
+    dm.session(inst("MSFT"), EventKind::Trade, too_old.into(), none)
+        .await
+        .expect("a session is not limited");
+}
+
 /// The seam ring keeps the provider's controls when its prints overflow it: the
 /// stream still carries the session's `SubscriptionChanged`, a joiner after
 /// the backfill gets it replayed, and the controls cost no print its place.

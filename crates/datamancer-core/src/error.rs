@@ -52,6 +52,15 @@ pub enum Error {
         kind: crate::EventKind,
     },
 
+    /// A client's backfill starts before the oldest start it may ask for.
+    #[error("backfill_from {from:?} is before the oldest allowed start {oldest:?}")]
+    BackfillTooOld {
+        /// The requested backfill start.
+        from: crate::Timestamp,
+        /// The oldest start allowed.
+        oldest: crate::Timestamp,
+    },
+
     /// A live backfill was asked to start at or past the live edge. Nothing
     /// lies in `[from, edge)`.
     #[error("backfill_from {from:?} is not before the live edge {edge:?}; nothing to backfill")]

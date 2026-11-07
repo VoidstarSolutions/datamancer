@@ -20,6 +20,7 @@ pub fn error_code(err: &datamancer::Error) -> &'static str {
         Error::UnsupportedEventKind { .. } => codes::UNSUPPORTED_EVENT_KIND,
         Error::PersistenceRequired => codes::PERSISTENCE_REQUIRED,
         Error::BackfillFromNotInPast { .. } => codes::BACKFILL_NOT_IN_PAST,
+        Error::BackfillTooOld { .. } => codes::BACKFILL_TOO_OLD,
         Error::DuplicateSubscription { .. } => codes::DUPLICATE_SUBSCRIPTION,
         Error::NotSubscribed { .. } => codes::NOT_SUBSCRIBED,
         Error::UnknownProvider(_) => codes::UNKNOWN_PROVIDER,
@@ -70,6 +71,13 @@ mod tests {
                 edge: datamancer::Timestamp(1),
             }),
             codes::BACKFILL_NOT_IN_PAST
+        );
+        assert_eq!(
+            error_code(&Error::BackfillTooOld {
+                from: datamancer::Timestamp(0),
+                oldest: datamancer::Timestamp(1),
+            }),
+            codes::BACKFILL_TOO_OLD
         );
         assert_eq!(
             error_code(&Error::DuplicateSubscription {

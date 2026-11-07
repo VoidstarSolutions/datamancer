@@ -58,6 +58,7 @@ use crate::fetch_locks::FetchLocks;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use datamancer_core::{
@@ -190,6 +191,8 @@ pub struct Datamancer {
 }
 
 struct DatamancerInner {
+    /// How far back a client session's backfill may start; `None` for no limit.
+    max_client_backfill: Option<Duration>,
     providers: Vec<Arc<dyn Provider>>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
@@ -390,6 +393,19 @@ impl Datamancer {
 
         self.create_authoritative(provider, instrument, kind, scope, options, key)
             .await
+    }
+
+    /// Refuse a client's backfill older than the configured limit, whether it
+    /// would create the session or join one.
+    pub(crate) fn check_client_backfill(&self, scope: LiveScope) -> Result<()> {
+        if let (Some(limit), Some(from)) = (self.inner.max_client_backfill, scope.backfill_from()) {
+            let limit = i64::try_from(limit.as_nanos()).unwrap_or(i64::MAX);
+            let oldest = Timestamp(wall_clock_ts().0.saturating_sub(limit));
+            if from < oldest {
+                return Err(Error::BackfillTooOld { from, oldest });
+            }
+        }
+        Ok(())
     }
 
     fn check_persistence(&self, options: PersistenceOptions) -> Result<()> {
@@ -946,6 +962,7 @@ pub struct DatamancerBuilder {
     historical_cache: Option<Arc<dyn HistoricalCache>>,
     instrument_provider: Vec<(Instrument, String)>,
     resume_buffer_events: Option<usize>,
+    max_client_backfill: Option<Duration>,
     /// Corporate-action adjustment mode. `Adjustment`'s `Default` is `All`, so
     /// `DatamancerBuilder::default()` already yields fully-adjusted bars; call
     /// [`adjustment`](Self::adjustment) to override.
@@ -1021,6 +1038,15 @@ impl DatamancerBuilder {
         self
     }
 
+    /// Limit how far back a [`ClientSession`](crate::ClientSession) subscribe
+    /// may start a backfill. Unlimited by default; a [`Session`] is not limited.
+    /// A zero `limit` refuses every client backfill.
+    #[must_use]
+    pub fn max_client_backfill(mut self, limit: Duration) -> Self {
+        self.max_client_backfill = Some(limit);
+        self
+    }
+
     /// Set the corporate-action adjustment mode applied to historical bar
     /// fetches and used to segregate the cache. Defaults to [`Adjustment::All`]
     /// (split + dividend + spin-off). The mode is stamped into both the
@@ -1063,6 +1089,7 @@ impl DatamancerBuilder {
                 historical_cache: self.historical_cache,
                 instrument_provider: self.instrument_provider,
                 live_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                max_client_backfill: self.max_client_backfill,
                 resume_buffer_events: self
                     .resume_buffer_events
                     .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),

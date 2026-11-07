@@ -1130,6 +1130,7 @@ impl ClientController {
         if self.entries.contains_key(&key) {
             return Err(Error::DuplicateSubscription { instrument, kind });
         }
+        self.dm.check_client_backfill(scope)?;
         let Attached {
             guard, rx, outcome, ..
         } = self
@@ -1539,6 +1540,8 @@ impl ClientSession {
     ///   surfaces the scope needs (live, plus history under backfill).
     /// - [`Error::PersistenceRequired`] — `options` needs a cache or tap log
     ///   that is not configured, on a joiner as on a creator.
+    /// - [`Error::BackfillTooOld`] — a backfill starts before the limit set by
+    ///   [`DatamancerBuilder::max_client_backfill`](crate::DatamancerBuilder::max_client_backfill).
     /// - [`Error::BackfillFromNotInPast`] — this subscribe would create a
     ///   session whose backfill starts at or past the live edge. A joiner is
     ///   not checked.

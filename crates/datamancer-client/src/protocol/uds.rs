@@ -679,6 +679,7 @@ mod tests {
         assert_eq!(crate::codes::RESTART_REQUIRED, "restart_required");
         assert_eq!(crate::codes::UNKNOWN_CONFIG_FIELD, "unknown_config_field");
         assert_eq!(crate::codes::BACKFILL_NOT_IN_PAST, "backfill_not_in_past");
+        assert_eq!(crate::codes::BACKFILL_TOO_OLD, "backfill_too_old");
     }
 
     #[test]

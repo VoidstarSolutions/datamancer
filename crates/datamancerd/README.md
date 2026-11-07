@@ -123,6 +123,7 @@ path = "/var/lib/datamancerd/taplog.db"  # optional; default: <data dir>/taplog.
 resume_buffer_events = 65536
 adjustment = "all"                # raw | split | dividend | spin_off | all
 query_persistence = "cached"      # none | cached | cached_with_tap | read_only | refresh | tap_only
+max_backfill_days = 7             # oldest start a client's live_backfill may ask for
 
 [server]
 # admin_socket defaults to the datamancer-owned well-known path
@@ -420,10 +421,10 @@ One JSON object per line; one reply line per request.
   -> {"ok":true,"service":"datamancerd/1729600000-4321/v3/data/0"}
 {"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
   -> {"ok":true,"scope":"live"}
-{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":1704067200000000000,"persistence":"cached"}
-  -> {"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000}
+{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":<t>,"persistence":"cached"}
+  -> {"ok":true,"scope":"live_backfill","backfill_from":<t>}
 {"op":"subscribe","client":"exec-2","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m"}
-  -> {"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000,"joined":true}
+  -> {"ok":true,"scope":"live_backfill","backfill_from":<t>,"joined":true}
 {"op":"unsubscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
 {"op":"close-client","client":"exec-1"}
 {"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1704067200000000000,"to":1704672000000000000}
@@ -460,11 +461,16 @@ One JSON object per line; one reply line per request.
 `subscribe` opens an unbounded subscription:
 
 - `scope` is `live` (the default) or `live_backfill`.
+- `<t>` in the examples above is a start within `[session] max_backfill_days`.
 - `backfill_from` (epoch nanoseconds, inclusive) is required under
   `live_backfill` and refused under `live`; either disagreement is
   `bad_request`.
 - A `backfill_from` at or past the live edge is `backfill_not_in_past`, on a
   subscribe that would create the session.
+- A `backfill_from` more than `[session] max_backfill_days` old is
+  `backfill_too_old`, whether the subscribe would create or join. A
+  `[[startup_session]]` is the operator's and has no such limit; longer history
+  comes from `open-query`.
 - The reply's `scope` and `backfill_from` are the scope of the pair's shared
   session, fixed by the subscriber that created it.
 - `"joined":true` marks a subscriber that joined an open session; the creator's
@@ -624,8 +630,8 @@ config-service ops (spec cycle 3); see the dedicated section below for
 gating, classification, and semantics.
 
 Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
-(`unsupported_event_kind`, `persistence_required`,
-`backfill_not_in_past`, `duplicate_subscription`, `not_subscribed`,
+(`unsupported_event_kind`, `persistence_required`, `backfill_not_in_past`,
+`backfill_too_old`, `duplicate_subscription`, `not_subscribed`,
 `unknown_provider`, `unknown_client`, `duplicate_client`,
 `service_cap_exceeded`, `bad_request`, `shutting_down`,
 `credentials_missing`, `credential_backend_unavailable`, `permission_denied`,

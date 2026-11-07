@@ -9,6 +9,8 @@ pub const UNSUPPORTED_EVENT_KIND: &str = "unsupported_event_kind";
 pub const PERSISTENCE_REQUIRED: &str = "persistence_required";
 /// A live backfill would start at or past the live edge.
 pub const BACKFILL_NOT_IN_PAST: &str = "backfill_not_in_past";
+/// A live backfill would start before the oldest start a client may ask for.
+pub const BACKFILL_TOO_OLD: &str = "backfill_too_old";
 /// The client already holds a subscription for this pair.
 pub const DUPLICATE_SUBSCRIPTION: &str = "duplicate_subscription";
 /// The client is not subscribed to this pair.

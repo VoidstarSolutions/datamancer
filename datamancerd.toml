@@ -39,6 +39,7 @@ path = "./.datamancerd/taplog.db"
 [session]
 resume_buffer_events = 65536      # bounded per-client resume buffer
 adjustment = "all"                # raw | split | dividend | spin_off | all
+max_backfill_days = 7             # oldest start a client's live_backfill may ask for
 
 # ── Control surface + service naming ───────────────────────────────────────
 [server]
