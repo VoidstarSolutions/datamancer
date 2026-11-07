@@ -2257,6 +2257,161 @@ async fn a_slow_reader_cannot_hold_a_co_subscriber_back_for_long() {
     let _ = reader.close().await;
 }
 
+/// Taking a stream late hands over the buffered events without blocking the
+/// client: a subscribe answers before the consumer reads, and everything still
+/// arrives, in order.
+#[tokio::test]
+async fn a_late_take_keeps_the_client_answering() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 5000)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let none = PersistenceOptions::none();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            none,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut stream = client.take_events().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        client.subscribe(inst("MSFT"), EventKind::Trade, LiveScope::Live, none),
+    )
+    .await
+    .expect("subscribe must not wait on the consumer")
+    .unwrap();
+
+    let (prints, gaps) = read_prints(&mut stream, 5000).await;
+    assert_eq!(gaps, 0);
+    assert_eq!(prints, (1..=5000).collect::<Vec<_>>());
+    let _ = client.close().await;
+}
+
+/// The resume buffer's occupancy counts what a late take left undelivered, and
+/// falls as the consumer reads it.
+#[tokio::test(start_paused = true)]
+async fn a_late_take_reports_its_backlog_in_occupancy() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 3000)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(3000)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let occupancy = |dm: &Datamancer| {
+        dm.snapshot_live().client_sessions[0]
+            .resume_buffer
+            .occupancy
+    };
+    assert_eq!(occupancy(&dm), 3000, "detached ring holds the history");
+
+    let mut stream = client.take_events().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        occupancy(&dm) > 0,
+        "a backlog the consumer has not read is in the resume buffer"
+    );
+
+    let (prints, _) = read_prints(&mut stream, 3000).await;
+    assert_eq!(prints.len(), 3000);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(occupancy(&dm), 0, "nothing left once read");
+    let _ = client.close().await;
+}
+
+/// A client's own controls reach a reading consumer whatever the buffer's size.
+#[tokio::test]
+async fn an_unsubscribe_control_arrives_with_a_zero_resume_buffer() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(0)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::Live,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    client
+        .unsubscribe(inst("AAPL"), EventKind::Trade)
+        .await
+        .unwrap();
+    let ev = next_ev(&mut stream).await;
+    assert!(
+        matches!(
+            &ev,
+            MarketEvent::Control(c)
+                if matches!(c.kind, ControlKind::SubscriptionChanged { active: false, .. })
+        ),
+        "{ev:?}"
+    );
+    let _ = client.close().await;
+}
+
+/// A client whose stream is full and unread still answers: its next subscribe
+/// waits on nothing, and its close on the consumer for a bounded time.
+#[tokio::test]
+async fn a_client_with_an_unread_stream_still_answers() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 5000)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let none = PersistenceOptions::none();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            none,
+        )
+        .await
+        .unwrap();
+    let _unread = client.take_events().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        client.subscribe(inst("MSFT"), EventKind::Trade, LiveScope::Live, none),
+    )
+    .await
+    .expect("subscribe must not wait on the stream")
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(4), client.close())
+        .await
+        .expect("close must stop waiting on the stream")
+        .unwrap();
+}
+
 /// A sole consumer slower than the feed cannot keep a seam flush going: once
 /// the flush has lost a whole ring, the session reaches its live loop.
 #[tokio::test(start_paused = true)]

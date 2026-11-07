@@ -222,6 +222,19 @@ impl Drop for SubscriberGuard {
     }
 }
 
+/// Resolves once an attached sink has room.
+async fn sink_room(sink: &ClientSink) {
+    if let ClientSink::Attached(tx) = sink {
+        let _ = tx.reserve().await;
+    }
+}
+
+/// How long closing waits for a consumer to take what it is owed.
+const CLOSE_DELIVERY_WAIT: Duration = Duration::from_secs(2);
+
+/// How many client-local controls may wait behind a drained ring.
+const CONTROL_BACKLOG: usize = 1024;
+
 /// A subscriber the controller has added.
 pub(crate) struct NewSubscriber {
     pub(crate) id: SubscriberId,
@@ -526,7 +539,8 @@ pub(crate) struct ClientStats {
     id: ClientSessionId,
     /// Resume-buffer capacity (events) — the builder knob, constant per client.
     capacity: usize,
-    /// Current per-client resume-buffer occupancy (0 while attached).
+    /// Current per-client resume-buffer occupancy: the detached ring, or the
+    /// backlog owed to an attached consumer.
     occupancy: AtomicUsize,
     /// Cumulative events evicted from the resume buffer (overflow).
     dropped_events: AtomicU64,
@@ -1301,6 +1315,9 @@ struct ClientController {
     streams: StreamMap<(Instrument, EventKind), SubStream>,
     entries: HashMap<(Instrument, EventKind), SubEntry>,
     sink: ClientSink,
+    /// Events owed to the sink ahead of the substreams: a drained ring and the
+    /// client's own controls. The run loop delivers them as the sink has room.
+    backlog: VecDeque<(MarketEvent, String)>,
     ring_capacity: usize,
     seen_provider_state: HashMap<String, ConnState>,
     last_provider_error: HashMap<String, String>,
@@ -1319,12 +1336,21 @@ fn substream(rx: mpsc::Receiver<MarketEvent>) -> SubStream {
 impl ClientController {
     async fn run(mut self) {
         loop {
+            let ready = self.sink_ready();
+            let backlogged = !self.backlog.is_empty();
             tokio::select! {
-                maybe = self.streams.next(), if !self.streams.is_empty() => {
+                () = sink_room(&self.sink), if !ready => {}
+                () = std::future::ready(()), if ready && backlogged => {
+                    if let Some((ev, provider)) = self.backlog.pop_front() {
+                        self.deliver(ev, provider).await;
+                        self.sync_occupancy();
+                    }
+                }
+                maybe = self.streams.next(), if ready && !backlogged && !self.streams.is_empty() => {
                     if let Some((key, msg)) = maybe {
                         match msg {
                             SubMsg::Event(ev) => self.route(key, ev).await,
-                            SubMsg::Ended => self.handle_substream_end(key).await,
+                            SubMsg::Ended => self.handle_substream_end(&key),
                         }
                     }
                 }
@@ -1344,6 +1370,14 @@ impl ClientController {
         // teardown when each was the last referrer.
     }
 
+    /// Whether the sink can take an event without waiting.
+    fn sink_ready(&self) -> bool {
+        match &self.sink {
+            ClientSink::Attached(tx) => tx.capacity() > 0 || tx.is_closed(),
+            ClientSink::Detached(_) => true,
+        }
+    }
+
     /// Returns false when the controller should exit.
     async fn handle_command(&mut self, cmd: ClientCommand) -> bool {
         match cmd {
@@ -1358,7 +1392,7 @@ impl ClientController {
                     .subscribe(instrument.clone(), kind, scope, options)
                     .await;
                 if matches!(reply.send(res), Err(Ok(_))) {
-                    let _ = self.unsubscribe(instrument, kind).await;
+                    let _ = self.unsubscribe(instrument, kind);
                 }
                 true
             }
@@ -1367,7 +1401,7 @@ impl ClientController {
                 kind,
                 reply,
             } => {
-                let res = self.unsubscribe(instrument, kind).await;
+                let res = self.unsubscribe(instrument, kind);
                 let _ = reply.send(res);
                 true
             }
@@ -1376,7 +1410,7 @@ impl ClientController {
                     Ok((rx, prior)) => {
                         let _ = reply.send(Ok(rx));
                         if let Some(ring) = prior {
-                            self.flush_ring(ring).await;
+                            self.flush_ring(ring);
                         }
                     }
                     Err(e) => {
@@ -1434,7 +1468,7 @@ impl ClientController {
         Ok(outcome)
     }
 
-    async fn unsubscribe(&mut self, instrument: Instrument, kind: EventKind) -> Result<()> {
+    fn unsubscribe(&mut self, instrument: Instrument, kind: EventKind) -> Result<()> {
         let key = (instrument.clone(), kind);
         let Some(entry) = self.entries.remove(&key) else {
             return Err(Error::NotSubscribed { instrument, kind });
@@ -1447,11 +1481,10 @@ impl ClientController {
         drop(entry);
         self.streams.remove(&key);
         self.sync_subscriptions();
-        self.deliver(
+        self.queue_control(
             subscription_changed(&instrument, kind, &provider, false),
             provider,
-        )
-        .await;
+        );
         Ok(())
     }
 
@@ -1459,18 +1492,17 @@ impl ClientController {
     /// teardown or fan-out removal). Surface a per-symbol
     /// `SubscriptionChanged { active: false }` and drop the entry. If the key is
     /// already gone (explicit unsubscribe handled it), this is a no-op.
-    async fn handle_substream_end(&mut self, key: (Instrument, EventKind)) {
-        let Some(entry) = self.entries.remove(&key) else {
+    fn handle_substream_end(&mut self, key: &(Instrument, EventKind)) {
+        let Some(entry) = self.entries.remove(key) else {
             return;
         };
         let provider = entry.provider.clone();
         drop(entry);
         self.sync_subscriptions();
-        self.deliver(
+        self.queue_control(
             subscription_changed(&key.0, key.1, &provider, false),
             provider,
-        )
-        .await;
+        );
     }
 
     /// Route one substream event into the per-client stream. Per-symbol controls
@@ -1535,6 +1567,15 @@ impl ClientController {
         }
     }
 
+    /// Queue a client-local control. Past [`CONTROL_BACKLOG`] on top of a
+    /// drained ring the consumer has stopped reading, and the control is lost.
+    fn queue_control(&mut self, ev: MarketEvent, provider: String) {
+        if self.backlog.len() < self.ring_capacity.saturating_add(CONTROL_BACKLOG) {
+            self.backlog.push_back((ev, provider));
+            self.sync_occupancy();
+        }
+    }
+
     /// Deliver one event to the client sink (emit-only — never tee; the tap-log
     /// tee already ran once at the authoritative source). On a gone/closed
     /// consumer the sink flips to a detached per-client ring.
@@ -1569,9 +1610,8 @@ impl ClientController {
         }
         let (tx, rx) = mpsc::channel(default_buffer());
         let prior = std::mem::replace(&mut self.sink, ClientSink::Attached(tx));
-        // Attached: nothing sits in the resume buffer. (The drained ring's
-        // cumulative `dropped_events` is retained on `ClientStats`.)
-        self.stats.set_occupancy(0);
+        // The drained ring moves to the backlog, which `flush_ring` counts.
+        // (Its cumulative `dropped_events` is retained on `ClientStats`.)
         Ok((
             rx,
             match prior {
@@ -1591,11 +1631,12 @@ impl ClientController {
     /// (first-evicted-`seq` order), then survivors in arrival order. Replayed
     /// events keep their source-stamped `seq` — the eviction `Gap` rides the
     /// first-evicted slot.
-    async fn flush_ring(&mut self, ring: ClientRing) {
+    fn flush_ring(&mut self, ring: ClientRing) {
         let (gaps, events) = ring.into_parts();
-        for (first_seq, instrument, span, provider) in gaps {
-            self.deliver(
-                MarketEvent::Control(Control {
+        let mut drained: VecDeque<_> = gaps
+            .into_iter()
+            .map(|(first_seq, instrument, span, provider)| {
+                let gap = MarketEvent::Control(Control {
                     source_ts: span.from_source_ts,
                     rx_ts: span.from_source_ts,
                     seq: first_seq,
@@ -1604,18 +1645,28 @@ impl ClientController {
                         instrument,
                         span,
                     },
-                }),
-                provider,
-            )
-            .await;
-        }
-        for (ev, provider) in events {
-            self.deliver(ev, provider).await;
+                });
+                (gap, provider)
+            })
+            .collect();
+        drained.extend(events);
+        drained.append(&mut self.backlog);
+        self.backlog = drained;
+        self.sync_occupancy();
+    }
+
+    /// Report the events owed to an attached consumer as the resume buffer's
+    /// occupancy. A detached client's occupancy is its ring.
+    fn sync_occupancy(&self) {
+        if matches!(self.sink, ClientSink::Attached(_)) {
+            self.stats.set_occupancy(self.backlog.len());
         }
     }
 
+    /// Hand the backlog and a terminal `SessionClosing` to the consumer, for up
+    /// to [`CLOSE_DELIVERY_WAIT`] in all. What it has not taken by then is lost.
     async fn emit_session_closing(&mut self) {
-        self.deliver(
+        self.backlog.push_back((
             MarketEvent::Control(Control {
                 source_ts: wall_clock_ts(),
                 rx_ts: wall_clock_ts(),
@@ -1623,8 +1674,20 @@ impl ClientController {
                 kind: ControlKind::SessionClosing,
             }),
             String::new(),
-        )
-        .await;
+        ));
+        let deadline = tokio::time::Instant::now() + CLOSE_DELIVERY_WAIT;
+        while let Some((ev, provider)) = self.backlog.pop_front() {
+            match &self.sink {
+                ClientSink::Attached(tx) if !tx.is_closed() => {
+                    match tokio::time::timeout_at(deadline, tx.send(ev)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(mpsc::error::SendError(ev))) => self.deliver(ev, provider).await,
+                        Err(_) => return,
+                    }
+                }
+                _ => self.deliver(ev, provider).await,
+            }
+        }
     }
 }
 
@@ -1785,6 +1848,7 @@ pub(crate) fn spawn_client(
         streams,
         entries,
         sink: ClientSink::Detached(ClientRing::new(ring_capacity)),
+        backlog: VecDeque::new(),
         ring_capacity,
         seen_provider_state: HashMap::new(),
         last_provider_error: HashMap::new(),
@@ -1880,7 +1944,9 @@ impl ClientSession {
     }
 
     /// Explicit termination. Emits a single `Control::SessionClosing` then tears
-    /// down every subscription (releasing the authoritative refcounts).
+    /// down every subscription (releasing the authoritative refcounts). A
+    /// consumer that has not read what it is owed within two seconds loses the
+    /// rest, the terminal control included.
     ///
     /// # Errors
     ///
