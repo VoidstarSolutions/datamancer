@@ -1,7 +1,9 @@
 //! The generic client-transport trait: one multiplexed consumer handle,
 //! transport chosen at compile time.
 
-use datamancer_core::{InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot};
+use datamancer_core::{
+    InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, Subscribed, SystemSnapshot,
+};
 use futures::Stream;
 
 use crate::error::ClientError;
@@ -43,11 +45,11 @@ pub trait Client: Sized + Send {
         cfg: Self::Config,
     ) -> impl Future<Output = Result<(Self, Self::Events), ClientError<Self::Error>>> + Send;
 
-    /// Add a subscription to this client's set.
+    /// Add a subscription to this client's set and return what it opened.
     fn subscribe(
         &mut self,
         spec: &SubscriptionSpec,
-    ) -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
+    ) -> impl Future<Output = Result<Subscribed, ClientError<Self::Error>>> + Send;
 
     /// Remove a subscription from this client's set.
     fn unsubscribe(
@@ -130,7 +132,7 @@ mod tests {
     use crate::error::ClientError;
     use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
     use datamancer_core::{
-        InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
+        InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, Subscribed, SystemSnapshot,
     };
     use futures::stream::{self, Empty};
 
@@ -152,9 +154,9 @@ mod tests {
         }
         async fn subscribe(
             &mut self,
-            _spec: &SubscriptionSpec,
-        ) -> Result<(), ClientError<Self::Error>> {
-            Ok(())
+            spec: &SubscriptionSpec,
+        ) -> Result<Subscribed, ClientError<Self::Error>> {
+            Ok(Subscribed::created(spec.scope))
         }
         async fn unsubscribe(
             &mut self,

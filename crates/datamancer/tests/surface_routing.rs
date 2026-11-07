@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datamancer::{
-    AssetClass, Datamancer, Error, EventKind, Instrument, LiveHandle, MarketEvent,
-    PersistenceOptions, Provider, ProviderId, Result, Scope, Surface, Timestamp,
+    AssetClass, Datamancer, Error, EventKind, Instrument, LiveHandle, LiveScope, MarketEvent,
+    PersistenceOptions, Provider, ProviderId, Result, Scope, Subscribed, Surface, Timestamp,
 };
 use datamancer_core::HistoryRequest;
 use tokio::sync::mpsc;
@@ -22,7 +22,10 @@ struct SurfaceFake {
     surfaces: &'static [Surface],
 }
 
-struct NoopHandle;
+/// Holds the sink, so the session stays open.
+struct NoopHandle {
+    _sink: mpsc::Sender<MarketEvent>,
+}
 
 #[async_trait]
 impl LiveHandle for NoopHandle {
@@ -47,8 +50,8 @@ impl Provider for SurfaceFake {
         self.surfaces.contains(&surface)
     }
 
-    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
-        Ok(Box::new(NoopHandle))
+    async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(NoopHandle { _sink: sink }))
     }
 
     async fn fetch_history(
@@ -162,6 +165,34 @@ async fn backfill_requires_both_surfaces() {
         .err()
         .expect("backfill needs a history surface");
     assert_missing_surface(err, Surface::History);
+}
+
+/// Joining fetches nothing, so a backfill request that finds a session open
+/// joins it even where the provider has no history to create one from.
+#[tokio::test]
+async fn a_backfill_request_joins_an_open_session_without_a_history_surface() {
+    let dm = dm(vec![live_only("fake")]);
+    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let none = PersistenceOptions::none();
+
+    let refused = dm
+        .client_session()
+        .subscribe(instrument(), EventKind::Trade, backfill, none)
+        .await
+        .expect_err("nothing to join, so the creator needs history");
+    assert_missing_surface(refused, Surface::History);
+
+    let creator = dm.client_session();
+    creator
+        .subscribe(instrument(), EventKind::Trade, LiveScope::Live, none)
+        .await
+        .expect("live needs only the live surface");
+    let joined = dm
+        .client_session()
+        .subscribe(instrument(), EventKind::Trade, backfill, none)
+        .await
+        .expect("a joiner needs no history surface");
+    assert_eq!(joined, Subscribed::joined(LiveScope::Live, false));
 }
 
 /// The determinism guard: two providers *between* them cover both surfaces, but

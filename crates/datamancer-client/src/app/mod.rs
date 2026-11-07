@@ -39,7 +39,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use datamancer_core::{
-    HealthView, InstrumentEntry, InstrumentInfo, ProviderCredentials, ProviderId, SystemSnapshot,
+    HealthView, InstrumentEntry, InstrumentInfo, ProviderCredentials, ProviderId, Subscribed,
+    SystemSnapshot,
 };
 
 use crate::Client as _;
@@ -470,7 +471,7 @@ impl AppHandle {
     pub async fn subscribe(
         &mut self,
         spec: &SubscriptionSpec,
-    ) -> Result<(), ClientError<DataError>> {
+    ) -> Result<Subscribed, ClientError<DataError>> {
         self.data_mut().subscribe(spec).await
     }
 

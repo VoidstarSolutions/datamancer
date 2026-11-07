@@ -22,6 +22,7 @@ mod instrument;
 mod price;
 mod quantity;
 mod snapshot;
+mod subscription;
 pub mod traits;
 
 pub use adjustment::Adjustment;
@@ -43,6 +44,7 @@ pub use snapshot::{
     ConnectionState, ProviderSnapshot, ResumeBufferSnapshot, StreamConnection, SubscriptionRef,
     SystemSnapshot,
 };
+pub use subscription::{LiveScope, ScopeMismatch, ScopeName, Subscribed};
 pub use traits::{
     CacheCatalogEntry, CacheCoverage, CacheKey, EventSink, HistoricalCache, HistoryRequest,
     LiveHandle, Provider, ProviderMetrics, PublishOutcome, ReplayRequest, ReplaySource, TapLog,

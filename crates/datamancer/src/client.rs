@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use datamancer_core::{
-    ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, MarketEvent,
-    Result, Seq, StreamConnection, SubscriptionRef, Timestamp,
+    ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, LiveScope,
+    MarketEvent, Result, Seq, StreamConnection, Subscribed, SubscriptionRef, Timestamp,
 };
 use futures::StreamExt as _;
 use tokio::sync::{mpsc, oneshot};
@@ -39,7 +39,7 @@ use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::session::{
-    ClientSessionRegistry, Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions, Scope,
+    ClientSessionRegistry, Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions,
     SessionCommand, default_buffer,
 };
 
@@ -69,7 +69,7 @@ pub(crate) struct AuthoritativeSession {
     /// The session's actual scope, shared across every referrer. A second opener
     /// attaches to this (its requested scope is not re-applied), so referrer
     /// handles must report *this*, not their own requested value.
-    pub(crate) scope: Scope,
+    pub(crate) scope: LiveScope,
     /// The session's current persistence options, shared across every referrer
     /// and the source of truth for the synchronous getter. Updated by
     /// [`Self::set_persistence`]; a second opener never re-applies its own
@@ -97,7 +97,7 @@ impl AuthoritativeSession {
         instrument: Instrument,
         kind: EventKind,
         provider_id: String,
-        scope: Scope,
+        scope: LiveScope,
         persistence: PersistenceOptions,
         cmd_tx: mpsc::Sender<SessionCommand>,
         remove_tx: mpsc::UnboundedSender<SubscriberId>,
@@ -130,9 +130,7 @@ impl AuthoritativeSession {
     /// Register a new fan-out subscriber, returning its id and the receiver the
     /// referrer drains. Fails with [`Error::SessionClosed`] if the controller
     /// has already torn down.
-    pub(crate) async fn add_subscriber(
-        &self,
-    ) -> Result<(SubscriberId, mpsc::Receiver<MarketEvent>)> {
+    pub(crate) async fn add_subscriber(&self) -> Result<NewSubscriber> {
         let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::channel(default_buffer());
         let (ack, ack_rx) = oneshot::channel();
@@ -144,8 +142,12 @@ impl AuthoritativeSession {
             })
             .await
             .map_err(|_| Error::SessionClosed)?;
-        ack_rx.await.map_err(|_| Error::SessionClosed)?;
-        Ok((id, rx))
+        let backfill_in_flight = ack_rx.await.map_err(|_| Error::SessionClosed)?;
+        Ok(NewSubscriber {
+            id,
+            rx,
+            backfill_in_flight,
+        })
     }
 
     /// Signal removal of a subscriber. Best-effort and non-blocking — invoked
@@ -213,6 +215,32 @@ impl SubscriberGuard {
 impl Drop for SubscriberGuard {
     fn drop(&mut self) {
         self.authoritative.remove_subscriber(self.id);
+    }
+}
+
+/// A subscriber the controller has added.
+pub(crate) struct NewSubscriber {
+    pub(crate) id: SubscriberId,
+    pub(crate) rx: mpsc::Receiver<MarketEvent>,
+    pub(crate) backfill_in_flight: bool,
+}
+
+/// One subscriber registered on an [`AuthoritativeSession`].
+pub(crate) struct Attached {
+    pub(crate) session: Arc<AuthoritativeSession>,
+    pub(crate) guard: SubscriberGuard,
+    pub(crate) rx: mpsc::Receiver<MarketEvent>,
+    pub(crate) outcome: Subscribed,
+}
+
+impl Attached {
+    pub(crate) fn joined(session: Arc<AuthoritativeSession>, subscriber: NewSubscriber) -> Self {
+        Self {
+            guard: SubscriberGuard::new(session.clone(), subscriber.id),
+            rx: subscriber.rx,
+            outcome: Subscribed::joined(session.scope, subscriber.backfill_in_flight),
+            session,
+        }
     }
 }
 
@@ -328,6 +356,16 @@ impl LiveStats {
                 | ControlKind::SessionClosing => {}
             },
             _ => {}
+        }
+    }
+
+    /// Record one replayed event: its `seq` position, and a control as
+    /// [`Self::record_event`] does, with no data timestamps.
+    pub(crate) fn record_replay(&self, ev: &MarketEvent) {
+        if matches!(ev, MarketEvent::Control(_)) {
+            self.record_event(ev);
+        } else {
+            self.record_seq(ev);
         }
     }
 
@@ -717,6 +755,11 @@ impl FanOut {
         self.subscribers.remove(&id);
     }
 
+    /// Remove every referrer whose receiver is gone.
+    pub(crate) fn remove_closed(&mut self) {
+        self.subscribers.retain(|_, r| !r.tx.is_closed());
+    }
+
     /// True once a subscriber has been added and the fan-out is now empty —
     /// the refcounted-teardown trigger.
     pub(crate) fn should_teardown(&self) -> bool {
@@ -947,9 +990,9 @@ enum ClientCommand {
     Subscribe {
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<Subscribed>>,
     },
     Unsubscribe {
         instrument: Instrument,
@@ -1031,8 +1074,12 @@ impl ClientController {
                 options,
                 reply,
             } => {
-                let res = self.subscribe(instrument, kind, scope, options).await;
-                let _ = reply.send(res);
+                let res = self
+                    .subscribe(instrument.clone(), kind, scope, options)
+                    .await;
+                if matches!(reply.send(res), Err(Ok(_))) {
+                    let _ = self.unsubscribe(instrument, kind).await;
+                }
                 true
             }
             ClientCommand::Unsubscribe {
@@ -1074,26 +1121,16 @@ impl ClientController {
         &mut self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<()> {
+    ) -> Result<Subscribed> {
         let key = (instrument.clone(), kind);
         if self.entries.contains_key(&key) {
             return Err(Error::DuplicateSubscription { instrument, kind });
         }
-        // Phase 2: client subscriptions are pure-live. A shared authoritative
-        // session has one creation-time scope, so a per-client backfill /
-        // historical join would break the identical-`(seq, source_ts)`
-        // guarantee. Reject the unsupported variants with a clear error.
-        if !matches!(
-            scope,
-            Scope::Live {
-                backfill_from: None
-            }
-        ) {
-            return Err(Error::UnsupportedClientScope);
-        }
-        let (_auth, guard, rx) = self
+        let Attached {
+            guard, rx, outcome, ..
+        } = self
             .dm
             .authoritative(instrument.clone(), kind, scope, options)
             .await?;
@@ -1107,7 +1144,7 @@ impl ClientController {
         );
         self.streams.insert(key, substream(rx));
         self.sync_subscriptions();
-        Ok(())
+        Ok(outcome)
     }
 
     async fn unsubscribe(&mut self, instrument: Instrument, kind: EventKind) -> Result<()> {
@@ -1376,9 +1413,9 @@ impl ClientHandle {
         &self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<()> {
+    ) -> Result<Subscribed> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(ClientCommand::Subscribe {
@@ -1476,7 +1513,8 @@ pub(crate) fn spawn_client(
 ///
 /// Determinism is **per symbol only**: each instrument's substream is
 /// `seq`-monotonic (source-stamped); there is no cross-instrument ordering
-/// (arrival order). Subscriptions are pure-live in Phase 2.
+/// (arrival order). Subscriptions are unbounded: pure-live, or a backfill
+/// seamed into the live tail.
 pub struct ClientSession {
     handle: ClientHandle,
 }
@@ -1486,24 +1524,30 @@ impl ClientSession {
         Self { handle }
     }
 
-    /// Add a subscription to this client's set.
+    /// Add a subscription to this client's set and return what it opened.
+    ///
+    /// The pair's authoritative session is created with the first subscriber's
+    /// `scope` and every later subscriber joins it as is.
     ///
     /// # Errors
     ///
     /// - [`Error::DuplicateSubscription`] — `(instrument, kind)` is already in
     ///   this client's set.
-    /// - [`Error::UnsupportedClientScope`] — Phase 2 client subscriptions are
-    ///   pure-live; `Scope::Historical` and `Live { backfill_from: Some(_) }`
-    ///   are rejected.
-    /// - [`Error::UnsupportedEventKind`] — no provider serves the pair.
+    /// - [`Error::UnsupportedEventKind`] — no provider serves the pair on the
+    ///   surfaces the scope needs (live, plus history under backfill).
+    /// - [`Error::PersistenceRequired`] — `options` needs a cache or tap log
+    ///   that is not configured, on a joiner as on a creator.
+    /// - [`Error::BackfillFromNotInPast`] — this subscribe would create a
+    ///   session whose backfill starts at or past the live edge. A joiner is
+    ///   not checked.
     /// - [`Error::SessionClosed`] — the controller has shut down.
     pub async fn subscribe(
         &self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<()> {
+    ) -> Result<Subscribed> {
         self.handle
             .subscribe(instrument, kind, scope, options)
             .await
@@ -1613,6 +1657,17 @@ mod live_stats_tests {
         assert_eq!(s.gap_count(), 1);
         // The gap also occupies a seq slot.
         assert_eq!(s.seq_position(), Some(Seq(7)));
+    }
+
+    #[test]
+    fn a_replayed_event_records_position_and_gaps_but_no_timestamps() {
+        let s = LiveStats::new();
+        s.record_replay(&trade(100, 3));
+        assert_eq!(s.seq_position(), Some(Seq(3)));
+        assert_eq!(s.last_source_ts(), None);
+        assert_eq!(s.last_rx_ts(), None);
+        s.record_replay(&gap());
+        assert_eq!(s.gap_count(), 1);
     }
 
     #[test]

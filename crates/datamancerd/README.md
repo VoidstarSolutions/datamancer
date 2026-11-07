@@ -163,7 +163,7 @@ asset_class = "crypto"            # equity | crypto
 symbol = "BTC/USD"
 kind = "trade"                    # trade | quote | bar1s | bar1m | bar5m | bar15m | bar1h | bar1d
 scope = "live"                    # live | live_backfill
-backfill_from = "2026-06-01T00:00:00Z"   # required iff scope = live_backfill
+# backfill_from = "2026-06-01T00:00:00Z" # required iff scope = live_backfill
 persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only | refresh | tap_only
 always_on = true                  # hold for the process lifetime regardless of clients
 
@@ -178,7 +178,8 @@ configured, and providers are enabled at runtime via the config service's
 restarting). Validation fails fast on the remaining cross-section invariants:
 a startup session using a cache preset requires `[cache]`; one writing the
 tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
-`backfill_from`.
+`backfill_from`, and `scope = live` refuses one. An `always_on` session's
+start must precede the live edge when it opens at boot.
 
 `[session] query_persistence` is the daemon's single cache policy for every
 `open-query` — queries carry no per-request persistence selector on the wire.
@@ -418,6 +419,11 @@ One JSON object per line; one reply line per request.
 {"op":"open-client","client":"exec-1","subscriptions":[ /* SubscriptionSpec… */ ]}
   -> {"ok":true,"service":"datamancerd/1729600000-4321/v3/data/0"}
 {"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
+  -> {"ok":true,"scope":"live"}
+{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":1704067200000000000,"persistence":"cached"}
+  -> {"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000}
+{"op":"subscribe","client":"exec-2","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m"}
+  -> {"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000,"joined":true}
 {"op":"unsubscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
 {"op":"close-client","client":"exec-1"}
 {"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1704067200000000000,"to":1704672000000000000}
@@ -450,6 +456,31 @@ One JSON object per line; one reply line per request.
 {"op":"health"}
   -> {"ok":true,"health":{ /* HealthView, schema_version 3, daemon-stamped */ }}
 ```
+
+`subscribe` opens an unbounded subscription:
+
+- `scope` is `live` (the default) or `live_backfill`.
+- `backfill_from` (epoch nanoseconds, inclusive) is required under
+  `live_backfill` and refused under `live`; either disagreement is
+  `bad_request`.
+- A `backfill_from` at or past the live edge is `backfill_not_in_past`, on a
+  subscribe that would create the session.
+- The reply's `scope` and `backfill_from` are the scope of the pair's shared
+  session, fixed by the subscriber that created it.
+- `"joined":true` marks a subscriber that joined an open session; the creator's
+  reply omits it. A joiner's stream begins where it joined, with no `Gap` for
+  what it missed.
+- `"backfill_in_flight":true` on a joiner's reply means a backfill was running
+  at the join: its stream carries what is left of it, then the buffered live
+  arrivals, then the live tail. A joiner that needs the whole history uses
+  `open-query`, and with the flag set must expect the overlap.
+
+`open-client` seeds follow the same rules and are live-only: any other scope
+is `bad_request`, checked for all seeds before any subscribes. A client that
+wants a backfill subscribes after opening.
+
+How a backfill seams into the live tail is in the
+[library README](../datamancer/README.md#subscriptions).
 
 `open-query` opens a **bounded historical query** over
 `from..to` (inclusive `from`, `to >= from` or `bad_request`) — **ungated**,
@@ -593,8 +624,8 @@ config-service ops (spec cycle 3); see the dedicated section below for
 gating, classification, and semantics.
 
 Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
-(`live_session_conflict`, `unsupported_event_kind`, `persistence_required`,
-`unsupported_client_scope`, `duplicate_subscription`, `not_subscribed`,
+(`unsupported_event_kind`, `persistence_required`,
+`backfill_not_in_past`, `duplicate_subscription`, `not_subscribed`,
 `unknown_provider`, `unknown_client`, `duplicate_client`,
 `service_cap_exceeded`, `bad_request`, `shutting_down`,
 `credentials_missing`, `credential_backend_unavailable`, `permission_denied`,
@@ -837,7 +868,7 @@ connection identifies the client):
 
 ```jsonc
 {"id":1,"op":"subscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
-  -> {"id":1,"ok":true}
+  -> {"id":1,"ok":true,"scope":"live"}
 {"id":2,"op":"snapshot"}
   -> {"id":2,"ok":true,"snapshot":{ /* SystemSnapshot */ }}
 {"id":3,"op":"unsubscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}

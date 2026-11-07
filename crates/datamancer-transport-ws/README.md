@@ -46,7 +46,7 @@ Requests are tagged JSON, `op` field, kebab-case:
 Replies echo the request `id`:
 
 ```jsonc
-{"id":1,"ok":true}
+{"id":1,"ok":true,"scope":"live"}
 {"id":3,"ok":true,"snapshot":{ /* SystemSnapshot */ }}
 {"id":5,"ok":false,"code":"unsupported_event_kind","message":"…"}
 ```

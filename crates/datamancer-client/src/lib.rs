@@ -37,6 +37,7 @@ pub mod pipe_control;
 pub mod ws;
 
 pub use client::Client;
+pub use datamancer_core::{LiveScope, ScopeMismatch, ScopeName, Subscribed};
 pub use error::ClientError;
 pub use paths::default_control_socket;
 

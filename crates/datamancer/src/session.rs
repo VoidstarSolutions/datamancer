@@ -51,7 +51,7 @@
 
 use crate::accounting::ProviderAccounting;
 use crate::client_session::{
-    AuthoritativeSession, ClientHandle, ClientSession, ClientStats, FanOut, LiveStats,
+    Attached, AuthoritativeSession, ClientHandle, ClientSession, ClientStats, FanOut, LiveStats,
     SubscriberGuard, SubscriberId, spawn_client,
 };
 use crate::fetch_locks::FetchLocks;
@@ -63,9 +63,9 @@ use async_trait::async_trait;
 use datamancer_core::{
     Adjustment, AuthoritativeSessionSnapshot, Bar, CacheKey, CacheSnapshot, ClientSessionSnapshot,
     Control, ControlKind, Error, EventKind, EventSink, GapSpan, HealthView, HistoricalCache,
-    HistoryRequest, Instrument, InstrumentEntry, InstrumentInfo, LiveHandle, MarketEvent, Provider,
-    ProviderId, ProviderSnapshot, PublishOutcome, Quote, ReplayRequest, Result, Seq, Surface,
-    SystemSnapshot, TapLog, Timestamp, Trade,
+    HistoryRequest, Instrument, InstrumentEntry, InstrumentInfo, LiveHandle, LiveScope,
+    MarketEvent, Provider, ProviderId, ProviderSnapshot, PublishOutcome, Quote, ReplayRequest,
+    Result, Seq, Subscribed, Surface, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -85,6 +85,14 @@ pub enum Scope {
     /// session fetches history from `t` up to the live edge and seams into
     /// the live tail; with `None`, it starts purely from "now."
     Live { backfill_from: Option<Timestamp> },
+}
+
+impl From<LiveScope> for Scope {
+    fn from(scope: LiveScope) -> Self {
+        Self::Live {
+            backfill_from: scope.backfill_from(),
+        }
+    }
 }
 
 /// How a session interacts with the configured persistence layer.
@@ -250,11 +258,10 @@ impl Datamancer {
     /// Fail-fast on:
     /// - [`Error::UnsupportedEventKind`] — no registered provider serves
     ///   `(instrument, kind)`.
-    /// - [`Error::LiveSessionConflict`] — a live session for this pair is
-    ///   already active (Live scope only; multiple Historical sessions for
-    ///   the same pair are stateless reads and run concurrently).
-    /// - [`Error::PersistenceRequired`] — `options` requires a cache but no
-    ///   [`HistoricalCache`] is configured.
+    /// - [`Error::PersistenceRequired`] — `options` needs a cache or tap log
+    ///   that is not configured.
+    /// - [`Error::BackfillFromNotInPast`] — a live backfill would start at or
+    ///   past the live edge.
     ///
     /// # Panics
     ///
@@ -267,15 +274,9 @@ impl Datamancer {
         scope: Scope,
         options: PersistenceOptions,
     ) -> Result<Session> {
-        if options.uses_cache() && self.inner.historical_cache.is_none() {
-            return Err(Error::PersistenceRequired);
-        }
-        if options.write_tap_log && self.inner.tap_log.is_none() {
-            return Err(Error::PersistenceRequired);
-        }
-
         match scope {
             Scope::Historical { from, to } => {
+                self.check_persistence(options)?;
                 // Historical sessions do not participate in the live registry
                 // (concurrent reads for the same pair run independently) and keep
                 // the single-consumer controller verbatim.
@@ -313,12 +314,19 @@ impl Datamancer {
                     variant: SessionVariant::Historical(HistoricalSession { inner }),
                 })
             }
-            Scope::Live { .. } => {
+            Scope::Live { backfill_from } => {
                 // Live sessions are refcounted referrers onto the shared
                 // authoritative session: a second opener for the same pair shares
-                // it (no longer `LiveSessionConflict`). The single-pair `Session`
-                // is implemented as a one-subscription client referrer.
-                let (authoritative, guard, rx) = self
+                // it. The single-pair `Session` is implemented as a one-subscription
+                // client referrer.
+                let scope =
+                    backfill_from.map_or(LiveScope::Live, |from| LiveScope::LiveBackfill { from });
+                let Attached {
+                    session: authoritative,
+                    guard,
+                    rx,
+                    ..
+                } = self
                     .authoritative(instrument.clone(), kind, scope, options)
                     .await?;
                 let provider = authoritative.provider_id.clone();
@@ -348,23 +356,12 @@ impl Datamancer {
         &self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<(
-        Arc<AuthoritativeSession>,
-        SubscriberGuard,
-        mpsc::Receiver<MarketEvent>,
-    )> {
-        // A backfilling live session seams a historical fetch into the live
-        // tail, so it needs both surfaces from the one provider that will serve
-        // the whole substream.
-        let surfaces: &[Surface] = match scope {
-            Scope::Live {
-                backfill_from: Some(_),
-            } => &[Surface::Live, Surface::History],
-            _ => &[Surface::Live],
-        };
-        let provider = self.route(&instrument, kind, surfaces)?;
+    ) -> Result<Attached> {
+        self.check_persistence(options)?;
+
+        self.route(&instrument, kind, &[Surface::Live])?;
         let key = (instrument.clone(), kind);
 
         // Probe under the lock; if a live session exists, try to share it.
@@ -377,14 +374,30 @@ impl Datamancer {
             map.get(&key).and_then(Weak::upgrade)
         };
         if let Some(existing) = existing
-            && let Ok((id, rx)) = existing.add_subscriber().await
+            && let Ok(subscriber) = existing.add_subscriber().await
         {
-            let guard = SubscriberGuard::new(existing.clone(), id);
-            return Ok((existing, guard, rx));
+            return Ok(Attached::joined(existing, subscriber));
         }
+
+        // Only a creator: a backfill needs both surfaces from one provider.
+        let surfaces: &[Surface] = if scope.backfill_from().is_some() {
+            &[Surface::Live, Surface::History]
+        } else {
+            &[Surface::Live]
+        };
+        let provider = self.route(&instrument, kind, surfaces)?;
+        check_backfill_start(scope)?;
 
         self.create_authoritative(provider, instrument, kind, scope, options, key)
             .await
+    }
+
+    fn check_persistence(&self, options: PersistenceOptions) -> Result<()> {
+        check_persistence(
+            options,
+            self.inner.historical_cache.as_ref(),
+            self.inner.tap_log.as_ref(),
+        )
     }
 
     async fn create_authoritative(
@@ -392,14 +405,10 @@ impl Datamancer {
         provider: Arc<dyn Provider>,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
         key: (Instrument, EventKind),
-    ) -> Result<(
-        Arc<AuthoritativeSession>,
-        SubscriberGuard,
-        mpsc::Receiver<MarketEvent>,
-    )> {
+    ) -> Result<Attached> {
         let accounting = self.inner.accounting_for(provider.id());
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(default_buffer());
         let (remove_tx, remove_rx) = mpsc::unbounded_channel::<SubscriberId>();
@@ -434,9 +443,8 @@ impl Datamancer {
             }
         };
         if let Some(winner) = winner {
-            let (id, rx) = winner.add_subscriber().await?;
-            let guard = SubscriberGuard::new(winner.clone(), id);
-            return Ok((winner, guard, rx));
+            let subscriber = winner.add_subscriber().await?;
+            return Ok(Attached::joined(winner, subscriber));
         }
 
         // Pre-seed the opener as the first fan-out subscriber *before* spawning
@@ -454,7 +462,7 @@ impl Datamancer {
         let inner = Arc::new(SessionInner {
             instrument: instrument.clone(),
             kind,
-            scope,
+            scope: scope.into(),
             events_holder: Mutex::new(None),
             persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
@@ -476,10 +484,7 @@ impl Datamancer {
             accounting: accounting.clone(),
             data_forwarded: false,
         };
-        let backfill_from = match scope {
-            Scope::Live { backfill_from } => backfill_from,
-            Scope::Historical { .. } => None,
-        };
+        let backfill_from = scope.backfill_from();
         // Pure-live only: fire a non-gating "latest value" fetch concurrently
         // with the live connect. The result is injected as the first data event
         // (immediate UI feedback) unless a real live value wins the race, in
@@ -514,7 +519,12 @@ impl Datamancer {
         ));
 
         let guard = SubscriberGuard::new(authoritative.clone(), first_id);
-        Ok((authoritative, guard, first_rx))
+        Ok(Attached {
+            session: authoritative,
+            guard,
+            rx: first_rx,
+            outcome: Subscribed::created(scope),
+        })
     }
 
     /// Spawn the non-gating `Provider::latest` fetch for a pure-live session
@@ -1251,7 +1261,7 @@ impl Session {
     pub fn scope(&self) -> Scope {
         match &self.variant {
             SessionVariant::Historical(h) => h.inner.scope,
-            SessionVariant::Live(l) => l.authoritative.scope,
+            SessionVariant::Live(l) => l.authoritative.scope.into(),
         }
     }
 }
@@ -1292,7 +1302,8 @@ pub(crate) enum SessionCommand {
     AddSubscriber {
         id: SubscriberId,
         sender: mpsc::Sender<MarketEvent>,
-        ack: oneshot::Sender<()>,
+        /// Answers whether a backfill is running.
+        ack: oneshot::Sender<bool>,
     },
 }
 
@@ -1318,12 +1329,16 @@ enum Sink {
     Detached(EventRing),
 }
 
-/// How a forwarded event reached the controller. Only stats and accounting
-/// read it: every arrival is stamped, teed and delivered the same way.
+/// How a delivered event reached the controller. Only stats and accounting
+/// read it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Arrival {
     /// From the provider's live stream.
     Live,
+    /// Replayed history, from the cache or a fetch, ahead of the live tail. It
+    /// records its `seq` position and any control, a `Gap` included, but no
+    /// timestamps, so a stream's latency and last-event times stay live ones.
+    Replay,
     /// The pure-live latest-value seed, a `Provider::latest` snapshot. It
     /// records its `seq` position but no timestamps (so no latency, and the
     /// stream reads idle until its first live event) and no live `messages`.
@@ -1390,7 +1405,7 @@ impl Controller {
     /// **unstamped** (`buffer_live_arrival` does a raw push) so their `seq` is
     /// deferred to here — stamping at the seam places the live arrivals *after*
     /// all backfill segments in canonical order and preserves monotonicity.
-    /// One `Gap` for anything the ring evicted, then the survivors, each through
+    /// One `Gap` for any data the ring evicted, then the survivors, each through
     /// `forward` (which stamps **then** tees **then** delivers). Going through
     /// `forward` rather than `emit` is load-bearing: it persists the
     /// seam-assigned source `seq` to the tap log verbatim. Teeing here (not at
@@ -2081,9 +2096,12 @@ impl Controller {
         self.fanout.as_ref().is_some_and(FanOut::should_teardown)
     }
 
+    /// Remove `id`, and with it every referrer whose receiver is gone (a join
+    /// cancelled after it was answered).
     fn remove_subscriber(&mut self, id: SubscriberId) {
         if let Some(fanout) = self.fanout.as_mut() {
             fanout.remove(id);
+            fanout.remove_closed();
             self.stats.set_subscribers(fanout.subscriber_count());
         }
     }
@@ -2147,13 +2165,8 @@ impl Controller {
     /// the ring push, an evicted event is already numbered, so a ring overflow
     /// is a real `seq` hole reported as `Control::Gap`. While detached there is
     /// no other producer into the outbound order, so push order == canonical
-    /// delivery order.
-    async fn deliver(&mut self, ev: MarketEvent) {
-        self.deliver_with(ev, Arrival::Live).await;
-    }
-
-    /// [`deliver`](Self::deliver), with the event's [`Arrival`]: a seed records
-    /// only its `seq` position in the per-symbol stats.
+    /// delivery order. The event's [`Arrival`] chooses what the per-symbol
+    /// stats record.
     async fn deliver_with(&mut self, ev: MarketEvent, arrival: Arrival) {
         // Live authoritative session: fan the stamped event out to every
         // referrer. Each referrer owns its per-client resume buffer, so there is
@@ -2161,6 +2174,7 @@ impl Controller {
         if self.fanout.is_some() {
             match arrival {
                 Arrival::Live => self.stats.record_event(&ev),
+                Arrival::Replay => self.stats.record_replay(&ev),
                 Arrival::Seed => self.stats.record_seed(&ev),
             }
             if let Some(fanout) = self.fanout.as_mut() {
@@ -2189,7 +2203,7 @@ impl Controller {
     /// not tee.
     async fn emit(&mut self, ev: MarketEvent) {
         let ev = self.stamp(ev);
-        self.deliver(ev).await;
+        self.deliver_with(ev, Arrival::Replay).await;
     }
 
     /// Stamp `seq` at the source, tee the (stamped) data event to the tap log
@@ -2295,11 +2309,17 @@ impl Controller {
                 true
             }
             Some(SessionCommand::AddSubscriber { id, sender, ack }) => {
-                if let Some(fanout) = self.fanout.as_mut() {
+                // A join cancelled while this command was queued has dropped its
+                // receiver; one cancelled after it is answered drops the answer.
+                // Neither may stay a referrer.
+                let open = !sender.is_closed();
+                if open && let Some(fanout) = self.fanout.as_mut() {
                     fanout.add(id, sender);
                     self.stats.set_subscribers(fanout.subscriber_count());
                 }
-                let _ = ack.send(());
+                if ack.send(self.stats.backfilling()).is_err() && open {
+                    self.remove_subscriber(id);
+                }
                 true
             }
             Some(SessionCommand::Close(ack)) => {
@@ -2312,12 +2332,11 @@ impl Controller {
     }
 
     fn apply_persistence(&self, options: PersistenceOptions) -> Result<()> {
-        if options.uses_cache() && self.historical_cache.is_none() {
-            return Err(Error::PersistenceRequired);
-        }
-        if options.write_tap_log && self.tap_log.is_none() {
-            return Err(Error::PersistenceRequired);
-        }
+        check_persistence(
+            options,
+            self.historical_cache.as_ref(),
+            self.tap_log.as_ref(),
+        )?;
         *self
             .inner
             .persistence
@@ -2607,6 +2626,32 @@ fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
         MarketEvent::Control(c) => Some(c.source_ts),
         _ => None,
     }
+}
+
+/// Check that a backfill in `scope` has something to fetch.
+///
+/// # Errors
+///
+/// [`Error::BackfillFromNotInPast`] when it starts at or past the live edge.
+fn check_backfill_start(scope: LiveScope) -> Result<()> {
+    if let Some(from) = scope.backfill_from() {
+        let edge = wall_clock_ts();
+        if from >= edge {
+            return Err(Error::BackfillFromNotInPast { from, edge });
+        }
+    }
+    Ok(())
+}
+
+fn check_persistence(
+    options: PersistenceOptions,
+    cache: Option<&Arc<dyn HistoricalCache>>,
+    tap_log: Option<&Arc<dyn TapLog>>,
+) -> Result<()> {
+    if (options.uses_cache() && cache.is_none()) || (options.write_tap_log && tap_log.is_none()) {
+        return Err(Error::PersistenceRequired);
+    }
+    Ok(())
 }
 
 fn wall_clock_ts() -> Timestamp {

@@ -11,8 +11,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer::Surface;
 use datamancer::{
-    AssetClass, ControlKind, Datamancer, EventKind, Instrument, LiveHandle, MarketEvent,
-    PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq, Timestamp, Trade,
+    AssetClass, ControlKind, Datamancer, EventKind, Instrument, LiveHandle, LiveScope, MarketEvent,
+    PersistenceOptions, Price, Provider, ProviderId, Result, Seq, Subscribed, Timestamp, Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -27,6 +27,16 @@ struct Shared {
     /// One sink per subscribed symbol. Each `start_live` is its own connection;
     /// `subscribe` registers that connection's sink for the pair's symbol.
     sinks: HashMap<String, mpsc::Sender<MarketEvent>>,
+    /// What `fetch_history` serves, filtered to the requested symbol.
+    history: Vec<MarketEvent>,
+    /// When set, `fetch_history` waits for one notification before serving,
+    /// so a test can push live prints while the backfill is in flight.
+    history_gate: Option<Arc<tokio::sync::Notify>>,
+    /// When set, `fetch_history` serves this many events, then waits for one
+    /// notification before serving the rest.
+    history_pause: Option<(usize, Arc<tokio::sync::Notify>)>,
+    /// When set, the next `LiveHandle::subscribe` waits for one notification.
+    subscribe_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 struct FakeProvider {
@@ -83,6 +93,22 @@ impl Ctrl {
         self.live_starts.load(Ordering::SeqCst)
     }
 
+    async fn set_history(&self, events: Vec<MarketEvent>) {
+        self.shared.lock().await.history = events;
+    }
+
+    async fn gate_history(&self, gate: Arc<tokio::sync::Notify>) {
+        self.shared.lock().await.history_gate = Some(gate);
+    }
+
+    async fn gate_next_subscribe(&self, gate: Arc<tokio::sync::Notify>) {
+        self.shared.lock().await.subscribe_gate = Some(gate);
+    }
+
+    async fn pause_history_after(&self, served: usize, gate: Arc<tokio::sync::Notify>) {
+        self.shared.lock().await.history_pause = Some((served, gate));
+    }
+
     fn unsubscribes(&self) -> usize {
         self.unsubscribes.load(Ordering::SeqCst)
     }
@@ -127,9 +153,34 @@ impl Provider for FakeProvider {
     }
     async fn fetch_history(
         &self,
-        _request: HistoryRequest,
-        _sink: mpsc::Sender<MarketEvent>,
+        request: HistoryRequest,
+        sink: mpsc::Sender<MarketEvent>,
     ) -> Result<()> {
+        let (history, gate, pause) = {
+            let shared = self.shared.lock().await;
+            (
+                shared.history.clone(),
+                shared.history_gate.clone(),
+                shared.history_pause.clone(),
+            )
+        };
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        for (served, ev) in history.into_iter().enumerate() {
+            if let Some((at, gate)) = &pause
+                && *at == served
+            {
+                gate.notified().await;
+            }
+            let MarketEvent::Trade(t) = &ev else {
+                continue;
+            };
+            if t.instrument.symbol() == request.instrument.symbol() && sink.send(ev).await.is_err()
+            {
+                break;
+            }
+        }
         Ok(())
     }
 }
@@ -147,6 +198,10 @@ struct FakeLiveHandle {
 #[async_trait]
 impl LiveHandle for FakeLiveHandle {
     async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
+        let gate = self.shared.lock().await.subscribe_gate.take();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         let symbol = instrument.symbol().to_string();
         self.shared
             .lock()
@@ -206,10 +261,8 @@ fn trade(symbol: &str, ts: i64) -> MarketEvent {
     })
 }
 
-fn live() -> Scope {
-    Scope::Live {
-        backfill_from: None,
-    }
+fn live() -> LiveScope {
+    LiveScope::Live
 }
 
 async fn next_ev(stream: &mut datamancer::EventStream) -> MarketEvent {
@@ -568,6 +621,107 @@ async fn last_referrer_drop_tears_down_authoritative_session() {
     let _ = c.close().await;
 }
 
+/// A subscribe whose caller gave up leaves no subscription behind, so the
+/// caller's retry is a subscribe of its own.
+#[tokio::test(start_paused = true)]
+async fn a_subscribe_whose_caller_gave_up_leaves_no_subscription() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_next_subscribe(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let abandoned = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        ),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the subscribe must still be waiting");
+
+    gate.notify_one();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .expect("the retry is a new subscribe");
+    let _ = client.close().await;
+}
+
+/// A join cancelled once its subscriber is queued, before or after the
+/// session takes it, leaves no referrer behind: once a real referrer leaves,
+/// the session counts only the one left, with no further event to reap the
+/// cancelled one.
+#[tokio::test]
+async fn a_cancelled_join_leaves_no_referrer() {
+    for taken_first in [false, true] {
+        let (provider, _ctrl) = FakeProvider::new("fake", false);
+        let dm = Datamancer::builder()
+            .provider_arc(provider)
+            .build()
+            .unwrap();
+        let stays = dm.client_session();
+        let leaves = dm.client_session();
+        for client in [&stays, &leaves] {
+            client
+                .subscribe(
+                    inst("AAPL"),
+                    EventKind::Trade,
+                    live(),
+                    PersistenceOptions::none(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut join = Box::pin(dm.session(
+            inst("AAPL"),
+            EventKind::Trade,
+            datamancer::Scope::Live {
+                backfill_from: None,
+            },
+            PersistenceOptions::none(),
+        ));
+        assert!(
+            futures::poll!(join.as_mut()).is_pending(),
+            "the join waits on the session's answer"
+        );
+        if taken_first {
+            // Let the session add the subscriber and answer before the cancel.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(join);
+
+        leaves.close().await.unwrap();
+        let referrers = || {
+            dm.snapshot_live()
+                .authoritative_sessions
+                .first()
+                .map(|s| s.subscriber_refcount)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while referrers() != Some(1) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "taken first: {taken_first}; referrers: {:?}",
+                referrers()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = stays.close().await;
+    }
+}
+
 #[tokio::test]
 async fn authoritative_survives_while_one_referrer_remains() {
     let (provider, ctrl) = FakeProvider::new("fake", false);
@@ -829,44 +983,405 @@ async fn unsubscribe_then_resubscribe_replays_subscription_changed() {
     let _ = keeper.close().await;
 }
 
+/// Replayed history moves a stream's `seq` position, but the live timestamps
+/// come only from the live tail.
 #[tokio::test]
-async fn client_subscribe_rejects_historical_and_backfill() {
-    let (provider, _ctrl) = FakeProvider::new("fake", false);
+async fn a_backfill_leaves_the_live_timestamps_alone() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(vec![trade("AAPL", 1), trade("AAPL", 3)])
+        .await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+
+    let (replayed, _) = drain_data(&mut stream, 2).await;
+    assert_eq!(replayed.len(), 2);
+    let snap = dm.snapshot().await.unwrap();
+    let session = &snap.authoritative_sessions[0];
+    assert_eq!(session.last_source_ts, None, "a replayed print is not live");
+    assert_eq!(session.last_rx_ts, None, "a replayed print is not live");
+    assert_eq!(session.latency_ns, None);
+    assert_eq!(session.seq_position, Some(Seq(1)));
+
+    ctrl.push("AAPL", trade("AAPL", 300)).await;
+    drain_data(&mut stream, 1).await;
+    let snap = dm.snapshot().await.unwrap();
+    assert_eq!(
+        snap.authoritative_sessions[0].last_source_ts,
+        Some(Timestamp(300))
+    );
+}
+
+/// A client subscription with `backfill_from` gets the library's seam: the
+/// history first, then the live prints that arrived during the backfill in
+/// arrival order, then the live tail — one monotonic `seq`, no `Gap` while
+/// nothing was lost.
+#[tokio::test]
+async fn client_subscribe_with_backfill_serves_history_then_buffered_then_live() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1), trade("AAPL", 2)])
+        .await;
+    ctrl.gate_history(gate.clone()).await;
     let dm = Datamancer::builder()
         .provider_arc(provider)
         .build()
         .unwrap();
     let client = dm.client_session();
 
-    match client
+    let actual = client
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Historical {
-                from: Timestamp(0),
-                to: Timestamp(10),
-            },
+            LiveScope::LiveBackfill { from: Timestamp(0) },
             PersistenceOptions::none(),
         )
         .await
-    {
-        Err(datamancer::Error::UnsupportedClientScope) => {}
-        other => panic!("expected UnsupportedClientScope, got {other:?}"),
+        .unwrap();
+    assert_eq!(
+        actual,
+        Subscribed::created(LiveScope::LiveBackfill { from: Timestamp(0) }),
+        "the first subscriber creates the session"
+    );
+    assert_eq!(actual.history_from(), Some(Timestamp(0)));
+    let mut stream = client.take_events().await.unwrap();
+
+    // The provider is subscribed before the backfill runs, so a print that
+    // lands while history is still being fetched is buffered, not lost.
+    ctrl.push("AAPL", trade("AAPL", 200)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    let (data, controls) = drain_data(&mut stream, 3).await;
+    assert_eq!(
+        data,
+        vec![
+            ("AAPL".to_string(), 1, 0),
+            ("AAPL".to_string(), 2, 1),
+            ("AAPL".to_string(), 200, 2),
+        ]
+    );
+    assert_eq!(
+        dm.snapshot().await.unwrap().authoritative_sessions[0].last_source_ts,
+        Some(Timestamp(200)),
+        "a print flushed at the seam is a live arrival"
+    );
+
+    // The live tail continues after the seam.
+    ctrl.push("AAPL", trade("AAPL", 300)).await;
+    let (tail, more_controls) = drain_data(&mut stream, 1).await;
+    assert_eq!(tail, vec![("AAPL".to_string(), 300, 3)]);
+    for control in controls.into_iter().chain(more_controls) {
+        assert!(
+            !matches!(control, ControlKind::Gap { .. }),
+            "no Gap at a healthy seam, got {control:?}"
+        );
     }
-    match client
+    let _ = client.close().await;
+}
+
+fn trades_from(first: i64, count: i64) -> Vec<MarketEvent> {
+    (first..first + count).map(|ts| trade("AAPL", ts)).collect()
+}
+
+/// Reads until `count` prints arrive and answers them and how many `Gap`s came
+/// with them.
+async fn read_prints(stream: &mut datamancer::EventStream, count: usize) -> (Vec<i64>, usize) {
+    let mut prints = Vec::new();
+    let mut gaps = 0;
+    while prints.len() < count {
+        let next = tokio::time::timeout(Duration::from_secs(40), stream.next());
+        match next.await.expect("prints stopped").expect("stream ended") {
+            MarketEvent::Trade(t) => prints.push(t.source_ts.0),
+            MarketEvent::Control(c) if matches!(c.kind, ControlKind::Gap { .. }) => gaps += 1,
+            _ => {}
+        }
+    }
+    (prints, gaps)
+}
+
+/// Once the backfill has finished, a joiner hears none is running.
+#[tokio::test]
+async fn a_joiner_after_the_backfill_hears_none_is_in_flight() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 2)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let none = PersistenceOptions::none();
+    let creator = dm.client_session();
+    creator
+        .subscribe(inst("AAPL"), EventKind::Trade, backfill, none)
+        .await
+        .unwrap();
+    let mut stream = creator.take_events().await.unwrap();
+    read_prints(&mut stream, 2).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    read_prints(&mut stream, 1).await;
+
+    let joined = dm
+        .client_session()
+        .subscribe(inst("AAPL"), EventKind::Trade, LiveScope::Live, none)
+        .await
+        .unwrap();
+    assert_eq!(joined, Subscribed::joined(backfill, false));
+    let _ = creator.close().await;
+}
+
+/// Options no backend can serve are refused whether the subscribe creates the
+/// session or joins it, so the answer never depends on who arrived first.
+#[tokio::test]
+async fn client_subscribe_refuses_options_no_backend_serves() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let live = LiveScope::default();
+    for options in [
+        PersistenceOptions::cached(),
+        PersistenceOptions::none().with_tap_log(true),
+    ] {
+        let refused = client
+            .subscribe(inst("AAPL"), EventKind::Trade, live, options)
+            .await;
+        assert!(
+            matches!(refused, Err(datamancer::Error::PersistenceRequired)),
+            "creator: {refused:?}"
+        );
+    }
+
+    client
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            live,
             PersistenceOptions::none(),
         )
         .await
-    {
-        Err(datamancer::Error::UnsupportedClientScope) => {}
-        other => panic!("expected UnsupportedClientScope, got {other:?}"),
-    }
+        .unwrap();
+    let joiner = dm.client_session();
+    let refused = joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live,
+            PersistenceOptions::cached(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(datamancer::Error::PersistenceRequired)),
+        "joiner: {refused:?}"
+    );
+    let _ = client.close().await;
+    let _ = joiner.close().await;
+}
+
+/// The pair's authoritative session is created with the first subscriber's
+/// scope; a later subscriber joins it as is and is told the session's scope.
+#[tokio::test]
+async fn client_subscribe_reports_the_shared_sessions_actual_scope() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1)]).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+
+    // AAPL: opened with a backfill; a pure-live joiner is told so while the
+    // backfill is still in flight.
+    let first = dm.client_session();
+    assert_eq!(
+        first
+            .subscribe(
+                inst("AAPL"),
+                EventKind::Trade,
+                backfill,
+                PersistenceOptions::none()
+            )
+            .await
+            .unwrap(),
+        Subscribed::created(backfill)
+    );
+    let second = dm.client_session();
+    assert_eq!(
+        second
+            .subscribe(
+                inst("AAPL"),
+                EventKind::Trade,
+                live(),
+                PersistenceOptions::none()
+            )
+            .await
+            .unwrap(),
+        Subscribed::joined(backfill, true),
+        "a joiner is told the session's scope, not its own request"
+    );
+    assert_eq!(ctrl.live_starts(), 1, "the pair is shared, not reopened");
+
+    // MSFT: opened pure-live; a backfill request joins it and is told so.
+    assert_eq!(
+        first
+            .subscribe(
+                inst("MSFT"),
+                EventKind::Trade,
+                live(),
+                PersistenceOptions::none()
+            )
+            .await
+            .unwrap(),
+        Subscribed::created(live())
+    );
+    assert_eq!(
+        second
+            .subscribe(
+                inst("MSFT"),
+                EventKind::Trade,
+                backfill,
+                PersistenceOptions::none()
+            )
+            .await
+            .unwrap(),
+        Subscribed::joined(live(), false),
+        "a backfill request on a pure-live pair comes back pure-live"
+    );
+
+    gate.notify_waiters();
+    let _ = first.close().await;
+    let _ = second.close().await;
+}
+
+/// A subscriber joining while the backfill runs is told it joined, and its
+/// stream carries what is left of the history, then the live tail, with no
+/// `Gap` for what it missed.
+#[tokio::test]
+async fn a_subscriber_joining_mid_backfill_receives_the_remaining_history_then_live() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1), trade("AAPL", 2), trade("AAPL", 3)])
+        .await;
+    ctrl.pause_history_after(1, gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+
+    let creator = dm.client_session();
+    creator
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            backfill,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut creator_stream = creator.take_events().await.unwrap();
+    let (head, _) = drain_data(&mut creator_stream, 1).await;
+    assert_eq!(head, vec![("AAPL".to_string(), 1, 0)]);
+
+    let joiner = dm.client_session();
+    let outcome = joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, Subscribed::joined(backfill, true));
+    assert_eq!(outcome.history_from(), None);
+    let mut joiner_stream = joiner.take_events().await.unwrap();
+
+    ctrl.push("AAPL", trade("AAPL", 200)).await;
+    gate.notify_one();
+    let (remainder, mut controls) = drain_data(&mut joiner_stream, 3).await;
+    assert_eq!(
+        remainder,
+        vec![
+            ("AAPL".to_string(), 2, 1),
+            ("AAPL".to_string(), 3, 2),
+            ("AAPL".to_string(), 200, 3),
+        ]
+    );
+
+    ctrl.push("AAPL", trade("AAPL", 300)).await;
+    let (tail, more_controls) = drain_data(&mut joiner_stream, 1).await;
+    assert_eq!(tail, vec![("AAPL".to_string(), 300, 4)]);
+    controls.extend(more_controls);
+    assert!(
+        !controls
+            .iter()
+            .any(|control| matches!(control, ControlKind::Gap { .. })),
+        "no Gap for what the joiner missed: {controls:?}"
+    );
+
+    let (creator_rest, _) = drain_data(&mut creator_stream, 4).await;
+    assert_eq!(
+        creator_rest.last(),
+        Some(&("AAPL".to_string(), 300, 4)),
+        "both consumers observe one stream"
+    );
+    let _ = joiner.close().await;
+    let _ = creator.close().await;
+}
+
+/// A subscriber learns whether it created the pair's session or joined one
+/// already open.
+#[tokio::test]
+async fn client_subscribe_reports_whether_it_joined() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let first = dm.client_session();
+    let created = first
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created, Subscribed::created(live()));
+    let second = dm.client_session();
+    let joined = second
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        joined,
+        Subscribed::joined(live(), false),
+        "the second subscriber joins the open session"
+    );
+    let _ = first.close().await;
+    let _ = second.close().await;
 }
 
 #[tokio::test]
@@ -901,5 +1416,83 @@ async fn client_subscribe_rejects_duplicate_pair() {
         }
         other => panic!("expected DuplicateSubscription, got {other:?}"),
     }
+    let _ = client.close().await;
+}
+
+/// The wall clock in epoch nanoseconds, for a `backfill_from` that is
+/// certainly not in the past.
+fn now_nanos() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("fits")
+}
+
+/// [`datamancer::Error::BackfillFromNotInPast`] applies on both consumer
+/// handles. A joiner is not checked: it takes the scope the pair already has.
+#[tokio::test]
+async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let future = Timestamp(now_nanos() + 3_600_000_000_000);
+    let backfill = LiveScope::LiveBackfill { from: future };
+
+    let client = dm.client_session();
+    let err = client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            backfill,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, datamancer::Error::BackfillFromNotInPast { from, .. } if from == future),
+        "{err:?}"
+    );
+    match dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            backfill.into(),
+            PersistenceOptions::none(),
+        )
+        .await
+    {
+        Err(datamancer::Error::BackfillFromNotInPast { from, .. }) => assert_eq!(from, future),
+        Err(other) => panic!("the single-pair handle follows the same rule: {other:?}"),
+        Ok(_) => panic!("the single-pair handle must refuse the empty window"),
+    }
+
+    // A pair another subscriber holds pure-live is joined as is; the start
+    // this subscriber asked for never applies, so it is not checked.
+    client
+        .subscribe(
+            inst("MSFT"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let other = dm.client_session();
+    let outcome = other
+        .subscribe(
+            inst("MSFT"),
+            EventKind::Trade,
+            backfill,
+            PersistenceOptions::none(),
+        )
+        .await
+        .expect("joins the pure-live session");
+    assert_eq!(outcome, Subscribed::joined(live(), false));
+    let _ = other.close().await;
     let _ = client.close().await;
 }
