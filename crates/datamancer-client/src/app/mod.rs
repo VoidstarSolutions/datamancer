@@ -18,8 +18,8 @@ use platform_windows as platform;
 
 pub use error::{EnsureError, ReadyDiagnosis};
 
-/// The daemon's current configuration (TOML as JSON) and whether any
-/// cold-classified field awaits a restart.
+/// The daemon's current configuration (TOML as JSON) and whether it takes a
+/// restart to fully apply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DaemonConfig {
     pub config: serde_json::Value,
@@ -31,7 +31,7 @@ pub struct DaemonConfig {
 pub enum Applied {
     /// Applied to the running daemon.
     Live,
-    /// Persisted; takes effect at the next daemon start.
+    /// Persisted; the daemon's config takes a restart to fully apply.
     RestartRequired,
 }
 

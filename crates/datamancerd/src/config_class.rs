@@ -63,27 +63,38 @@ fn leaf_paths(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Cold-classified leaves that differ between `baseline` (the boot-applied
-/// config) and `current`. Non-empty ⇒ a restart is required for `current`
-/// to fully apply.
-pub(crate) fn cold_divergence(baseline: &Config, current: &Config) -> Vec<String> {
+/// What keeps `current` from fully applying without a restart, against
+/// `baseline` (the boot-applied config): each Cold-classified leaf that
+/// differs, and `startup_session.<provider>.<symbol>.<kind>` for each
+/// `always_on` startup session whose provider `baseline` lacks and `current`
+/// enables. Sorted, without duplicates; empty when no restart is required.
+pub(crate) fn restart_divergence(baseline: &Config, current: &Config) -> Vec<String> {
     let a = serde_json::to_value(baseline).expect("Config serializes");
     let b = serde_json::to_value(current).expect("Config serializes");
     let mut paths = Vec::new();
     leaf_paths(&a, "", &mut paths);
-    let mut more = Vec::new();
-    leaf_paths(&b, "", &mut more);
-    paths.extend(more);
+    leaf_paths(&b, "", &mut paths);
+    paths.retain(|p| lookup(&a, p) != lookup(&b, p) && classify(p) == Some(FieldClass::Cold));
+    let enabled_at_boot = baseline.provider_ids();
+    let enabled_now = current.provider_ids();
+    paths.extend(
+        current
+            .startup_session
+            .iter()
+            .filter(|s| {
+                s.always_on
+                    && !enabled_at_boot.contains(&s.provider.as_str())
+                    && enabled_now.contains(&s.provider.as_str())
+            })
+            .map(|s| {
+                let kind = serde_json::to_value(s.kind).expect("EventKindCfg serializes");
+                let kind = kind.as_str().expect("EventKindCfg serializes as a string");
+                format!("startup_session.{}.{}.{kind}", s.provider, s.symbol)
+            }),
+    );
     paths.sort();
     paths.dedup();
     paths
-        .into_iter()
-        .filter(|p| {
-            let av = lookup(&a, p);
-            let bv = lookup(&b, p);
-            av != bv && classify(p) == Some(FieldClass::Cold)
-        })
-        .collect()
 }
 
 fn lookup<'v>(value: &'v serde_json::Value, path: &str) -> Option<&'v serde_json::Value> {
@@ -199,15 +210,90 @@ persistence = "none"
     }
 
     #[test]
-    fn cold_divergence_ignores_hot_changes_and_flags_cold_ones() {
+    fn restart_divergence_ignores_hot_changes_and_flags_cold_ones() {
         let boot = Config::parse(FULL).expect("parse");
         let mut hot_changed = boot.clone();
         hot_changed.provider.alpaca = None; // hot: enable/disable
-        assert!(cold_divergence(&boot, &hot_changed).is_empty());
+        assert!(restart_divergence(&boot, &hot_changed).is_empty());
 
         let mut cold_changed = boot.clone();
         cold_changed.session.resume_buffer_events = 42;
-        let diverged = cold_divergence(&boot, &cold_changed);
+        let diverged = restart_divergence(&boot, &cold_changed);
         assert_eq!(diverged, vec!["session.resume_buffer_events".to_string()]);
+    }
+
+    #[test]
+    fn enabling_the_provider_of_a_skipped_anchor_needs_a_restart() {
+        let anchor = |always_on: bool| {
+            format!(
+                r#"
+[[startup_session]]
+provider = "alpaca"
+asset_class = "equity"
+symbol = "AAPL"
+kind = "trade"
+always_on = {always_on}
+"#
+            )
+        };
+        let boot = Config::parse(&anchor(true)).expect("parse");
+        let mut enabled = boot.clone();
+        enabled.provider = Config::parse(FULL).expect("parse").provider;
+        assert_eq!(
+            restart_divergence(&boot, &enabled),
+            vec!["startup_session.alpaca.AAPL.trade".to_string()]
+        );
+        assert!(restart_divergence(&enabled, &enabled).is_empty());
+
+        let refcounted = Config::parse(&anchor(false)).expect("parse");
+        let mut enabled = refcounted.clone();
+        enabled.provider = Config::parse(FULL).expect("parse").provider;
+        assert!(restart_divergence(&refcounted, &enabled).is_empty());
+    }
+
+    #[test]
+    fn quote_and_trade_anchors_stay_distinct() {
+        let boot = Config::parse(
+            r#"
+[tap_log]
+backend = "embedded"
+path = "/tmp/dmc-taplog"
+
+[[startup_session]]
+provider = "alpaca"
+asset_class = "equity"
+symbol = "AAPL"
+kind = "trade"
+always_on = true
+
+[[startup_session]]
+provider = "alpaca"
+asset_class = "equity"
+symbol = "AAPL"
+kind = "quote"
+always_on = true
+
+[[startup_session]]
+provider = "alpaca"
+asset_class = "equity"
+symbol = "AAPL"
+kind = "quote"
+scope = "live_backfill"
+backfill_from = "2020-01-01T00:00:00Z"
+always_on = true
+"#,
+        )
+        .expect("parse");
+        let mut enabled = boot.clone();
+        enabled.provider = Config::parse(FULL).expect("parse").provider;
+        enabled.tap_log.as_mut().expect("tap_log").path = Some("/tmp/elsewhere".into());
+        assert_eq!(
+            restart_divergence(&boot, &enabled),
+            vec![
+                "startup_session.alpaca.AAPL.quote".to_string(),
+                "startup_session.alpaca.AAPL.trade".to_string(),
+                "tap_log.path".to_string(),
+            ]
+        );
     }
 }

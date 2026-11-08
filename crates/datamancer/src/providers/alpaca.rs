@@ -72,7 +72,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
-use super::runtime::SettingsSource;
+use super::runtime::{Park, SettingsSource};
 use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca-backed provider.
@@ -280,13 +280,28 @@ impl Default for AlpacaProviderConfig {
 /// the common path a no-op.
 #[derive(Clone)]
 struct RestClients {
-    /// Market-data REST client. `None` when credentials aren't available —
-    /// `fetch_history` will surface a Provider error in that case.
+    /// Market-data REST client. `None` when disabled or without credentials.
     market_data: Option<MarketDataClient>,
     /// Trading API client, used for the reference-data surface (asset
-    /// catalog). `None` when credentials aren't available —
-    /// `list_instruments` will surface a Provider error in that case.
+    /// catalog). `None` when disabled or without credentials.
     trading: Option<TradingClient>,
+    /// Whether the settings read these clients were built from found the
+    /// provider enabled.
+    enabled: bool,
+}
+
+impl RestClients {
+    /// The market-data client, or the refusal this snapshot decides.
+    fn market_data(self) -> Result<MarketDataClient> {
+        self.market_data
+            .ok_or_else(|| super::runtime::no_rest_client(PROVIDER_ID, self.enabled))
+    }
+
+    /// The trading client, or the refusal this snapshot decides.
+    fn trading(self) -> Result<TradingClient> {
+        self.trading
+            .ok_or_else(|| super::runtime::no_rest_client(PROVIDER_ID, self.enabled))
+    }
 }
 
 fn build_rest(cfg: &AlpacaProviderConfig) -> RestClients {
@@ -294,28 +309,27 @@ fn build_rest(cfg: &AlpacaProviderConfig) -> RestClients {
         return RestClients {
             market_data: None,
             trading: None,
+            enabled: false,
         };
     };
-    match cfg.credentials.current() {
-        Resolved::Env => RestClients {
-            market_data: MarketDataClient::new(settings.account_type).ok(),
-            trading: TradingClient::new(settings.account_type).ok(),
-        },
+    let (market_data, trading) = match cfg.credentials.current() {
+        Resolved::Env => (
+            MarketDataClient::new(settings.account_type).ok(),
+            TradingClient::new(settings.account_type).ok(),
+        ),
         Resolved::Creds(c) => {
             let key = c.to_api_key();
-            RestClients {
-                market_data: MarketDataClient::new_with_credentials(
-                    settings.account_type,
-                    key.clone(),
-                )
-                .ok(),
-                trading: TradingClient::new_with_credentials(settings.account_type, key).ok(),
-            }
+            (
+                MarketDataClient::new_with_credentials(settings.account_type, key.clone()).ok(),
+                TradingClient::new_with_credentials(settings.account_type, key).ok(),
+            )
         }
-        Resolved::Missing => RestClients {
-            market_data: None,
-            trading: None,
-        },
+        Resolved::Missing => (None, None),
+    };
+    RestClients {
+        market_data,
+        trading,
+        enabled: true,
     }
 }
 
@@ -484,13 +498,16 @@ impl Provider for AlpacaProvider {
         }
         match surface {
             // The equity websocket streams trades, quotes, and only minute and
-            // daily bars.
-            Surface::Live => match kind {
-                EventKind::Trade
-                | EventKind::Quote
-                | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
-                EventKind::Bar(_) => false,
-            },
+            // daily bars, all decoded as equities.
+            Surface::Live => {
+                instrument.asset_class() == AssetClass::Equity
+                    && match kind {
+                        EventKind::Trade
+                        | EventKind::Quote
+                        | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
+                        EventKind::Bar(_) => false,
+                    }
+            }
             // The REST bar surface is wider than the streamed one: `stock_bars`
             // accepts every interval `fetch_history_via` maps except one-second,
             // which has no endpoint. Keep this in step with that match — an
@@ -517,13 +534,7 @@ impl Provider for AlpacaProvider {
         request: HistoryRequest,
         sink: mpsc::Sender<MarketEvent>,
     ) -> Result<()> {
-        let rest = self
-            .rest_clients()
-            .market_data
-            .ok_or_else(|| Error::Provider {
-                provider: PROVIDER_ID.to_string(),
-                message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
-            })?;
+        let rest = self.rest_clients().market_data()?;
         // The REST client above is `None` whenever the settings are, so a
         // missing value here is unreachable; fall back to the default rule
         // rather than fail a fetch the client would otherwise serve.
@@ -546,13 +557,7 @@ impl Provider for AlpacaProvider {
         let Some(feed) = snapshot_feed(self.cfg.stream_feed) else {
             return Ok(None);
         };
-        let rest = self
-            .rest_clients()
-            .market_data
-            .ok_or_else(|| Error::Provider {
-                provider: PROVIDER_ID.to_string(),
-                message: "REST client not initialized (Alpaca credentials missing?)".to_string(),
-            })?;
+        let rest = self.rest_clients().market_data()?;
         let snap = rest
             .stock_snapshot(instrument.symbol())
             .feed(feed)
@@ -566,10 +571,7 @@ impl Provider for AlpacaProvider {
     }
 
     async fn list_instruments(&self) -> Result<Vec<InstrumentEntry>> {
-        let trading = self.rest_clients().trading.ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
-        })?;
+        let trading = self.rest_clients().trading()?;
         // Filter at the API edge: status=Active + class=UsEquity is what
         // Alpaca's `/v2/assets` understands; we still re-filter on
         // `tradable` because inactive-but-listed rows occasionally slip
@@ -588,10 +590,7 @@ impl Provider for AlpacaProvider {
     }
 
     async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
-        let trading = self.rest_clients().trading.ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
-        })?;
+        let trading = self.rest_clients().trading()?;
         let asset = trading
             .get_asset(instrument.symbol())
             .await
@@ -1099,38 +1098,6 @@ async fn run_hub_task(cfg: AlpacaProviderConfig, mut cmd_rx: mpsc::Receiver<HubC
     }
 }
 
-/// Why the hub task is parked in [`wait_for_provisioning`], and so which
-/// error a subscribe/unsubscribe gets meanwhile: a credential park is
-/// `Error::Unauthenticated` (retrying cannot help; provisioning can), a
-/// disable is a plain provider error.
-#[derive(Debug, Clone, Copy)]
-enum Park {
-    Disabled,
-    MissingCredentials,
-    RejectedCredentials,
-}
-
-impl Park {
-    fn reason(self) -> &'static str {
-        match self {
-            Self::Disabled => "provider disabled",
-            Self::MissingCredentials => "waiting for credentials",
-            Self::RejectedCredentials => "waiting for new credentials after auth rejection",
-        }
-    }
-
-    fn error(self) -> Error {
-        let message = self.reason().to_string();
-        let provider = PROVIDER_ID.to_string();
-        match self {
-            Self::Disabled => Error::Provider { provider, message },
-            Self::MissingCredentials | Self::RejectedCredentials => {
-                Error::Unauthenticated { provider, message }
-            }
-        }
-    }
-}
-
 /// Waits for a `Watch` source (settings or credentials) to deliver a new
 /// value, servicing the command channel meanwhile (drop of the provider and
 /// every handle exits; subscribe/unsubscribe fail fast with `park`'s error).
@@ -1157,7 +1124,7 @@ async fn wait_for_provisioning<T>(
                             HubCommand::Subscribe { ack, .. }
                             | HubCommand::Unsubscribe { ack, .. },
                         ) => {
-                            let _ = ack.send(Err(park.error()));
+                            let _ = ack.send(Err(park.error(PROVIDER_ID)));
                         }
                         None => return false,
                     }
@@ -1169,7 +1136,7 @@ async fn wait_for_provisioning<T>(
                         HubCommand::Subscribe { ack, .. }
                         | HubCommand::Unsubscribe { ack, .. },
                     ) => {
-                        let _ = ack.send(Err(park.error()));
+                        let _ = ack.send(Err(park.error(PROVIDER_ID)));
                     }
                     None => return false,
                 }
@@ -1964,6 +1931,14 @@ mod tests {
     }
 
     #[test]
+    fn an_etf_is_history_only_because_live_decodes_as_equity() {
+        let p = AlpacaProvider::new(AlpacaProviderConfig::default());
+        let etf = Instrument::new(ProviderId::from_static(PROVIDER_ID), AssetClass::Etf, "SPY");
+        assert!(!p.supports(&etf, EventKind::Trade, Surface::Live));
+        assert!(p.supports(&etf, EventKind::Trade, Surface::History));
+    }
+
+    #[test]
     fn provider_supports_live_kinds() {
         let p = AlpacaProvider::new(AlpacaProviderConfig::default());
         let inst = provider_instrument("AAPL");
@@ -2036,11 +2011,65 @@ mod tests {
             .subscribe(provider_instrument("AAPL"), EventKind::Trade)
             .await
             .expect_err("disabled provider must fail subscribes fast");
-        let msg = format!("{err}");
-        assert!(msg.contains("provider disabled"), "msg={msg:?}");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
+        let err = p
+            .list_instruments()
+            .await
+            .expect_err("a disabled provider has no REST client");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
         // `start_live` already returns `Box<dyn LiveHandle>`; `close` takes
         // `self: Box<Self>`, so call it directly on the box.
         handle.close().await.expect("close while parked");
+    }
+
+    #[tokio::test]
+    async fn missing_rest_credentials_are_unauthenticated() {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let p = AlpacaProvider::new(AlpacaProviderConfig {
+            credentials: CredentialsSource::Watch(rx),
+            ..Default::default()
+        });
+        let err = p
+            .list_instruments()
+            .await
+            .expect_err("no credentials, no trading client");
+        assert!(matches!(err, Error::Unauthenticated { .. }), "{err:?}");
+        let (sink, _events) = tokio::sync::mpsc::channel(8);
+        let request = HistoryRequest {
+            instrument: provider_instrument("AAPL"),
+            kind: EventKind::Trade,
+            from: Timestamp(0),
+            to: Timestamp(1),
+            adjustment: datamancer_core::Adjustment::default(),
+        };
+        let err = p
+            .fetch_history(request, sink)
+            .await
+            .expect_err("no credentials, no market-data client");
+        assert!(matches!(err, Error::Unauthenticated { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_rest_refusal_is_decided_from_one_snapshot() {
+        let (settings_tx, settings_rx) = tokio::sync::watch::channel(None);
+        let (_creds_tx, creds_rx) = tokio::sync::watch::channel(None);
+        let p = AlpacaProvider::new(AlpacaProviderConfig {
+            settings: SettingsSource::Watch(settings_rx),
+            credentials: CredentialsSource::Watch(creds_rx),
+            ..Default::default()
+        });
+
+        let disabled = p.rest_clients();
+        settings_tx.send(Some(AlpacaSettings::default())).unwrap();
+        let err = disabled.trading().expect_err("taken while disabled");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
+
+        let enabled = p.rest_clients();
+        settings_tx.send(None).unwrap();
+        let err = enabled
+            .market_data()
+            .expect_err("taken without credentials");
+        assert!(matches!(err, Error::Unauthenticated { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -2293,7 +2322,7 @@ mod tests {
                 .subscribe(provider_instrument(symbol), EventKind::Trade)
                 .await
                 .expect_err("parked hub fails subscribes fast");
-            assert!(format!("{err}").contains("provider disabled"), "{err}");
+            assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
         }
 
         let task = p.take_hub_task().expect("the hub was spawned");

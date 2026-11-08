@@ -735,7 +735,14 @@ impl Config {
                 )));
             }
         }
+        let compiled = compiled_provider_ids();
         for s in &self.startup_session {
+            if !compiled.contains(&s.provider.as_str()) {
+                return Err(DaemonError::ConfigInvalid(format!(
+                    "startup_session {} names provider {:?}, which is not one of {compiled:?}",
+                    s.symbol, s.provider
+                )));
+            }
             let options = persistence_options(s.persistence);
             if options.uses_cache() && self.cache.is_none() {
                 return Err(DaemonError::ConfigInvalid(format!(
@@ -840,6 +847,16 @@ impl Config {
             providers.push((alpaca_crypto::PROVIDER_ID, c.account_type.into()));
         }
         providers
+    }
+
+    /// The ids of the configured providers, as
+    /// [`configured_providers`](Self::configured_providers) lists them.
+    #[must_use]
+    pub fn provider_ids(&self) -> Vec<&'static str> {
+        self.configured_providers()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// Build the full daemon runtime: construct every compiled-in provider
@@ -1407,6 +1424,22 @@ backfill_from = "2200-01-01T00:00:00Z"
         assert_eq!(config.session.max_backfill_days, 7);
         config.session.max_backfill_days = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_rejects_a_startup_session_naming_an_unknown_provider() {
+        let text = r#"
+[[startup_session]]
+provider = "alpaca_crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+"#;
+        let config = Config::parse(text).expect("parse");
+        match config.validate().expect_err("must reject") {
+            DaemonError::ConfigInvalid(m) => assert!(m.contains("alpaca_crypto"), "{m}"),
+            other => panic!("wrong error: {other:?}"),
+        }
     }
 
     #[test]
