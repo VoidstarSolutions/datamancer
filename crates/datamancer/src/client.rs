@@ -1413,7 +1413,13 @@ impl ClientController {
             guard, rx, outcome, ..
         } = self
             .dm
-            .authoritative(instrument.clone(), kind, scope, options)
+            .authoritative(
+                instrument.clone(),
+                kind,
+                scope,
+                options,
+                self.dm.client_backfill_permits(),
+            )
             .await?;
         let provider = guard.provider().to_string();
         self.entries.insert(

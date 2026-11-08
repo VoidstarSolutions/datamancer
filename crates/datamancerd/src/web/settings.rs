@@ -126,6 +126,7 @@ function render(cfg) {
       + L('admin_socket', TXT('srv-socket', cfg.server.admin_socket))
       + L('service_prefix', TXT('srv-prefix', cfg.server.service_prefix))
       + L('shutdown_timeout_secs', NUM('srv-timeout', cfg.server.shutdown_timeout_secs))
+      + L('max_concurrent_backfills', NUM('srv-backfills', cfg.server.max_concurrent_backfills))
     + `</fieldset>`
     + `<fieldset><legend>diagnostics</legend>`
       + L('publish_interval_ms', NUM('diag-live', cfg.diagnostics.publish_interval_ms))
@@ -167,7 +168,8 @@ function collect() {
   }
   cfg.session = { resume_buffer_events: num('sess-buffer'), adjustment: val('sess-adjust'),
     query_persistence: val('sess-query'), max_backfill_days: num('sess-backfill') };
-  cfg.server = { admin_socket: val('srv-socket'), service_prefix: val('srv-prefix'), shutdown_timeout_secs: num('srv-timeout') };
+  cfg.server = { admin_socket: val('srv-socket'), service_prefix: val('srv-prefix'), shutdown_timeout_secs: num('srv-timeout'),
+    max_concurrent_backfills: num('srv-backfills') };
   cfg.diagnostics = { publish_interval_ms: num('diag-live'), cache_catalog_interval_ms: num('diag-catalog') };
   cfg.iceoryx2 = { max_clients: num('iox-clients') };
   cfg.web_ui = { enabled: chk('web-on'), bind: val('web-bind'), port: num('web-port'),

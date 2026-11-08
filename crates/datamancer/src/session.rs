@@ -70,7 +70,7 @@ use datamancer_core::{
 };
 use futures::StreamExt;
 use futures::stream::Stream;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -199,6 +199,9 @@ pub struct Datamancer {
 struct DatamancerInner {
     /// How far back a client session's backfill may start; `None` for no limit.
     max_client_backfill: Option<Duration>,
+    /// One permit per client backfill fetching history at once; `None` for no
+    /// limit.
+    client_backfill_permits: Option<Arc<Semaphore>>,
     providers: Vec<Arc<dyn Provider>>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
@@ -317,6 +320,7 @@ impl Datamancer {
                     stats: Arc::new(LiveStats::new()),
                     accounting,
                     data_forwarded: false,
+                    backfill_permits: None,
                 };
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
                 Ok(Session {
@@ -336,7 +340,7 @@ impl Datamancer {
                     rx,
                     ..
                 } = self
-                    .authoritative(instrument.clone(), kind, scope, options)
+                    .authoritative(instrument.clone(), kind, scope, options, None)
                     .await?;
                 let provider = authoritative.provider_id.clone();
                 let handle = spawn_client(
@@ -361,12 +365,16 @@ impl Datamancer {
     /// so two concurrent openers cannot both create; the share path adds a
     /// subscriber to the existing session, the create path starts a fresh
     /// provider connection.
+    ///
+    /// A backfill this creates waits for one of `permits`, if given, before it
+    /// fetches history.
     pub(crate) async fn authoritative(
         &self,
         instrument: Instrument,
         kind: EventKind,
         scope: LiveScope,
         options: PersistenceOptions,
+        permits: Option<Arc<Semaphore>>,
     ) -> Result<Attached> {
         self.check_persistence(options)?;
 
@@ -397,8 +405,13 @@ impl Datamancer {
         let provider = self.route(&instrument, kind, surfaces)?;
         check_backfill_start(scope)?;
 
-        self.create_authoritative(provider, instrument, kind, scope, options)
+        self.create_authoritative(provider, instrument, kind, scope, options, permits)
             .await
+    }
+
+    /// The permits client backfills take to fetch history, if they are limited.
+    pub(crate) fn client_backfill_permits(&self) -> Option<Arc<Semaphore>> {
+        self.inner.client_backfill_permits.clone()
     }
 
     /// Refuse a client's backfill older than the configured limit, whether it
@@ -429,6 +442,7 @@ impl Datamancer {
         kind: EventKind,
         scope: LiveScope,
         options: PersistenceOptions,
+        backfill_permits: Option<Arc<Semaphore>>,
     ) -> Result<Attached> {
         let key = (instrument.clone(), kind);
         let accounting = self.inner.accounting_for(provider.id());
@@ -505,6 +519,7 @@ impl Datamancer {
             stats,
             accounting: accounting.clone(),
             data_forwarded: false,
+            backfill_permits,
         };
         let backfill_from = scope.backfill_from();
         // Pure-live only: fire a non-gating "latest value" fetch concurrently
@@ -969,6 +984,7 @@ pub struct DatamancerBuilder {
     instrument_provider: Vec<(Instrument, String)>,
     resume_buffer_events: Option<usize>,
     max_client_backfill: Option<Duration>,
+    max_concurrent_client_backfills: Option<std::num::NonZeroUsize>,
     /// Corporate-action adjustment mode. `Adjustment`'s `Default` is `All`, so
     /// `DatamancerBuilder::default()` already yields fully-adjusted bars; call
     /// [`adjustment`](Self::adjustment) to override.
@@ -1053,6 +1069,23 @@ impl DatamancerBuilder {
         self
     }
 
+    /// Limit how many [`ClientSession`](crate::ClientSession) backfills fetch
+    /// history at once. Unlimited by default; a [`Session`] is not limited. A
+    /// backfill past the limit waits for one to finish its history, and so does
+    /// one the cache could serve whole. Meanwhile its live arrivals fill the
+    /// resume buffer, and an overflow is a `Gap`. A subscribe that joins an
+    /// existing session does not count.
+    ///
+    /// # Panics
+    ///
+    /// [`build`](Self::build) panics if `limit` exceeds
+    /// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS).
+    #[must_use]
+    pub fn max_concurrent_client_backfills(mut self, limit: std::num::NonZeroUsize) -> Self {
+        self.max_concurrent_client_backfills = Some(limit);
+        self
+    }
+
     /// Set the corporate-action adjustment mode applied to historical bar
     /// fetches and used to segregate the cache. Defaults to [`Adjustment::All`]
     /// (split + dividend + spin-off). The mode is stamped into both the
@@ -1096,6 +1129,9 @@ impl DatamancerBuilder {
                 instrument_provider: self.instrument_provider,
                 live_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 max_client_backfill: self.max_client_backfill,
+                client_backfill_permits: self
+                    .max_concurrent_client_backfills
+                    .map(|limit| Arc::new(Semaphore::new(limit.get()))),
                 resume_buffer_events: self
                     .resume_buffer_events
                     .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),
@@ -1431,6 +1467,9 @@ struct Controller {
     /// authoritative session. Gates the pure-live "latest value" seed: once a
     /// real live value has been delivered, a late-arriving seed is discarded.
     data_forwarded: bool,
+    /// The permits a backfill waits for before it fetches history; `None` for
+    /// no wait.
+    backfill_permits: Option<Arc<Semaphore>>,
 }
 
 impl Controller {
@@ -2079,6 +2118,13 @@ impl Controller {
             live_rx: Some(provider_rx),
             pending: Some(&mut pending),
         };
+        let permit = match self.backfill_permits.clone() {
+            Some(permits) => match self.serving(&mut io, permits.acquire_owned()).await {
+                Some(permit) => permit.ok(),
+                None => return false,
+            },
+            None => None,
+        };
         // NOTE: single-flight (see `run_historical_cached`) is deliberately
         // NOT wired here. Backfill is the stitched-live path and out of scope
         // for the cold-sweep coalescer, which only runs over `Scope::Historical`
@@ -2117,6 +2163,7 @@ impl Controller {
         let outcome = self
             .stream_segments(segments, options, &mut io, Some(edge))
             .await;
+        drop(permit);
         if outcome == SegmentOutcome::Closed {
             return false;
         }

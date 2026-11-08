@@ -40,6 +40,8 @@ struct Shared {
     history_pause: Option<(usize, Arc<tokio::sync::Notify>)>,
     /// When set, the next `LiveHandle::subscribe` waits for one notification.
     subscribe_gate: Option<Arc<tokio::sync::Notify>>,
+    /// How many `fetch_history` calls have started.
+    fetches: usize,
 }
 
 struct FakeProvider {
@@ -116,6 +118,10 @@ impl Ctrl {
         self.unsubscribes.load(Ordering::SeqCst)
     }
 
+    async fn fetches(&self) -> usize {
+        self.shared.lock().await.fetches
+    }
+
     #[allow(dead_code)]
     fn closes(&self) -> usize {
         self.closes.load(Ordering::SeqCst)
@@ -160,7 +166,8 @@ impl Provider for FakeProvider {
         sink: mpsc::Sender<MarketEvent>,
     ) -> Result<()> {
         let (history, gate, pause) = {
-            let shared = self.shared.lock().await;
+            let mut shared = self.shared.lock().await;
+            shared.fetches += 1;
             (
                 shared.history.clone(),
                 shared.history_gate.clone(),
@@ -1356,6 +1363,152 @@ async fn backfilling_client(
         .unwrap();
     let stream = client.take_events().await.unwrap();
     (client, stream)
+}
+
+/// Waits until `ctrl` has seen `count` history fetches start.
+async fn wait_for_fetches(ctrl: &Ctrl, count: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while ctrl.fetches().await != count {
+        assert!(tokio::time::Instant::now() < deadline, "fetches stuck");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Subscribes `symbol` with a backfill from 0 on a new client session.
+async fn backfill_symbol(dm: &Datamancer, symbol: &str) -> datamancer::ClientSession {
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst(symbol),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    client
+}
+
+/// With room for one client backfill, a second waits until the first's
+/// history ends and then fetches; a subscribe that joins takes no room.
+#[tokio::test]
+async fn a_client_backfill_past_the_limit_waits_for_the_history_before_it() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1), trade("MSFT", 1)])
+        .await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .max_concurrent_client_backfills(std::num::NonZeroUsize::MIN)
+        .build()
+        .unwrap();
+    let first = backfill_symbol(&dm, "AAPL").await;
+    let mut first_stream = first.take_events().await.unwrap();
+    wait_for_fetches(&ctrl, 1).await;
+    let second = backfill_symbol(&dm, "MSFT").await;
+    let mut second_stream = second.take_events().await.unwrap();
+    let joiner = backfill_symbol(&dm, "AAPL").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        ctrl.fetches().await,
+        1,
+        "the second backfill fetched at once"
+    );
+
+    gate.notify_one();
+    assert_eq!(read_prints(&mut first_stream, 1).await, (vec![1], 0));
+    wait_for_fetches(&ctrl, 2).await;
+    gate.notify_one();
+    assert_eq!(read_prints(&mut second_stream, 1).await, (vec![1], 0));
+    let _ = joiner.close().await;
+    let _ = first.close().await;
+    let _ = second.close().await;
+}
+
+/// A `Session`'s backfill takes no room: it fetches while a client's backfill
+/// holds the only slot.
+#[tokio::test]
+async fn a_sessions_backfill_is_outside_the_client_limit() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1), trade("MSFT", 1)])
+        .await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .max_concurrent_client_backfills(std::num::NonZeroUsize::MIN)
+        .build()
+        .unwrap();
+    let client = backfill_symbol(&dm, "AAPL").await;
+    wait_for_fetches(&ctrl, 1).await;
+
+    let session = dm
+        .session(
+            inst("MSFT"),
+            EventKind::Trade,
+            datamancer::Scope::Live {
+                backfill_from: Some(Timestamp(0)),
+            },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    wait_for_fetches(&ctrl, 2).await;
+    let _ = session.close().await;
+    let _ = client.close().await;
+}
+
+/// A reader stopped during its seam flush holds no fetch slot: the next
+/// client backfill fetches once the history has ended.
+#[tokio::test(start_paused = true)]
+async fn a_reader_stopped_in_the_seam_flush_holds_no_fetch_slot() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("AAPL", 1), trade("MSFT", 1)])
+        .await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .max_concurrent_client_backfills(std::num::NonZeroUsize::MIN)
+        .build()
+        .unwrap();
+    let first = backfill_symbol(&dm, "AAPL").await;
+    let _unread = first.take_events().await.unwrap();
+    wait_for_fetches(&ctrl, 1).await;
+    for ts in 2..=3000 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    let _second = backfill_symbol(&dm, "MSFT").await;
+
+    gate.notify_one();
+    wait_for_fetches(&ctrl, 2).await;
+}
+
+/// A waiting client backfill starts once the one fetching closes.
+#[tokio::test]
+async fn a_closed_backfill_lets_a_waiting_one_fetch() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(vec![trade("MSFT", 1)]).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .max_concurrent_client_backfills(std::num::NonZeroUsize::MIN)
+        .build()
+        .unwrap();
+    let first = backfill_symbol(&dm, "AAPL").await;
+    wait_for_fetches(&ctrl, 1).await;
+    let second = backfill_symbol(&dm, "MSFT").await;
+    let mut second_stream = second.take_events().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(ctrl.fetches().await, 1);
+
+    first.close().await.unwrap();
+    wait_for_fetches(&ctrl, 2).await;
+    gate.notify_one();
+    assert_eq!(read_prints(&mut second_stream, 1).await, (vec![1], 0));
+    let _ = second.close().await;
 }
 
 /// A disconnect that meets a full stream reaches the reader once it has read

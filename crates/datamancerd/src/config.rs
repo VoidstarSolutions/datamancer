@@ -306,6 +306,11 @@ pub struct ServerConfig {
     /// drains take at most half of it.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
+    /// Client backfills that fetch history at once, UDS and WS together. One
+    /// past it waits for another's history to end; a subscribe that joins an
+    /// open session does not count. At least 1.
+    #[serde(default = "default_max_concurrent_backfills")]
+    pub max_concurrent_backfills: usize,
     /// Windows only: when `true`, the control pipe accepts a daemon or client
     /// at any integrity level instead of requiring Medium. Ignored off Windows.
     #[serde(default)]
@@ -318,6 +323,7 @@ impl Default for ServerConfig {
             admin_socket: default_admin_socket(),
             service_prefix: default_service_prefix(),
             shutdown_timeout_secs: default_shutdown_timeout(),
+            max_concurrent_backfills: default_max_concurrent_backfills(),
             allow_any_integrity: false,
         }
     }
@@ -334,6 +340,10 @@ fn default_service_prefix() -> String {
 
 const fn default_shutdown_timeout() -> u64 {
     30
+}
+
+const fn default_max_concurrent_backfills() -> usize {
+    2
 }
 
 /// Diagnostics-plane cadence.
@@ -746,6 +756,17 @@ impl Config {
                 "[server].shutdown_timeout_secs must be at least 1".to_string(),
             ));
         }
+        if self.server.max_concurrent_backfills == 0 {
+            return Err(DaemonError::ConfigInvalid(
+                "[server].max_concurrent_backfills must be at least 1".to_string(),
+            ));
+        }
+        if self.server.max_concurrent_backfills > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(DaemonError::ConfigInvalid(format!(
+                "[server].max_concurrent_backfills must be at most {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
         if self.session.max_backfill_days == 0 {
             return Err(DaemonError::ConfigInvalid(
                 "[session].max_backfill_days must be greater than 0".to_string(),
@@ -842,6 +863,15 @@ impl Config {
             .max_client_backfill(Duration::from_secs(
                 u64::from(self.session.max_backfill_days) * 86_400,
             ))
+            .max_concurrent_client_backfills(
+                std::num::NonZeroUsize::new(self.server.max_concurrent_backfills).ok_or_else(
+                    || {
+                        DaemonError::ConfigInvalid(
+                            "[server].max_concurrent_backfills must be at least 1".to_string(),
+                        )
+                    },
+                )?,
+            )
             .adjustment(self.session.adjustment.into());
 
         // Cycle 3: every compiled-in provider is constructed and registered,
@@ -1340,6 +1370,35 @@ backfill_from = "2200-01-01T00:00:00Z"
         config
             .validate()
             .expect("the anchor's open checks the start");
+    }
+
+    #[test]
+    fn max_concurrent_backfills_past_the_semaphore_limit_is_refused() {
+        let mut config = Config::parse("").expect("parse");
+        config.server.max_concurrent_backfills = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(config.validate().is_ok());
+        config.server.max_concurrent_backfills = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("max_concurrent_backfills"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_concurrent_backfills_defaults_to_two_and_refuses_zero() {
+        let mut config = Config::parse("").expect("parse");
+        assert_eq!(config.server.max_concurrent_backfills, 2);
+        config.server.max_concurrent_backfills = 0;
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("max_concurrent_backfills"), "{msg}");
+            }
+            other => {
+                panic!("expected ConfigInvalid for zero max_concurrent_backfills, got {other:?}")
+            }
+        }
     }
 
     #[test]

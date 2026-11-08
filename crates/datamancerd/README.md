@@ -142,6 +142,7 @@ service_prefix = "datamancerd"
 # Seconds the whole exit may take after SIGTERM/SIGINT, every drain step
 # included. At least 1; the web and WS drains take at most half of it.
 shutdown_timeout_secs = 30
+max_concurrent_backfills = 2      # client backfills fetching history at once
 
 [diagnostics]
 publish_interval_ms = 1000
@@ -193,7 +194,12 @@ still serves queries, straight from the provider. `[iceoryx2] max_queries`
 bounds concurrent in-flight historical queries (default 2, small on purpose:
 provider rate limit, not daemon capacity, is the binding constraint) — an
 `open-query` past the cap answers `service_cap_exceeded`, same as `max_clients`
-does for `open-client`.
+does for `open-client`. `[server] max_concurrent_backfills` bounds the client
+backfills that fetch history at once, UDS and WS together (default 2). A
+subscribe past it is not refused: its backfill waits until another's history
+ends, even one the cache could serve whole, and its live arrivals fill the
+resume buffer meanwhile, where an overflow is a `gap`. A subscribe that joins
+an open session does not count, nor does a `[[startup_session]]`.
 
 `[log]` configures the tracing subscriber installed at the very start of
 `main` — before the single-instance lock or config-file resolution/scaffolding
@@ -480,6 +486,9 @@ One JSON object per line; one reply line per request.
   `backfill_too_old`, whether the subscribe would create or join. A
   `[[startup_session]]` is the operator's and has no such limit; longer history
   comes from `open-query`.
+- At most `[server] max_concurrent_backfills` created backfills fetch history
+  at once; one past it waits for its turn, with its live arrivals in the resume
+  buffer, where an overflow is a `gap`.
 - With a tap log, live arrivals during a backfill reach it at the seam. An
   arrival the seam ring evicts, or one still buffered when the session closes
   before the seam, is not logged and leaves no mark in the log.
