@@ -5,10 +5,13 @@
 //!
 //! Behavior, all knobs on [`ScriptedSettings`]:
 //! - `fetch_history` waits `history_delay_ms`, then serves `history_prints`
-//!   trades spaced evenly over the requested range, prices `1.0, 2.0, …`, or
-//!   fails if the symbol is `failing_symbol`.
-//! - `LiveHandle::subscribe` emits `ProviderConnected`, then one trade every
-//!   `live_interval_ms`, stamped with the wall clock and priced
+//!   trades over the requested range `[from, to)`, the first at `from`, the
+//!   last at `to - 1`, the rest evenly between (a single print sits at
+//!   `from`), prices `1.0, 2.0, …`, or fails if the symbol is
+//!   `failing_symbol`.
+//! - `LiveHandle::subscribe` returns after `connect_delay_ms`, emitting
+//!   nothing before it; then it emits `ProviderConnected`, then one trade
+//!   every `live_interval_ms`, stamped with the wall clock and priced
 //!   `100.0, 101.0, …`, until unsubscribe or close. The interval is re-read
 //!   from the settings source at every tick; when the source goes to `None`,
 //!   the pair gets `ProviderDisconnected` and its trades stop, and when it
@@ -60,6 +63,9 @@ pub struct ScriptedSettings {
     /// The symbol whose history requests fail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failing_symbol: Option<String>,
+    /// Milliseconds a live subscribe takes to return; nothing is emitted
+    /// before then.
+    pub connect_delay_ms: u64,
 }
 
 impl Default for ScriptedSettings {
@@ -71,6 +77,7 @@ impl Default for ScriptedSettings {
             latest: true,
             latest_delay_ms: 0,
             failing_symbol: None,
+            connect_delay_ms: 0,
         }
     }
 }
@@ -153,10 +160,16 @@ impl Provider for ScriptedProvider {
                 message: format!("scripted history failure for {symbol}"),
             });
         }
+        let last = request.to.0.saturating_sub(1).max(request.from.0);
+        let span = i128::from(last) - i128::from(request.from.0);
         let n = i64::from(settings.history_prints);
-        let step = request.to.0.saturating_sub(request.from.0) / n.max(1);
         for i in 0..n {
-            let ts = Timestamp(request.from.0 + step * i);
+            let offset = if n > 1 {
+                span * i128::from(i) / i128::from(n - 1)
+            } else {
+                0
+            };
+            let ts = Timestamp(request.from.0 + i64::try_from(offset).unwrap_or(0));
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "a handful of scripted prints; exact for any count a test uses"
@@ -287,11 +300,12 @@ async fn emit(
 #[async_trait]
 impl LiveHandle for ScriptedLiveHandle {
     async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
-        if self.settings.current().is_none() {
+        let Some(settings) = self.settings.current() else {
             return Err(Error::ProviderDisabled {
                 provider: PROVIDER_ID.to_string(),
             });
-        }
+        };
+        tokio::time::sleep(Duration::from_millis(settings.connect_delay_ms)).await;
         let _ = self
             .sink
             .send(control(ControlKind::ProviderConnected {
@@ -329,11 +343,47 @@ impl LiveHandle for ScriptedLiveHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use datamancer::providers::SettingsSource;
     use datamancer_core::{AssetClass, Error, EventKind, Instrument, Provider as _, ProviderId};
     use tokio::sync::{mpsc, watch};
 
     use super::{PROVIDER_ID, ScriptedProvider, ScriptedSettings};
+
+    fn aapl() -> Instrument {
+        Instrument::new(
+            ProviderId::from_static(PROVIDER_ID),
+            AssetClass::Equity,
+            "AAPL",
+        )
+    }
+
+    /// A `connect_delay_ms` change reaches the next subscribe on a live
+    /// handle that was started before it.
+    #[tokio::test]
+    async fn subscribe_rereads_connect_delay_ms() {
+        let settings = |connect_delay_ms| ScriptedSettings {
+            connect_delay_ms,
+            ..ScriptedSettings::default()
+        };
+        let (tx, rx) = watch::channel(Some(settings(0)));
+        let provider = ScriptedProvider::new(SettingsSource::Watch(rx));
+        let (sink, _events) = mpsc::channel(16);
+        let live = provider.start_live(sink).await.expect("start_live");
+
+        tx.send_replace(Some(settings(300)));
+        let started = Instant::now();
+        live.subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("subscribe");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "subscribe returned after {:?}",
+            started.elapsed()
+        );
+        live.close().await.expect("close");
+    }
 
     /// A subscribe on a live handle whose settings source has gone to `None`
     /// is refused with `ProviderDisabled`.
@@ -345,12 +395,7 @@ mod tests {
         let live = provider.start_live(sink).await.expect("start_live");
 
         tx.send_replace(None);
-        let instrument = Instrument::new(
-            ProviderId::from_static(PROVIDER_ID),
-            AssetClass::Equity,
-            "AAPL",
-        );
-        let result = live.subscribe(instrument, EventKind::Trade).await;
+        let result = live.subscribe(aapl(), EventKind::Trade).await;
         assert!(
             matches!(result, Err(Error::ProviderDisabled { ref provider }) if provider == PROVIDER_ID),
             "expected ProviderDisabled, got {result:?}"

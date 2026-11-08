@@ -306,17 +306,18 @@ joiner's replay.
 `Scope::live_backfill(t)` stitches history ahead of the live tail: the window
 `[t, live-edge)` is served through the historical read-through path (cache +
 provider gap-fetch, honoring the session's `read_cache`/`write_cache` axes)
-while live arrivals buffer; the seam drains in arrival order. Coverage for the
-segment touching the live edge is claimed conservatively (history endpoints lag
-the live feed), so a later request re-fetches the sliver instead of permanently
-masking it. The live edge is the local wall clock read after
-`LiveHandle::subscribe` returns, and nothing dedupes at the seam: an event
-between the start of live delivery and that reading can arrive on both sides,
-and with clock skew, a lagging history endpoint or a provider that returns
-before the venue acknowledges the pair, events can be missing. None of these is
-known loss, so none is a `Gap`; a `Gap` reports a failed fetch, a buffer
-overflow or a subscriber that stops pacing the replay. The tap log captures only
-the live tail — backfill data belongs to the cache.
+while live arrivals buffer; the seam drains in arrival order. The live edge is
+the local wall clock sampled once the provider has confirmed the live
+subscription (`LiveHandle::subscribe` returned), so a provider that connects
+lazily on the first subscribe has its socket up and the pair acknowledged by
+then. Coverage for the segment touching the live edge is claimed conservatively
+(history endpoints lag the live feed), so a later request re-fetches the sliver
+instead of permanently masking it. Nothing dedupes at the seam: an event between
+the provider's acknowledgement and the local clock reading can arrive on both
+sides, and with clock skew or a lagging history endpoint events can be missing.
+None of these is known loss, so none is a `Gap`; a `Gap` reports a failed fetch,
+a buffer overflow or a subscriber that stops pacing the replay. The tap log
+captures only the live tail — backfill data belongs to the cache.
 
 See `examples/resume.rs` for a runnable, credential-free demo.
 
