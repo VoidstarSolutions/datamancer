@@ -59,7 +59,7 @@ use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
@@ -104,13 +104,32 @@ pub(crate) fn stamped_health_view(
 }
 
 /// One connected client: its multiplexing session, its per-client data-plane
-/// sink, the pump task feeding the sink, and its service name.
+/// sink, the pump task feeding the sink, and its service name. Dropping the
+/// entry aborts the pump.
 struct ClientEntry {
     name: String,
-    session: Option<ClientSession>,
+    /// Shared with each subscribe or unsubscribe in flight, which lets go of
+    /// it once `closing` is set.
+    session: Option<Arc<ClientSession>>,
     sink: Arc<dyn EventSink>,
     pump: JoinHandle<()>,
     service: String,
+    /// Set once the client is torn down. Each subscribe or unsubscribe in
+    /// flight holds a receiver and answers `session_closed` when it is set.
+    closing: watch::Sender<bool>,
+}
+
+impl ClientEntry {
+    /// Whether a subscribe or unsubscribe of this client is in flight.
+    fn subscribing(&self) -> bool {
+        self.closing.receiver_count() > 0
+    }
+}
+
+impl Drop for ClientEntry {
+    fn drop(&mut self) {
+        self.pump.abort();
+    }
 }
 
 #[async_trait]
@@ -126,8 +145,13 @@ impl DrainClient for ClientEntry {
     }
 
     async fn close(&mut self) {
-        if let Some(session) = self.session.take() {
+        self.closing.send_replace(true);
+        // Each subscribe or unsubscribe in flight answers `session_closed` and
+        // lets go of the session.
+        self.closing.closed().await;
+        if let Some(session) = self.session.take().and_then(Arc::into_inner) {
             // Closing emits a terminal `SessionClosing` into the client stream.
+            // It waits behind a subscribe the session is still running.
             let _ = session.close().await;
         }
         // Let the pump deliver the remaining stream (incl. `SessionClosing`) into
@@ -135,13 +159,49 @@ impl DrainClient for ClientEntry {
         // The session close ends the stream, so the pump finishes on its own;
         // bound the wait so a reader that has stopped cannot hang teardown. A
         // pump waiting on that reader's full queue ends when aborted.
-        let mut pump = std::mem::replace(&mut self.pump, tokio::spawn(async {}));
-        if tokio::time::timeout(Duration::from_secs(2), &mut pump)
+        if tokio::time::timeout(Duration::from_secs(2), &mut self.pump)
             .await
             .is_err()
         {
-            pump.abort();
+            self.pump.abort();
         }
+    }
+
+    fn waits_on_provider(&self) -> bool {
+        self.subscribing()
+    }
+
+    fn abort(&mut self) {
+        self.pump.abort();
+    }
+}
+
+/// A torn-down client whose flush and close run on a task of their own. It
+/// counts toward `max_clients` until that task ends.
+struct ClosingClient {
+    name: String,
+    task: JoinHandle<()>,
+}
+
+#[async_trait]
+impl DrainClient for ClosingClient {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The task flushes the sink itself.
+    async fn flush_sink(&self) {}
+
+    async fn close(&mut self) {
+        let _ = (&mut self.task).await;
+    }
+
+    fn waits_on_provider(&self) -> bool {
+        true
+    }
+
+    fn abort(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -180,8 +240,10 @@ enum ServerCommand {
         request: Request,
         reply: oneshot::Sender<Reply>,
     },
-    /// A control connection for `client` hit EOF (emergency teardown).
-    Disconnect { client: String },
+    /// Tear `client` down if it is still the client opened with `service`:
+    /// its control connection hit EOF (emergency teardown) or one of its
+    /// initial subscriptions was refused.
+    Disconnect { client: String, service: String },
     /// A query's pump reached the end of its stream; reap the entry.
     #[cfg(not(windows))]
     QueryFinished { query: QueryId },
@@ -229,6 +291,8 @@ pub struct Server {
     /// Startup-session anchors, held for the process lifetime.
     anchors: Vec<Session>,
     clients: HashMap<String, ClientEntry>,
+    /// Clients torn down whose close is still running.
+    closing: Vec<ClosingClient>,
     /// In-flight historical queries, keyed by id. Ids share `next_client_id`
     /// with clients, so a query's data-service name can never collide with a
     /// client's.
@@ -450,6 +514,7 @@ impl Server {
             tap_log,
             anchors,
             clients: HashMap::new(),
+            closing: Vec::new(),
             #[cfg(not(windows))]
             queries: HashMap::new(),
             #[cfg(not(windows))]
@@ -600,27 +665,39 @@ impl Server {
 
         // Stop accepting new WS clients and let in-flight connections tear down.
         #[cfg(feature = "ws")]
-        {
+        let connections_aborted = {
             if let Some(trigger) = ws_shutdown {
                 let _ = trigger.send(());
             }
-            if tokio::time::timeout_at(step_deadline(deadlines.steps), ws_task)
-                .await
-                .is_err()
+            if let Ok(joined) =
+                tokio::time::timeout_at(step_deadline(deadlines.steps), ws_task).await
             {
+                joined.map_or(true, |served| served.unwrap_or(false))
+            } else {
                 tracing::warn!("ws surface did not drain within timeout");
+                true
             }
-        }
+        };
+        #[cfg(not(feature = "ws"))]
+        let connections_aborted = false;
 
         // Abort in-flight queries up front; this also unblocks `cmd_rx` closing below.
         self.abort_all_queries();
 
         let recorder = DrainRecorder::default();
-        let clients: Vec<Box<dyn DrainClient>> = self
+        let mut clients: Vec<Box<dyn DrainClient>> = self
             .clients
             .drain()
             .map(|(_, entry)| Box::new(entry) as Box<dyn DrainClient>)
             .collect();
+        clients.extend(
+            self.closing
+                .drain(..)
+                .map(|closing| Box::new(closing) as Box<dyn DrainClient>),
+        );
+        // Half of what is left for the client closes, so the tap-log and
+        // sink flushes keep the other half.
+        let close_limit = exit_deadline.saturating_duration_since(tokio::time::Instant::now()) / 2;
         let drain_fut = drain(
             &recorder,
             move || accept.abort(),
@@ -630,8 +707,10 @@ impl Server {
             #[cfg(windows)]
             || {},
             clients,
+            close_limit,
             std::mem::take(&mut self.anchors),
             self.tap_log.clone(),
+            connections_aborted,
         );
 
         // Drop the supervisor's own `cmd_tx` clone so `cmd_rx` closes once the
@@ -718,11 +797,11 @@ impl Server {
     fn start_ws(
         &self,
     ) -> (
-        tokio::task::JoinHandle<std::io::Result<()>>,
+        tokio::task::JoinHandle<std::io::Result<bool>>,
         Option<oneshot::Sender<()>>,
     ) {
         let Some(cfg) = self.ws.as_ref().filter(|w| w.enabled).cloned() else {
-            return (tokio::spawn(async { Ok(()) }), None);
+            return (tokio::spawn(async { Ok(false) }), None);
         };
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let dm = self.dm.clone();
@@ -906,11 +985,32 @@ impl Server {
                     let _ = reply.send(Reply::ok());
                     return std::ops::ControlFlow::Break(());
                 }
-                let response = self.dispatch(request, cmd_tx).await;
-                let _ = reply.send(response);
+                // A subscribe waits on its provider, a cold one's connect
+                // included, and a client's other commands wait behind it, so
+                // these answer from a task of their own.
+                match request {
+                    Request::OpenClient {
+                        client,
+                        subscriptions,
+                    } => self.open_client(client, subscriptions, reply, cmd_tx).await,
+                    Request::Subscribe { client, spec } => self.subscribe(&client, spec, reply),
+                    Request::Unsubscribe { client, spec } => {
+                        self.unsubscribe(&client, spec, reply);
+                    }
+                    request => {
+                        let response = self.dispatch(request, cmd_tx).await;
+                        let _ = reply.send(response);
+                    }
+                }
             }
-            ServerCommand::Disconnect { client } => {
-                self.teardown_client(&client).await;
+            ServerCommand::Disconnect { client, service } => {
+                if self
+                    .clients
+                    .get(&client)
+                    .is_some_and(|entry| entry.service == service)
+                {
+                    self.teardown_client(&client);
+                }
             }
             #[cfg(not(windows))]
             ServerCommand::QueryFinished { query } => {
@@ -940,23 +1040,17 @@ impl Server {
             return Reply::error(codes::SHUTTING_DOWN, "daemon is shutting down");
         }
         match request {
-            Request::OpenClient {
-                client,
-                subscriptions,
-            } => self.open_client(client, subscriptions).await,
-            Request::Subscribe { client, spec } => self.subscribe(&client, spec).await,
-            Request::Unsubscribe { client, spec } => {
-                let instrument = Instrument::new(
-                    ProviderId::new(spec.provider),
-                    spec.asset_class.into(),
-                    spec.symbol,
-                );
-                self.unsubscribe(&client, instrument, spec.kind.into())
-                    .await
-            }
+            // Handled in `handle`, which answers them from a task of their
+            // own. These arms only exist for match exhaustiveness.
+            Request::OpenClient { .. }
+            | Request::Subscribe { .. }
+            | Request::Unsubscribe { .. } => Reply::error(
+                codes::INTERNAL,
+                "subscription ops are handled before dispatch; this arm is unreachable",
+            ),
             Request::CloseClient { client } => {
                 if self.clients.contains_key(&client) {
-                    self.teardown_client(&client).await;
+                    self.teardown_client(&client);
                     Reply::ok()
                 } else {
                     Reply::error(codes::UNKNOWN_CLIENT, format!("no such client {client:?}"))
@@ -1024,36 +1118,52 @@ impl Server {
     /// sink and pump the session's stream to it. Unix/macOS only — this is the
     /// iceoryx2 data flow, which has no node on Windows.
     #[cfg(windows)]
-    #[allow(clippy::unused_async)] // symmetric with the unix (async) arm the dispatcher awaits
+    #[allow(clippy::unused_async)] // symmetric with the unix (async) arm the actor awaits
     async fn open_client(
         &mut self,
         _client: String,
         _subscriptions: Vec<SubscriptionSpec>,
-    ) -> Reply {
+        reply: oneshot::Sender<Reply>,
+        _cmd_tx: &mpsc::Sender<ServerCommand>,
+    ) {
         // On Windows the control plane is the admin surface only; data rides the
         // WS-loopback transport, so there is no iceoryx2 data service to open.
-        Reply::error(
+        let _ = reply.send(Reply::error(
             codes::UNSUPPORTED_ON_WINDOWS,
             "open-client (iceoryx2 data plane) is unavailable on Windows; use the WS data surface",
-        )
+        ));
     }
 
+    /// Open an iceoryx2 same-host client. The entry, its sink and its pump
+    /// exist before the initial subscriptions are made, from a task that
+    /// replies once they all are; on a refusal the task tears the client down
+    /// and replies the refusal.
     #[cfg(not(windows))]
-    async fn open_client(&mut self, client: String, subscriptions: Vec<SubscriptionSpec>) -> Reply {
+    async fn open_client(
+        &mut self,
+        client: String,
+        subscriptions: Vec<SubscriptionSpec>,
+        reply: oneshot::Sender<Reply>,
+        cmd_tx: &mpsc::Sender<ServerCommand>,
+    ) {
         if self.clients.contains_key(&client) {
-            return Reply::error(
+            let _ = reply.send(Reply::error(
                 codes::DUPLICATE_CLIENT,
                 format!("client {client:?} already open"),
-            );
+            ));
+            return;
         }
-        if self.clients.len() >= self.max_clients {
-            return Reply::error(
+        self.closing.retain(|closing| !closing.task.is_finished());
+        if self.clients.len() + self.closing.len() >= self.max_clients {
+            let _ = reply.send(Reply::error(
                 codes::SERVICE_CAP_EXCEEDED,
                 format!("service cap {} exceeded", self.max_clients),
-            );
+            ));
+            return;
         }
-        if let Some(reply) = validate_initial_subscriptions(&subscriptions) {
-            return reply;
+        if let Some(refusal) = validate_initial_subscriptions(&subscriptions) {
+            let _ = reply.send(refusal);
+            return;
         }
 
         let id = self.next_client_id;
@@ -1061,46 +1171,69 @@ impl Server {
         let sink = match Iceoryx2DataSink::new(&self.node, name) {
             Ok(sink) => sink,
             Err(e) => {
-                return Reply::error(codes::INTERNAL, format!("data sink: {e:?}"));
+                let _ = reply.send(Reply::error(codes::INTERNAL, format!("data sink: {e:?}")));
+                return;
             }
         };
         let service = sink.data_service_name().to_string();
         let sink = Arc::new(sink) as Arc<dyn EventSink>;
 
-        let session = self.dm.client_session();
-        for spec in subscriptions {
-            let instrument = spec_instrument(&spec);
-            if let Err(e) = session
-                .subscribe(
-                    instrument,
-                    spec.kind.into(),
-                    spec.scope,
-                    crate::config::persistence_options(spec.persistence),
-                )
-                .await
-            {
-                return reply_from_library_error(&e);
-            }
-        }
-
+        let session = Arc::new(self.dm.client_session());
         let stream = match session.take_events().await {
             Ok(stream) => stream,
-            Err(e) => return reply_from_library_error(&e),
+            Err(e) => {
+                let _ = reply.send(reply_from_library_error(&e));
+                return;
+            }
         };
         let pump = spawn_pump(stream, sink.clone());
+        let (closing, mut closed) = watch::channel(false);
 
         self.next_client_id += 1;
         self.clients.insert(
             client.clone(),
             ClientEntry {
-                name: client,
-                session: Some(session),
+                name: client.clone(),
+                session: Some(Arc::clone(&session)),
                 sink,
                 pump,
                 service: service.clone(),
+                closing,
             },
         );
-        Reply::service(service)
+        if subscriptions.is_empty() {
+            let _ = reply.send(Reply::service(service));
+            return;
+        }
+
+        let cmd_tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            let subscribed = tokio::select! {
+                biased;
+                _ = closed.wait_for(|closed| *closed) => None,
+                subscribed = subscribe_all(&session, subscriptions) => Some(subscribed),
+            };
+            // Let go of the session before the receiver: a teardown waits for
+            // every receiver and then closes the session it holds.
+            drop(session);
+            drop(closed);
+            let Some(subscribed) = subscribed else {
+                let _ = reply.send(session_closing());
+                return;
+            };
+            match subscribed {
+                Ok(()) => {
+                    let _ = reply.send(Reply::service(service));
+                }
+                Err(e) => {
+                    // Queued ahead of anything the opener sends after the reply.
+                    let _ = cmd_tx
+                        .send(ServerCommand::Disconnect { client, service })
+                        .await;
+                    let _ = reply.send(reply_from_library_error(&e));
+                }
+            }
+        });
     }
 
     /// Open a bounded historical query: validate the range, open the session,
@@ -1257,53 +1390,130 @@ impl Server {
     #[allow(clippy::unused_self)] // symmetric with the unix arm's `&mut self`
     fn abort_all_queries(&mut self) {}
 
-    async fn subscribe(&mut self, client: &str, spec: SubscriptionSpec) -> Reply {
+    /// Subscribe `client` from a task that replies once the provider has the
+    /// pair, or `session_closed` if the client is torn down first.
+    fn subscribe(&self, client: &str, spec: SubscriptionSpec, reply: oneshot::Sender<Reply>) {
         let Some(entry) = self.clients.get(client) else {
-            return Reply::error(codes::UNKNOWN_CLIENT, format!("no such client {client:?}"));
+            let _ = reply.send(Reply::error(
+                codes::UNKNOWN_CLIENT,
+                format!("no such client {client:?}"),
+            ));
+            return;
         };
-        let Some(session) = entry.session.as_ref() else {
-            return Reply::error(codes::SESSION_CLOSED, "client session is closing");
+        let Some(session) = entry.session.clone() else {
+            let _ = reply.send(session_closing());
+            return;
         };
-        let instrument = spec_instrument(&spec);
-        match session
-            .subscribe(
-                instrument,
-                spec.kind.into(),
-                spec.scope,
-                crate::config::persistence_options(spec.persistence),
-            )
-            .await
-        {
-            Ok(subscribed) => Reply::from_subscribed(subscribed),
-            Err(e) => reply_from_library_error(&e),
-        }
+        let mut closed = entry.closing.subscribe();
+        tokio::spawn(async move {
+            let response = tokio::select! {
+                biased;
+                _ = closed.wait_for(|closed| *closed) => session_closing(),
+                subscribed = subscribe_spec(&session, spec) => match subscribed {
+                    Ok(subscribed) => Reply::from_subscribed(subscribed),
+                    Err(e) => reply_from_library_error(&e),
+                },
+            };
+            drop(session);
+            drop(closed);
+            let _ = reply.send(response);
+        });
     }
 
-    async fn unsubscribe(
-        &mut self,
+    /// Unsubscribe `client` from a task that replies once its session has
+    /// handled the unsubscribe, or `session_closed` if the client is torn down
+    /// first.
+    fn unsubscribe(
+        &self,
         client: &str,
-        instrument: Instrument,
-        kind: EventKind,
-    ) -> Reply {
+        spec: datamancer_client::spec::UnsubscribeSpec,
+        reply: oneshot::Sender<Reply>,
+    ) {
         let Some(entry) = self.clients.get(client) else {
-            return Reply::error(codes::UNKNOWN_CLIENT, format!("no such client {client:?}"));
+            let _ = reply.send(Reply::error(
+                codes::UNKNOWN_CLIENT,
+                format!("no such client {client:?}"),
+            ));
+            return;
         };
-        let Some(session) = entry.session.as_ref() else {
-            return Reply::error(codes::SESSION_CLOSED, "client session is closing");
+        let Some(session) = entry.session.clone() else {
+            let _ = reply.send(session_closing());
+            return;
         };
-        match session.unsubscribe(instrument, kind).await {
-            Ok(()) => Reply::ok(),
-            Err(e) => reply_from_library_error(&e),
-        }
+        let mut closed = entry.closing.subscribe();
+        let instrument = Instrument::new(
+            ProviderId::new(spec.provider),
+            spec.asset_class.into(),
+            spec.symbol,
+        );
+        let kind: EventKind = spec.kind.into();
+        tokio::spawn(async move {
+            let response = tokio::select! {
+                biased;
+                _ = closed.wait_for(|closed| *closed) => session_closing(),
+                unsubscribed = session.unsubscribe(instrument, kind) => match unsubscribed {
+                    Ok(()) => Reply::ok(),
+                    Err(e) => reply_from_library_error(&e),
+                },
+            };
+            drop(session);
+            drop(closed);
+            let _ = reply.send(response);
+        });
     }
 
-    async fn teardown_client(&mut self, client: &str) {
+    /// Remove `client` and flush and close it on a task of its own, which
+    /// counts toward `max_clients` until it ends. A subscribe or unsubscribe
+    /// in flight answers `session_closed`; the session takes the close once a
+    /// subscribe it is running has returned.
+    fn teardown_client(&mut self, client: &str) {
         if let Some(mut entry) = self.clients.remove(client) {
             tracing::info!(client, service = %entry.service, "tearing down client");
-            entry.flush_sink().await;
-            entry.close().await;
+            entry.closing.send_replace(true);
+            let task = tokio::spawn(async move {
+                entry.flush_sink().await;
+                entry.close().await;
+            });
+            self.closing.push(ClosingClient {
+                name: client.to_string(),
+                task,
+            });
         }
     }
+}
+
+/// The reply to a request on a client that is being torn down.
+fn session_closing() -> Reply {
+    Reply::error(codes::SESSION_CLOSED, "client session is closing")
+}
+
+/// Subscribe `session` to `spec`.
+async fn subscribe_spec(
+    session: &ClientSession,
+    spec: SubscriptionSpec,
+) -> datamancer::Result<datamancer::Subscribed> {
+    let instrument = spec_instrument(&spec);
+    session
+        .subscribe(
+            instrument,
+            spec.kind.into(),
+            spec.scope,
+            crate::config::persistence_options(spec.persistence),
+        )
+        .await
+}
+
+/// Subscribe `session` to each of `subscriptions` in order, stopping at the
+/// first refusal.
+#[cfg(not(windows))]
+async fn subscribe_all(
+    session: &ClientSession,
+    subscriptions: Vec<SubscriptionSpec>,
+) -> datamancer::Result<()> {
+    for spec in subscriptions {
+        subscribe_spec(session, spec).await?;
+    }
+    Ok(())
 }
 
 /// The instrument for a subscription spec.
@@ -1827,15 +2037,15 @@ impl TeardownArm {
     fn apply(
         self,
         reply: &Reply,
-        opened_client: &mut Option<String>,
+        opened_client: &mut Option<(String, String)>,
         opened_queries: &mut Vec<QueryId>,
     ) {
         // Arm teardown only after a *successful* open, so a rejected open
         // (e.g. duplicate-name) never causes the EOF path to tear down the
         // existing client/query it did not actually create.
         if reply.ok {
-            if let Some(name) = self.open_client {
-                *opened_client = Some(name);
+            if let (Some(name), Some(service)) = (self.open_client, reply.service.clone()) {
+                *opened_client = Some((name, service));
             }
             if self.is_open_query
                 && let Some(id) = reply.query
@@ -1891,7 +2101,7 @@ async fn serve_connection<R, W>(
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut lines = BufReader::new(read).lines();
-    let mut opened_client: Option<String> = None;
+    let mut opened_client: Option<(String, String)> = None;
     let mut opened_queries: Vec<QueryId> = Vec::new();
 
     loop {
@@ -1956,6 +2166,8 @@ async fn serve_connection<R, W>(
                     {
                         break;
                     }
+                    // The next line is read only once this reply is in, so a
+                    // connection's requests are answered in the order sent.
                     match rx.await {
                         Ok(reply) => {
                             teardown.apply(&reply, &mut opened_client, &mut opened_queries);
@@ -1986,11 +2198,13 @@ async fn serve_connection<R, W>(
 /// query case.
 async fn emergency_teardown(
     cmd_tx: &mpsc::Sender<ServerCommand>,
-    opened_client: Option<String>,
+    opened_client: Option<(String, String)>,
     opened_queries: Vec<QueryId>,
 ) {
-    if let Some(client) = opened_client {
-        let _ = cmd_tx.send(ServerCommand::Disconnect { client }).await;
+    if let Some((client, service)) = opened_client {
+        let _ = cmd_tx
+            .send(ServerCommand::Disconnect { client, service })
+            .await;
     }
     if !opened_queries.is_empty() {
         let _ = cmd_tx
@@ -2388,6 +2602,44 @@ always_on = true
             cmd_rx.try_recv().is_err(),
             "a frame that does not parse never reaches the actor"
         );
+    }
+
+    /// A connection's EOF tears down the client it opened, naming the
+    /// service its `open-client` was answered with, so a later client opened
+    /// under that name is not torn down.
+    #[tokio::test]
+    async fn serve_connection_eof_names_the_opened_clients_service() {
+        let (client, task, mut cmd_rx, _dir) = spawn_connection(true);
+        let (c_read, mut c_write) = tokio::io::split(client);
+        let mut replies = BufReader::new(c_read).lines();
+
+        c_write
+            .write_all(b"{\"op\":\"open-client\",\"client\":\"exec-1\"}\n")
+            .await
+            .expect("write request");
+        let Some(ServerCommand::Request { request, reply }) = cmd_rx.recv().await else {
+            panic!("open-client reaches the actor");
+        };
+        assert!(matches!(request, Request::OpenClient { .. }));
+        reply
+            .send(Reply::service("svc-1".to_string()))
+            .expect("connection waits for the reply");
+        replies
+            .next_line()
+            .await
+            .expect("read reply")
+            .expect("reply line present");
+
+        drop(c_write);
+        drop(replies);
+        task.await.expect("serve_connection task joins");
+        match cmd_rx.recv().await {
+            Some(ServerCommand::Disconnect { client, service }) => {
+                assert_eq!(client, "exec-1");
+                assert_eq!(service, "svc-1");
+            }
+            _ => panic!("EOF sends no Disconnect"),
+        }
     }
 
     /// The `privileged == false` denial **wiring** (not just the predicate).
