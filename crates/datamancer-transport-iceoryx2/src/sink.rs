@@ -77,6 +77,7 @@ pub struct Iceoryx2DataSink {
     /// advertises in its `open-client` / `open-query` reply.
     name: DataServiceName,
     data_service: PortFactory<ipc_threadsafe::Service, DataPayload, ()>,
+    ann_service: PortFactory<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
     data: Publisher<ipc_threadsafe::Service, DataPayload, ()>,
     announcements: Publisher<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
     state: Mutex<State>,
@@ -139,6 +140,7 @@ impl Iceoryx2DataSink {
         Ok(Self {
             name,
             data_service,
+            ann_service,
             data,
             announcements,
             state: Mutex::new(State {
@@ -155,6 +157,14 @@ impl Iceoryx2DataSink {
     #[must_use]
     pub fn data_service_name(&self) -> &DataServiceName {
         &self.name
+    }
+
+    /// Whether a subscriber is attached to both the data and the announcement
+    /// service, so it receives everything published from here on.
+    #[must_use]
+    pub fn has_subscriber(&self) -> bool {
+        self.data_service.dynamic_config().number_of_subscribers() > 0
+            && self.ann_service.dynamic_config().number_of_subscribers() > 0
     }
 
     /// Publish one announcement sample.

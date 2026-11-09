@@ -47,9 +47,10 @@ pub enum Request {
         #[serde(flatten)]
         spec: QuerySpec,
     },
-    /// Abort an in-flight query and release its data service. Answering
-    /// `unknown_query` means the query already finished or was already
-    /// cancelled.
+    /// Cancel an in-flight query: its fetch stops, its data stream ends, and
+    /// the daemon releases its data service and `max_queries` slot at once.
+    /// Answering `unknown_query` means the query already finished or was
+    /// already cancelled.
     CancelQuery { query: QueryId },
     /// All in-flight query ids, daemon-wide (the `list-clients` analogue).
     ListQueries,

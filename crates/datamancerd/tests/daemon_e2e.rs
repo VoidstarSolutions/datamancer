@@ -296,8 +296,10 @@ fn dump_iceoryx2_state(why: &str) {
     }
 }
 
-/// A bounded historical bar query over a month-long, long-closed range: real
-/// bars, then `SessionClosing`, then the service disappears on its own.
+/// A bounded historical bar query nobody attaches to: in flight after the
+/// reply, then gone once the daemon's attach grace passes, without
+/// `cancel-query` and with the opening connection still up. No bar is
+/// published.
 ///
 /// The opening connection is held open for the query's whole lifetime rather
 /// than using `round_trip` to send `open-query` itself: a dropped connection
@@ -310,25 +312,9 @@ fn dump_iceoryx2_state(why: &str) {
 /// could ever observe it in flight. Holding the connection open here proves
 /// "still in flight" and "self-reaped without cancel-query" for real, instead
 /// of merely proving EOF-teardown a second time.
-///
-/// Uses `bar1m` over `2024-01-01..2024-02-01` rather than the daily-bar,
-/// single-week range this docstring's title once suggested: in two
-/// independent real runs against Alpaca paper credentials, an equity
-/// `bar1d` request over `2024-01-01..2024-01-08` connected successfully
-/// (TCP+TLS to `data.alpaca.markets` completed) and then never received a
-/// response — 30+ seconds with zero further activity, confirmed by
-/// `RUST_LOG=debug` request tracing. The `bar1m`/month-long request below,
-/// by contrast, paginates and completes in ~1-2 seconds every time it was
-/// run. The cause is **unconfirmed**: this branch's own reading of the fetch
-/// path found it identical for both intervals (only the `TimeFrame` differs),
-/// so the two candidate explanations — an Alpaca-side quirk for that exact
-/// short/holiday-adjacent daily range, or simple rate limiting from repeated
-/// development runs — are both at least as plausible as a defect in our
-/// daily-bar path. Recorded as an observation to reproduce deliberately, not
-/// as a known bug.
 #[test]
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
-fn open_query_streams_bars_then_reaps_its_service() {
+fn open_query_nobody_attaches_to_is_reaped_after_the_grace() {
     let dir = tempfile::tempdir().expect("tempdir");
     let daemon = spawn_daemon(dir.path());
 
@@ -375,11 +361,10 @@ fn open_query_streams_bars_then_reaps_its_service() {
         "expected {id} in {listed}"
     );
 
-    // Let the bounded fetch finish — the opening connection (`writer`/
-    // `reader`) is still alive here — then confirm the daemon reaped the
-    // query on its own: nobody called cancel-query, and the connection that
-    // opened it never dropped, so this can only be the query's own
-    // completion, not EOF teardown.
+    // Nobody attaches, so the daemon gives the query up once its attach grace
+    // passes. The opening connection (`writer`/`reader`) is still alive here
+    // and nobody called cancel-query, so this can only be the daemon's own
+    // reap, not EOF teardown.
     wait_until_reaped(&daemon, id);
 
     drop((writer, reader));
@@ -410,11 +395,8 @@ fn wait_until_reaped(daemon: &Daemon, id: u64) {
 /// receives the queried instrument's bars and then the terminal
 /// `SessionClosing`, after which the daemon reaps the query on its own
 /// (#108). Until now only the reap was asserted; a query whose events were
-/// dropped before the sink would have passed. The subscriber attaches right
-/// after the reply: the pump is already running (see `open_query`'s "Attach
-/// race"), and a month of 1-minute bars pages through Alpaca's REST API for
-/// far longer than the attach takes, so the service is still there. Same
-/// request as [`open_query_streams_bars_then_reaps_its_service`].
+/// dropped before the sink would have passed. Same request as
+/// [`open_query_nobody_attaches_to_is_reaped_after_the_grace`].
 #[test]
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime and Alpaca credentials"]
 fn open_query_delivers_bars_to_a_subscriber_then_closes() {
@@ -449,23 +431,21 @@ fn open_query_delivers_bars_to_a_subscriber_then_closes() {
     let mut subscriber =
         datamancer::transport::DataSubscriber::open(&node, &name).expect("subscriber");
 
-    // Drain until the terminal control, then a little longer: a bar whose
-    // symbol announcement lands on a later poll is held and released then,
-    // so the last bars may follow `SessionClosing` out of the buffer.
+    // Drain to the end of the stream, which the reap closes.
     let deadline = Instant::now() + Duration::from_mins(1);
     let mut bars = 0u64;
     let mut closed = false;
-    let mut settle = 0;
-    while !closed || settle < 10 {
-        if closed {
-            settle += 1;
-        } else {
-            assert!(
-                Instant::now() < deadline,
-                "no SessionClosing within 60 s ({bars} bars so far)"
-            );
-        }
-        for event in subscriber.poll().expect("poll") {
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the stream did not end within 60 s ({bars} bars so far)"
+        );
+        let events = match subscriber.poll() {
+            Ok(events) => events,
+            Err(datamancer::transport::TransportError::ServiceClosed) => break,
+            Err(e) => panic!("poll: {e}"),
+        };
+        for event in events {
             match event {
                 MarketEvent::Bar(bar) => {
                     assert_eq!(bar.instrument.symbol(), "AAPL", "{bar:?}");
@@ -481,6 +461,7 @@ fn open_query_delivers_bars_to_a_subscriber_then_closes() {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert!(closed, "the stream ended without SessionClosing");
     assert!(bars > 0, "SessionClosing arrived before any bar");
     assert_eq!(
         subscriber.held_len(),

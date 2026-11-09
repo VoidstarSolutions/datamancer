@@ -21,7 +21,7 @@ use datamancer_core::{
 use datamancer_transport_iceoryx2::{
     DataServiceName, DataSubscriber, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher,
     Iceoryx2DiagnosticsSubscriber, Iceoryx2HealthPublisher, Iceoryx2HealthSubscriber,
-    ServicePrefix,
+    ServicePrefix, TransportError,
 };
 use iceoryx2::prelude::{Node, NodeBuilder, ipc_threadsafe};
 
@@ -304,6 +304,46 @@ async fn late_joiner_resolves_all_symbols() {
             "late joiner resolved {symbol}"
         );
     }
+}
+
+#[test]
+#[ignore = "needs the iceoryx2 runtime"]
+fn opening_a_service_nobody_created_fails() {
+    let client = unique_client_id();
+    let node = node();
+    assert!(
+        DataSubscriber::open(&node, &name(client)).is_err(),
+        "the attach must not create the service"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_sink_sees_its_subscriber_attach_and_leave() {
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    assert!(!sink.has_subscriber());
+    let sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
+    assert!(sink.has_subscriber());
+    drop(sub);
+    assert!(!sink.has_subscriber());
+}
+
+#[tokio::test]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_subscriber_receives_everything_before_its_service_closes() {
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
+    assert!(sub.poll().expect("idle poll").is_empty());
+
+    sink.publish(trade("BTC/USD", 0, 100)).await;
+    drop(sink);
+
+    assert_eq!(drain_until(&mut sub, 1).len(), 1);
+    assert!(matches!(sub.poll(), Err(TransportError::ServiceClosed)));
 }
 
 #[tokio::test]

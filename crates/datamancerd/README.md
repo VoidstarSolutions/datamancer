@@ -573,7 +573,9 @@ like `snapshot`, and, unlike `open-client`/`subscribe`, it needs **no** prior
 own short-lived data service
 (`{service_prefix}/{boot_id}/v{WIRE_VERSION}/data/{id}`, the same id space
 and name shape as `open-client`'s per-client services, advertised verbatim in
-the reply's `service`), and pumps the bounded stream into it.
+the reply's `service`), and pumps the bounded stream into it once a
+subscriber has attached. A query nobody attaches to within 5 s is reaped
+without publishing anything, holding its `max_queries` slot until then.
 A query that runs to completion ends with a terminal `SessionClosing` control
 on its data stream and the daemon reaps the entry (and the service) on its
 own — no `cancel-query` needed. A provider fetch failure is emitted
@@ -585,14 +587,15 @@ each failed or skipped fetch left unserved, ahead of the terminal
 empty or truncated stream ending in the terminal `SessionClosing`, on the data
 plane alone indistinguishable from a legitimately empty range; the daemon log
 and the diagnostics plane tell them apart. A failure is never a control-socket
-error after the reply. `cancel-query` aborts an in-flight query and releases
-its service early; a stale/finished/unknown id answers
+error after the reply. `cancel-query` stops an in-flight query's fetch, ends
+its data stream and frees its service and `max_queries` slot at once, even
+while its subscriber has stopped reading; a stale/finished/unknown id answers
 `unknown_query`. Two things implicitly cancel every query a connection opened:
 **dropping the `datamancer-client` `QueryStream`** (its `Drop` sends
 `cancel-query` — a client-library courtesy, not something the daemon detects:
-the iceoryx2 publisher cannot observe a subscriber going away, so a raw
-consumer that just drops its subscriber leaves the query running to
-completion) and
+the daemon checks for a subscriber only while it waits for the first one, so
+a raw consumer that just drops its subscriber later leaves the query running
+to completion) and
 **dropping the control connection itself** (EOF on the socket — the daemon
 tracks which in-flight queries each control connection opened and aborts them
 on that connection's teardown, the same way `close-client`/EOF tears down an
@@ -732,11 +735,12 @@ stale.)
   dynamic storage under iceoryx2's root, bounded by the number of crashes).
 - **The host-global `datamancer/diagnostics` and `datamancer/health` names
   can.** Clients find them by fixed name, so they cannot be boot-scoped. If
-  one is stale, the daemon refuses to boot with
-  `transport: … is marked for destruction with no live owner …` naming the
-  service and this recovery. iceoryx2 0.10 ships no supported way for the
-  daemon to remove such a service on its own (`Node::force_remove_service` is
-  `unsafe` and this workspace forbids unsafe code outside Win32/FFI), so the
+  one is marked for destruction, the daemon refuses to boot with
+  `iceoryx2 service … is marked for destruction: a predecessor is removing it
+  or crashed while doing so`, naming the service and this recovery. A
+  predecessor still removing it is done within moments, so try the start
+  again first; if it fails again, the predecessor crashed. iceoryx2 0.10 ships
+  no supported way for the daemon to remove such a service on its own, so the
   recovery is manual: stop every iceoryx2 process on the host for this user
   (`datamancerd` and its consumers), remove iceoryx2's root directory
   (`/tmp/iceoryx2` by default; `global.root_path` in the iceoryx2 config) and
