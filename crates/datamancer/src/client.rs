@@ -30,13 +30,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use datamancer_core::{
     ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, LiveScope,
     MarketEvent, Result, Seq, StreamConnection, Subscribed, SubscriptionRef, Timestamp,
 };
 use futures::StreamExt as _;
-use tokio::sync::{mpsc, oneshot};
+use futures::stream::FuturesUnordered;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -609,13 +611,99 @@ impl Drop for ClientStats {
 // Fan-out (lives inside the authoritative controller)
 // ---------------------------------------------------------------------------
 
-/// A referrer's bounded channel plus any loss owed to it as a `Gap`. When the
-/// channel is full the dropped event is folded into `pending` (a per-instrument
-/// span) rather than discarded, and the accumulated `Gap` is flushed ahead of
-/// resumed live delivery once the channel drains.
+/// A referrer's bounded channel plus what a full channel left owed to it. A
+/// dropped data event is folded into `pending` (a per-instrument span), and a
+/// dropped control other than a `Gap` is kept in `owed`. Both go out in `seq`
+/// order ahead of the next event once the channel has room.
 struct Referrer {
     tx: mpsc::Sender<MarketEvent>,
     pending: Option<PendingGap>,
+    /// Controls dropped on a full channel, in `seq` order, at most one per
+    /// kind (see [`supersedes`]).
+    owed: Vec<MarketEvent>,
+    /// This referrer does not pace a replay.
+    unpaced: bool,
+    /// The replay's current wait is on this referrer.
+    blocking: bool,
+    /// How long the replay has waited on this referrer since it last freed a
+    /// slot.
+    stalled: Duration,
+    /// How long, in all, the replay has waited on this referrer while another
+    /// referrer had room.
+    held_back: Duration,
+    /// Its channel's free slots when the replay's current wait began.
+    free_at_wait: usize,
+}
+
+impl Referrer {
+    fn new(tx: mpsc::Sender<MarketEvent>) -> Self {
+        Self {
+            tx,
+            pending: None,
+            owed: Vec::new(),
+            unpaced: false,
+            blocking: false,
+            stalled: Duration::ZERO,
+            held_back: Duration::ZERO,
+            free_at_wait: 0,
+        }
+    }
+
+    /// Whether a `Gap` or a control is owed to it.
+    fn owes(&self) -> bool {
+        self.pending.is_some() || !self.owed.is_empty()
+    }
+
+    /// Slots the next event takes: its own, and one for each `Gap` and control
+    /// still owed.
+    fn slots_needed(&self) -> usize {
+        1 + usize::from(self.pending.is_some()) + self.owed.len()
+    }
+
+    /// Record `ev`, which the full channel refused: data and `Gap`s fold into
+    /// the pending `Gap`; another control replaces an owed one it supersedes.
+    fn owe(&mut self, ev: &MarketEvent) {
+        if let MarketEvent::Control(control) = ev
+            && !matches!(control.kind, ControlKind::Gap { .. })
+        {
+            self.owed.retain(|owed| match owed {
+                MarketEvent::Control(older) => !supersedes(&control.kind, &older.kind),
+                _ => true,
+            });
+            self.owed.push(ev.clone());
+        } else {
+            absorb_drop(&mut self.pending, ev);
+        }
+    }
+
+    /// Send what is owed, in `seq` order, until nothing is or the channel
+    /// refuses.
+    fn send_owed(&mut self) -> std::result::Result<(), Refused> {
+        loop {
+            match (&self.pending, self.owed.first()) {
+                (None, None) => return Ok(()),
+                (Some(gap), control)
+                    if control
+                        .and_then(MarketEvent::seq)
+                        .is_none_or(|seq| gap.first_seq <= seq) =>
+                {
+                    self.tx.try_send(gap.to_event()).map_err(Refused::from)?;
+                    self.pending = None;
+                }
+                _ => {
+                    self.tx
+                        .try_send(self.owed[0].clone())
+                        .map_err(Refused::from)?;
+                    self.owed.remove(0);
+                }
+            }
+        }
+    }
+
+    /// Whether its channel is short of the slots the next event takes.
+    fn short(&self) -> bool {
+        self.tx.capacity() < self.slots_needed()
+    }
 }
 
 /// Accumulated, undelivered loss for one backed-up referrer. `FanOut` is
@@ -651,10 +739,8 @@ impl PendingGap {
 
 /// Extract `(instrument, from, to, provider, seq)` for an event that can be
 /// represented as a per-instrument `Gap`. Data events span `[ts, ts+1)`; an
-/// already-`Gap` control contributes its embedded span. Connection-scoped
-/// controls carry no instrument and return `None` — a dropped one is not folded
-/// into a data gap (it is re-derivable from the diagnostics snapshot / on
-/// reconnect).
+/// already-`Gap` control contributes its embedded span. Other controls return
+/// `None`.
 fn gap_coords(ev: &MarketEvent) -> Option<(Instrument, Timestamp, Timestamp, String, Seq)> {
     match ev {
         MarketEvent::Control(Control {
@@ -689,9 +775,49 @@ fn gap_coords(ev: &MarketEvent) -> Option<(Instrument, Timestamp, Timestamp, Str
     }
 }
 
+/// Why a referrer's channel refused a send.
+enum Refused {
+    Full,
+    Closed,
+}
+
+impl From<mpsc::error::TrySendError<MarketEvent>> for Refused {
+    fn from(e: mpsc::error::TrySendError<MarketEvent>) -> Self {
+        match e {
+            mpsc::error::TrySendError::Full(_) => Self::Full,
+            mpsc::error::TrySendError::Closed(_) => Self::Closed,
+        }
+    }
+}
+
+/// Whether `newer` replaces `older` as an owed control: a connect or disconnect
+/// replaces the provider's last one, a `ProviderError` the provider's last
+/// error, and a `SubscriptionChanged` the instrument's.
+fn supersedes(newer: &ControlKind, older: &ControlKind) -> bool {
+    fn connection_provider(kind: &ControlKind) -> Option<&str> {
+        match kind {
+            ControlKind::ProviderConnected { provider }
+            | ControlKind::ProviderDisconnected { provider, .. } => Some(provider),
+            _ => None,
+        }
+    }
+    match (newer, older) {
+        (
+            ControlKind::ProviderError { provider: a, .. },
+            ControlKind::ProviderError { provider: b, .. },
+        ) => a == b,
+        (
+            ControlKind::SubscriptionChanged { instrument: a, .. },
+            ControlKind::SubscriptionChanged { instrument: b, .. },
+        ) => a == b,
+        (ControlKind::SessionClosing, ControlKind::SessionClosing) => true,
+        _ => connection_provider(newer)
+            .is_some_and(|provider| connection_provider(older) == Some(provider)),
+    }
+}
+
 /// Fold a dropped event into a referrer's pending gap (starting one if needed).
-/// A drop with no per-instrument identity (a connection-scoped control) is not
-/// recorded here.
+/// A drop with no per-instrument identity is not recorded here.
 fn absorb_drop(pending: &mut Option<PendingGap>, ev: &MarketEvent) {
     let Some((instrument, from, to, provider, seq)) = gap_coords(ev) else {
         return;
@@ -714,12 +840,34 @@ fn absorb_drop(pending: &mut Option<PendingGap>, ev: &MarketEvent) {
 
 /// The authoritative controller's consumer-facing side: one bounded channel per
 /// referrer. The controller **`try_send`s** so a slow/wedged referrer never
-/// stalls its co-subscribers or the provider. A referrer that closes its
-/// channel is removed; a referrer whose bounded channel is momentarily full has
-/// the dropped event folded into a pending per-instrument `Gap` (surfaced to it
-/// once the channel drains) — never silently lost.
+/// stalls the provider, and its co-subscribers only within the rules below. A
+/// referrer that closes its channel is removed. A referrer whose bounded channel
+/// is full has a dropped data event folded into a pending per-instrument `Gap`,
+/// and a dropped control kept until a newer one of its kind replaces it. Both
+/// reach it in `seq` order and ahead of its next event: in the live phase as
+/// soon as its channel has room, during a replay ahead of the next replayed
+/// event.
+///
+/// A backfill's replay comes at fetch speed, so the controller paces it:
+///
+/// 1. A replay, history or seam flush, sends only when every pacing referrer
+///    has room.
+/// 2. A referrer stops pacing on either of two 30 s clocks
+///    ([`next_wait`](Self::next_wait)). One counts the time since it last freed
+///    a slot. The other sums the waits on it that began with another referrer
+///    already having room, and nothing resets it. Both belong to the referrer,
+///    so a resubscribe, which adds a new one, starts again from zero.
+/// 3. A seam flush that has lost a whole ring stops pacing for referrers full at
+///    that moment ([`stop_pacing_full`](Self::stop_pacing_full)).
+///
+/// A referrer that stops pacing gets a `Gap`.
 pub(crate) struct FanOut {
     subscribers: HashMap<SubscriberId, Referrer>,
+    /// Ends a [`next_wait`](Self::next_wait) when the referrers pacing a replay
+    /// change.
+    pacers_changed: Arc<Notify>,
+    /// Some referrer had room when the replay's current wait began.
+    room_at_wait: bool,
     /// Last per-symbol `SubscriptionChanged { active: true }` (a real,
     /// source-stamped event), replayed to each new subscriber so a late join
     /// sees the subscription state without a fresh provider ack.
@@ -727,14 +875,19 @@ pub(crate) struct FanOut {
     /// Set once the first subscriber is added. Distinguishes "never had a
     /// subscriber yet" (do not tear down) from "last subscriber left".
     had_subscriber: bool,
+    /// A referrer may be owed a `Gap` or a control (see [`Self::owed_room`]).
+    owing: bool,
 }
 
 impl FanOut {
     pub(crate) fn new() -> Self {
         Self {
             subscribers: HashMap::new(),
+            pacers_changed: Arc::new(Notify::new()),
+            room_at_wait: false,
             last_subscription_changed: None,
             had_subscriber: false,
+            owing: false,
         }
     }
 
@@ -744,22 +897,147 @@ impl FanOut {
         if let Some(ev) = &self.last_subscription_changed {
             let _ = sender.try_send(ev.clone());
         }
-        self.subscribers.insert(
-            id,
-            Referrer {
-                tx: sender,
-                pending: None,
-            },
-        );
+        self.subscribers.insert(id, Referrer::new(sender));
+        self.pacers_changed.notify_one();
+    }
+
+    /// Charge `waited` to the referrers the last wait was blocked on and stop
+    /// those that reach `limit` on either clock from pacing: its stall, which
+    /// a slot freed during the wait clears, and its held-back time, charged
+    /// when another referrer had room as the wait began and never cleared.
+    /// `None` when every pacing referrer has room.
+    ///
+    /// Otherwise the next wait, blocked on the pacing referrers short of room.
+    /// It resolves when a referrer short of room gets it, pacing or not, when
+    /// the referrers pacing the replay change, or when a blocking referrer
+    /// reaches `limit`. Any of those can change whom the replay waits on, so
+    /// the caller asks again.
+    pub(crate) fn next_wait(
+        &mut self,
+        waited: Duration,
+        limit: Duration,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let room_at_wait = std::mem::take(&mut self.room_at_wait);
+        let mut pacer_short = false;
+        for referrer in self.subscribers.values_mut() {
+            let free = referrer.tx.capacity();
+            let short = free < referrer.slots_needed();
+            if referrer.blocking {
+                if free > referrer.free_at_wait {
+                    referrer.stalled = Duration::ZERO;
+                } else {
+                    referrer.stalled += waited;
+                }
+                if room_at_wait {
+                    referrer.held_back += waited;
+                }
+                referrer.unpaced |= referrer.stalled >= limit || referrer.held_back >= limit;
+            }
+            let closed = referrer.tx.is_closed();
+            self.room_at_wait |= !closed && !short;
+            referrer.blocking = !closed && short;
+            referrer.free_at_wait = free;
+            pacer_short |= referrer.blocking && !referrer.unpaced;
+        }
+        if !pacer_short {
+            for referrer in self.subscribers.values_mut() {
+                referrer.blocking = false;
+            }
+            return None;
+        }
+        let short: Vec<_> = self
+            .subscribers
+            .values()
+            .filter(|r| r.blocking)
+            .map(|r| (r.tx.clone(), r.slots_needed()))
+            .collect();
+        for referrer in self.subscribers.values_mut() {
+            referrer.blocking &= !referrer.unpaced;
+        }
+        let timer = self
+            .subscribers
+            .values()
+            .filter(|r| r.blocking)
+            .map(|r| {
+                let held_back = if self.room_at_wait {
+                    r.held_back
+                } else {
+                    Duration::ZERO
+                };
+                limit.saturating_sub(r.stalled.max(held_back))
+            })
+            .min();
+        let pacers_changed = self.pacers_changed.clone();
+        Some(async move {
+            let mut room: FuturesUnordered<_> = short
+                .iter()
+                .map(|(tx, slots)| tx.reserve_many(*slots))
+                .collect();
+            tokio::select! {
+                _ = room.next() => {}
+                () = pacers_changed.notified() => {}
+                () = tokio::time::sleep(timer.unwrap_or_default()), if timer.is_some() => {}
+            }
+        })
+    }
+
+    /// A wait that ends when a referrer owed a `Gap` or a control has room for
+    /// one event; `None` when nothing is owed. The caller then calls
+    /// [`Self::flush_owed`].
+    pub(crate) fn owed_room(&mut self) -> Option<impl Future<Output = ()> + Send + 'static> {
+        if !self.owing {
+            return None;
+        }
+        let owing: Vec<_> = self
+            .subscribers
+            .values()
+            .filter(|r| r.owes())
+            .map(|r| r.tx.clone())
+            .collect();
+        if owing.is_empty() {
+            self.owing = false;
+            return None;
+        }
+        Some(async move {
+            let mut room: FuturesUnordered<_> = owing.iter().map(mpsc::Sender::reserve).collect();
+            room.next().await;
+        })
+    }
+
+    /// Send each referrer what it is owed, as far as its channel has room.
+    pub(crate) fn flush_owed(&mut self) {
+        let mut dead: Vec<SubscriberId> = Vec::new();
+        for (id, r) in &mut self.subscribers {
+            if r.owes() && matches!(r.send_owed(), Err(Refused::Closed)) {
+                dead.push(*id);
+            }
+        }
+        for id in dead {
+            self.subscribers.remove(&id);
+        }
+        self.owing = self.subscribers.values().any(Referrer::owes);
+    }
+
+    /// Referrers full now stop pacing this session's replay.
+    pub(crate) fn stop_pacing_full(&mut self) {
+        for referrer in self.subscribers.values_mut() {
+            referrer.unpaced |= referrer.short();
+        }
+        self.pacers_changed.notify_one();
     }
 
     pub(crate) fn remove(&mut self, id: SubscriberId) {
         self.subscribers.remove(&id);
+        self.pacers_changed.notify_one();
     }
 
     /// Remove every referrer whose receiver is gone.
     pub(crate) fn remove_closed(&mut self) {
+        let before = self.subscribers.len();
         self.subscribers.retain(|_, r| !r.tx.is_closed());
+        if self.subscribers.len() != before {
+            self.pacers_changed.notify_one();
+        }
     }
 
     /// True once a subscriber has been added and the fan-out is now empty —
@@ -787,18 +1065,18 @@ impl FanOut {
         }
         let mut dead: Vec<SubscriberId> = Vec::new();
         for (id, r) in &mut self.subscribers {
-            // Flush any loss owed to this referrer first, so the `Gap` is ordered
-            // ahead of resumed live delivery. If the channel is still full, fold
-            // this event into the pending gap and move on — never stall a
-            // co-subscriber or the provider.
-            if let Some(p) = &r.pending {
-                match r.tx.try_send(p.to_event()) {
-                    Ok(()) => r.pending = None,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        absorb_drop(&mut r.pending, ev);
+            // What a full channel left owed goes first. If the channel is still
+            // full, this event is owed too, and nothing waits: neither a
+            // co-subscriber nor the provider stalls on a slow referrer.
+            if r.owes() {
+                match r.send_owed() {
+                    Ok(()) => {}
+                    Err(Refused::Full) => {
+                        r.owe(ev);
+                        self.owing = true;
                         continue;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(Refused::Closed) => {
                         dead.push(*id);
                         continue;
                     }
@@ -806,10 +1084,10 @@ impl FanOut {
             }
             match r.tx.try_send(ev.clone()) {
                 Ok(()) => {}
-                // A momentarily-full channel means a slow referrer: record the
-                // loss as a per-instrument `Gap` (delivered when it drains)
-                // rather than dropping it silently.
-                Err(mpsc::error::TrySendError::Full(_)) => absorb_drop(&mut r.pending, ev),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    r.owe(ev);
+                    self.owing = true;
+                }
                 Err(mpsc::error::TrySendError::Closed(_)) => dead.push(*id),
             }
         }
@@ -1804,11 +2082,17 @@ mod client_ring_tests {
 
 #[cfg(test)]
 mod fanout_tests {
+    use std::time::Duration;
+
+    use futures::FutureExt as _;
+
     use super::{FanOut, SubscriberId};
     use datamancer_core::{
         AssetClass, ControlKind, Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
     };
     use tokio::sync::mpsc;
+
+    const LIMIT: Duration = Duration::from_secs(30);
 
     fn inst(symbol: &str) -> Instrument {
         Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, symbol)
@@ -1854,5 +2138,377 @@ mod fanout_tests {
             },
             other => panic!("expected a Control::Gap, got {other:?}"),
         }
+    }
+
+    fn control(seq: u64, kind: ControlKind) -> MarketEvent {
+        MarketEvent::Control(datamancer_core::Control {
+            source_ts: Timestamp(0),
+            rx_ts: Timestamp(0),
+            seq: Seq(seq),
+            kind,
+        })
+    }
+
+    fn disconnected(seq: u64) -> MarketEvent {
+        control(
+            seq,
+            ControlKind::ProviderDisconnected {
+                provider: "p".to_string(),
+                reason: "reset".to_string(),
+                cause: datamancer_core::DisconnectCause::Error,
+            },
+        )
+    }
+
+    fn connected(seq: u64) -> MarketEvent {
+        control(
+            seq,
+            ControlKind::ProviderConnected {
+                provider: "p".to_string(),
+            },
+        )
+    }
+
+    fn subscription_changed(seq: u64, active: bool) -> MarketEvent {
+        control(
+            seq,
+            ControlKind::SubscriptionChanged {
+                provider: "p".to_string(),
+                instrument: inst("AAPL"),
+                kind: datamancer_core::EventKind::Trade,
+                active,
+            },
+        )
+    }
+
+    /// A fan-out with one referrer whose channel holds `depth` events and is
+    /// full, plus the receiver and a sender for filling it again.
+    fn full_referrer(depth: usize) -> (FanOut, mpsc::Receiver<MarketEvent>) {
+        let (tx, rx) = mpsc::channel(depth);
+        for _ in 0..depth {
+            tx.try_send(trade(1, 0)).unwrap();
+        }
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), tx);
+        (fanout, rx)
+    }
+
+    /// Empty the channel, fan `next` out, and return what the referrer then
+    /// receives as `(seq, what)`.
+    fn drain_then(
+        fanout: &mut FanOut,
+        rx: &mut mpsc::Receiver<MarketEvent>,
+        next: &MarketEvent,
+    ) -> Vec<(u64, &'static str)> {
+        while rx.try_recv().is_ok() {}
+        fanout.fanout(next);
+        let mut got = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            let what = match &ev {
+                MarketEvent::Control(c) => match c.kind {
+                    ControlKind::Gap { .. } => "gap",
+                    ControlKind::ProviderConnected { .. } => "connected",
+                    ControlKind::ProviderDisconnected { .. } => "disconnected",
+                    ControlKind::ProviderError { .. } => "error",
+                    ControlKind::SubscriptionChanged { active: true, .. } => "active",
+                    ControlKind::SubscriptionChanged { active: false, .. } => "inactive",
+                    _ => "other control",
+                },
+                _ => "data",
+            };
+            got.push((ev.seq().unwrap().0, what));
+        }
+        got
+    }
+
+    #[test]
+    fn a_control_dropped_on_a_full_channel_comes_before_the_next_event() {
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&disconnected(2));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(3, 3)),
+            [(2, "disconnected"), (3, "data")]
+        );
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&subscription_changed(2, false));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(3, 3)),
+            [(2, "inactive"), (3, "data")]
+        );
+    }
+
+    #[test]
+    fn owed_controls_and_a_gap_come_in_seq_order() {
+        let (mut fanout, mut rx) = full_referrer(4);
+        fanout.fanout(&trade(2, 2));
+        fanout.fanout(&disconnected(3));
+        fanout.fanout(&trade(4, 4));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(5, 5)),
+            [(2, "gap"), (3, "disconnected"), (5, "data")]
+        );
+        let (mut fanout, mut rx) = full_referrer(4);
+        fanout.fanout(&subscription_changed(2, false));
+        fanout.fanout(&trade(3, 3));
+        fanout.fanout(&disconnected(4));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(5, 5)),
+            [
+                (2, "inactive"),
+                (3, "gap"),
+                (4, "disconnected"),
+                (5, "data")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newer_owed_control_of_its_kind_replaces_the_older() {
+        let (mut fanout, mut rx) = full_referrer(4);
+        fanout.fanout(&disconnected(2));
+        fanout.fanout(&subscription_changed(3, false));
+        fanout.fanout(&connected(4));
+        fanout.fanout(&subscription_changed(5, true));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(6, 6)),
+            [(4, "connected"), (5, "active"), (6, "data")]
+        );
+    }
+
+    fn provider_error(seq: u64) -> MarketEvent {
+        control(
+            seq,
+            ControlKind::ProviderError {
+                provider: "p".to_string(),
+                message: "re-subscribe failed".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn an_owed_error_leaves_the_owed_connection_state() {
+        let (mut fanout, mut rx) = full_referrer(4);
+        fanout.fanout(&disconnected(2));
+        fanout.fanout(&connected(3));
+        fanout.fanout(&provider_error(4));
+        fanout.fanout(&provider_error(5));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(6, 6)),
+            [(3, "connected"), (5, "error"), (6, "data")]
+        );
+    }
+
+    #[test]
+    fn owed_controls_left_over_wait_for_the_next_room() {
+        let (mut fanout, mut rx) = full_referrer(1);
+        fanout.fanout(&trade(2, 2));
+        fanout.fanout(&disconnected(3));
+        // Room for the Gap only: the control and the event stay owed.
+        assert_eq!(drain_then(&mut fanout, &mut rx, &trade(4, 4)), [(2, "gap")]);
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(5, 5)),
+            [(3, "disconnected")]
+        );
+        assert_eq!(drain_then(&mut fanout, &mut rx, &trade(6, 6)), [(4, "gap")]);
+    }
+
+    #[tokio::test]
+    async fn what_is_owed_goes_out_once_the_channel_has_room() {
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&trade(2, 2));
+        fanout.fanout(&disconnected(3));
+        let room = fanout.owed_room().expect("something is owed");
+        while rx.try_recv().is_ok() {}
+        tokio::time::timeout(Duration::from_secs(1), room)
+            .await
+            .expect("room was not seen");
+        fanout.flush_owed();
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|ev| ev.seq().unwrap().0)
+            .collect();
+        assert_eq!(got, [2, 3], "the Gap, then the disconnect");
+        assert!(fanout.owed_room().is_none(), "nothing is owed");
+    }
+
+    #[tokio::test]
+    async fn a_closed_referrer_that_owes_is_removed_by_the_flush() {
+        let (mut fanout, rx) = full_referrer(2);
+        fanout.fanout(&disconnected(2));
+        let room = fanout.owed_room().expect("something is owed");
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), room)
+            .await
+            .expect("a closed channel ends the wait");
+        fanout.flush_owed();
+        assert_eq!(fanout.subscriber_count(), 0);
+        assert!(fanout.owed_room().is_none(), "nothing is owed");
+    }
+
+    #[tokio::test]
+    async fn a_referrer_owed_a_control_needs_room_for_it() {
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&disconnected(2));
+        rx.recv().await;
+        assert!(
+            fanout.next_wait(Duration::ZERO, LIMIT).is_some(),
+            "the control takes the only free slot"
+        );
+        rx.recv().await;
+        assert!(fanout.next_wait(Duration::ZERO, LIMIT).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_referrer_owed_a_gap_needs_room_for_two() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), tx);
+        let trade = |ts| {
+            datamancer_core::MarketEvent::Trade(datamancer_core::Trade {
+                instrument: datamancer_core::Instrument::new(
+                    datamancer_core::ProviderId::from_static("fake"),
+                    datamancer_core::AssetClass::Equity,
+                    "AAPL",
+                ),
+                source_ts: datamancer_core::Timestamp(ts),
+                rx_ts: datamancer_core::Timestamp(ts),
+                seq: datamancer_core::Seq(0),
+                price: datamancer_core::Price(1),
+                size: datamancer_core::Quantity::from_raw(1),
+            })
+        };
+        for ts in 1..=3 {
+            fanout.fanout(&trade(ts));
+        }
+        rx.recv().await;
+        assert!(
+            fanout.next_wait(Duration::ZERO, LIMIT).is_some(),
+            "the Gap takes the only free slot"
+        );
+        rx.recv().await;
+        assert!(fanout.next_wait(Duration::ZERO, LIMIT).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_slot_free_before_the_wait_is_not_progress() {
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&trade(3, 3));
+        rx.recv().await;
+        assert!(
+            fanout.next_wait(Duration::ZERO, LIMIT).is_some(),
+            "the Gap takes the only free slot"
+        );
+        assert!(
+            fanout.next_wait(LIMIT, LIMIT).is_none(),
+            "a full wait with nothing read is the limit"
+        );
+    }
+
+    /// The timer on the wait `next_wait` plans: how long it runs with nothing
+    /// else happening, `None` if that is forever.
+    async fn timer(fanout: &mut FanOut, waited: Duration) -> Option<Duration> {
+        let _ = fanout.pacers_changed.notified().now_or_never();
+        let wait = fanout.next_wait(waited, LIMIT).expect("a wait");
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_hours(1), wait)
+            .await
+            .ok()
+            .map(|()| started.elapsed())
+    }
+
+    /// A full channel and one with room, both added to a new fan-out.
+    fn stopped_and_reading() -> (
+        FanOut,
+        tokio::sync::mpsc::Receiver<datamancer_core::MarketEvent>,
+        tokio::sync::mpsc::Receiver<datamancer_core::MarketEvent>,
+    ) {
+        let (full_tx, full_rx) = tokio::sync::mpsc::channel(1);
+        let (room_tx, room_rx) = tokio::sync::mpsc::channel(1);
+        full_tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), full_tx);
+        fanout.add(SubscriberId(2), room_tx);
+        (fanout, full_rx, room_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_full_referrer_stops_pacing_at_the_limit_in_total() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), tx);
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+        assert_eq!(
+            timer(&mut fanout, Duration::from_secs(20)).await,
+            Some(Duration::from_secs(10))
+        );
+        assert!(fanout.next_wait(Duration::from_secs(10), LIMIT).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_referrer_stops_pacing_at_the_limit_in_total() {
+        let (mut fanout, _full, _room) = stopped_and_reading();
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+        assert_eq!(
+            timer(&mut fanout, Duration::from_secs(20)).await,
+            Some(Duration::from_secs(10))
+        );
+        assert!(fanout.next_wait(Duration::from_secs(10), LIMIT).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_join_is_not_charged_for_the_wait_before_it() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), tx);
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+        let (joiner, _joiner_rx) = tokio::sync::mpsc::channel(1);
+        joiner.try_send(trade(1, 1)).unwrap();
+        fanout.add(SubscriberId(2), joiner);
+        assert_eq!(
+            timer(&mut fanout, Duration::from_secs(20)).await,
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            timer(&mut fanout, Duration::from_secs(10)).await,
+            Some(Duration::from_secs(20)),
+            "the joiner is charged from its join"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unpaced_referrer_is_not_waited_on() {
+        let (full_tx, _full) = tokio::sync::mpsc::channel(2);
+        let (room_tx, _room) = tokio::sync::mpsc::channel(1);
+        full_tx.try_send(trade(1, 1)).unwrap();
+        full_tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), full_tx);
+        fanout.add(SubscriberId(2), room_tx);
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+        assert!(
+            fanout.next_wait(LIMIT, LIMIT).is_none(),
+            "the first is charged out"
+        );
+        // The other fills; the replay waits on it alone, from zero.
+        fanout.fanout(&trade(2, 2));
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+    }
+
+    #[tokio::test]
+    async fn room_for_one_of_two_short_referrers_ends_the_wait() {
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(1);
+        let (second_tx, _second_rx) = tokio::sync::mpsc::channel(1);
+        first_tx.try_send(trade(1, 1)).unwrap();
+        second_tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), first_tx);
+        fanout.add(SubscriberId(2), second_tx);
+        let _ = fanout.pacers_changed.notified().now_or_never();
+        let wait = fanout.next_wait(Duration::ZERO, LIMIT).expect("a wait");
+        first_rx.recv().await;
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("a wake-up was lost");
     }
 }

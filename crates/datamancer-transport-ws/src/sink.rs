@@ -1,18 +1,24 @@
 //! The channel-backed WS data-plane sink (`impl EventSink`).
 //!
-//! `publish` serializes the event to a JSON frame and `try_send`s it into a
-//! bounded channel drained by [`run_writer`](crate::run_writer). A **full**
-//! channel (a remote consumer too slow to keep up) yields
-//! `PublishOutcome::Rejected`, handing the event back — the pump then stops and
-//! the connection is torn down. Delivery is therefore lossy-on-overrun by
-//! disconnection, never by silent drop.
+//! `publish` serializes the event to a JSON frame and sends it into a bounded
+//! channel drained by [`run_writer`](crate::run_writer), waiting up to 30 s
+//! for room, so a replay runs at the speed the remote consumer reads. A
+//! channel still full after that (a remote consumer that stopped reading)
+//! yields `PublishOutcome::Rejected`, handing the event back — the pump
+//! then stops and the connection is torn down. A consumer that keeps reading
+//! but falls behind stays connected, and its loss arrives upstream as a `Gap`.
+//! Nothing is silently dropped.
 
 use async_trait::async_trait;
 use datamancer_core::{EventSink, MarketEvent, PublishOutcome, Result as CoreResult};
+use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
 
 use crate::wire::to_wire;
+
+/// How long `publish` waits for room in the outbound channel: the library's
+/// own limit on a consumer that takes nothing.
+const PUBLISH_WAIT: Duration = datamancer_core::REPLAY_STALL_LIMIT;
 
 /// Per-connection WebSocket data-plane sink. Serializes events to JSON frames
 /// and enqueues them for the connection's single writer task.
@@ -43,9 +49,9 @@ impl EventSink for WsDataSink {
         let Ok(json) = serde_json::to_string(&frame) else {
             return PublishOutcome::Rejected(ev);
         };
-        match self.tx.try_send(json) {
+        match self.tx.send_timeout(json, PUBLISH_WAIT).await {
             Ok(()) => PublishOutcome::Delivered,
-            Err(TrySendError::Full(_) | TrySendError::Closed(_)) => PublishOutcome::Rejected(ev),
+            Err(_) => PublishOutcome::Rejected(ev),
         }
     }
 
@@ -63,6 +69,7 @@ mod tests {
         AssetClass, Control, ControlKind, EventSink, Instrument, MarketEvent, Price, ProviderId,
         PublishOutcome, Quantity, Seq, Timestamp, Trade,
     };
+    use std::time::Duration;
 
     fn trade() -> MarketEvent {
         MarketEvent::Trade(Trade {
@@ -92,19 +99,38 @@ mod tests {
         assert!(line.contains("\"price\":42"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn publish_waits_for_a_reader_within_the_limit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        let sink = WsDataSink::new(tx);
+        sink.publish(trade()).await;
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            rx.recv().await;
+            rx
+        });
+        assert!(matches!(
+            sink.publish(trade()).await,
+            PublishOutcome::Delivered
+        ));
+        drop(reader.await);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn full_channel_rejects_and_hands_event_back() {
-        // Capacity 1, no reader draining: second publish finds the channel full.
+        // Capacity 1, no reader draining: second publish waits, then gives up.
         let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
         let sink = WsDataSink::new(tx);
         assert!(matches!(
             sink.publish(trade()).await,
             PublishOutcome::Delivered
         ));
+        let started = tokio::time::Instant::now();
         match sink.publish(trade()).await {
             PublishOutcome::Rejected(MarketEvent::Trade(t)) => assert_eq!(t.price, Price(42)),
             other => panic!("expected Rejected, got {other:?}"),
         }
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
     }
 
     #[tokio::test]

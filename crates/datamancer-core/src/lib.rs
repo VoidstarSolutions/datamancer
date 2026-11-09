@@ -44,7 +44,7 @@ pub use snapshot::{
     ConnectionState, ProviderSnapshot, ResumeBufferSnapshot, StreamConnection, SubscriptionRef,
     SystemSnapshot,
 };
-pub use subscription::{LiveScope, ScopeMismatch, ScopeName, Subscribed};
+pub use subscription::{LiveScope, REPLAY_STALL_LIMIT, ScopeMismatch, ScopeName, Subscribed};
 pub use traits::{
     CacheCatalogEntry, CacheCoverage, CacheKey, EventSink, HistoricalCache, HistoryRequest,
     LiveHandle, Provider, ProviderMetrics, PublishOutcome, ReplayRequest, ReplaySource, TapLog,

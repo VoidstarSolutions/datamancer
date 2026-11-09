@@ -44,6 +44,8 @@ mod win_control;
 #[cfg(feature = "ws")]
 mod ws;
 
+use std::time::Duration;
+
 use clap::Parser;
 
 use crate::config::Config;
@@ -99,8 +101,7 @@ fn init_iceoryx2_logging() {
     iceoryx2::prelude::set_log_level_from_env_or_default();
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
     let args = Args::parse();
     let log = peek_log_config(args.config.as_deref());
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -115,7 +116,7 @@ async fn main() -> std::process::ExitCode {
     #[cfg(not(windows))]
     init_iceoryx2_logging();
 
-    match run(args).await {
+    match run(args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "datamancerd failed");
@@ -124,7 +125,7 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-async fn run(args: Args) -> Result<()> {
+fn run(args: Args) -> Result<()> {
     // Acquire the global single-instance lock before touching any shared
     // resource (config scaffold, tap-log/cache DBs, iceoryx2 node). Held for
     // the whole process; released by the kernel on exit. A second launch —
@@ -133,15 +134,64 @@ async fn run(args: Args) -> Result<()> {
     let config_path = paths::resolve_config_path(args.config)?;
     tracing::info!(path = %config_path.display(), "loading config");
     let config = Config::load(&config_path)?;
-    server::Server::bootstrap(config, config_path)
-        .await?
-        .run()
-        .await
+    let shutdown_timeout = Duration::from_secs(config.server.shutdown_timeout_secs);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let served = runtime.block_on(async {
+        server::Server::bootstrap(config, config_path)
+            .await?
+            .run()
+            .await
+    });
+    // Dropping a runtime waits on its blocking tasks without limit.
+    runtime.shutdown_timeout(runtime_shutdown_budget(
+        served.as_ref().ok().copied(),
+        shutdown_timeout,
+        std::time::Instant::now(),
+    ));
+    served.map(|_| ())
+}
+
+/// How long the runtime's own shutdown may take at `now`: what is left of the
+/// exit deadline `run` returned, or all of `shutdown_timeout` after a failed
+/// boot, which never reached a deadline.
+fn runtime_shutdown_budget(
+    exit_deadline: Option<std::time::Instant>,
+    shutdown_timeout: Duration,
+    now: std::time::Instant,
+) -> Duration {
+    exit_deadline.map_or(shutdown_timeout, |deadline| {
+        deadline.saturating_duration_since(now)
+    })
 }
 
 #[cfg(test)]
 mod main_tests {
     use super::*;
+
+    #[test]
+    fn the_runtime_gets_what_is_left_of_the_exit_deadline() {
+        let now = std::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+        let budget = |deadline| runtime_shutdown_budget(Some(deadline), timeout, now);
+        assert_eq!(budget(now + Duration::from_secs(4)), Duration::from_secs(4));
+        assert_eq!(budget(now), Duration::ZERO, "a drain that used it all");
+        assert_eq!(
+            runtime_shutdown_budget(Some(now), timeout, now + Duration::from_secs(1)),
+            Duration::ZERO,
+            "a drain that overran"
+        );
+    }
+
+    #[test]
+    fn a_failed_boot_gives_the_runtime_the_whole_timeout() {
+        let timeout = Duration::from_secs(30);
+        assert_eq!(
+            runtime_shutdown_budget(None, timeout, std::time::Instant::now()),
+            timeout
+        );
+    }
 
     #[test]
     fn peek_log_config_reads_valid_section() {

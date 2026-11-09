@@ -15,7 +15,7 @@ tokio = { workspace = true }
 tokio-tungstenite = "0.29.0"
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

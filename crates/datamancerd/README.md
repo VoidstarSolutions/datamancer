@@ -139,6 +139,8 @@ max_backfill_days = 7             # oldest start a client's live_backfill may as
 # different prefixes never share a service, and the per-process boot id keeps
 # a restart off its predecessor's names. Non-empty, checked at boot.
 service_prefix = "datamancerd"
+# Seconds the whole exit may take after SIGTERM/SIGINT, every drain step
+# included. At least 1; the web and WS drains take at most half of it.
 shutdown_timeout_secs = 30
 
 [diagnostics]
@@ -233,6 +235,13 @@ crashed predecessor's names either, even with the same config (see
 "Recovering from a crashed predecessor" below). There is strictly **one sink
 per client** (never shared), so per-client resume/gap accounting stays
 isolated.
+
+A client data service takes one subscriber; a second is refused at open while
+the first is attached, or after it crashed until iceoryx2 cleans up the dead
+node. A full subscriber makes the client's stream wait for it. With no
+subscriber attached, events go to the service's 16-sample history: a subscriber
+that attaches later receives those and nothing before them, a `seq` hole with
+no `gap`.
 
 A graceful `close-client` or a connection **EOF** tears the client down,
 flushing its sink and releasing its authoritative refcounts.
@@ -471,6 +480,9 @@ One JSON object per line; one reply line per request.
   `backfill_too_old`, whether the subscribe would create or join. A
   `[[startup_session]]` is the operator's and has no such limit; longer history
   comes from `open-query`.
+- With a tap log, live arrivals during a backfill reach it at the seam. An
+  arrival the seam ring evicts, or one still buffered when the session closes
+  before the seam, is not logged and leaves no mark in the log.
 - The reply's `scope` and `backfill_from` are the scope of the pair's shared
   session, fixed by the subscriber that created it.
 - `"joined":true` marks a subscriber that joined an open session; the creator's
@@ -916,10 +928,10 @@ distinguishes them by the presence of `type` vs. `id`/`ok`. Connection-scoped
 controls (provider connect/disconnect/error) are **not** carried on the event
 stream; read connectivity via the `snapshot` reply instead.
 
-Backpressure is bounded and lossy-on-overrun **by disconnection**: if a remote
-consumer falls behind and the connection's outbound channel
-(`channel_depth`) fills, the connection is torn down rather than silently
-dropping frames on a live connection.
+A full outbound channel (`channel_depth`) holds the stream for up to 30 s. A
+remote consumer that has still not read is disconnected. One that keeps reading
+but falls behind the live feed stays connected, and what it misses arrives as a
+`gap`.
 
 Graceful daemon shutdown tears down live WS connections before the UDS-client
 drain: each connection's `session.close()` emits a terminal
@@ -941,6 +953,8 @@ sink → drop the clients/sinks. The web server (and WS surface) are drained
 first so they stop reporting on / mutating a data plane about to be torn down;
 the tap log flushes **before** the best-effort per-client sink flushes (the
 load-bearing tap-log-before-sink-flush contract) so a stall in those
-best-effort steps cannot lose durable writes. The whole drain is bounded by
-`server.shutdown_timeout_secs` so a disk-stalled tap-log flush cannot hang
-shutdown forever (it is logged and the process force-exits).
+best-effort steps cannot lose durable writes. `server.shutdown_timeout_secs`
+(at least 1) bounds the whole exit, counted from the signal: the web and WS
+drains (5 s each at most, and half the budget together), the drain and the
+runtime's own shutdown share that one deadline, so a disk-stalled tap-log flush
+cannot hang shutdown forever (it is logged and the process force-exits).

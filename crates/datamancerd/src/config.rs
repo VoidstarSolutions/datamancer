@@ -301,6 +301,9 @@ pub struct ServerConfig {
     /// services are not scoped by it.
     #[serde(default = "default_service_prefix")]
     pub service_prefix: String,
+    /// Seconds the whole exit may take after SIGTERM/SIGINT, every drain step
+    /// and the runtime's own shutdown included. At least 1; the web and WS
+    /// drains take at most half of it.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
     /// Windows only: when `true`, the control pipe accepts a daemon or client
@@ -737,6 +740,11 @@ impl Config {
                 )));
             }
             s.resolve_scope()?;
+        }
+        if self.server.shutdown_timeout_secs == 0 {
+            return Err(DaemonError::ConfigInvalid(
+                "[server].shutdown_timeout_secs must be at least 1".to_string(),
+            ));
         }
         if self.session.max_backfill_days == 0 {
             return Err(DaemonError::ConfigInvalid(
@@ -1176,6 +1184,21 @@ account_type = "paper"
             .expect("parse")
             .validate()
             .expect("positive interval validates");
+    }
+
+    #[test]
+    fn a_shutdown_timeout_under_one_second_is_rejected() {
+        let config = Config::parse("[server]\nshutdown_timeout_secs = 0\n").expect("parse");
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("shutdown_timeout_secs"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid for a zero shutdown timeout, got {other:?}"),
+        }
+        Config::parse("[server]\nshutdown_timeout_secs = 1\n")
+            .expect("parse")
+            .validate()
+            .expect("one second validates");
     }
 
     #[test]

@@ -29,7 +29,8 @@ use crate::{Instrument, Price, Quantity};
 ///   backfill-seam overflow) observes a real `seq` hole, surfaced in-band as
 ///   [`ControlKind::Gap`]. In a client session's stream as the session
 ///   delivers it, a hole with no `Gap` is one of these, and only the first
-///   two are loss:
+///   two are loss (a transport that carries the stream on may add holes of
+///   its own, see its docs):
 ///   - events still unread in a stream's channel when its consumer drops it
 ///     are gone, and the next stream goes on past their slots;
 ///   - with two kinds on one instrument, what a detached client's resume
@@ -44,7 +45,11 @@ use crate::{Instrument, Price, Quantity};
 ///     provider's connection and the subscription state;
 ///   - a joiner's stream opens with the session's last active
 ///     `SubscriptionChanged`, replayed with its original `seq`, and goes on
-///     from the session's current `seq`.
+///     from the session's current `seq`;
+///   - a connection control or `SubscriptionChanged` that met a full consumer
+///     channel, and was superseded by a newer one for the same provider or
+///     instrument before the channel had room, is dropped and its slot stays
+///     empty.
 /// - **`SYNTHETIC` is exempt.** [`Seq::SYNTHETIC`] tags out-of-band synthetic
 ///   control events and is exempt from per-`(instrument, kind)` monotonicity.
 ///

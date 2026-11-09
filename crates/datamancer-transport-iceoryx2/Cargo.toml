@@ -12,8 +12,6 @@ iceoryx2-bb-container = "0.10.0"
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
 tokio = { workspace = true }
 
 [lints]

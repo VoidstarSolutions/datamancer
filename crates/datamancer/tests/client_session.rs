@@ -5,16 +5,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use datamancer::Surface;
 use datamancer::{
     AssetClass, ControlKind, Datamancer, EventKind, Instrument, LiveHandle, LiveScope, MarketEvent,
-    PersistenceOptions, Price, Provider, ProviderId, Result, Seq, Subscribed, Timestamp, Trade,
+    PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq, Subscribed, Timestamp,
+    Trade,
 };
-use datamancer_core::HistoryRequest;
+use datamancer_core::{
+    CacheCoverage, CacheKey, HistoricalCache, HistoryRequest, ReplaySource, TapLog,
+};
 use futures::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 
@@ -1229,7 +1232,7 @@ fn trades_from(first: i64, count: i64) -> Vec<MarketEvent> {
 }
 
 /// Reads until `count` prints arrive and answers them and how many `Gap`s came
-/// with them.
+/// with them. Its wait outlasts the backfill stall limit.
 async fn read_prints(stream: &mut datamancer::EventStream, count: usize) -> (Vec<i64>, usize) {
     let mut prints = Vec::new();
     let mut gaps = 0;
@@ -1242,6 +1245,599 @@ async fn read_prints(stream: &mut datamancer::EventStream, count: usize) -> (Vec
         }
     }
     (prints, gaps)
+}
+
+/// A history far longer than every channel on the way reaches a consumer that
+/// reads late, whole: the replay runs at the speed the consumer reads.
+#[tokio::test]
+async fn a_backfill_reaches_a_slow_consumer_whole() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 5000)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (prints, gaps) = read_prints(&mut stream, 5000).await;
+    assert_eq!(gaps, 0);
+    assert_eq!(prints, (1..=5000).collect::<Vec<_>>());
+    let _ = client.close().await;
+}
+
+/// The live arrivals buffered during a backfill are replayed at the same pace.
+#[tokio::test]
+async fn a_seam_flush_reaches_a_slow_consumer_whole() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 1)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    for ts in 100..5100 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (prints, gaps) = read_prints(&mut stream, 5001).await;
+    assert_eq!(gaps, 0);
+    assert_eq!(prints.len(), 5001);
+    let _ = client.close().await;
+}
+
+/// Reads until the print stamped `last` arrives and answers every `(ts, seq)`
+/// on the way and how many `Gap`s came with them.
+async fn read_through(stream: &mut datamancer::EventStream, last: i64) -> (Vec<(i64, u64)>, usize) {
+    let mut prints = Vec::new();
+    let mut gaps = 0;
+    while prints.last().is_none_or(|p: &(i64, u64)| p.0 != last) {
+        let next = tokio::time::timeout(Duration::from_secs(40), stream.next());
+        match next.await.expect("prints stopped").expect("stream ended") {
+            MarketEvent::Trade(t) => prints.push((t.source_ts.0, t.seq.0)),
+            MarketEvent::Control(c) if matches!(c.kind, ControlKind::Gap { .. }) => gaps += 1,
+            _ => {}
+        }
+    }
+    (prints, gaps)
+}
+
+/// Reads until a `Gap` arrives, failing on the print stamped `tail`: the loss
+/// comes ahead of it.
+async fn read_to_gap(stream: &mut datamancer::EventStream, tail: i64) {
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(40), stream.next());
+        match next.await.expect("prints stopped").expect("stream ended") {
+            MarketEvent::Control(c) if matches!(c.kind, ControlKind::Gap { .. }) => return,
+            MarketEvent::Trade(t) => assert!(t.source_ts.0 != tail, "no Gap before the live tail"),
+            _ => {}
+        }
+    }
+}
+
+/// Subscribes a client to the backfill and takes its stream.
+async fn backfilling_client(
+    dm: &Datamancer,
+) -> (datamancer::ClientSession, datamancer::EventStream) {
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let stream = client.take_events().await.unwrap();
+    (client, stream)
+}
+
+/// A disconnect that meets a full stream reaches the reader once it has read
+/// its way to room, with no event after it to carry it.
+#[tokio::test(start_paused = true)]
+async fn a_refused_disconnect_arrives_when_the_reader_drains() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    for ts in 1..=10_000 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    ctrl.push(
+        "AAPL",
+        MarketEvent::Control(datamancer::Control {
+            source_ts: Timestamp(10_001),
+            rx_ts: Timestamp(10_001),
+            seq: Seq(0),
+            kind: ControlKind::ProviderDisconnected {
+                provider: "fake".to_string(),
+                reason: "reset".to_string(),
+                cause: datamancer_core::DisconnectCause::Error,
+            },
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut gaps = 0;
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(40), stream.next());
+        let ev = next
+            .await
+            .expect("the disconnect never came")
+            .expect("stream ended");
+        if let MarketEvent::Control(c) = ev {
+            match c.kind {
+                ControlKind::ProviderDisconnected { .. } => break,
+                ControlKind::Gap { .. } => gaps += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(gaps > 0, "the stream was never full");
+    let _ = client.close().await;
+}
+
+/// A reader that stops is waited on for 30 s in all, then stops pacing: the
+/// other gets the whole history and the stopped one's loss is a `Gap`.
+#[tokio::test(start_paused = true)]
+async fn a_reader_that_held_another_30s_stops_pacing() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 5000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (stopped, mut stopped_stream) = backfilling_client(&dm).await;
+    let (reader, mut stream) = backfilling_client(&dm).await;
+    gate.notify_one();
+
+    let started = tokio::time::Instant::now();
+    let (prints, gaps) = read_prints(&mut stream, 5000).await;
+    assert_eq!(gaps, 0);
+    assert_eq!(prints, (1..=5000).collect::<Vec<_>>());
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(30), "waited {waited:?}");
+    assert!(waited < Duration::from_secs(31), "waited {waited:?}");
+
+    let (_, stopped_gaps) = read_prints(&mut stopped_stream, 1000).await;
+    assert_eq!(stopped_gaps, 0, "the first prints were delivered");
+    ctrl.push("AAPL", trade("AAPL", 9000)).await;
+    read_to_gap(&mut stopped_stream, 9000).await;
+    let _ = stopped.close().await;
+    let _ = reader.close().await;
+}
+
+/// A sole reader that keeps taking events is waited on for as long as the
+/// replay lasts, past 30 s in all, and loses nothing.
+#[tokio::test(start_paused = true)]
+async fn a_lone_steady_reader_is_waited_on_past_30s() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 6000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = backfilling_client(&dm).await;
+    gate.notify_one();
+
+    let mut prints = Vec::new();
+    while prints.len() < 6000 {
+        let ev = next_ev(&mut stream).await;
+        assert!(
+            !matches!(&ev, MarketEvent::Control(c) if matches!(c.kind, ControlKind::Gap { .. })),
+            "a steady reader lost events: {ev:?}"
+        );
+        if let MarketEvent::Trade(t) = ev {
+            prints.push(t.source_ts.0);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(prints, (1..=6000).collect::<Vec<_>>());
+    let _ = client.close().await;
+}
+
+/// A sole reader that takes events and then stops has 30 s from its last
+/// event, however long the replay waited on it before.
+#[tokio::test(start_paused = true)]
+async fn a_lone_reader_that_stops_is_released_after_30s() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 5000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = backfilling_client(&dm).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_secs(29)).await;
+    for _ in 0..200 {
+        next_ev(&mut stream).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(29)).await;
+    assert!(
+        dm.snapshot().await.unwrap().authoritative_sessions[0].backfilling,
+        "released before 30 s without an event"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_replay_over(&dm).await;
+    drop(client);
+    drop(stream);
+}
+
+/// Two stopped readers are both waited on from the start, so the replay goes
+/// on after 30 s with nobody reading.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_pair_stops_pacing_after_30s() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 5000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (first, _first_stream) = backfilling_client(&dm).await;
+    let (second, _second_stream) = backfilling_client(&dm).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    assert_replay_over(&dm).await;
+    drop(first);
+    drop(second);
+}
+
+/// Each stopped reader has its own 30 s: one that resumes after 10 s is
+/// charged no further and gets the whole history, which goes on once the
+/// other's 30 s are spent.
+#[tokio::test(start_paused = true)]
+async fn each_stopped_reader_has_its_own_30s() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 5000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (stopped, mut stopped_stream) = backfilling_client(&dm).await;
+    let (resumed, mut stream) = backfilling_client(&dm).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let started = tokio::time::Instant::now();
+    let (prints, gaps) = read_prints(&mut stream, 5000).await;
+    assert_eq!((prints.len(), gaps), (5000, 0));
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(20), "waited {waited:?}");
+    assert!(waited < Duration::from_secs(21), "waited {waited:?}");
+
+    read_prints(&mut stopped_stream, 1000).await;
+    ctrl.push("AAPL", trade("AAPL", 9000)).await;
+    read_to_gap(&mut stopped_stream, 9000).await;
+    let _ = stopped.close().await;
+    let _ = resumed.close().await;
+}
+
+/// Charges the first reader out while the second reads, leaving the second
+/// stopped as the replay's only pacer.
+async fn charge_out_first_of(
+    dm: &Datamancer,
+    gate: &tokio::sync::Notify,
+) -> (
+    (datamancer::ClientSession, datamancer::EventStream),
+    (datamancer::ClientSession, datamancer::EventStream),
+) {
+    let first = backfilling_client(dm).await;
+    let mut second = backfilling_client(dm).await;
+    gate.notify_one();
+    let (prints, gaps) = read_prints(&mut second.1, 5000).await;
+    assert_eq!((prints.len(), gaps), (5000, 0));
+    (first, second)
+}
+
+/// Reads to the print stamped `tail`, checking that every history print up to
+/// `last` was delivered in order or reported in a `Gap`.
+async fn read_all_accounted(mut stream: datamancer::EventStream, last: i64, tail: i64) {
+    let mut seen = 0;
+    let mut gaps: Vec<(i64, i64)> = Vec::new();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(40), stream.next());
+        match next.await.expect("prints stopped").expect("stream ended") {
+            MarketEvent::Trade(t) if t.source_ts.0 == tail => break,
+            MarketEvent::Trade(t) => {
+                let ts = t.source_ts.0;
+                let missed = seen + 1..ts;
+                assert!(ts > seen, "{ts} came after {seen}");
+                for lost in missed {
+                    assert!(
+                        gaps.iter().any(|g| (g.0..g.1).contains(&lost)),
+                        "{lost} neither delivered nor reported"
+                    );
+                }
+                seen = ts;
+            }
+            MarketEvent::Control(c) => {
+                if let ControlKind::Gap { span, .. } = c.kind {
+                    gaps.push((span.from_source_ts.0, span.to_source_ts.0));
+                }
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+    assert!(
+        seen == last || gaps.iter().any(|g| (g.0..g.1).contains(&last)),
+        "the history ended at {seen}, gaps {gaps:?}"
+    );
+}
+
+/// The replay has ended: a joiner hears no backfill is in flight.
+async fn assert_replay_over(dm: &Datamancer) {
+    let joined = dm
+        .client_session()
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::Live,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        joined,
+        Subscribed::joined(LiveScope::LiveBackfill { from: Timestamp(0) }, false)
+    );
+}
+
+/// The replay waits on the last pacer while a reader that has stopped pacing
+/// has room: it is charged like any other, so that reader gets the rest of the
+/// history, what it missed as a `Gap`, and the live tail.
+#[tokio::test(start_paused = true)]
+async fn an_unpaced_reader_is_not_starved_by_the_last_pacer() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 20000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let ((charged, stream), (last_pacer, _unread)) = charge_out_first_of(&dm, &gate).await;
+
+    let reader = tokio::spawn(read_all_accounted(stream, 20000, 90000));
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    assert_replay_over(&dm).await;
+    ctrl.push("AAPL", trade("AAPL", 90000)).await;
+    reader.await.unwrap();
+    drop(charged);
+    drop(last_pacer);
+}
+
+/// A stopped reader whose only co-subscriber leaves is still waited on, and
+/// stops pacing once that wait reaches 30 s in all.
+#[tokio::test(start_paused = true)]
+async fn a_reader_left_alone_goes_on_being_charged() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 5000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (stopped, mut stream) = backfilling_client(&dm).await;
+    let (leaver, mut leaver_stream) = backfilling_client(&dm).await;
+    gate.notify_one();
+    read_prints(&mut leaver_stream, 2000).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    drop(leaver_stream);
+    leaver.close().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(26)).await;
+    assert_replay_over(&dm).await;
+
+    read_prints(&mut stream, 1000).await;
+    ctrl.push("AAPL", trade("AAPL", 9000)).await;
+    read_to_gap(&mut stream, 9000).await;
+    let _ = stopped.close().await;
+}
+
+/// A reader leaving while the replay waits on it ends the wait at once: the
+/// co-subscriber gets everything and the session reaches its live loop.
+#[tokio::test(start_paused = true)]
+async fn a_replay_goes_on_when_the_reader_it_waits_on_leaves() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 5000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (stopped, stopped_stream) = backfilling_client(&dm).await;
+    let (reader, mut stream) = backfilling_client(&dm).await;
+    gate.notify_one();
+    let (mut prints, gaps) = read_prints(&mut stream, 2000).await;
+    assert_eq!(gaps, 0);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let started = tokio::time::Instant::now();
+    drop(stopped_stream);
+    stopped.close().await.unwrap();
+    let (rest, gaps) = read_prints(&mut stream, 3000).await;
+    assert_eq!(gaps, 0);
+    prints.extend(rest);
+    assert_eq!(prints, (1..=5000).collect::<Vec<_>>());
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    ctrl.push("AAPL", trade("AAPL", 9000)).await;
+    assert_eq!(read_prints(&mut stream, 1).await, (vec![9000], 0));
+    let joined = dm
+        .client_session()
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::Live,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        joined,
+        Subscribed::joined(LiveScope::LiveBackfill { from: Timestamp(0) }, false)
+    );
+    let _ = reader.close().await;
+}
+
+/// A subscriber joining while the seam flush waits gets what is left of it and
+/// then the live tail, gapless and in `seq` order.
+#[tokio::test]
+async fn a_join_during_the_flush_gets_the_rest_in_order() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 1)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (creator, mut stream) = backfilling_client(&dm).await;
+    for ts in 100..5100 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let joiner = dm.client_session();
+    let outcome = joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::Live,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Subscribed::joined(LiveScope::LiveBackfill { from: Timestamp(0) }, true)
+    );
+    let mut joined_stream = joiner.take_events().await.unwrap();
+    ctrl.push("AAPL", trade("AAPL", 9000)).await;
+    let tail = tokio::spawn(async move { read_through(&mut joined_stream, 9000).await });
+
+    let (prints, gaps) = read_through(&mut stream, 9000).await;
+    assert_eq!((prints.len(), gaps), (5002, 0));
+    let (joined_prints, gaps) = tail.await.unwrap();
+    assert_eq!(gaps, 0);
+    assert!(
+        joined_prints.len() > 1,
+        "the join came before the flush ended"
+    );
+    assert!(joined_prints.windows(2).all(|p| p[1].1 == p[0].1 + 1));
+    assert_eq!(
+        joined_prints[..],
+        prints[prints.len() - joined_prints.len()..]
+    );
+    assert_replay_over(&dm).await;
+    let _ = creator.close().await;
+    let _ = joiner.close().await;
+}
+
+/// The replay waits on a stopped creator for 30 s, then it stops pacing: the
+/// joiner gets the rest in order and the session reaches live.
+#[tokio::test(start_paused = true)]
+async fn a_join_during_the_flush_of_a_stopped_creator_reaches_live() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 1)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (creator, _unread) = backfilling_client(&dm).await;
+    for ts in 100..5100 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let joiner = dm.client_session();
+    let outcome = joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::Live,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Subscribed::joined(LiveScope::LiveBackfill { from: Timestamp(0) }, true)
+    );
+    let mut stream = joiner.take_events().await.unwrap();
+    ctrl.push("AAPL", trade("AAPL", 9000)).await;
+
+    let started = tokio::time::Instant::now();
+    let (prints, gaps) = read_through(&mut stream, 9000).await;
+    assert_eq!(gaps, 0);
+    assert!(prints.windows(2).all(|p| p[1].1 == p[0].1 + 1));
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(29), "waited {waited:?}");
+    assert!(waited < Duration::from_secs(31), "waited {waited:?}");
+
+    assert_replay_over(&dm).await;
+    ctrl.push("AAPL", trade("AAPL", 9001)).await;
+    assert_eq!(read_prints(&mut stream, 1).await, (vec![9001], 0));
+    drop(creator);
+    drop(joiner);
 }
 
 /// Once the backfill has finished, a joiner hears none is running.
@@ -1324,6 +1920,698 @@ async fn a_client_backfill_past_the_limit_is_refused() {
     dm.session(inst("MSFT"), EventKind::Trade, too_old.into(), none)
         .await
         .expect("a session is not limited");
+}
+
+/// Live arrivals keep landing while a paced seam flush waits, so the provider
+/// never parks on a full channel, and they reach the consumer after the flush.
+#[tokio::test]
+async fn a_paced_seam_flush_keeps_taking_live_arrivals() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 1)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    for ts in 100..4100 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The flush now waits on an unread stream; more than a channel's worth
+    // lands behind it.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for ts in 5000..8000 {
+            ctrl.push("AAPL", trade("AAPL", ts)).await;
+        }
+    })
+    .await
+    .expect("the provider must not park");
+
+    let joined = tokio::time::timeout(
+        Duration::from_secs(1),
+        dm.client_session().subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::Live,
+            PersistenceOptions::none(),
+        ),
+    )
+    .await
+    .expect("a join must not wait on the flush")
+    .unwrap();
+    assert!(matches!(joined, Subscribed::Joined { .. }));
+
+    let (prints, gaps) = read_prints(&mut stream, 7001).await;
+    assert_eq!(gaps, 0);
+    assert!(prints.is_sorted());
+    let _ = client.close().await;
+}
+
+/// A seam overflow's `Gap` costs a slow consumer nothing after it: every
+/// survivor arrives.
+#[tokio::test]
+async fn a_slow_consumer_gets_every_survivor_of_a_seam_overflow() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 3000)).await;
+    let attached = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_history(attached.clone()).await;
+    ctrl.pause_history_after(2900, gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(64)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    attached.notify_one();
+    for ts in 5000..5200 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.notify_one();
+
+    let (prints, gaps) = read_prints(&mut stream, 3064).await;
+    assert_eq!(gaps, 1);
+    assert_eq!(prints.last(), Some(&5199));
+    let _ = client.close().await;
+}
+
+/// Two readers that keep reading, one a beat behind the other, are held back
+/// by that beat alone: neither stops pacing, however long the replay lasts,
+/// and neither loses anything.
+#[tokio::test(start_paused = true)]
+async fn two_steady_readers_a_beat_apart_both_stay_paced() {
+    async fn read_steadily(mut stream: datamancer::EventStream, beat: Duration) -> Vec<i64> {
+        tokio::time::sleep(beat).await;
+        let mut prints = Vec::new();
+        while prints.len() < 6000 {
+            let ev = next_ev(&mut stream).await;
+            assert!(
+                !matches!(&ev, MarketEvent::Control(c) if matches!(c.kind, ControlKind::Gap { .. })),
+                "a steady reader lost events: {ev:?}"
+            );
+            if let MarketEvent::Trade(t) = ev {
+                prints.push(t.source_ts.0);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        prints
+    }
+
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 6000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (first, first_stream) = backfilling_client(&dm).await;
+    let (second, second_stream) = backfilling_client(&dm).await;
+    gate.notify_one();
+
+    let first_reader = tokio::spawn(read_steadily(first_stream, Duration::ZERO));
+    let second_reader = tokio::spawn(read_steadily(second_stream, Duration::from_millis(1)));
+    let whole = (1..=6000).collect::<Vec<_>>();
+    assert_eq!(first_reader.await.unwrap(), whole);
+    assert_eq!(second_reader.await.unwrap(), whole);
+    let _ = first.close().await;
+    let _ = second.close().await;
+}
+
+/// A consumer that keeps reading, too slowly, can hold a shared replay back for
+/// a bounded time in all, however often it frees a slot.
+#[tokio::test(start_paused = true)]
+async fn a_slow_reader_cannot_hold_a_co_subscriber_back_for_long() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 5000)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let none = PersistenceOptions::none();
+    let slow = dm.client_session();
+    slow.subscribe(inst("AAPL"), EventKind::Trade, backfill, none)
+        .await
+        .unwrap();
+    let mut slow_stream = slow.take_events().await.unwrap();
+    let reader = dm.client_session();
+    reader
+        .subscribe(inst("AAPL"), EventKind::Trade, backfill, none)
+        .await
+        .unwrap();
+    let mut stream = reader.take_events().await.unwrap();
+    gate.notify_one();
+    let slow_reader = tokio::spawn(async move {
+        while slow_stream.next().await.is_some() {
+            tokio::time::sleep(Duration::from_secs(29)).await;
+        }
+    });
+
+    let started = tokio::time::Instant::now();
+    let (prints, gaps) = read_prints(&mut stream, 5000).await;
+    assert_eq!((prints.len(), gaps), (5000, 0));
+    assert!(started.elapsed() < Duration::from_secs(40));
+    slow_reader.abort();
+    let _ = reader.close().await;
+}
+
+/// A sole consumer slower than the feed cannot keep a seam flush going: once
+/// the flush has lost a whole ring, the session reaches its live loop.
+#[tokio::test(start_paused = true)]
+async fn a_flush_ends_when_the_feed_outruns_the_consumer() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 1)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(3000)
+        .build()
+        .unwrap();
+    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let none = PersistenceOptions::none();
+    let client = dm.client_session();
+    client
+        .subscribe(inst("AAPL"), EventKind::Trade, backfill, none)
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    for ts in 100..3100 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for ts in 5000..12000 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    read_prints(&mut stream, 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let joined = dm
+        .client_session()
+        .subscribe(inst("AAPL"), EventKind::Trade, LiveScope::Live, none)
+        .await
+        .unwrap();
+    assert_eq!(joined, Subscribed::joined(backfill, false));
+}
+
+/// A flush that has lost a whole ring ends with no help from the consumer: the
+/// loss itself cuts a reader that never reads again loose.
+#[tokio::test(start_paused = true)]
+async fn a_flush_that_lost_a_ring_ends_for_a_stopped_reader() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 1)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(3000)
+        .build()
+        .unwrap();
+    let (client, _unread) = backfilling_client(&dm).await;
+    for ts in 100..3100 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for ts in 5000..12000 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_replay_over(&dm).await;
+    drop(client);
+}
+
+/// Past the whole-ring threshold, an arrival that evicts nothing costs a full
+/// reader nothing: it stays paced and every survivor reaches it.
+#[tokio::test(start_paused = true)]
+async fn an_arrival_past_the_threshold_that_evicts_nothing_unpaces_nobody() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let attached = Arc::new(tokio::sync::Notify::new());
+    let last_print = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 2000)).await;
+    ctrl.gate_history(attached.clone()).await;
+    ctrl.pause_history_after(1999, last_print.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(100)
+        .build()
+        .unwrap();
+    let (stopped, _unread) = backfilling_client(&dm).await;
+    let (reader, mut stream) = backfilling_client(&dm).await;
+    attached.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    read_prints(&mut stream, 50).await;
+    for ts in 5000..5100 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    last_print.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The flush waits on the stopped reader. These lose a whole ring, which
+    // stops it pacing; the flush then fills the reader and waits on it.
+    for ts in 5100..5258 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ctrl.push("AAPL", trade("AAPL", 9000)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (prints, _) = read_through(&mut stream, 9000).await;
+    let survivors = &prints[prints.len() - 31..prints.len() - 1];
+    assert!(survivors.windows(2).all(|p| p[1].0 == p[0].0 + 1));
+    assert_eq!(survivors.last().map(|p| p.0), Some(5257));
+    drop(stopped);
+    drop(reader);
+}
+
+/// A tap log that fills the provider's channel at the first append and looks
+/// at it `READ_AFTER` appends later.
+#[derive(Default)]
+struct ProbeTap {
+    sink: std::sync::OnceLock<mpsc::Sender<MarketEvent>>,
+    appended: AtomicUsize,
+    read_meanwhile: AtomicBool,
+    looked: AtomicBool,
+}
+
+impl ProbeTap {
+    const READ_AFTER: usize = 500;
+}
+
+#[async_trait]
+impl TapLog for ProbeTap {
+    async fn append(&self, _ev: &MarketEvent) -> Result<()> {
+        let sink = self.sink.get().expect("the sink is set");
+        let appended = self.appended.fetch_add(1, Ordering::SeqCst);
+        if appended == 0 {
+            while sink.try_send(trade("AAPL", 9000)).is_ok() {}
+        } else if appended == Self::READ_AFTER {
+            self.read_meanwhile
+                .store(sink.capacity() > 0, Ordering::SeqCst);
+            self.looked.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+    fn as_replay_source(&self) -> Box<dyn ReplaySource> {
+        unreachable!("the test replays nothing")
+    }
+}
+
+/// A flush with room for everything still reads the provider as it goes.
+#[tokio::test]
+async fn a_flush_with_room_still_reads_arrivals() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_history(trades_from(1, 1)).await;
+    ctrl.gate_history(gate.clone()).await;
+    let tap = Arc::new(ProbeTap::default());
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .tap_log_arc(tap.clone())
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none().with_tap_log(true),
+        )
+        .await
+        .unwrap();
+    let _unread = client.take_events().await.unwrap();
+    for ts in 100..1600 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    let sink = ctrl.shared.lock().await.sinks.get("AAPL").cloned();
+    tap.sink.set(sink.expect("subscribed")).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.notify_one();
+
+    wait_until(|| tap.looked.load(Ordering::SeqCst)).await;
+    assert!(tap.read_meanwhile.load(Ordering::SeqCst));
+    drop(client);
+}
+
+/// A little overflow in a flush costs a reader that keeps up only what was
+/// evicted: pacing holds, every survivor arrives, and the hole is the loss.
+#[tokio::test]
+async fn a_small_flush_overflow_keeps_a_reader_paced() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 2300)).await;
+    let attached = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_history(attached.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(100)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    attached.notify_one();
+    for ts in 5000..5100 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    // Reading this much lets the history finish, and the flush begins full.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    read_prints(&mut stream, 270).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for ts in 5100..5140 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut trades = Vec::new();
+    let mut gaps = 0;
+    while trades.len() < 2130 {
+        let next = tokio::time::timeout(Duration::from_secs(5), stream.next());
+        match next.await.expect("prints stopped").expect("stream ended") {
+            MarketEvent::Trade(t) => trades.push((t.source_ts.0, t.seq.0)),
+            MarketEvent::Control(c) if matches!(c.kind, ControlKind::Gap { .. }) => gaps += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(gaps, 1);
+    let last_history = trades.iter().find(|t| t.0 == 2300).expect("history").1;
+    for (ts, seq) in trades.iter().filter(|t| t.0 >= 5000) {
+        let slot = u64::try_from(ts - 5000).unwrap() + 1;
+        assert_eq!(
+            *seq,
+            last_history + slot,
+            "a lost print leaves its slot empty"
+        );
+    }
+    let _ = client.close().await;
+}
+
+/// A sole reader that never reads again stops pacing once the replay has
+/// waited on it for 30 s: the backfill ends, and the reader gets what it
+/// missed as a `Gap` ahead of the live tail.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_sole_reader_stops_pacing_after_30s() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 5000)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = backfilling_client(&dm).await;
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    assert_replay_over(&dm).await;
+
+    let (_, gaps) = read_prints(&mut stream, 1000).await;
+    assert_eq!(gaps, 0, "the first prints were delivered");
+    ctrl.push("AAPL", trade("AAPL", 9000)).await;
+    read_to_gap(&mut stream, 9000).await;
+    let _ = client.close().await;
+}
+
+/// A cache that answers `lookup` or `store` only when told to.
+struct GatedCache {
+    gate: Arc<tokio::sync::Notify>,
+    gate_store: bool,
+    stored: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl HistoricalCache for GatedCache {
+    async fn lookup(&self, _key: &CacheKey) -> Result<Option<CacheCoverage>> {
+        if !self.gate_store {
+            self.gate.notified().await;
+        }
+        Ok(None)
+    }
+    async fn store(&self, _key: &CacheKey, _events: &[MarketEvent]) -> Result<()> {
+        if self.gate_store {
+            self.gate.notified().await;
+        }
+        self.stored.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn as_replay_source(&self, _key: CacheKey) -> Box<dyn ReplaySource> {
+        unreachable!("the gate holds the backfill before any replay")
+    }
+}
+
+/// A backfill waiting on its cache still answers a joiner.
+#[tokio::test]
+async fn a_join_is_answered_while_the_backfill_waits_on_its_cache() {
+    join_during_cache_wait(false).await;
+    join_during_cache_wait(true).await;
+}
+
+async fn join_during_cache_wait(gate_store: bool) {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .historical_cache(Box::new(GatedCache {
+            gate: gate.clone(),
+            gate_store,
+            stored: Arc::default(),
+        }))
+        .build()
+        .unwrap();
+    let creator = dm.client_session();
+    creator
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let joiner = dm.client_session();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        joiner.subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::Live,
+            PersistenceOptions::none(),
+        ),
+    )
+    .await
+    .expect("the join must not wait on the cache")
+    .unwrap();
+    assert!(matches!(outcome, Subscribed::Joined { .. }));
+    gate.notify_one();
+    let _ = joiner.close().await;
+    let _ = creator.close().await;
+}
+
+/// A backfill waiting on its cache keeps reading the provider, so the shared
+/// hub never parks, and the arrivals reach the seam ring.
+#[tokio::test]
+async fn live_arrivals_are_read_while_the_cache_answers() {
+    arrivals_during_cache_wait(false).await;
+    arrivals_during_cache_wait(true).await;
+}
+
+async fn arrivals_during_cache_wait(gate_store: bool) {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 1)).await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .historical_cache(Box::new(GatedCache {
+            gate: gate.clone(),
+            gate_store,
+            stored: Arc::default(),
+        }))
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for ts in 100..2148 {
+            ctrl.push("AAPL", trade("AAPL", ts)).await;
+        }
+    })
+    .await
+    .expect("the provider must not park");
+    gate.notify_one();
+
+    let (prints, gaps) = read_prints(&mut stream, 2049).await;
+    assert_eq!(gaps, 0);
+    let expected: Vec<i64> = std::iter::once(1).chain(100..2148).collect();
+    assert_eq!(prints, expected);
+    let _ = client.close().await;
+}
+
+/// A close during a held store releases the provider at once, with nothing
+/// waiting on the cache, and the store still reaches its end.
+#[tokio::test]
+async fn a_close_during_a_held_store_leaves_the_provider_free() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.set_history(trades_from(1, 1)).await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let stored = Arc::new(AtomicUsize::new(0));
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .historical_cache(Box::new(GatedCache {
+            gate: gate.clone(),
+            gate_store: true,
+            stored: stored.clone(),
+        }))
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::LiveBackfill { from: Timestamp(0) },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.close().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for ts in 100..2148 {
+            ctrl.push("AAPL", trade("AAPL", ts)).await;
+        }
+    })
+    .await
+    .expect("the provider must not park");
+    wait_until(|| ctrl.unsubscribes() == 1).await;
+    assert_eq!(stored.load(Ordering::SeqCst), 0);
+
+    gate.notify_one();
+    wait_until(|| stored.load(Ordering::SeqCst) == 1).await;
+}
+
+fn historical() -> Scope {
+    Scope::Historical {
+        from: Timestamp(0),
+        to: Timestamp(10),
+    }
+}
+
+/// A historical session answers a close while its cache plans the range.
+#[tokio::test]
+async fn a_historical_close_is_answered_while_the_cache_plans() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .historical_cache(Box::new(GatedCache {
+            gate: Arc::default(),
+            gate_store: false,
+            stored: Arc::default(),
+        }))
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            historical(),
+            PersistenceOptions::cached(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(1), session.close())
+        .await
+        .expect("the close must not wait on the cache")
+        .unwrap();
+}
+
+/// A historical session queued behind another's fetch answers a close.
+#[tokio::test]
+async fn a_close_queued_behind_the_fetch_slot_is_answered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .historical_cache(Box::new(GatedCache {
+            gate: Arc::default(),
+            gate_store: true,
+            stored: Arc::default(),
+        }))
+        .build()
+        .unwrap();
+    let cached = PersistenceOptions::cached();
+    let holder = dm
+        .session(inst("AAPL"), EventKind::Trade, historical(), cached)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let queued = dm
+        .session(inst("AAPL"), EventKind::Trade, historical(), cached)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(1), queued.close())
+        .await
+        .expect("the close must not wait on the slot")
+        .unwrap();
+    drop(holder);
 }
 
 /// The seam ring keeps the provider's controls when its prints overflow it: the

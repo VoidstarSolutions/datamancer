@@ -144,12 +144,23 @@ client.subscribe(aapl, EventKind::Quote, scope, options).await?;
 `scope` is a `LiveScope`: `Live`, or `LiveBackfill { from }`, a backfill from `from` to the live
 edge seamed ahead of the live tail. The session subscribes upstream first, buffers live arrivals
 while the backfill runs, and delivers the history, then those arrivals in arrival order, then the
-live tail, with one `Gap` only for real loss (a failed fetch, or a buffer overflow bounded by the
-resume buffer's setting). `subscribe` returns a `Subscribed`: the pair's authoritative session is
-created with its first subscriber's scope and later subscribers join it as is.
-`Subscribed::history_from` gives the start of the history this subscriber created, and the type's
-docs say what a joiner receives. A start at or past the live edge is `Error::BackfillFromNotInPast`.
-Bounded ranges are a `Session` concern (`Scope::Historical`).
+live tail, with a `Gap` only for real loss (a failed fetch, a buffer overflow bounded by the
+resume buffer's setting, or a consumer that stops pacing the replay). Three rules pace the replay:
+
+1. The history and the buffered arrivals are sent only when every pacing subscriber has room. The
+   session keeps taking commands and live arrivals meanwhile.
+2. A subscriber the replay waits on stops pacing after 30 s in which it takes nothing, or once the
+   waits on it that began with another subscriber already having room reach 30 s, however it reads.
+   Both belong to the subscription: a client that unsubscribes and subscribes again starts new ones.
+3. A subscriber full at the moment the buffered arrivals have lost a whole resume buffer, while they
+   are delivered, stops pacing.
+
+A subscriber that stops pacing gets a `Gap`. A client with no attached stream buffers the replay in
+its resume buffer. `subscribe` returns a `Subscribed`: the pair's authoritative session is created
+with its first subscriber's scope and later subscribers join it as is. `Subscribed::history_from`
+gives the start of the history this subscriber created, and the type's docs say what a joiner
+receives. A start at or past the live edge is `Error::BackfillFromNotInPast`. Bounded ranges are a
+`Session` concern (`Scope::Historical`).
 
 Subscriptions accumulate; the client session's multiplexed stream **interleaves** everything that has been requested — per-symbol deterministic (`(instrument, seq)`, source-stamped within each instrument), arrival-order across symbols, never globally merge-sorted. Each `(instrument, kind)` pair is backed by a refcounted shared **authoritative session**, so two consumers of the same pair observe identical `(seq, source_ts)`. Adding the same instrument with a new event kind extends the subscription set rather than duplicating it.
 
@@ -163,8 +174,9 @@ and `TapLog`, and process-wide knobs such as the per-client resume-buffer size.
 **Per-session arguments** — `Scope` (`LiveScope` for `subscribe()`) and `PersistenceOptions`
 — are passed at `session()` / `subscribe()` time, so one `Datamancer` serves bounded-replay,
 pure-live, and stitched consumers simultaneously. Datamancer owns the backfill→live seam: a
-failed fetch or a buffer overflow there is a `Control::Gap`, and at the live edge an event can
-arrive twice or be missing with no `Gap` (see [Resume](#resume)).
+failed fetch, a buffer overflow or a subscriber that stops pacing the replay there is a
+`Control::Gap`, and at the live edge an event can arrive twice or be missing with no `Gap` (see
+[Resume](#resume)).
 
 **Per-provider configuration** is the provider's own struct, carrying two hot-reloadable
 sources rather than being fixed at build time:
@@ -271,12 +283,12 @@ flow. `seq` is stamped once at the source (not per-consumer), so survivors keep
 their original `seq` and an evicted event is a reported gap **and** a real `seq`
 hole at the evicted span — the delivered stream is contiguous only while
 no data is lost. The live arrivals buffered during a backfill are bounded by the
-same setting and overflow the same way: one `Gap` right after the history names
-the evicted span, and the evicted prints' `seq` slots stay empty ahead of the
-survivors, so a seam overflow is the same real hole a resume-buffer overflow is.
-The provider's controls stay in that buffer, outside the setting (up to 64; past
-that, the oldest goes), so an overflow never takes the subscription state from
-the stream or from a later joiner's replay.
+same setting and overflow the same way: a `Gap` names the evicted span, and the
+evicted prints' `seq` slots stay empty ahead of the survivors, so a seam overflow
+is the same real hole a resume-buffer overflow is. The provider's controls stay
+in that buffer, outside the setting (up to 64; past that, the oldest goes), so an
+overflow never takes the subscription state from the stream or from a later
+joiner's replay.
 
 `Scope::Live { backfill_from: Some(t) }` stitches history ahead of the live
 tail: the window `[t, live-edge)` is served through the historical
@@ -290,8 +302,8 @@ at the seam: an event between the start of live delivery and that reading can
 arrive on both sides, and with clock skew, a lagging history endpoint or a
 provider that returns before the venue acknowledges the pair, events can be
 missing. None of these is known loss, so none is a `Gap`; a `Gap` reports a
-failed fetch or a buffer overflow. The tap log captures only the live tail —
-backfill data belongs to the cache.
+failed fetch, a buffer overflow or a subscriber that stops pacing the replay.
+The tap log captures only the live tail — backfill data belongs to the cache.
 
 See `examples/resume.rs` for a runnable, credential-free demo.
 

@@ -1,8 +1,17 @@
 //! What a live subscription asks for and what it opened.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Timestamp;
+
+/// How long a replay waits on one consumer: since it last freed a slot, or in
+/// all while another consumer had room. Past it the fan-out stops pacing that
+/// consumer and its loss folds into a
+/// [`ControlKind::Gap`](crate::ControlKind::Gap); a WS sink gives the
+/// connection up.
+pub const REPLAY_STALL_LIMIT: Duration = Duration::from_secs(30);
 
 /// What a live subscription covers. On the wire it is a `scope` name and,
 /// for a backfill, a `backfill_from`; no `scope` reads as live.
@@ -23,7 +32,12 @@ pub enum LiveScope {
     /// once live. With clock skew, a lagging history endpoint or a provider
     /// that returns before the venue acknowledges the pair, events at the edge
     /// can be missing with no [`Gap`](crate::ControlKind::Gap). A `Gap` reports
-    /// a failed fetch or a buffer overflow.
+    /// a failed fetch, a buffer overflow or a subscriber that stops pacing the
+    /// replay.
+    ///
+    /// With a tap log, live arrivals reach it at the seam. An arrival the seam
+    /// ring evicts, or one still buffered when the session closes before the
+    /// seam, is not logged and leaves no mark in the log.
     LiveBackfill {
         /// Inclusive source-time start of the history.
         from: Timestamp,

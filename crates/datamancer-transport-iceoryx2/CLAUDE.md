@@ -53,4 +53,5 @@ Same-host, zero-copy iceoryx2 transport for datamancer. Two planes:
 Unit tests (normal CI) protect the wire format: POD round-trips per variant,
 symbol-table round-trip, capacity rejection, control routing, diagnostics codec
 + cap. iceoryx2 runtime integration tests live in `tests/iceoryx2_runtime.rs`
-and are `#[ignore]`d (run with `--ignored`); they need a live iceoryx2 runtime.
+and are `#[ignore]`d (run with `--ignored`); they need a live iceoryx2 runtime,
+and CI runs them in a step of their own.

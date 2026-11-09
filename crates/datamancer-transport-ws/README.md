@@ -100,11 +100,12 @@ stream.
 ## Backpressure
 
 Each connection's outbound channel is bounded (`[ws].channel_depth`,
-default 1024). If a remote consumer falls behind and the channel fills, the
-sink's `publish` returns `PublishOutcome::Rejected` and the connection is
-**torn down** — delivery is lossy-on-overrun *by disconnection*, never by
-silently dropping frames on a live connection. A reconnecting client gets a
-fresh session with no attempt at replay-from-overrun in this crate.
+default 1024). A full channel makes `publish` wait up to 30 s, so a replay runs
+at the speed the consumer reads. If the channel is still full, `publish` returns
+`PublishOutcome::Rejected` and the connection is **torn down**. A consumer that
+keeps reading but falls behind stays connected, and its loss arrives as a `Gap`.
+Frames are never silently dropped. A reconnecting client gets a fresh session
+with no attempt at replay-from-overrun in this crate.
 
 ## Security posture
 

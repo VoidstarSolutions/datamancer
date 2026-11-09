@@ -133,8 +133,8 @@ impl DrainClient for ClientEntry {
         // Let the pump deliver the remaining stream (incl. `SessionClosing`) into
         // the sink before the later flush, rather than severing it immediately.
         // The session close ends the stream, so the pump finishes on its own;
-        // bound the wait so a wedged pump cannot hang shutdown, aborting only if
-        // it overruns.
+        // bound the wait so a reader that has stopped cannot hang teardown. A
+        // pump waiting on that reader's full queue ends when aborted.
         let mut pump = std::mem::replace(&mut self.pump, tokio::spawn(async {}));
         if tokio::time::timeout(Duration::from_secs(2), &mut pump)
             .await
@@ -194,11 +194,11 @@ struct WebHandles {
 
 #[cfg(feature = "web-ui")]
 impl WebHandles {
-    /// Trigger graceful shutdown: signal the serve task to drain, await it under
-    /// a short bound, then abort the refresh tasks.
-    async fn shutdown(self) {
+    /// Trigger graceful shutdown: signal the serve task to drain, await it for
+    /// at most 5 s and never past `deadline`, then abort the refresh tasks.
+    async fn shutdown(self, deadline: tokio::time::Instant) {
         let _ = self.shutdown.send(());
-        if tokio::time::timeout(Duration::from_secs(5), self.serve)
+        if tokio::time::timeout_at(step_deadline(deadline), self.serve)
             .await
             .is_err()
         {
@@ -460,6 +460,10 @@ impl Server {
 
     /// Run the daemon until a shutdown signal, then drain gracefully.
     ///
+    /// `shutdown_timeout_secs` bounds the whole exit, counted from the signal.
+    /// Returns the instant it runs out, which also bounds the runtime's own
+    /// shutdown.
+    ///
     /// # Errors
     ///
     /// Propagates control-socket bind errors.
@@ -468,7 +472,7 @@ impl Server {
         reason = "one sequential boot-then-select-loop-then-drain shutdown ordering; \
                   splitting the drain steps across functions would scatter load-bearing order"
     )]
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(mut self) -> Result<std::time::Instant> {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(256);
         let accept = self.spawn_control(cmd_tx.clone())?;
 
@@ -540,12 +544,14 @@ impl Server {
         }
 
         self.draining = true;
+        let deadlines = ExitDeadlines::from_now(self.shutdown_timeout);
+        let exit_deadline = deadlines.exit;
 
         // Drain the embedded web server first: stop serving introspection HTTP
         // before tearing down the data plane it reports on.
         #[cfg(feature = "web-ui")]
         if let Some(handles) = web_handles.take() {
-            handles.shutdown().await;
+            handles.shutdown(deadlines.steps).await;
         }
 
         // Stop accepting new WS clients and let in-flight connections tear down.
@@ -554,7 +560,7 @@ impl Server {
             if let Some(trigger) = ws_shutdown {
                 let _ = trigger.send(());
             }
-            if tokio::time::timeout(Duration::from_secs(5), ws_task)
+            if tokio::time::timeout_at(step_deadline(deadlines.steps), ws_task)
                 .await
                 .is_err()
             {
@@ -588,7 +594,7 @@ impl Server {
         // accept loop and connection tasks release theirs.
         drop(cmd_tx);
 
-        if !drain_servicing_late_requests(drain_fut, &mut cmd_rx, self.shutdown_timeout).await {
+        if !drain_servicing_late_requests(drain_fut, &mut cmd_rx, exit_deadline).await {
             tracing::error!("shutdown drain exceeded timeout; forcing exit");
         }
         tracing::debug!(phases = ?recorder.entries(), "drain phases");
@@ -598,7 +604,7 @@ impl Server {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&self.admin_socket);
         tracing::info!("datamancerd shutdown complete");
-        Ok(())
+        Ok(exit_deadline.into_std())
     }
 
     /// Start the embedded web UI if it is configured and enabled: warm both
@@ -1375,7 +1381,10 @@ async fn open_anchor(dm: &Datamancer, s: &crate::config::StartupSession) -> Resu
 /// this drives the iceoryx2 `open-client` sink; the WS surface has its own
 /// pump (`ws/conn.rs`).
 #[cfg(not(windows))]
-fn spawn_pump(mut stream: datamancer::EventStream, sink: Arc<dyn EventSink>) -> JoinHandle<()> {
+fn spawn_pump<S>(mut stream: S, sink: Arc<dyn EventSink>) -> JoinHandle<()>
+where
+    S: futures::Stream<Item = datamancer::MarketEvent> + Send + Unpin + 'static,
+{
     tokio::spawn(async move {
         while let Some(ev) = stream.next().await {
             match sink.publish(ev).await {
@@ -1951,19 +1960,43 @@ fn spawn_diagnostics(
     })
 }
 
+/// The two deadlines of an exit, counted from the signal.
+struct ExitDeadlines {
+    /// The web and WS drain steps end by here, half the budget.
+    steps: tokio::time::Instant,
+    /// The whole exit ends by here.
+    exit: tokio::time::Instant,
+}
+
+impl ExitDeadlines {
+    fn from_now(shutdown_timeout: Duration) -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            steps: now + shutdown_timeout / 2,
+            exit: now + shutdown_timeout,
+        }
+    }
+}
+
+/// The deadline of one bounded web or WS drain step: 5 s from now, or
+/// `steps_deadline` if that comes first.
+fn step_deadline(steps_deadline: tokio::time::Instant) -> tokio::time::Instant {
+    (tokio::time::Instant::now() + Duration::from_secs(5)).min(steps_deadline)
+}
+
 /// Run `drain_fut` to completion while still servicing `cmd_rx`: the accept
 /// loop is aborted at the start of `drain`, but connection tasks already
 /// spawned may still send a request. Reply `shutting_down` promptly so a
 /// producer never blocks forever on its reply channel (which would otherwise
 /// leave a wedged connection task and could stall a clean exit). Returns
-/// `false` if `shutdown_timeout` was exceeded.
+/// `false` if `deadline` passed first.
 async fn drain_servicing_late_requests(
     drain_fut: impl std::future::Future<Output = ()>,
     cmd_rx: &mut mpsc::Receiver<ServerCommand>,
-    shutdown_timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> bool {
     tokio::pin!(drain_fut);
-    let drained = tokio::time::timeout(shutdown_timeout, async {
+    let drained = tokio::time::timeout_at(deadline, async {
         let mut producers_open = true;
         loop {
             tokio::select! {
@@ -2051,6 +2084,84 @@ mod tests {
         let text = other.to_string();
         assert!(text.contains("ExceedsMaxNumberOfNodes"), "{text}");
         assert!(!text.contains("Recovering"), "{text}");
+    }
+
+    /// A pump waiting on a reader that has stopped ends as soon as it is
+    /// aborted and lets go of the sink, round after round, so a torn-down
+    /// client leaves no task or publisher behind.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[ignore = "needs the iceoryx2 runtime"]
+    async fn a_pump_waiting_on_a_stalled_reader_ends_when_aborted() {
+        use datamancer::transport::DataSubscriber;
+        use datamancer::{Price, Quantity, Seq, Trade};
+
+        let node = create_node().expect("node");
+        let prefix = effective_service_prefix("pump-abort-test").expect("prefix");
+        for round in 0..3 {
+            let sink = Arc::new(
+                Iceoryx2DataSink::new(&node, DataServiceName::new(&prefix, round)).expect("sink"),
+            );
+            let _reader = DataSubscriber::open(&node, sink.data_service_name()).expect("reader");
+            let released = Arc::downgrade(&sink);
+            let events = futures::stream::iter((0_i64..).map(|ts| {
+                datamancer::MarketEvent::Trade(Trade {
+                    instrument: Instrument::new(
+                        ProviderId::from_static("fake"),
+                        AssetClass::Equity,
+                        "AAPL",
+                    ),
+                    source_ts: Timestamp(ts),
+                    rx_ts: Timestamp(ts),
+                    seq: Seq(u64::try_from(ts).expect("non-negative")),
+                    price: Price::from_f64_round(1.0),
+                    size: Quantity::from_units(1),
+                })
+            }));
+            let pump = spawn_pump(events, sink as Arc<dyn EventSink>);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !pump.is_finished(),
+                "round {round}: the pump waits on the full queue"
+            );
+
+            pump.abort();
+            let ended = tokio::time::timeout(Duration::from_secs(2), pump)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: the aborted pump is still running"));
+            assert!(ended.expect_err("aborted").is_cancelled(), "round {round}");
+            assert!(
+                released.upgrade().is_none(),
+                "round {round}: the aborted pump still holds the sink"
+            );
+        }
+    }
+
+    /// The web and WS steps, which share one deadline, leave the drain at
+    /// least half of `shutdown_timeout`.
+    #[test]
+    fn the_web_and_ws_steps_leave_the_drain_half_the_budget() {
+        let shutdown_timeout = Duration::from_secs(3);
+        let deadlines = ExitDeadlines::from_now(shutdown_timeout);
+        let left = deadlines.exit - step_deadline(deadlines.steps);
+        assert!(left >= shutdown_timeout / 2, "the drain has {left:?}");
+    }
+
+    /// The drain gets what is left of the exit deadline once the steps before
+    /// it have spent part of it, not a fresh `shutdown_timeout`.
+    #[tokio::test]
+    async fn the_drain_gets_only_what_is_left_of_the_exit_deadline() {
+        let exit_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let started = tokio::time::Instant::now();
+        assert!(
+            !drain_servicing_late_requests(std::future::pending(), &mut cmd_rx, exit_deadline)
+                .await,
+            "a drain that never finishes runs out of time"
+        );
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(1200), "the drain ran {took:?}");
     }
 
     // The peer-cred gate is Unix-only (Windows uses the pipe owner DACL).

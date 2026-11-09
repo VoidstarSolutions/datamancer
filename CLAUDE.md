@@ -115,7 +115,7 @@ These are load-bearing design rules — violating them breaks downstream consume
   - `rx_ts` — wall-clock at byte receipt. **Observability only.** Engine decision logic must never depend on it (re-introduces wall-clock non-determinism). Collapses to `source_ts` in pure-historical replay.
 - **`Control` events ride the data stream.** Connectivity changes, gaps, subscription state — all in-band, not a side channel.
 - **No timestamp re-sort.** Events emit in arrival order, not re-sorted by `source_ts`. Consumers needing strict timestamp ordering buffer themselves.
-- **Replay drains as fast as the consumer reads.** No wall-clock pacing.
+- **Replay drains as fast as the consumer reads.** No wall-clock pacing. A live session's backfill sends only when every pacing subscriber has room; a subscriber stops pacing after 30 s without freeing a slot, after the waits on it that began with another subscriber already having room reach 30 s, or when it is full as a seam flush loses a whole ring, and gets a `Gap`.
 - **`Instrument` stays opaque.** Newtype around a symbol string; structured fields (asset class, exchange, contract spec) only when a real use case demands them.
 - **Trait dispatch boundary.** `Provider`/`LiveHandle` are dyn-dispatched at the cold session boundary; per-message decode loops inside each provider stay monomorphic.
 
