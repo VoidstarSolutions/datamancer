@@ -159,7 +159,9 @@ pub struct ProviderSurfaces {
 }
 
 impl ProviderSurfaces {
-    /// Surfaces with these outcomes.
+    /// Surfaces with these outcomes. Outside this crate,
+    /// [`with_history`](Self::with_history) and [`with_live`](Self::with_live)
+    /// on a [`Default`] value name each surface, so the two cannot be swapped.
     ///
     /// ```
     /// use datamancer_core::{ProviderSurfaces, SurfaceOutcome, Timestamp};
@@ -174,6 +176,33 @@ impl ProviderSurfaces {
     #[must_use]
     pub const fn new(history: SurfaceOutcome, live: SurfaceOutcome) -> Self {
         Self { history, live }
+    }
+
+    /// These surfaces with `history` as the history surface's outcome.
+    ///
+    /// ```
+    /// use datamancer_core::{ProviderSurfaces, SurfaceOutcome, Timestamp};
+    ///
+    /// let surfaces = ProviderSurfaces::default()
+    ///     .with_history(SurfaceOutcome::ok(Timestamp(1)))
+    ///     .with_live(SurfaceOutcome::failing(Timestamp(2), "refused"));
+    /// assert_eq!(surfaces.history, SurfaceOutcome::ok(Timestamp(1)));
+    /// assert_eq!(
+    ///     surfaces.live,
+    ///     SurfaceOutcome::failing(Timestamp(2), "refused")
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_history(mut self, history: SurfaceOutcome) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// These surfaces with `live` as the live surface's outcome.
+    #[must_use]
+    pub fn with_live(mut self, live: SurfaceOutcome) -> Self {
+        self.live = live;
+        self
     }
 }
 
@@ -604,6 +633,19 @@ mod tests {
         assert!(p.enabled); // default: enabled (embedder Static sources)
         assert_eq!(p.surfaces, ProviderSurfaces::default());
         assert!(!p.with_enabled(false).enabled);
+    }
+
+    #[test]
+    fn surface_builders_set_one_surface_each() {
+        let history = SurfaceOutcome::ok(Timestamp(1));
+        let live = SurfaceOutcome::failing(Timestamp(2), "down");
+        let surfaces = ProviderSurfaces::default()
+            .with_history(history.clone())
+            .with_live(live.clone());
+        assert_eq!(surfaces, ProviderSurfaces::new(history.clone(), live));
+        let only_history = ProviderSurfaces::default().with_history(history.clone());
+        assert_eq!(only_history.history, history);
+        assert_eq!(only_history.live, SurfaceOutcome::Unknown);
     }
 
     #[test]
