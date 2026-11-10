@@ -891,6 +891,174 @@ async fn connection_scoped_control_appears_once_in_multiplex() {
     let _ = client.close().await;
 }
 
+fn provider_control(kind: ControlKind, rx_ts: i64) -> MarketEvent {
+    MarketEvent::Control(datamancer::Control {
+        source_ts: Timestamp(rx_ts),
+        rx_ts: Timestamp(rx_ts),
+        seq: Seq(0),
+        kind,
+    })
+}
+
+fn provider_error(message: &str, rx_ts: i64) -> MarketEvent {
+    provider_control(
+        ControlKind::ProviderError {
+            provider: "fake".to_string(),
+            message: message.to_string(),
+        },
+        rx_ts,
+    )
+}
+
+/// Read until `last` trade's `source_ts`, counting the `ProviderError`s.
+async fn errors_until(stream: &mut datamancer::EventStream, last: i64) -> usize {
+    let mut errors = 0;
+    loop {
+        match next_ev(stream).await {
+            MarketEvent::Trade(t) if t.source_ts.0 == last => return errors,
+            MarketEvent::Control(c) if matches!(c.kind, ControlKind::ProviderError { .. }) => {
+                errors += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_provider_error_repeated_after_a_reconnect_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    ctrl.push("AAPL", provider_error("HTTP 403", 10)).await;
+    ctrl.push(
+        "AAPL",
+        provider_control(
+            ControlKind::ProviderDisconnected {
+                provider: "fake".to_string(),
+                reason: "reset".to_string(),
+                cause: datamancer::DisconnectCause::Error,
+            },
+            11,
+        ),
+    )
+    .await;
+    ctrl.push(
+        "AAPL",
+        provider_control(
+            ControlKind::ProviderConnected {
+                provider: "fake".to_string(),
+            },
+            12,
+        ),
+    )
+    .await;
+    // Same text, same timestamp: only the reconnect tells it apart.
+    ctrl.push("AAPL", provider_error("HTTP 403", 10)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(
+        errors_until(&mut stream, 100).await,
+        2,
+        "the error after the reconnect is a new one"
+    );
+    let _ = client.close().await;
+}
+
+#[tokio::test]
+async fn a_connected_copy_between_two_error_copies_keeps_the_second_dropped() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    for symbol in ["AAPL", "MSFT"] {
+        client
+            .subscribe(
+                inst(symbol),
+                EventKind::Trade,
+                live(),
+                PersistenceOptions::none(),
+            )
+            .await
+            .unwrap();
+    }
+    let mut stream = client.take_events().await.unwrap();
+    let connected = || {
+        provider_control(
+            ControlKind::ProviderConnected {
+                provider: "fake".to_string(),
+            },
+            5,
+        )
+    };
+    // A reconnect fanned out to both substreams, then one re-subscribe error
+    // fanned out the same way; AAPL's pair is read before MSFT's.
+    ctrl.push("AAPL", connected()).await;
+    ctrl.push("AAPL", provider_error("re-subscribe failed", 10))
+        .await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1);
+    ctrl.push("MSFT", connected()).await;
+    ctrl.push("MSFT", provider_error("re-subscribe failed", 10))
+        .await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        0,
+        "the second substream's copy of one error is dropped"
+    );
+    let _ = client.close().await;
+}
+
+#[tokio::test]
+async fn a_later_error_with_the_same_text_is_delivered_and_a_copy_is_not() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    for symbol in ["AAPL", "MSFT"] {
+        client
+            .subscribe(
+                inst(symbol),
+                EventKind::Trade,
+                live(),
+                PersistenceOptions::none(),
+            )
+            .await
+            .unwrap();
+    }
+    let mut stream = client.take_events().await.unwrap();
+    // One provider error fanned out to both substreams: one copy each.
+    ctrl.push("AAPL", provider_error("HTTP 403", 10)).await;
+    ctrl.push("MSFT", provider_error("HTTP 403", 10)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1, "copies coalesce");
+    // A second failure later, with the same text (a second fetch failing).
+    ctrl.push("MSFT", provider_error("HTTP 403", 20)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        1,
+        "a later failure with the same text keeps its cause"
+    );
+    let _ = client.close().await;
+}
+
 #[tokio::test]
 async fn session_closing_emitted_once_on_client_close() {
     let (provider, ctrl) = FakeProvider::new("fake", false);
