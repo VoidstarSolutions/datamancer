@@ -986,8 +986,9 @@ impl Server {
                     return std::ops::ControlFlow::Break(());
                 }
                 // A subscribe waits on its provider, a cold one's connect
-                // included, and a client's other commands wait behind it, so
-                // these answer from a task of their own.
+                // included, and a client's other commands wait behind it, and
+                // a snapshot waits on the cache catalog's disk read, so these
+                // answer from a task of their own.
                 match request {
                     Request::OpenClient {
                         client,
@@ -997,6 +998,7 @@ impl Server {
                     Request::Unsubscribe { client, spec } => {
                         self.unsubscribe(&client, spec, reply);
                     }
+                    Request::Snapshot => self.snapshot(reply),
                     request => {
                         let response = self.dispatch(request, cmd_tx).await;
                         let _ = reply.send(response);
@@ -1044,9 +1046,11 @@ impl Server {
             // own. These arms only exist for match exhaustiveness.
             Request::OpenClient { .. }
             | Request::Subscribe { .. }
-            | Request::Unsubscribe { .. } => Reply::error(
+            | Request::Unsubscribe { .. }
+            | Request::Snapshot => Reply::error(
                 codes::INTERNAL,
-                "subscription ops are handled before dispatch; this arm is unreachable",
+                "subscription and snapshot ops are handled before dispatch; \
+                 this arm is unreachable",
             ),
             Request::CloseClient { client } => {
                 if self.clients.contains_key(&client) {
@@ -1058,10 +1062,6 @@ impl Server {
             }
             Request::ListClients => Reply::clients(self.clients.keys().cloned().collect()),
             Request::Ping => Reply::pong(env!("CARGO_PKG_VERSION"), self.credential_backend),
-            Request::Snapshot => match self.dm.snapshot().await {
-                Ok(snapshot) => Reply::snapshot(snapshot),
-                Err(e) => reply_from_library_error(&e),
-            },
             // Dispatched off-actor in `handle_connection` (a catalog request
             // awaits live provider REST and must not stall the actor). This
             // arm only exists for match exhaustiveness / defense in depth —
@@ -1389,6 +1389,21 @@ impl Server {
     #[cfg(windows)]
     #[allow(clippy::unused_self)] // symmetric with the unix arm's `&mut self`
     fn abort_all_queries(&mut self) {}
+
+    /// Take a snapshot from a task that replies once the cache catalog is
+    /// read, so a slow disk stalls no other request. The drain does not wait
+    /// on the task; the runtime's shutdown, bounded by the exit deadline,
+    /// stops one still reading.
+    fn snapshot(&self, reply: oneshot::Sender<Reply>) {
+        let dm = self.dm.clone();
+        tokio::spawn(async move {
+            let response = match dm.snapshot().await {
+                Ok(snapshot) => Reply::snapshot(snapshot),
+                Err(e) => reply_from_library_error(&e),
+            };
+            let _ = reply.send(response);
+        });
+    }
 
     /// Subscribe `client` from a task that replies once the provider has the
     /// pair, or `session_closed` if the client is torn down first.
@@ -2515,6 +2530,139 @@ mod tests {
             .expect("runtime")
             .datamancer;
         (dm, dir)
+    }
+
+    /// A cache whose catalog read waits until `release` is notified.
+    struct BlockingCatalogCache {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl datamancer::HistoricalCache for BlockingCatalogCache {
+        async fn lookup(
+            &self,
+            _key: &datamancer::CacheKey,
+        ) -> datamancer::Result<Option<datamancer::CacheCoverage>> {
+            Ok(None)
+        }
+        async fn store(
+            &self,
+            _key: &datamancer::CacheKey,
+            _events: &[datamancer::MarketEvent],
+        ) -> datamancer::Result<()> {
+            Ok(())
+        }
+        async fn catalog(&self) -> datamancer::Result<Vec<datamancer::CacheCatalogEntry>> {
+            self.release.notified().await;
+            Ok(Vec::new())
+        }
+        fn as_replay_source(
+            &self,
+            _key: datamancer::CacheKey,
+        ) -> Box<dyn datamancer::ReplaySource> {
+            unimplemented!("never replayed")
+        }
+    }
+
+    /// A server around `dm` with no anchors, clients or tap log.
+    fn test_server(dm: Datamancer, dir: &std::path::Path) -> Server {
+        let config = Config::parse("").expect("empty config parses to defaults");
+        let store = datamancer_credentials::CredentialStore::with_backend(Box::new(
+            datamancer_credentials::FileBackend::new(dir.join("creds.json")),
+        ));
+        let (hub, _sources) = CredentialHub::with_store(store, &["alpaca"]);
+        let (config_hub, _settings) =
+            crate::config_hub::ConfigHub::bootstrap(config.clone(), dir.join("config.toml"));
+        Server {
+            dm,
+            #[cfg(not(windows))]
+            node: create_node().expect("node"),
+            tap_log: None,
+            anchors: Vec::new(),
+            clients: HashMap::new(),
+            closing: Vec::new(),
+            #[cfg(not(windows))]
+            queries: HashMap::new(),
+            #[cfg(not(windows))]
+            max_queries: 1,
+            #[cfg(not(windows))]
+            query_persistence: datamancer::PersistenceOptions::none(),
+            #[cfg(not(windows))]
+            next_client_id: 0,
+            #[cfg(not(windows))]
+            service_prefix: effective_service_prefix("datamancerd-test").expect("prefix"),
+            #[cfg(not(windows))]
+            max_clients: 1,
+            admin_socket: dir.join("admin.sock"),
+            shutdown_timeout: Duration::from_secs(1),
+            diag_interval: Duration::from_secs(1),
+            #[cfg(feature = "web-ui")]
+            web: None,
+            #[cfg(feature = "ws")]
+            ws: None,
+            #[cfg(feature = "web-ui")]
+            config_state: crate::web::ConfigState::new(
+                dir.join("config.toml"),
+                config,
+                config_hub.clone(),
+            ),
+            hub: Arc::new(hub),
+            config_hub,
+            credential_backend: "file",
+            #[cfg(windows)]
+            allow_any_integrity: false,
+            draining: false,
+        }
+    }
+
+    /// A snapshot whose cache catalog read blocks leaves the actor answering
+    /// `ping`, and replies once the read returns.
+    #[tokio::test]
+    async fn a_snapshot_waiting_on_the_cache_does_not_stall_ping() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dm = Datamancer::builder()
+            .historical_cache(Box::new(BlockingCatalogCache {
+                release: release.clone(),
+            }))
+            .build()
+            .expect("build");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut server = test_server(dm, dir.path());
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<ServerCommand>(4);
+
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        let handled = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.handle(
+                ServerCommand::Request {
+                    request: Request::Snapshot,
+                    reply: snapshot_tx,
+                },
+                &cmd_tx,
+            ),
+        )
+        .await;
+        assert!(handled.is_ok(), "the actor waited on the cache catalog");
+
+        let (ping_tx, ping_rx) = oneshot::channel();
+        let _ = server
+            .handle(
+                ServerCommand::Request {
+                    request: Request::Ping,
+                    reply: ping_tx,
+                },
+                &cmd_tx,
+            )
+            .await;
+        let pong = ping_rx.await.expect("ping answered");
+        assert!(pong.ok, "{pong:?}");
+
+        release.notify_one();
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), snapshot_rx)
+            .await
+            .expect("snapshot answered once the catalog returns")
+            .expect("reply sent");
+        assert!(snapshot.ok, "{snapshot:?}");
     }
 
     #[tokio::test]

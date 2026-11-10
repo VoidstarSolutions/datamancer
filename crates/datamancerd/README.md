@@ -516,6 +516,9 @@ One JSON object per line; one reply line per request.
   -> {"ok":true,"health":{ /* HealthView, schema_version 3, daemon-stamped */ }}
 ```
 
+`snapshot` reads the cache catalog, which can wait on the disk; the daemon
+answers other requests meanwhile.
+
 `subscribe` opens an unbounded subscription:
 
 - The reply comes once the provider has the pair, which on a provider not yet
