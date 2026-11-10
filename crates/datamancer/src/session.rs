@@ -1133,9 +1133,7 @@ impl DatamancerBuilder {
     /// resume buffer, and an overflow is a `Gap`. A subscribe that joins an
     /// existing session does not count.
     ///
-    /// # Panics
-    ///
-    /// [`build`](Self::build) panics if `limit` exceeds
+    /// [`build`](Self::build) returns `Error::Config` if `limit` exceeds
     /// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS).
     #[must_use]
     pub fn max_concurrent_client_backfills(mut self, limit: std::num::NonZeroUsize) -> Self {
@@ -1157,8 +1155,19 @@ impl DatamancerBuilder {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Config` if two registered providers share an id.
+    /// Returns `Error::Config` if two registered providers share an id, or if
+    /// the [`max_concurrent_client_backfills`](Self::max_concurrent_client_backfills)
+    /// limit exceeds
+    /// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS).
     pub fn build(self) -> Result<Datamancer> {
+        if let Some(limit) = self.max_concurrent_client_backfills
+            && limit.get() > Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Config(format!(
+                "max_concurrent_client_backfills must be at most {}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
         let mut ids: Vec<&str> = self.providers.iter().map(|p| p.id()).collect();
         ids.sort_unstable();
         for window in ids.windows(2) {
@@ -3737,5 +3746,31 @@ mod backfill_window_tests {
             BackfillWindow::of(LiveScope::default(), Timestamp(5)).unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::{Datamancer, Error};
+
+    #[test]
+    fn a_backfill_limit_past_max_permits_is_a_config_error() {
+        let limit =
+            std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).expect("nonzero");
+        let result = Datamancer::builder()
+            .max_concurrent_client_backfills(limit)
+            .build();
+        assert!(
+            matches!(result, Err(Error::Config(_))),
+            "{:?}",
+            result.err()
+        );
+
+        let limit =
+            std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS).expect("nonzero");
+        Datamancer::builder()
+            .max_concurrent_client_backfills(limit)
+            .build()
+            .expect("MAX_PERMITS builds");
     }
 }

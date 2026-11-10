@@ -146,7 +146,8 @@ max_backfill_days = 7             # oldest start a client's live_backfill may as
 # a restart off its predecessor's names. Non-empty, checked at boot.
 service_prefix = "datamancerd"
 # Seconds the whole exit may take after SIGTERM/SIGINT, every drain step
-# included. At least 1; the web and WS drains take at most half of it.
+# included. At least 1 and at most 86400 (one day); the web and WS drains
+# take at most half of it.
 shutdown_timeout_secs = 30
 max_concurrent_backfills = 2      # client backfills fetching history at once
 
@@ -1092,7 +1093,7 @@ flush: it closes alongside them, and the tap log is flushed once more after it,
 as it is after a close the limit cuts off or a WS connection the drain aborts.
 The tap log flushes **before** the best-effort per-client sink flushes (the
 load-bearing tap-log-before-sink-flush contract). `server.shutdown_timeout_secs`
-(at least 1) bounds the whole exit, counted from the signal: the web and WS
+(1 to 86400) bounds the whole exit, counted from the signal: the web and WS
 drains (5 s each at most, and half the budget together), the drain and the
 runtime's own shutdown share that one deadline, so a disk-stalled tap-log flush
 cannot hang shutdown forever (it is logged and the process force-exits).

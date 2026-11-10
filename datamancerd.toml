@@ -45,7 +45,7 @@ max_backfill_days = 7             # oldest start a client's live_backfill may as
 [server]
 admin_socket = "./.datamancerd/admin.sock"     # newline-JSON control socket (use /run/datamancerd/admin.sock in prod)
 service_prefix = "datamancerd"                 # iceoryx2 service-name prefix
-shutdown_timeout_secs = 30                      # bounds the graceful exit; at least 1
+shutdown_timeout_secs = 30                      # bounds the graceful exit; 1 to 86400
 max_concurrent_backfills = 2                    # client backfills fetching history at once
 
 # ── Diagnostics-plane cadence ──────────────────────────────────────────────
