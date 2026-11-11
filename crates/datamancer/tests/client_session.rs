@@ -929,6 +929,28 @@ fn subscription_error(message: &str, rx_ts: i64) -> MarketEvent {
     )
 }
 
+/// The provider's `ProviderConnected`.
+fn connected(rx_ts: i64) -> MarketEvent {
+    provider_control(
+        ControlKind::ProviderConnected {
+            provider: "fake".to_string(),
+        },
+        rx_ts,
+    )
+}
+
+/// The provider's `ProviderDisconnected` after a connection reset.
+fn disconnected(rx_ts: i64) -> MarketEvent {
+    provider_control(
+        ControlKind::ProviderDisconnected {
+            provider: "fake".to_string(),
+            reason: "reset".to_string(),
+            cause: datamancer::DisconnectCause::Error,
+        },
+        rx_ts,
+    )
+}
+
 /// Read until `last` trade's `source_ts`, counting the `ProviderError`s.
 async fn errors_until(stream: &mut datamancer::EventStream, last: i64) -> usize {
     let mut errors = 0;
@@ -982,28 +1004,8 @@ async fn a_provider_error_repeated_after_a_reconnect_is_delivered() {
     let mut stream = client.take_events().await.unwrap();
     let [e0, e1] = fanout_ids();
     ctrl.push("AAPL", fanout_error("HTTP 403", e0, 10)).await;
-    ctrl.push(
-        "AAPL",
-        provider_control(
-            ControlKind::ProviderDisconnected {
-                provider: "fake".to_string(),
-                reason: "reset".to_string(),
-                cause: datamancer::DisconnectCause::Error,
-            },
-            11,
-        ),
-    )
-    .await;
-    ctrl.push(
-        "AAPL",
-        provider_control(
-            ControlKind::ProviderConnected {
-                provider: "fake".to_string(),
-            },
-            12,
-        ),
-    )
-    .await;
+    ctrl.push("AAPL", disconnected(11)).await;
+    ctrl.push("AAPL", connected(12)).await;
     // Same text, same timestamp, but a second broadcast: its own fan-out id.
     ctrl.push("AAPL", fanout_error("HTTP 403", e1, 10)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
@@ -1024,22 +1026,14 @@ async fn a_connected_copy_between_two_error_copies_keeps_the_second_dropped() {
         .unwrap();
     let (client, mut stream) = two_symbol_client(&dm).await;
     let [e0] = fanout_ids();
-    let connected = || {
-        provider_control(
-            ControlKind::ProviderConnected {
-                provider: "fake".to_string(),
-            },
-            5,
-        )
-    };
     // A reconnect fanned out to both substreams, then one re-subscribe error
     // fanned out the same way; AAPL's pair is read before MSFT's.
-    ctrl.push("AAPL", connected()).await;
+    ctrl.push("AAPL", connected(5)).await;
     ctrl.push("AAPL", fanout_error("re-subscribe failed", e0, 10))
         .await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 1);
-    ctrl.push("MSFT", connected()).await;
+    ctrl.push("MSFT", connected(5)).await;
     ctrl.push("MSFT", fanout_error("re-subscribe failed", e0, 10))
         .await;
     ctrl.push("MSFT", trade("MSFT", 200)).await;
@@ -3603,33 +3597,15 @@ async fn a_pre_reconnect_error_copy_after_the_reconnect_is_dropped() {
         .unwrap();
     let (client, mut stream) = two_symbol_client(&dm).await;
     let [e0] = fanout_ids();
-    let connected = || {
-        provider_control(
-            ControlKind::ProviderConnected {
-                provider: "fake".to_string(),
-            },
-            12,
-        )
-    };
-    let disconnected = || {
-        provider_control(
-            ControlKind::ProviderDisconnected {
-                provider: "fake".to_string(),
-                reason: "reset".to_string(),
-                cause: datamancer::DisconnectCause::Error,
-            },
-            11,
-        )
-    };
     ctrl.push("AAPL", fanout_error("HTTP 403", e0, 10)).await;
-    ctrl.push("AAPL", disconnected()).await;
-    ctrl.push("AAPL", connected()).await;
+    ctrl.push("AAPL", disconnected(11)).await;
+    ctrl.push("AAPL", connected(12)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 1);
     // MSFT's copies of the same error and the same reconnect.
     ctrl.push("MSFT", fanout_error("HTTP 403", e0, 10)).await;
-    ctrl.push("MSFT", disconnected()).await;
-    ctrl.push("MSFT", connected()).await;
+    ctrl.push("MSFT", disconnected(11)).await;
+    ctrl.push("MSFT", connected(12)).await;
     ctrl.push("MSFT", trade("MSFT", 200)).await;
     assert_eq!(
         errors_until(&mut stream, 200).await,
