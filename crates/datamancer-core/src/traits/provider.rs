@@ -28,6 +28,14 @@ use crate::{
 };
 
 /// One configured upstream source of market data.
+///
+/// A provider reports an error as a
+/// [`ControlKind::provider_error`](crate::ControlKind::provider_error). An
+/// error it sends to every subscription is an
+/// [`ErrorOrigin::Fanout`](crate::ErrorOrigin::Fanout) whose copies all carry
+/// one [`FanoutId::next`](crate::FanoutId::next) id, allocated once per
+/// broadcast; an error about one subscription is an
+/// [`ErrorOrigin::Subscription`](crate::ErrorOrigin::Subscription).
 #[async_trait]
 pub trait Provider: Send + Sync + 'static {
     /// Stable identifier for this provider (e.g. `"alpaca"`). Used in

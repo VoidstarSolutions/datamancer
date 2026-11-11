@@ -14,9 +14,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer::Surface;
 use datamancer::{
-    AssetClass, ControlKind, Datamancer, ErrorOrigin, EventKind, FanoutCounter, FanoutId,
-    Instrument, LiveHandle, LiveScope, MarketEvent, PersistenceOptions, Price, Provider,
-    ProviderId, Result, Scope, Seq, Subscribed, Timestamp, Trade,
+    AssetClass, ControlKind, Datamancer, ErrorOrigin, EventKind, FanoutId, Instrument, LiveHandle,
+    LiveScope, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq,
+    Subscribed, Timestamp, Trade,
 };
 use datamancer_core::{
     CacheCoverage, CacheKey, HistoricalCache, HistoryRequest, ReplaySource, TapLog,
@@ -908,10 +908,9 @@ fn provider_control(kind: ControlKind, rx_ts: i64) -> MarketEvent {
     })
 }
 
-/// `N` fan-out ids in allocation order, as one provider hub allocates them.
+/// `N` fresh fan-out ids in allocation order.
 fn fanout_ids<const N: usize>() -> [FanoutId; N] {
-    let mut fanouts = FanoutCounter::default();
-    std::array::from_fn(|_| fanouts.allocate())
+    std::array::from_fn(|_| FanoutId::next())
 }
 
 /// One copy of the provider's fan-out error `id`.

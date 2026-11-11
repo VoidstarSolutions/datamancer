@@ -4,6 +4,8 @@
 //! cover live and historical market data plus in-band [`Control`] entries for
 //! connectivity, subscription state, and gap reporting.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{Instrument, Price, Quantity};
@@ -356,8 +358,9 @@ impl ControlKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorOrigin {
-    /// One error a provider sent to every subscription. Its copies share the
-    /// [`FanoutId`], and a client session delivers one of them (see [`Seq`]).
+    /// One error a provider sent to every subscription. Its copies share one
+    /// [`FanoutId::next`] id, and a client session delivers one of them (see
+    /// [`Seq`]).
     Fanout(FanoutId),
     /// An error about this one subscription. A client session always
     /// delivers it, never treating it as a copy of another (see [`Seq`]).
@@ -370,29 +373,22 @@ fn subscription_origin() -> ErrorOrigin {
 
 /// The identity of one [`ErrorOrigin::Fanout`] error, shared by its copies.
 ///
-/// A provider allocates these from one [`FanoutCounter`] per connection hub,
-/// in emission order, so each subscription receives a hub's fan-outs in
-/// increasing [`FanoutId`] order.
+/// Every id comes from [`FanoutId::next`], one process-wide sequence, so a
+/// provider that allocates once per broadcast sends each subscription its
+/// fan-outs in increasing [`FanoutId`] order, and no two broadcasts share an
+/// id however many connections or restarts a provider goes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FanoutId(u64);
 
-/// Allocates [`FanoutId`]s in increasing order: a provider keeps one per
-/// connection hub and allocates once per error it sends to every
-/// subscription.
-#[derive(Debug, Default)]
-pub struct FanoutCounter {
-    next: u64,
-}
-
-impl FanoutCounter {
-    /// Allocates the next [`FanoutId`], greater than every one this counter
-    /// allocated before.
+impl FanoutId {
+    /// Allocates a new [`FanoutId`], greater than every one allocated before
+    /// in this process. Call it once per error sent to every subscription and
+    /// give each copy the same id.
     #[must_use]
-    pub fn allocate(&mut self) -> FanoutId {
-        let id = FanoutId(self.next);
-        self.next += 1;
-        id
+    pub fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -405,8 +401,8 @@ pub struct GapSpan {
 #[cfg(test)]
 mod serde_tests {
     use super::{
-        BarInterval, ControlKind, DisconnectCause, ErrorOrigin, EventKind, FanoutCounter, GapSpan,
-        Seq, Timestamp,
+        BarInterval, ControlKind, DisconnectCause, ErrorOrigin, EventKind, FanoutId, GapSpan, Seq,
+        Timestamp,
     };
 
     #[test]
@@ -421,25 +417,23 @@ mod serde_tests {
 
     #[test]
     fn provider_error_round_trips_with_its_origin() {
-        let mut fanouts = FanoutCounter::default();
-        let _ = fanouts.allocate();
         for origin in [
-            ErrorOrigin::Fanout(fanouts.allocate()),
+            ErrorOrigin::Fanout(FanoutId::next()),
             ErrorOrigin::Subscription,
         ] {
             let kind = ControlKind::provider_error("p", "HTTP 403", origin);
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(serde_json::from_str::<ControlKind>(&json).unwrap(), kind);
         }
-        let json = serde_json::to_string(&ErrorOrigin::Fanout(fanouts.allocate())).unwrap();
-        assert_eq!(json, r#"{"fanout":2}"#);
+        let id = FanoutId::next();
+        let json = serde_json::to_string(&ErrorOrigin::Fanout(id)).unwrap();
+        assert_eq!(json, format!(r#"{{"fanout":{}}}"#, id.0));
     }
 
     #[test]
-    fn fanout_counter_allocates_increasing_ids() {
-        let mut fanouts = FanoutCounter::default();
-        let first = fanouts.allocate();
-        let second = fanouts.allocate();
+    fn fanout_ids_increase() {
+        let first = FanoutId::next();
+        let second = FanoutId::next();
         assert!(first < second);
     }
 

@@ -37,7 +37,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
     AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, Error, ErrorOrigin,
-    EventKind, FanoutCounter, HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry,
+    EventKind, FanoutId, HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry,
     LiveHandle, MarketEvent, OrderType, Price, Provider, ProviderId, Quantity, Quote, Result, Seq,
     Surface, TimeInForce, Timestamp, Trade,
 };
@@ -553,7 +553,6 @@ impl LiveHandle for SharedLiveHandle {
 async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receiver<HubCommand>) {
     let mut routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>> = HashMap::new();
     let mut subs = CryptoSubscriptionList::new();
-    let mut fanouts = FanoutCounter::default();
     let mut backoff = cfg.reconnect.initial_backoff_ms;
 
     'outer: loop {
@@ -661,7 +660,6 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
         {
             broadcast_error(
                 &routes,
-                &mut fanouts,
                 format!("re-subscribe failed: {}", error_chain(&err)),
             )
             .await;
@@ -681,7 +679,7 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                 next = client.next_message() => {
                     match next {
                         Ok(msg) => {
-                            for ev in translate_crypto_message(msg, &mut fanouts) {
+                            for ev in translate_crypto_message(msg) {
                                 dispatch_event(&routes, ev).await;
                             }
                         }
@@ -1128,16 +1126,11 @@ async fn broadcast_control(
 /// same fresh fan-out id.
 async fn broadcast_error(
     routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    fanouts: &mut FanoutCounter,
     message: String,
 ) {
     broadcast_control(
         routes,
-        ControlKind::provider_error(
-            PROVIDER_ID,
-            message,
-            ErrorOrigin::Fanout(fanouts.allocate()),
-        ),
+        ControlKind::provider_error(PROVIDER_ID, message, ErrorOrigin::Fanout(FanoutId::next())),
     )
     .await;
 }
@@ -1172,10 +1165,7 @@ fn wall_clock_ts() -> Timestamp {
 // Translation: oxidized_alpaca crypto -> MarketEvent
 // ---------------------------------------------------------------------------
 
-pub(crate) fn translate_crypto_message(
-    msg: CryptoStreamMessage,
-    fanouts: &mut FanoutCounter,
-) -> Vec<MarketEvent> {
+pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEvent> {
     let rx = wall_clock_ts();
     match msg {
         CryptoStreamMessage::Trade(t) => vec![MarketEvent::Trade(translate_trade(&t, rx))],
@@ -1197,7 +1187,7 @@ pub(crate) fn translate_crypto_message(
             kind: ControlKind::provider_error(
                 PROVIDER_ID,
                 format!("{:?}: {}", err.code, err.message),
-                ErrorOrigin::Fanout(fanouts.allocate()),
+                ErrorOrigin::Fanout(FanoutId::next()),
             ),
         })],
         // Subscription confirmations and orderbook updates aren't part of the
@@ -1327,7 +1317,7 @@ mod tests {
         // boundary it collapsed to `size: 0`; it must now survive exactly.
         let json = r#"{"T":"t","S":"BTC/USD","i":12345,"p":50050.0,"s":0.004,"tks":"B","t":"2024-01-02T15:30:00Z"}"#;
         let msg: CryptoStreamMessage = serde_json::from_str(json).unwrap();
-        let events = translate_crypto_message(msg, &mut FanoutCounter::default());
+        let events = translate_crypto_message(msg);
         assert_eq!(events.len(), 1);
         match &events[0] {
             MarketEvent::Trade(t) => {
@@ -1344,7 +1334,7 @@ mod tests {
     fn translates_crypto_quote() {
         let json = r#"{"T":"q","S":"BTC/USD","bp":50000.0,"bs":1.0,"ap":50100.0,"as":2.0,"t":"2024-01-02T15:30:00Z"}"#;
         let msg: CryptoStreamMessage = serde_json::from_str(json).unwrap();
-        let events = translate_crypto_message(msg, &mut FanoutCounter::default());
+        let events = translate_crypto_message(msg);
         assert_eq!(events.len(), 1);
         match &events[0] {
             MarketEvent::Quote(q) => {
@@ -1392,9 +1382,8 @@ mod tests {
     #[tokio::test]
     async fn every_copy_of_a_broadcast_error_shares_one_increasing_id() {
         let (routes, mut a_rx, mut b_rx) = two_routes();
-        let mut fanouts = FanoutCounter::default();
-        broadcast_error(&routes, &mut fanouts, "first".to_string()).await;
-        broadcast_error(&routes, &mut fanouts, "second".to_string()).await;
+        broadcast_error(&routes, "first".to_string()).await;
+        broadcast_error(&routes, "second".to_string()).await;
         let a = fanout_ids(&mut a_rx);
         assert_eq!(a, fanout_ids(&mut b_rx));
         assert_eq!(a.len(), 2);
@@ -1404,11 +1393,10 @@ mod tests {
     #[tokio::test]
     async fn every_copy_of_a_stream_error_shares_one_increasing_id() {
         let (routes, mut a_rx, mut b_rx) = two_routes();
-        let mut fanouts = FanoutCounter::default();
         for _ in 0..2 {
             let msg: CryptoStreamMessage =
                 serde_json::from_str(r#"{"T":"error","code":400,"msg":"invalid"}"#).unwrap();
-            for ev in translate_crypto_message(msg, &mut fanouts) {
+            for ev in translate_crypto_message(msg) {
                 dispatch_event(&routes, ev).await;
             }
         }
