@@ -42,9 +42,9 @@ use crate::{Instrument, Price, Quantity};
 ///     `ProviderError`) the client has already delivered for that provider,
 ///     on another instrument or earlier, is dropped and its slot stays empty.
 ///     A [`ControlKind::ProviderError`] is already delivered only as a copy of
-///     an [`ErrorOrigin::Fanout`] whose [`FanoutId`] the client delivered
-///     from another of its subscriptions; an [`ErrorOrigin::Subscription`]
-///     error never is;
+///     an [`ErrorOrigin::Fanout`] whose [`FanoutId`] the client already
+///     delivered, on any of its subscriptions; an
+///     [`ErrorOrigin::Subscription`] error never is;
 ///   - a connection control or `SubscriptionChanged` that a detached client's
 ///     resume buffer evicted is gone and its slot stays empty, with no `Gap`
 ///     since no data was lost; the diagnostics plane still carries the
