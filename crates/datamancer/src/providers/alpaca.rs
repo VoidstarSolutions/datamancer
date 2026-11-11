@@ -1072,7 +1072,7 @@ async fn fetch_history_via(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::providers::hub::dispatch_event;
     use crate::providers::hub::tests::{fanout_ids, two_routes};
@@ -1823,6 +1823,15 @@ mod tests {
         assert_eq!(a, fanout_ids(&mut b_rx));
         assert_eq!(a.len(), 2);
         assert_ne!(a[0], a[1]);
+    }
+
+    /// A mid-stream server error envelope carrying `code`, as the stream
+    /// delivers it.
+    pub(in crate::providers) fn stream_error(code: StreamErrorCode) -> oxidized_alpaca::Error {
+        let e: oxidized_alpaca::streaming::StreamError =
+            serde_json::from_value(serde_json::json!({ "code": code, "msg": "server says" }))
+                .expect("documented code");
+        oxidized_alpaca::Error::StreamingError(e)
     }
 
     /// `402 auth failed` is the only server error that parks the hub; a
