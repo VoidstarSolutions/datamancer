@@ -391,11 +391,12 @@ fn subscription_origin() -> ErrorOrigin {
 
 /// The identity of one [`ErrorOrigin::Fanout`] error, shared by its copies.
 ///
-/// Only [`ControlKind::fanout_error`] makes one, from a single process-wide
+/// [`ControlKind::fanout_error`] makes one from a single process-wide
 /// sequence, so each new fan-out's id is greater than every earlier one and no
-/// two fan-outs share an id. A deserialized id is a fresh one: an id
-/// identifies copies within one process only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+/// two fan-outs from one process share an id. An id only identifies copies
+/// among fan-outs from the process that made it: a deserialized id keeps the
+/// sender's value, and is not comparable with ids made elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FanoutId(u64);
 
@@ -403,13 +404,6 @@ impl FanoutId {
     fn next() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-impl<'de> Deserialize<'de> for FanoutId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        u64::deserialize(deserializer)?;
-        Ok(Self::next())
     }
 }
 
@@ -422,8 +416,7 @@ pub struct GapSpan {
 #[cfg(test)]
 mod serde_tests {
     use super::{
-        BarInterval, ControlKind, DisconnectCause, ErrorOrigin, EventKind, FanoutId, GapSpan, Seq,
-        Timestamp,
+        BarInterval, ControlKind, DisconnectCause, EventKind, FanoutId, GapSpan, Seq, Timestamp,
     };
 
     #[test]
@@ -435,31 +428,13 @@ mod serde_tests {
 
     #[test]
     fn provider_error_round_trips_with_its_origin() {
-        let kind = ControlKind::subscription_error("p", "HTTP 403");
-        let json = serde_json::to_string(&kind).unwrap();
-        assert_eq!(serde_json::from_str::<ControlKind>(&json).unwrap(), kind);
-
-        let fanout = ControlKind::fanout_error("p", "HTTP 403");
-        let ControlKind::ProviderError {
-            origin: ErrorOrigin::Fanout(id),
-            ..
-        } = fanout
-        else {
-            panic!("fanout_error builds a fan-out");
-        };
-        let json = serde_json::to_string(&fanout).unwrap();
-        assert!(
-            json.contains(&format!(r#"{{"fanout":{}}}"#, id.0)),
-            "{json}"
-        );
-    }
-
-    #[test]
-    fn a_deserialized_fanout_id_is_fresh() {
-        let id = FanoutId::next();
-        let json = serde_json::to_string(&id).unwrap();
-        let back: FanoutId = serde_json::from_str(&json).unwrap();
-        assert!(back > id);
+        for kind in [
+            ControlKind::subscription_error("p", "HTTP 403"),
+            ControlKind::fanout_error("p", "HTTP 403"),
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<ControlKind>(&json).unwrap(), kind);
+        }
     }
 
     #[test]
