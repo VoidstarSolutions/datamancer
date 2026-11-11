@@ -3716,14 +3716,14 @@ async fn adv_seventeen_interleaved_error_copies_are_dropped() {
         .build()
         .unwrap();
     let (client, mut stream) = two_symbol_client(&dm).await;
-    let ids: [ControlKind; 17] = std::array::from_fn(|i| fanout(&format!("error {i}")));
-    for (i, id) in (0i64..).zip(&ids) {
-        ctrl.push("AAPL", fanout_error(id, 10 + i)).await;
+    let errors: [ControlKind; 17] = std::array::from_fn(|i| fanout(&format!("error {i}")));
+    for (i, error) in (0i64..).zip(&errors) {
+        ctrl.push("AAPL", fanout_error(error, 10 + i)).await;
     }
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 17);
-    for (i, id) in (0i64..).zip(&ids) {
-        ctrl.push("MSFT", fanout_error(id, 10 + i)).await;
+    for (i, error) in (0i64..).zip(&errors) {
+        ctrl.push("MSFT", fanout_error(error, 10 + i)).await;
     }
     ctrl.push("MSFT", trade("MSFT", 200)).await;
     assert_eq!(
