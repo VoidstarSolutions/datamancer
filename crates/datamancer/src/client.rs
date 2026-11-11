@@ -1254,6 +1254,15 @@ impl ClientRing {
         evicted
     }
 
+    /// The event the next [`Self::push`] evicts, if the ring is full.
+    fn oldest_if_full(&self) -> Option<&(MarketEvent, String)> {
+        if self.buf.len() == self.capacity {
+            self.buf.front()
+        } else {
+            None
+        }
+    }
+
     /// Current buffered event count.
     pub(crate) fn len(&self) -> usize {
         self.buf.len()
@@ -1668,6 +1677,23 @@ impl ClientController {
             self.sink = ClientSink::Detached(ClientRing::new(self.ring_capacity));
         }
         let (evicted, occupancy) = if let ClientSink::Detached(ring) = &mut self.sink {
+            // A fan-out error the ring evicts was never delivered: forget its
+            // id, so a later copy on another subscription is delivered.
+            if let Some((
+                MarketEvent::Control(Control {
+                    kind:
+                        ControlKind::ProviderError {
+                            origin: ErrorOrigin::Fanout(id),
+                            ..
+                        },
+                    ..
+                }),
+                oldest_provider,
+            )) = ring.oldest_if_full()
+                && let Some(ids) = self.delivered_fanouts.get_mut(oldest_provider)
+            {
+                ids.remove(id);
+            }
             let evicted = ring.push(ev, provider);
             (evicted, ring.len())
         } else {

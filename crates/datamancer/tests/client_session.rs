@@ -3863,3 +3863,40 @@ async fn adv_an_older_fanout_first_seen_on_a_later_subscription_is_delivered() {
     );
     let _ = client.close().await;
 }
+
+/// A fan-out whose first copy a detached client's resume buffer evicted was
+/// never delivered, so by the `Seq` contract ("already delivered only as a
+/// copy of an `ErrorOrigin::Fanout` whose `FanoutId` the client already
+/// delivered") a later copy on another subscription is not a copy of a
+/// delivered error and must reach the consumer.
+#[tokio::test]
+async fn a_fanout_copy_after_the_first_was_evicted_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(2)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    for symbol in ["AAPL", "MSFT"] {
+        subscribe_live(&client, symbol).await;
+    }
+    // Detached (stream never taken): events go to the per-client ring, cap 2.
+    let e0 = fanout("HTTP 403");
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    ctrl.push("AAPL", trade("AAPL", 101)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // AAPL's copy is evicted by now; MSFT's copy arrives after the eviction
+    // and fits in the ring.
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut stream = client.take_events().await.unwrap();
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        1,
+        "the fan-out was never delivered; MSFT's copy is not a copy of a delivered error"
+    );
+    let _ = client.close().await;
+}
