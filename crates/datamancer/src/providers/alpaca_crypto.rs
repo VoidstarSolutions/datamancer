@@ -27,7 +27,10 @@
 //! exponential backoff per the configured [`ReconnectPolicy`], and
 //! reconnects, re-applying the active subscription set. A
 //! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast
-//! to all active sinks so consumers see the gap window.
+//! to all active sinks so consumers see the gap window. A rejected
+//! credential pair (`402`) parks until the credentials rotate when they
+//! come from a watched source, and backs off like any other failure
+//! otherwise; a `406` or any other server error is transient and backs off.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -472,16 +475,12 @@ impl Connector for CryptoConnector {
         }
     }
 
-    /// `oxidized_alpaca` 0.0.10 returns `Error::StreamingAuth` when the
-    /// market-data connect handshake's auth response is not `Authenticated`;
-    /// only that parks. Every other failure, a mid-stream server error
-    /// envelope included, backs off.
+    /// The crypto stream speaks the same protocol as the stock stream, so it
+    /// classifies the same way: a rejected credential, at connect, on a
+    /// subscribe or mid-stream, is reported as unauthenticated, and
+    /// everything else as transient.
     fn classify(failure: &oxidized_alpaca::Error) -> StreamFailure {
-        if matches!(failure, oxidized_alpaca::Error::StreamingAuth) {
-            StreamFailure::Unauthenticated
-        } else {
-            StreamFailure::Transient
-        }
+        super::alpaca::classify_stream_failure(failure)
     }
 }
 
@@ -981,8 +980,30 @@ mod tests {
         assert!(!SubscriptionSet::is_empty(&set));
     }
 
+    /// A subscribe the server refuses with `402 auth failed` reports a
+    /// rejected credential; any other refusal, `401 not authenticated`
+    /// included, is transient.
     #[test]
-    fn crypto_classifies_only_streaming_auth_as_unauthenticated() {
+    fn crypto_subscribe_refused_with_402_is_unauthenticated() {
+        let refused = oxidized_alpaca::Error::StreamingSubscribe;
+        assert_eq!(
+            CryptoConnector::classify(&server_error(refused, StreamErrorCode::AuthFailed)),
+            StreamFailure::Unauthenticated
+        );
+        for code in [
+            StreamErrorCode::ConnectionLimitExceeded,
+            StreamErrorCode::NotAuthenticated,
+        ] {
+            assert_eq!(
+                CryptoConnector::classify(&server_error(refused, code)),
+                StreamFailure::Transient,
+                "code {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crypto_stream_failures_park_on_402_and_back_off_on_406() {
         assert_eq!(
             CryptoConnector::classify(&oxidized_alpaca::Error::StreamingAuth),
             StreamFailure::Unauthenticated
@@ -991,6 +1012,13 @@ mod tests {
             CryptoConnector::classify(&server_error(
                 oxidized_alpaca::Error::StreamingError,
                 StreamErrorCode::AuthFailed
+            )),
+            StreamFailure::Unauthenticated
+        );
+        assert_eq!(
+            CryptoConnector::classify(&server_error(
+                oxidized_alpaca::Error::StreamingError,
+                StreamErrorCode::ConnectionLimitExceeded
             )),
             StreamFailure::Transient
         );
