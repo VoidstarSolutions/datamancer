@@ -1263,6 +1263,24 @@ impl ClientRing {
         }
     }
 
+    /// Remove the buffered copy of fan-out `id` from `provider`, if any.
+    fn remove_fanout(&mut self, provider: &str, id: FanoutId) -> bool {
+        let found = self.buf.iter().position(|(ev, p)| {
+            p == provider
+                && matches!(
+                    ev,
+                    MarketEvent::Control(Control {
+                        kind: ControlKind::ProviderError {
+                            origin: ErrorOrigin::Fanout(buffered),
+                            ..
+                        },
+                        ..
+                    }) if *buffered == id
+                )
+        });
+        found.and_then(|i| self.buf.remove(i)).is_some()
+    }
+
     /// Current buffered event count.
     pub(crate) fn len(&self) -> usize {
         self.buf.len()
@@ -1631,7 +1649,15 @@ impl ClientController {
                         .or_default()
                         .insert(*id)
                     {
-                        return;
+                        // A copy still in the detached ring is not delivered
+                        // yet: carry this newer copy in its place, so the one
+                        // copy the ring holds is the last to be evicted.
+                        let ClientSink::Detached(ring) = &mut self.sink else {
+                            return;
+                        };
+                        if !ring.remove_fanout(&ring_provider, *id) {
+                            return;
+                        }
                     }
                 }
                 ControlKind::ProviderError { .. }
