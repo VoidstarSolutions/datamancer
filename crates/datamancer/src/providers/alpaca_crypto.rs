@@ -460,6 +460,11 @@ impl Connector for CryptoConnector {
             AlpacaCryptoVenue::UsKraken => CryptoFeed::UsKraken,
             AlpacaCryptoVenue::EuKraken => CryptoFeed::EuKraken,
         };
+        tracing::info!(
+            provider = PROVIDER_ID,
+            account_type = ?settings.account_type,
+            "connecting to the market-data stream"
+        );
         match credentials {
             PresentCredentials::Env => {
                 StreamingCryptoClient::new(settings.account_type, feed).await
