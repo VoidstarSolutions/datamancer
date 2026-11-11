@@ -45,6 +45,8 @@ struct Shared {
     subscribe_gate: Option<Arc<tokio::sync::Notify>>,
     /// How many `fetch_history` calls have started.
     fetches: usize,
+    /// When set, `fetch_history` fails with this message.
+    history_error: Option<String>,
 }
 
 struct FakeProvider {
@@ -171,6 +173,12 @@ impl Provider for FakeProvider {
         let (history, gate, pause) = {
             let mut shared = self.shared.lock().await;
             shared.fetches += 1;
+            if let Some(message) = shared.history_error.clone() {
+                return Err(datamancer::Error::Provider {
+                    provider: self.id.clone(),
+                    message,
+                });
+            }
             (
                 shared.history.clone(),
                 shared.history_gate.clone(),
@@ -3530,6 +3538,48 @@ async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
         .expect("joins the pure-live session");
     assert!(joined_as(outcome, live(), false), "{outcome:?}");
     let _ = other.close().await;
+    let _ = client.close().await;
+}
+
+/// A retried backfill over the same range that fails the way the first did
+/// is a second fetch failing, and its `ProviderError` must reach the client
+/// (`duplicate_error`: "a second fetch failing the way the first did ... is
+/// delivered"; `emit_provider_error`: without it the failure is
+/// indistinguishable from an empty range).
+#[tokio::test]
+async fn a_retried_backfill_failing_the_same_way_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.shared.lock().await.history_error = Some("HTTP 403".to_string());
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let mut stream = client.take_events().await.unwrap();
+    for (attempt, sentinel) in [(1usize, 100i64), (2, 200)] {
+        client
+            .subscribe(
+                inst("AAPL"),
+                EventKind::Trade,
+                LiveScope::backfill(Timestamp(0)),
+                PersistenceOptions::none(),
+            )
+            .await
+            .unwrap();
+        wait_for_fetches(&ctrl, attempt).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ctrl.push("AAPL", trade("AAPL", sentinel)).await;
+        assert_eq!(
+            errors_until(&mut stream, sentinel).await,
+            1,
+            "attempt {attempt}: the failed fetch's ProviderError reached the client"
+        );
+        client
+            .unsubscribe(inst("AAPL"), EventKind::Trade)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let _ = client.close().await;
 }
 
