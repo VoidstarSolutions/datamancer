@@ -333,8 +333,7 @@ impl ControlKind {
     /// subscription, with a fresh [`FanoutId`].
     ///
     /// Build it once and send a clone to each route: the clones share the id,
-    /// so a client session delivers one of them. Send each route its fan-outs
-    /// in the order they were built.
+    /// so a client session delivers one of them.
     ///
     /// # Arguments
     ///

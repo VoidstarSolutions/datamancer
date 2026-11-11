@@ -27,7 +27,7 @@
 //! controller runs upstream `unsubscribe` + `close` and exits, and the
 //! `Arc<AuthoritativeSession>` drop clears the registry slot.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -238,32 +238,6 @@ const CLOSE_DELIVERY_WAIT: Duration = Duration::from_secs(2);
 
 /// How many client-local controls may wait behind a drained ring.
 const CONTROL_BACKLOG: usize = 1024;
-
-/// One provider's fan-out errors as a client has seen them: every substream
-/// on the provider has passed the ids up to `floor`, and `delivered` holds the
-/// ids above it.
-#[derive(Default)]
-struct FanoutLedger {
-    floor: Option<FanoutId>,
-    delivered: BTreeSet<FanoutId>,
-}
-
-impl FanoutLedger {
-    fn high(&self) -> Option<FanoutId> {
-        self.delivered.last().copied().or(self.floor)
-    }
-
-    fn first_sighting(&mut self, id: FanoutId) -> bool {
-        self.floor.is_none_or(|floor| id > floor) && self.delivered.insert(id)
-    }
-
-    fn forget_through(&mut self, passed: FanoutId) {
-        if self.floor.is_none_or(|floor| passed > floor) {
-            self.delivered.retain(|id| *id > passed);
-            self.floor = Some(passed);
-        }
-    }
-}
 
 /// A subscriber the controller has added.
 pub(crate) struct NewSubscriber {
@@ -1382,9 +1356,6 @@ enum ConnState {
 struct SubEntry {
     _guard: SubscriberGuard,
     provider: String,
-    /// The last fan-out id this substream passed: the newest it carried, or
-    /// on subscribe the newest the client had already seen.
-    fanout_mark: Option<FanoutId>,
 }
 
 /// Item type for an interleaved substream: a stamped event, then a terminal
@@ -1436,7 +1407,10 @@ struct ClientController {
     backlog: VecDeque<(MarketEvent, String)>,
     ring_capacity: usize,
     seen_provider_state: HashMap<String, ConnState>,
-    fanouts: HashMap<String, FanoutLedger>,
+    /// The fan-out ids delivered per provider, kept for the client's life:
+    /// a substream can carry an old copy at any time, including one it joined
+    /// with in flight.
+    delivered_fanouts: HashMap<String, HashSet<FanoutId>>,
     /// Per-client introspection state read by the diagnostics snapshot.
     stats: Arc<ClientStats>,
 }
@@ -1565,13 +1539,11 @@ impl ClientController {
             .authoritative(instrument.clone(), kind, scope, options, Caller::Client)
             .await?;
         let provider = guard.provider().to_string();
-        let fanout_mark = self.fanouts.get(&provider).and_then(FanoutLedger::high);
         self.entries.insert(
             key.clone(),
             SubEntry {
                 _guard: guard,
                 provider,
-                fanout_mark,
             },
         );
         self.streams.insert(key, substream(rx));
@@ -1591,7 +1563,6 @@ impl ClientController {
         // clients), so it is synthetic and rides `Seq::SYNTHETIC`.
         drop(entry);
         self.streams.remove(&key);
-        self.forget_passed_fanouts(&provider);
         self.sync_subscriptions();
         self.queue_control(
             subscription_changed(&instrument, kind, &provider, false),
@@ -1610,7 +1581,6 @@ impl ClientController {
         };
         let provider = entry.provider.clone();
         drop(entry);
-        self.forget_passed_fanouts(&provider);
         self.sync_subscriptions();
         self.queue_control(
             subscription_changed(&key.0, key.1, &provider, false),
@@ -1646,7 +1616,12 @@ impl ClientController {
                     origin: ErrorOrigin::Fanout(id),
                     ..
                 } => {
-                    if !self.first_fanout_sighting(&key, &ring_provider, *id) {
+                    let first = self
+                        .delivered_fanouts
+                        .entry(ring_provider.clone())
+                        .or_default()
+                        .insert(*id);
+                    if !first {
                         return;
                     }
                 }
@@ -1666,44 +1641,6 @@ impl ClientController {
                 self.seen_provider_state.insert(provider.to_string(), new);
                 true
             }
-        }
-    }
-
-    /// Returns true the first time fan-out `id` reaches the client from any
-    /// of `provider`'s substreams.
-    fn first_fanout_sighting(
-        &mut self,
-        key: &(Instrument, EventKind),
-        provider: &str,
-        id: FanoutId,
-    ) -> bool {
-        if let Some(entry) = self.entries.get_mut(key) {
-            entry.fanout_mark = entry.fanout_mark.max(Some(id));
-        }
-        let first = self
-            .fanouts
-            .entry(provider.to_string())
-            .or_default()
-            .first_sighting(id);
-        self.forget_passed_fanouts(provider);
-        first
-    }
-
-    /// Forget `provider`'s fan-out ids that every one of its substreams has
-    /// passed.
-    fn forget_passed_fanouts(&mut self, provider: &str) {
-        let Some(ledger) = self.fanouts.get_mut(provider) else {
-            return;
-        };
-        let passed = self
-            .entries
-            .values()
-            .filter(|entry| entry.provider == provider)
-            .map(|entry| entry.fanout_mark)
-            .min()
-            .unwrap_or_else(|| ledger.high());
-        if let Some(passed) = passed {
-            ledger.forget_through(passed);
         }
     }
 
@@ -1971,7 +1908,6 @@ pub(crate) fn spawn_client(
             SubEntry {
                 _guard: guard,
                 provider,
-                fanout_mark: None,
             },
         );
         streams.insert(key, substream(rx));
@@ -1992,7 +1928,7 @@ pub(crate) fn spawn_client(
         backlog: VecDeque::new(),
         ring_capacity,
         seen_provider_state: HashMap::new(),
-        fanouts: HashMap::new(),
+        delivered_fanouts: HashMap::new(),
         stats,
     };
     tokio::spawn(controller.run());

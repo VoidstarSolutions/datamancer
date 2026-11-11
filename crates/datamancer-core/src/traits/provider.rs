@@ -31,8 +31,7 @@ use crate::{
 ///
 /// A provider reports an error it sends to every subscription with one
 /// [`ControlKind::fanout_error`](crate::ControlKind::fanout_error), built once
-/// and cloned to each route, each route receiving its fan-outs in the order
-/// they were built. An error about one subscription is a
+/// and cloned to each route. An error about one subscription is a
 /// [`ControlKind::subscription_error`](crate::ControlKind::subscription_error).
 #[async_trait]
 pub trait Provider: Send + Sync + 'static {

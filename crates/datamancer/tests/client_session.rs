@@ -3786,3 +3786,115 @@ async fn a_subscription_made_while_a_fanout_is_in_flight_gets_it_once() {
     assert_eq!(errors_until(&mut stream, 800).await, 0);
     let _ = client.close().await;
 }
+
+/// A fan-out the client never delivered must reach it when one of its
+/// subscriptions carries it (`datamancer_core::Seq`: a `ProviderError` is
+/// already delivered only as a copy of a fan-out the client delivered from
+/// another of its subscriptions). Here the older fan-out was sent to MSFT's
+/// route alone, before AAPL's route existed, and sat in MSFT's backfill
+/// buffer; the client joins MSFT after delivering a newer fan-out from AAPL.
+#[tokio::test]
+async fn adv_an_undelivered_older_fanout_on_a_joined_backfill_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    // Another client opens MSFT with a backfill that waits on the gate.
+    let creator = dm.client_session();
+    creator
+        .subscribe(
+            inst("MSFT"),
+            EventKind::Trade,
+            LiveScope::backfill(Timestamp(0)),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let _creator_stream = creator.take_events().await.unwrap();
+    wait_for_fetches(&ctrl, 1).await;
+    // The provider fans `old` out to its one route, MSFT's: buffered there.
+    let old = fanout("old error");
+    ctrl.push("MSFT", fanout_error(&old, 10)).await;
+
+    // The client subscribes AAPL; the provider then fans `new` out to both.
+    let client = dm.client_session();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    let new = fanout("new error");
+    ctrl.push("AAPL", fanout_error(&new, 20)).await;
+    ctrl.push("MSFT", fanout_error(&new, 20)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1, "`new` from AAPL");
+
+    // The client joins MSFT while its backfill is in flight, then the
+    // backfill ends and MSFT's buffer (`old`, then `new`) is flushed.
+    client
+        .subscribe(
+            inst("MSFT"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    gate.notify_one();
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        1,
+        "`old` was never delivered to this client and must be; `new` is a copy"
+    );
+    let _ = client.close().await;
+    let _ = creator.close().await;
+}
+
+/// `older` was built while only MSFT's route existed (another client's
+/// session), `newer` afterwards for both routes. The client delivered
+/// `newer` from AAPL, then joined MSFT's session while both were still in
+/// flight there. `older` never reached the client from any subscription, so
+/// by the `Seq` contract it is not "already delivered" and must arrive.
+#[tokio::test]
+async fn adv_an_older_fanout_first_seen_on_a_later_subscription_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let subscribe = |symbol: &'static str| {
+        client.subscribe(
+            inst(symbol),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+    };
+    subscribe("AAPL").await.unwrap();
+    let mut stream = client.take_events().await.unwrap();
+    let [older, newer] = [fanout("older"), fanout("newer")];
+    ctrl.push("AAPL", fanout_error(&newer, 20)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1);
+    subscribe("MSFT").await.unwrap();
+    // Still in flight on MSFT's session when the client joined it.
+    ctrl.push("MSFT", fanout_error(&older, 10)).await;
+    ctrl.push("MSFT", fanout_error(&newer, 20)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        1,
+        "`older` was never delivered from any subscription, so it is not a copy"
+    );
+    let _ = client.close().await;
+}
