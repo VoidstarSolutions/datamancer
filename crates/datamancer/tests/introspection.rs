@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use datamancer::Surface;
 use datamancer::storage::{TursoCache, TursoCacheConfig};
 use datamancer::{
-    AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, DisconnectCause, EventKind,
-    GapSpan, HealthView, Instrument, LiveHandle, LiveScope, Liveness, MarketEvent,
+    AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, DisconnectCause, ErrorOrigin,
+    EventKind, GapSpan, HealthView, Instrument, LiveHandle, LiveScope, Liveness, MarketEvent,
     PersistenceOptions, Price, Provider, ProviderId, ProviderSnapshot, ProviderState, Result,
     Scope, Seq, StreamConnection, SurfaceOutcome, Timestamp, Trade,
 };
@@ -467,10 +467,7 @@ fn provider_error(id: &str, message: &str) -> MarketEvent {
         source_ts: Timestamp(0),
         rx_ts: Timestamp(0),
         seq: Seq(0),
-        kind: ControlKind::ProviderError {
-            provider: id.to_string(),
-            message: message.to_string(),
-        },
+        kind: ControlKind::provider_error(id, message, ErrorOrigin::Subscription),
     })
 }
 

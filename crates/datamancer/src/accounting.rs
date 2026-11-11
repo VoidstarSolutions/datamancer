@@ -306,9 +306,9 @@ impl ProviderAccounting {
 mod tests {
     use super::{ConnectionChange, ProviderAccounting};
     use datamancer_core::{
-        AssetClass, ConnectionState, Control, ControlKind, DisconnectCause, GapSpan, Instrument,
-        MarketEvent, Price, ProviderId, ProviderSurfaces, Seq, StreamConnection, SurfaceOutcome,
-        Timestamp, Trade,
+        AssetClass, ConnectionState, Control, ControlKind, DisconnectCause, ErrorOrigin, GapSpan,
+        Instrument, MarketEvent, Price, ProviderId, ProviderSurfaces, Seq, StreamConnection,
+        SurfaceOutcome, Timestamp, Trade,
     };
 
     fn trade() -> MarketEvent {
@@ -556,10 +556,7 @@ mod tests {
         assert_eq!(a.surfaces().live, failing(8, "ws closed"));
         // A provider error frame is not an outcome on either surface.
         a.record_provider_control(
-            &ControlKind::ProviderError {
-                provider: "p".to_string(),
-                message: "boom".to_string(),
-            },
+            &ControlKind::provider_error("p", "boom", ErrorOrigin::Subscription),
             ConnectionChange::None,
             Timestamp(9),
         );
@@ -595,10 +592,7 @@ mod tests {
         assert_eq!(a.gaps_emitted(), 1);
         assert_eq!(a.last_error(), None);
         a.record_provider_control(
-            &ControlKind::ProviderError {
-                provider: "p".to_string(),
-                message: "boom".to_string(),
-            },
+            &ControlKind::provider_error("p", "boom", ErrorOrigin::Subscription),
             ConnectionChange::None,
             Timestamp(1),
         );

@@ -85,7 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ControlKind::ProviderConnected { provider } => {
                         println!("connected: {provider}");
                     }
-                    ControlKind::ProviderError { provider, message } => {
+                    ControlKind::ProviderError {
+                        provider, message, ..
+                    } => {
                         eprintln!("provider {provider} error: {message}");
                     }
                     _ => {}

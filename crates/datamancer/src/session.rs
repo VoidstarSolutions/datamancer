@@ -63,10 +63,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer_core::{
     Adjustment, AuthoritativeSessionSnapshot, Bar, CacheKey, CacheSnapshot, ClientSessionSnapshot,
-    Control, ControlKind, Error, EventKind, EventSink, GapSpan, HealthView, HistoricalCache,
-    HistoryRequest, Instrument, InstrumentEntry, InstrumentInfo, LiveHandle, LiveScope,
-    MarketEvent, Provider, ProviderId, ProviderSnapshot, PublishOutcome, Quote, ReplayRequest,
-    Result, Seq, Subscribed, Surface, SurfaceOutcome, SystemSnapshot, TapLog, Timestamp, Trade,
+    Control, ControlKind, Error, ErrorOrigin, EventKind, EventSink, GapSpan, HealthView,
+    HistoricalCache, HistoryRequest, Instrument, InstrumentEntry, InstrumentInfo, LiveHandle,
+    LiveScope, MarketEvent, Provider, ProviderId, ProviderSnapshot, PublishOutcome, Quote,
+    ReplayRequest, Result, Seq, Subscribed, Surface, SurfaceOutcome, SystemSnapshot, TapLog,
+    Timestamp, Trade,
 };
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -1752,10 +1753,11 @@ impl Controller {
             source_ts,
             rx_ts: source_ts,
             seq: Seq(0),
-            kind: ControlKind::ProviderError {
-                provider: self.provider.id().to_string(),
+            kind: ControlKind::provider_error(
+                self.provider.id().to_string(),
                 message,
-            },
+                ErrorOrigin::Subscription,
+            ),
         }))
         .await;
     }
