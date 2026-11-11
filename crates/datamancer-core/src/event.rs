@@ -50,9 +50,9 @@ use crate::{Instrument, Price, Quantity};
 ///     since no data was lost; the diagnostics plane still carries the
 ///     provider's connection and the subscription state;
 ///   - an [`ErrorOrigin::Fanout`] `ProviderError` that a detached client's
-///     resume buffer still held when a later copy of it arrived on another
-///     subscription is dropped and its slot stays empty: the later copy takes
-///     its place, at the later copy's own slot;
+///     resume buffer still held when a later copy of it arrived, on any of
+///     its subscriptions, is dropped and its slot stays empty: the later copy
+///     takes its place, at the later copy's own slot;
 ///   - a joiner's stream opens with the session's last active
 ///     `SubscriptionChanged`, replayed with its original `seq`, and goes on
 ///     from the session's current `seq`;
