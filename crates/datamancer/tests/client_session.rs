@@ -3940,3 +3940,64 @@ async fn a_fanout_copy_dropped_while_the_first_was_buffered_is_not_lost() {
     );
     let _ = client.close().await;
 }
+
+/// `ControlKind::subscription_error`: "an error about one subscription, which
+/// a client session always delivers". One that meets a full channel must not
+/// be replaced by a later, unrelated fan-out error on the same provider: the
+/// fan-out has copies elsewhere, the subscription error has none.
+#[tokio::test]
+async fn a_subscription_error_owed_on_a_full_channel_survives_a_later_fanout() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    subscribe_live(&client, "AAPL").await;
+    let mut stream = client.take_events().await.unwrap();
+    // Fill the client's channel and the session-to-client channel without
+    // reading, so the next controls meet a full channel.
+    for ts in 0..2200 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ctrl.push("AAPL", subscription_error("backfill fetch failed", 3000))
+        .await;
+    ctrl.push("AAPL", fanout_error(&fanout("unrelated"), 3001))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Read what is queued, then a sentinel lets the owed controls out.
+    let mut subscription_errors = 0;
+    let mut fanout_errors = 0;
+    let mut sentinel_pushed = false;
+    loop {
+        let ev = match tokio::time::timeout(Duration::from_millis(300), stream.next()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => panic!("stream ended"),
+            Err(_) => {
+                assert!(!sentinel_pushed, "timed out after the sentinel");
+                ctrl.push("AAPL", trade("AAPL", 99_999)).await;
+                sentinel_pushed = true;
+                continue;
+            }
+        };
+        match ev {
+            MarketEvent::Trade(t) if t.source_ts.0 == 99_999 => break,
+            MarketEvent::Control(c) => match c.kind {
+                ControlKind::ProviderError {
+                    origin: datamancer::ErrorOrigin::Subscription,
+                    ..
+                } => subscription_errors += 1,
+                ControlKind::ProviderError { .. } => fanout_errors += 1,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    assert_eq!(fanout_errors, 1, "the fan-out arrives");
+    assert_eq!(
+        subscription_errors, 1,
+        "the subscription error is always delivered"
+    );
+    let _ = client.close().await;
+}

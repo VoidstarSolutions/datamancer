@@ -827,8 +827,10 @@ impl From<mpsc::error::TrySendError<MarketEvent>> for Refused {
 }
 
 /// Whether `newer` replaces `older` as an owed control: a connect or disconnect
-/// replaces the provider's last one, a `ProviderError` the provider's last
-/// error, and a `SubscriptionChanged` the instrument's.
+/// replaces the provider's last one, a fan-out `ProviderError` the provider's
+/// last fan-out error, and a `SubscriptionChanged` the instrument's. A
+/// subscription error is never replaced, and never replaces one: a client
+/// session always delivers it.
 fn supersedes(newer: &ControlKind, older: &ControlKind) -> bool {
     fn connection_provider(kind: &ControlKind) -> Option<&str> {
         match kind {
@@ -839,8 +841,16 @@ fn supersedes(newer: &ControlKind, older: &ControlKind) -> bool {
     }
     match (newer, older) {
         (
-            ControlKind::ProviderError { provider: a, .. },
-            ControlKind::ProviderError { provider: b, .. },
+            ControlKind::ProviderError {
+                provider: a,
+                origin: ErrorOrigin::Fanout(_),
+                ..
+            },
+            ControlKind::ProviderError {
+                provider: b,
+                origin: ErrorOrigin::Fanout(_),
+                ..
+            },
         ) => a == b,
         (
             ControlKind::SubscriptionChanged { instrument: a, .. },
@@ -2486,10 +2496,7 @@ mod fanout_tests {
     }
 
     fn provider_error(seq: u64) -> MarketEvent {
-        control(
-            seq,
-            ControlKind::subscription_error("p", "re-subscribe failed"),
-        )
+        control(seq, ControlKind::fanout_error("p", "re-subscribe failed"))
     }
 
     #[test]
