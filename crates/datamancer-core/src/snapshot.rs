@@ -180,6 +180,10 @@ impl ProviderSurfaces {
 
     /// These surfaces with `history` as the history surface's outcome.
     ///
+    /// # Arguments
+    ///
+    /// * `history` - the newest concluded attempt to serve history.
+    ///
     /// ```
     /// use datamancer_core::{ProviderSurfaces, SurfaceOutcome, Timestamp};
     ///
@@ -199,6 +203,10 @@ impl ProviderSurfaces {
     }
 
     /// These surfaces with `live` as the live surface's outcome.
+    ///
+    /// # Arguments
+    ///
+    /// * `live` - the newest concluded attempt on the connect path.
     #[must_use]
     pub fn with_live(mut self, live: SurfaceOutcome) -> Self {
         self.live = live;
