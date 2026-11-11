@@ -1754,7 +1754,7 @@ impl Controller {
             rx_ts: source_ts,
             seq: Seq(0),
             kind: ControlKind::provider_error(
-                self.provider.id().to_string(),
+                self.provider.id(),
                 message,
                 ErrorOrigin::Subscription,
             ),
