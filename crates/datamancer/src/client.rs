@@ -1616,12 +1616,12 @@ impl ClientController {
                     origin: ErrorOrigin::Fanout(id),
                     ..
                 } => {
-                    let first = self
+                    if !self
                         .delivered_fanouts
                         .entry(ring_provider.clone())
                         .or_default()
-                        .insert(*id);
-                    if !first {
+                        .insert(*id)
+                    {
                         return;
                     }
                 }
