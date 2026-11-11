@@ -29,13 +29,11 @@ use crate::{
 
 /// One configured upstream source of market data.
 ///
-/// A provider reports an error as a
-/// [`ControlKind::provider_error`](crate::ControlKind::provider_error). An
-/// error it sends to every subscription is an
-/// [`ErrorOrigin::Fanout`](crate::ErrorOrigin::Fanout) whose copies all carry
-/// one [`FanoutId::next`](crate::FanoutId::next) id, allocated once per
-/// broadcast; an error about one subscription is an
-/// [`ErrorOrigin::Subscription`](crate::ErrorOrigin::Subscription).
+/// A provider reports an error it sends to every subscription with one
+/// [`ControlKind::fanout_error`](crate::ControlKind::fanout_error), built once
+/// and cloned to each route, each route receiving its fan-outs in the order
+/// they were built. An error about one subscription is a
+/// [`ControlKind::subscription_error`](crate::ControlKind::subscription_error).
 #[async_trait]
 pub trait Provider: Send + Sync + 'static {
     /// Stable identifier for this provider (e.g. `"alpaca"`). Used in

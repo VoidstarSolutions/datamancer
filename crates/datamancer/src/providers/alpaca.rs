@@ -47,10 +47,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    Adjustment, AssetClass, BarInterval, Control, ControlKind, DisconnectCause, Error, ErrorOrigin,
-    EventKind, FanoutId, HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry,
-    LiveHandle, MarketEvent, OrderType, Price, Provider, ProviderId, Quantity, Result, Seq,
-    Surface, TimeInForce, Timestamp, Trade,
+    Adjustment, AssetClass, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
+    HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent,
+    OrderType, Price, Provider, ProviderId, Quantity, Result, Seq, Surface, TimeInForce, Timestamp,
+    Trade,
 };
 use datamancer_core::{Bar, Quote};
 use oxidized_alpaca::{
@@ -1358,11 +1358,7 @@ async fn broadcast_error(
     routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
     message: String,
 ) {
-    broadcast_control(
-        routes,
-        ControlKind::provider_error(PROVIDER_ID, message, ErrorOrigin::Fanout(FanoutId::next())),
-    )
-    .await;
+    broadcast_control(routes, ControlKind::fanout_error(PROVIDER_ID, message)).await;
 }
 
 /// Send a control to one sink, if present.
@@ -1429,10 +1425,9 @@ pub(crate) fn translate_stock_message(msg: StockStreamMessage) -> Vec<MarketEven
             source_ts: rx,
             rx_ts: rx,
             seq: Seq(0),
-            kind: ControlKind::provider_error(
+            kind: ControlKind::fanout_error(
                 PROVIDER_ID,
                 format!("{:?}: {}", err.code, err.message),
-                ErrorOrigin::Fanout(FanoutId::next()),
             ),
         })],
         // Control envelopes, subscription confirmations, and the auxiliary
@@ -1755,6 +1750,7 @@ async fn fetch_history_via(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datamancer_core::{ErrorOrigin, FanoutId};
 
     const ALL_STREAM_FEEDS: [AlpacaStreamFeed; 4] = [
         AlpacaStreamFeed::Iex,

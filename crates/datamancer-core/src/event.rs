@@ -310,9 +310,9 @@ pub enum ControlKind {
         span: GapSpan,
     },
     /// A non-fatal provider error worth surfacing to the consumer. Build it
-    /// with [`ControlKind::provider_error`]; its [`ErrorOrigin`] says whether
-    /// it is one copy of an error sent to every subscription or an error
-    /// about this subscription alone.
+    /// with [`ControlKind::fanout_error`] for one copy of an error sent to
+    /// every subscription, or [`ControlKind::subscription_error`] for an error
+    /// about this subscription alone; its [`ErrorOrigin`] records which.
     #[non_exhaustive]
     ProviderError {
         /// The provider that reported the error.
@@ -329,17 +329,35 @@ pub enum ControlKind {
 }
 
 impl ControlKind {
-    /// Builds a [`ControlKind::ProviderError`].
+    /// Builds a [`ControlKind::ProviderError`] a provider sends to every
+    /// subscription, with a fresh [`FanoutId`].
+    ///
+    /// Build it once and send a clone to each route: the clones share the id,
+    /// so a client session delivers one of them. Send each route its fan-outs
+    /// in the order they were built.
     ///
     /// # Arguments
     ///
     /// * `provider` - the provider that reported the error.
     /// * `message` - the provider's error text.
-    /// * `origin` - an [`ErrorOrigin::Fanout`] for one error sent to every
-    ///   subscription, an [`ErrorOrigin::Subscription`] for an error about
-    ///   one subscription.
     #[must_use]
-    pub fn provider_error(
+    pub fn fanout_error(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::provider_error(provider, message, ErrorOrigin::Fanout(FanoutId::next()))
+    }
+
+    /// Builds a [`ControlKind::ProviderError`] about one subscription, which a
+    /// client session always delivers.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - the provider that reported the error.
+    /// * `message` - the provider's error text.
+    #[must_use]
+    pub fn subscription_error(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::provider_error(provider, message, ErrorOrigin::Subscription)
+    }
+
+    fn provider_error(
         provider: impl Into<String>,
         message: impl Into<String>,
         origin: ErrorOrigin,
@@ -358,12 +376,13 @@ impl ControlKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorOrigin {
-    /// One error a provider sent to every subscription. Its copies share one
-    /// [`FanoutId::next`] id, and a client session delivers one of them (see
-    /// [`Seq`]).
+    /// One error a provider sent to every subscription, built by
+    /// [`ControlKind::fanout_error`]. Its copies share the [`FanoutId`], and a
+    /// client session delivers one of them (see [`Seq`]).
     Fanout(FanoutId),
-    /// An error about this one subscription. A client session always
-    /// delivers it, never treating it as a copy of another (see [`Seq`]).
+    /// An error about this one subscription, built by
+    /// [`ControlKind::subscription_error`]. A client session always delivers
+    /// it, never treating it as a copy of another (see [`Seq`]).
     Subscription,
 }
 
@@ -373,22 +392,25 @@ fn subscription_origin() -> ErrorOrigin {
 
 /// The identity of one [`ErrorOrigin::Fanout`] error, shared by its copies.
 ///
-/// Every id comes from [`FanoutId::next`], one process-wide sequence, so a
-/// provider that allocates once per broadcast sends each subscription its
-/// fan-outs in increasing [`FanoutId`] order, and no two broadcasts share an
-/// id however many connections or restarts a provider goes through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Only [`ControlKind::fanout_error`] makes one, from a single process-wide
+/// sequence, so each new fan-out's id is greater than every earlier one and no
+/// two fan-outs share an id. A deserialized id is a fresh one: an id
+/// identifies copies within one process only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct FanoutId(u64);
 
 impl FanoutId {
-    /// Allocates a new [`FanoutId`], greater than every one allocated before
-    /// in this process. Call it once per error sent to every subscription and
-    /// give each copy the same id.
-    #[must_use]
-    pub fn next() -> Self {
+    fn next() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl<'de> Deserialize<'de> for FanoutId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        u64::deserialize(deserializer)?;
+        Ok(Self::next())
     }
 }
 
@@ -409,25 +431,36 @@ mod serde_tests {
     fn provider_error_origin_defaults_on_old_frames() {
         let old = r#"{"ProviderError":{"provider":"p","message":"HTTP 403"}}"#;
         let kind: ControlKind = serde_json::from_str(old).unwrap();
-        assert_eq!(
-            kind,
-            ControlKind::provider_error("p", "HTTP 403", ErrorOrigin::Subscription)
-        );
+        assert_eq!(kind, ControlKind::subscription_error("p", "HTTP 403"));
     }
 
     #[test]
     fn provider_error_round_trips_with_its_origin() {
-        for origin in [
-            ErrorOrigin::Fanout(FanoutId::next()),
-            ErrorOrigin::Subscription,
-        ] {
-            let kind = ControlKind::provider_error("p", "HTTP 403", origin);
-            let json = serde_json::to_string(&kind).unwrap();
-            assert_eq!(serde_json::from_str::<ControlKind>(&json).unwrap(), kind);
-        }
+        let kind = ControlKind::subscription_error("p", "HTTP 403");
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(serde_json::from_str::<ControlKind>(&json).unwrap(), kind);
+
+        let fanout = ControlKind::fanout_error("p", "HTTP 403");
+        let ControlKind::ProviderError {
+            origin: ErrorOrigin::Fanout(id),
+            ..
+        } = fanout
+        else {
+            panic!("fanout_error builds a fan-out");
+        };
+        let json = serde_json::to_string(&fanout).unwrap();
+        assert!(
+            json.contains(&format!(r#"{{"fanout":{}}}"#, id.0)),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_deserialized_fanout_id_is_fresh() {
         let id = FanoutId::next();
-        let json = serde_json::to_string(&ErrorOrigin::Fanout(id)).unwrap();
-        assert_eq!(json, format!(r#"{{"fanout":{}}}"#, id.0));
+        let json = serde_json::to_string(&id).unwrap();
+        let back: FanoutId = serde_json::from_str(&json).unwrap();
+        assert!(back > id);
     }
 
     #[test]

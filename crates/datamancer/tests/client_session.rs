@@ -14,9 +14,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use datamancer::Surface;
 use datamancer::{
-    AssetClass, ControlKind, Datamancer, ErrorOrigin, EventKind, FanoutId, Instrument, LiveHandle,
-    LiveScope, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq,
-    Subscribed, Timestamp, Trade,
+    AssetClass, ControlKind, Datamancer, EventKind, Instrument, LiveHandle, LiveScope, MarketEvent,
+    PersistenceOptions, Price, Provider, ProviderId, Result, Scope, Seq, Subscribed, Timestamp,
+    Trade,
 };
 use datamancer_core::{
     CacheCoverage, CacheKey, HistoricalCache, HistoryRequest, ReplaySource, TapLog,
@@ -908,25 +908,19 @@ fn provider_control(kind: ControlKind, rx_ts: i64) -> MarketEvent {
     })
 }
 
-/// `N` fresh fan-out ids in allocation order.
-fn fanout_ids<const N: usize>() -> [FanoutId; N] {
-    std::array::from_fn(|_| FanoutId::next())
+/// A fan-out error from the fake provider; each copy is a clone of it.
+fn fanout(message: &str) -> ControlKind {
+    ControlKind::fanout_error("fake", message)
 }
 
-/// One copy of the provider's fan-out error `id`.
-fn fanout_error(message: &str, id: FanoutId, rx_ts: i64) -> MarketEvent {
-    provider_control(
-        ControlKind::provider_error("fake", message, ErrorOrigin::Fanout(id)),
-        rx_ts,
-    )
+/// One copy of the fan-out error `kind`.
+fn fanout_error(kind: &ControlKind, rx_ts: i64) -> MarketEvent {
+    provider_control(kind.clone(), rx_ts)
 }
 
 /// An error about the one subscription it arrives on.
 fn subscription_error(message: &str, rx_ts: i64) -> MarketEvent {
-    provider_control(
-        ControlKind::provider_error("fake", message, ErrorOrigin::Subscription),
-        rx_ts,
-    )
+    provider_control(ControlKind::subscription_error("fake", message), rx_ts)
 }
 
 /// The provider's `ProviderConnected`.
@@ -1002,12 +996,12 @@ async fn a_provider_error_repeated_after_a_reconnect_is_delivered() {
         .await
         .unwrap();
     let mut stream = client.take_events().await.unwrap();
-    let [e0, e1] = fanout_ids();
-    ctrl.push("AAPL", fanout_error("HTTP 403", e0, 10)).await;
+    let [e0, e1] = [fanout("HTTP 403"), fanout("HTTP 403")];
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
     ctrl.push("AAPL", disconnected(11)).await;
     ctrl.push("AAPL", connected(12)).await;
     // Same text, same timestamp, but a second broadcast: its own fan-out id.
-    ctrl.push("AAPL", fanout_error("HTTP 403", e1, 10)).await;
+    ctrl.push("AAPL", fanout_error(&e1, 10)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(
         errors_until(&mut stream, 100).await,
@@ -1025,17 +1019,15 @@ async fn a_connected_copy_between_two_error_copies_keeps_the_second_dropped() {
         .build()
         .unwrap();
     let (client, mut stream) = two_symbol_client(&dm).await;
-    let [e0] = fanout_ids();
+    let e0 = fanout("re-subscribe failed");
     // A reconnect fanned out to both substreams, then one re-subscribe error
     // fanned out the same way; AAPL's pair is read before MSFT's.
     ctrl.push("AAPL", connected(5)).await;
-    ctrl.push("AAPL", fanout_error("re-subscribe failed", e0, 10))
-        .await;
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 1);
     ctrl.push("MSFT", connected(5)).await;
-    ctrl.push("MSFT", fanout_error("re-subscribe failed", e0, 10))
-        .await;
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
     ctrl.push("MSFT", trade("MSFT", 200)).await;
     assert_eq!(
         errors_until(&mut stream, 200).await,
@@ -1053,10 +1045,10 @@ async fn a_later_error_with_the_same_text_is_delivered_and_a_copy_is_not() {
         .build()
         .unwrap();
     let (client, mut stream) = two_symbol_client(&dm).await;
-    let [e0] = fanout_ids();
+    let e0 = fanout("HTTP 403");
     // One provider error fanned out to both substreams: one copy each.
-    ctrl.push("AAPL", fanout_error("HTTP 403", e0, 10)).await;
-    ctrl.push("MSFT", fanout_error("HTTP 403", e0, 10)).await;
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 1, "copies coalesce");
     // A second failure later, with the same text (a second fetch failing).
@@ -3596,14 +3588,14 @@ async fn a_pre_reconnect_error_copy_after_the_reconnect_is_dropped() {
         .build()
         .unwrap();
     let (client, mut stream) = two_symbol_client(&dm).await;
-    let [e0] = fanout_ids();
-    ctrl.push("AAPL", fanout_error("HTTP 403", e0, 10)).await;
+    let e0 = fanout("HTTP 403");
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
     ctrl.push("AAPL", disconnected(11)).await;
     ctrl.push("AAPL", connected(12)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 1);
     // MSFT's copies of the same error and the same reconnect.
-    ctrl.push("MSFT", fanout_error("HTTP 403", e0, 10)).await;
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
     ctrl.push("MSFT", disconnected(11)).await;
     ctrl.push("MSFT", connected(12)).await;
     ctrl.push("MSFT", trade("MSFT", 200)).await;
@@ -3627,17 +3619,13 @@ async fn same_text_errors_interleaved_copies_are_dropped() {
         .build()
         .unwrap();
     let (client, mut stream) = two_symbol_client(&dm).await;
-    let [e0, e1] = fanout_ids();
-    ctrl.push("AAPL", fanout_error("re-subscribe failed", e0, 10))
-        .await;
-    ctrl.push("AAPL", fanout_error("re-subscribe failed", e1, 20))
-        .await;
+    let [e0, e1] = [fanout("re-subscribe failed"), fanout("re-subscribe failed")];
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", fanout_error(&e1, 20)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     let _ = errors_until(&mut stream, 100).await;
-    ctrl.push("MSFT", fanout_error("re-subscribe failed", e0, 10))
-        .await;
-    ctrl.push("MSFT", fanout_error("re-subscribe failed", e1, 20))
-        .await;
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    ctrl.push("MSFT", fanout_error(&e1, 20)).await;
     ctrl.push("MSFT", trade("MSFT", 200)).await;
     assert_eq!(
         errors_until(&mut stream, 200).await,
@@ -3657,13 +3645,13 @@ async fn distinct_errors_interleaved_copies_are_dropped() {
         .build()
         .unwrap();
     let (client, mut stream) = two_symbol_client(&dm).await;
-    let [e0, e1] = fanout_ids();
-    ctrl.push("AAPL", fanout_error("error A", e0, 10)).await;
-    ctrl.push("AAPL", fanout_error("error B", e1, 20)).await;
+    let [e0, e1] = [fanout("error A"), fanout("error B")];
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", fanout_error(&e1, 20)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 2);
-    ctrl.push("MSFT", fanout_error("error A", e0, 10)).await;
-    ctrl.push("MSFT", fanout_error("error B", e1, 20)).await;
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    ctrl.push("MSFT", fanout_error(&e1, 20)).await;
     ctrl.push("MSFT", trade("MSFT", 200)).await;
     assert_eq!(
         errors_until(&mut stream, 200).await,
@@ -3728,16 +3716,14 @@ async fn adv_seventeen_interleaved_error_copies_are_dropped() {
         .build()
         .unwrap();
     let (client, mut stream) = two_symbol_client(&dm).await;
-    let ids: [FanoutId; 17] = fanout_ids();
-    for (i, id) in (0i64..).zip(ids) {
-        ctrl.push("AAPL", fanout_error(&format!("error {i}"), id, 10 + i))
-            .await;
+    let ids: [ControlKind; 17] = std::array::from_fn(|i| fanout(&format!("error {i}")));
+    for (i, id) in (0i64..).zip(&ids) {
+        ctrl.push("AAPL", fanout_error(id, 10 + i)).await;
     }
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 17);
-    for (i, id) in (0i64..).zip(ids) {
-        ctrl.push("MSFT", fanout_error(&format!("error {i}"), id, 10 + i))
-            .await;
+    for (i, id) in (0i64..).zip(&ids) {
+        ctrl.push("MSFT", fanout_error(id, 10 + i)).await;
     }
     ctrl.push("MSFT", trade("MSFT", 200)).await;
     assert_eq!(
@@ -3769,31 +3755,28 @@ async fn a_subscription_made_while_a_fanout_is_in_flight_gets_it_once() {
     };
     subscribe("AAPL").await.unwrap();
     let mut stream = client.take_events().await.unwrap();
-    let [unread, delivered, next] = fanout_ids();
+    let [unread, delivered, next] = [fanout("unread"), fanout("delivered"), fanout("next")];
     // In flight on AAPL, unread, when MSFT subscribes; MSFT carries it too.
-    ctrl.push("AAPL", fanout_error("unread", unread, 10)).await;
+    ctrl.push("AAPL", fanout_error(&unread, 10)).await;
     subscribe("MSFT").await.unwrap();
-    ctrl.push("MSFT", fanout_error("unread", unread, 10)).await;
+    ctrl.push("MSFT", fanout_error(&unread, 10)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     ctrl.push("MSFT", trade("MSFT", 200)).await;
     assert_eq!(errors_until(&mut stream, 200).await, 1);
     // Delivered from AAPL before GOOG subscribes; GOOG still carries a copy.
-    ctrl.push("AAPL", fanout_error("delivered", delivered, 20))
-        .await;
-    ctrl.push("MSFT", fanout_error("delivered", delivered, 20))
-        .await;
+    ctrl.push("AAPL", fanout_error(&delivered, 20)).await;
+    ctrl.push("MSFT", fanout_error(&delivered, 20)).await;
     ctrl.push("AAPL", trade("AAPL", 300)).await;
     assert_eq!(errors_until(&mut stream, 300).await, 1);
     ctrl.push("MSFT", trade("MSFT", 400)).await;
     assert_eq!(errors_until(&mut stream, 400).await, 0);
     subscribe("GOOG").await.unwrap();
-    ctrl.push("GOOG", fanout_error("delivered", delivered, 20))
-        .await;
+    ctrl.push("GOOG", fanout_error(&delivered, 20)).await;
     ctrl.push("GOOG", trade("GOOG", 500)).await;
     assert_eq!(errors_until(&mut stream, 500).await, 0);
     // The next fan-out reaches all three substreams and the client once.
     for symbol in ["GOOG", "MSFT", "AAPL"] {
-        ctrl.push(symbol, fanout_error("next", next, 30)).await;
+        ctrl.push(symbol, fanout_error(&next, 30)).await;
     }
     ctrl.push("AAPL", trade("AAPL", 600)).await;
     assert_eq!(errors_until(&mut stream, 600).await, 1);

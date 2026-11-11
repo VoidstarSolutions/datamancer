@@ -36,10 +36,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, Error, ErrorOrigin,
-    EventKind, FanoutId, HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry,
-    LiveHandle, MarketEvent, OrderType, Price, Provider, ProviderId, Quantity, Quote, Result, Seq,
-    Surface, TimeInForce, Timestamp, Trade,
+    AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
+    HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent,
+    OrderType, Price, Provider, ProviderId, Quantity, Quote, Result, Seq, Surface, TimeInForce,
+    Timestamp, Trade,
 };
 use oxidized_alpaca::{
     AccountType, CryptoFeed, MarketDataClient, TradingClient,
@@ -1128,11 +1128,7 @@ async fn broadcast_error(
     routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
     message: String,
 ) {
-    broadcast_control(
-        routes,
-        ControlKind::provider_error(PROVIDER_ID, message, ErrorOrigin::Fanout(FanoutId::next())),
-    )
-    .await;
+    broadcast_control(routes, ControlKind::fanout_error(PROVIDER_ID, message)).await;
 }
 
 async fn broadcast_control_to(sink: Option<&mpsc::Sender<MarketEvent>>, kind: ControlKind) {
@@ -1184,10 +1180,9 @@ pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEv
             source_ts: rx,
             rx_ts: rx,
             seq: Seq(0),
-            kind: ControlKind::provider_error(
+            kind: ControlKind::fanout_error(
                 PROVIDER_ID,
                 format!("{:?}: {}", err.code, err.message),
-                ErrorOrigin::Fanout(FanoutId::next()),
             ),
         })],
         // Subscription confirmations and orderbook updates aren't part of the
@@ -1309,6 +1304,7 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datamancer_core::{ErrorOrigin, FanoutId};
 
     #[test]
     fn translates_crypto_trade() {

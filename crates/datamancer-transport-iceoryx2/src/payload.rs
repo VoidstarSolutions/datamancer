@@ -409,9 +409,8 @@ mod tests {
     use super::{DataPayload, FromPodError, PayloadKind, from_pod, to_pod};
     use crate::symbol_table::{SymbolId, SymbolResolver, SymbolTable};
     use datamancer_core::{
-        AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, ErrorOrigin,
-        EventKind, GapSpan, Instrument, MarketEvent, Price, ProviderId, Quantity, Quote, Seq,
-        Timestamp, Trade,
+        AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, EventKind, GapSpan,
+        Instrument, MarketEvent, Price, ProviderId, Quantity, Quote, Seq, Timestamp, Trade,
     };
 
     fn inst(symbol: &str) -> Instrument {
@@ -565,7 +564,7 @@ mod tests {
                 reason: "boom".to_string(),
                 cause: DisconnectCause::Error,
             },
-            ControlKind::provider_error("alpaca", "oops", ErrorOrigin::Subscription),
+            ControlKind::subscription_error("alpaca", "oops"),
         ] {
             let ev = MarketEvent::Control(Control {
                 source_ts: Timestamp(1),

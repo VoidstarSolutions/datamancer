@@ -2310,8 +2310,7 @@ mod fanout_tests {
 
     use super::{FanOut, SubscriberId};
     use datamancer_core::{
-        AssetClass, ControlKind, ErrorOrigin, Instrument, MarketEvent, Price, ProviderId, Seq,
-        Timestamp, Trade,
+        AssetClass, ControlKind, Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
     };
     use tokio::sync::mpsc;
 
@@ -2501,7 +2500,7 @@ mod fanout_tests {
     fn provider_error(seq: u64) -> MarketEvent {
         control(
             seq,
-            ControlKind::provider_error("p", "re-subscribe failed", ErrorOrigin::Subscription),
+            ControlKind::subscription_error("p", "re-subscribe failed"),
         )
     }
 
