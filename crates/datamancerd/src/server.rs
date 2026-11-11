@@ -2349,14 +2349,14 @@ fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn an_exit_deadline_past_instant_range_does_not_panic() {
         let now = tokio::time::Instant::now();
-        let deadlines = super::ExitDeadlines::from_now(Duration::MAX);
+        let deadlines = ExitDeadlines::from_now(Duration::MAX);
         assert!(deadlines.exit > now && deadlines.steps > now);
     }
-
-    use super::*;
 
     /// The effective prefix is the configured value scoped to this process,
     /// and a name derived from it parses back to that scoped prefix and the
