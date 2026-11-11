@@ -238,6 +238,18 @@ const CLOSE_DELIVERY_WAIT: Duration = Duration::from_secs(2);
 /// How many client-local controls may wait behind a drained ring.
 const CONTROL_BACKLOG: usize = 1024;
 
+/// How many delivered `ProviderError`s per provider a client remembers to
+/// recognise another substream's copy of one.
+const RECENT_PROVIDER_ERRORS: usize = 16;
+
+/// A `ProviderError` a client delivered: its text, its `rx_ts` and the
+/// substream that delivered it.
+struct DeliveredError {
+    text: String,
+    rx_ts: Timestamp,
+    from: (Instrument, EventKind),
+}
+
 /// A subscriber the controller has added.
 pub(crate) struct NewSubscriber {
     pub(crate) id: SubscriberId,
@@ -1406,9 +1418,9 @@ struct ClientController {
     backlog: VecDeque<(MarketEvent, String)>,
     ring_capacity: usize,
     seen_provider_state: HashMap<String, ConnState>,
-    /// Each provider's last delivered `ProviderError`: its text, its `rx_ts`
-    /// and the substream that delivered it.
-    last_provider_error: HashMap<String, (String, Timestamp, (Instrument, EventKind))>,
+    /// Each provider's most recently delivered `ProviderError`s, newest last,
+    /// at most [`RECENT_PROVIDER_ERRORS`].
+    last_provider_error: HashMap<String, VecDeque<DeliveredError>>,
     /// Per-client introspection state read by the diagnostics snapshot.
     stats: Arc<ClientStats>,
 }
@@ -1633,7 +1645,7 @@ impl ClientController {
     }
 
     /// Returns true when this `ProviderError` is another substream's copy of
-    /// the last one delivered for the provider (suppress it): the same text
+    /// one recently delivered for the provider (suppress it): the same text
     /// with the same `rx_ts`, as a provider's fan-out to every substream
     /// carries, arriving on a substream other than the one that delivered
     /// it. The same error again on the delivering substream is a new one.
@@ -1644,19 +1656,25 @@ impl ClientController {
         message: &str,
         rx_ts: Timestamp,
     ) -> bool {
-        if self
+        let recent = self
             .last_provider_error
-            .get(provider)
-            .is_some_and(|(last, at, from)| last == message && *at == rx_ts && from != key)
+            .entry(provider.to_string())
+            .or_default();
+        if recent
+            .iter()
+            .any(|e| e.text == message && e.rx_ts == rx_ts && e.from != *key)
         {
-            true
-        } else {
-            self.last_provider_error.insert(
-                provider.to_string(),
-                (message.to_string(), rx_ts, key.clone()),
-            );
-            false
+            return true;
         }
+        if recent.len() == RECENT_PROVIDER_ERRORS {
+            recent.pop_front();
+        }
+        recent.push_back(DeliveredError {
+            text: message.to_string(),
+            rx_ts,
+            from: key.clone(),
+        });
+        false
     }
 
     /// Queue a client-local control. Past [`CONTROL_BACKLOG`] on top of a

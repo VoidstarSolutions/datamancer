@@ -3648,3 +3648,35 @@ async fn a_pre_reconnect_error_copy_after_the_reconnect_is_dropped() {
     );
     let _ = client.close().await;
 }
+
+/// Two failures with the same text, each fanned out to both substreams
+/// (Alpaca's `broadcast_control` stamps one `rx_ts` per broadcast); AAPL's
+/// channel is drained before MSFT's. MSFT's copies are connection controls
+/// "the client has already delivered for that provider, on another
+/// instrument" (`datamancer_core::Seq` docs) and must be dropped.
+#[tokio::test]
+async fn same_text_errors_interleaved_copies_are_dropped() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
+    ctrl.push("AAPL", provider_error("re-subscribe failed", 10))
+        .await;
+    ctrl.push("AAPL", provider_error("re-subscribe failed", 20))
+        .await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    let _ = errors_until(&mut stream, 100).await;
+    ctrl.push("MSFT", provider_error("re-subscribe failed", 10))
+        .await;
+    ctrl.push("MSFT", provider_error("re-subscribe failed", 20))
+        .await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        0,
+        "MSFT's copies of errors already delivered on AAPL are dropped"
+    );
+    let _ = client.close().await;
+}
