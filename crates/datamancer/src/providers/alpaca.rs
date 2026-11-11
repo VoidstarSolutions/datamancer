@@ -2521,18 +2521,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_copy_of_a_broadcast_error_shares_one_increasing_id() {
+    async fn every_copy_of_a_broadcast_error_shares_one_distinct_id() {
         let (routes, mut a_rx, mut b_rx) = two_routes();
         broadcast_error(&routes, "first".to_string()).await;
         broadcast_error(&routes, "second".to_string()).await;
         let a = fanout_ids(&mut a_rx);
         assert_eq!(a, fanout_ids(&mut b_rx));
         assert_eq!(a.len(), 2);
-        assert!(a[0] < a[1]);
+        assert_ne!(a[0], a[1]);
     }
 
     #[tokio::test]
-    async fn every_copy_of_a_stream_error_shares_one_increasing_id() {
+    async fn every_copy_of_a_stream_error_shares_one_distinct_id() {
         let (routes, mut a_rx, mut b_rx) = two_routes();
         for _ in 0..2 {
             let msg: StockStreamMessage =
@@ -2544,7 +2544,7 @@ mod tests {
         let a = fanout_ids(&mut a_rx);
         assert_eq!(a, fanout_ids(&mut b_rx));
         assert_eq!(a.len(), 2);
-        assert!(a[0] < a[1]);
+        assert_ne!(a[0], a[1]);
     }
 
     #[test]

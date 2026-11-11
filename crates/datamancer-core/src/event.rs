@@ -392,11 +392,11 @@ fn subscription_origin() -> ErrorOrigin {
 /// The identity of one [`ErrorOrigin::Fanout`] error, shared by its copies.
 ///
 /// [`ControlKind::fanout_error`] makes one from a single process-wide
-/// sequence, so each new fan-out's id is greater than every earlier one and no
-/// two fan-outs from one process share an id. An id only identifies copies
-/// among fan-outs from the process that made it: a deserialized id keeps the
-/// sender's value, and is not comparable with ids made elsewhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// sequence, so no two fan-outs from one process share an id. An id only
+/// identifies copies among fan-outs from the process that made it: a
+/// deserialized id keeps the sender's value, and is not comparable with ids
+/// made elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FanoutId(u64);
 
@@ -438,10 +438,8 @@ mod serde_tests {
     }
 
     #[test]
-    fn fanout_ids_increase() {
-        let first = FanoutId::next();
-        let second = FanoutId::next();
-        assert!(first < second);
+    fn fanout_ids_are_distinct() {
+        assert_ne!(FanoutId::next(), FanoutId::next());
     }
 
     #[test]
