@@ -107,7 +107,12 @@ pub(super) trait Connector: Send + Sync + 'static {
         settings: &Self::Settings,
         credentials: PresentCredentials,
     ) -> impl Future<Output = std::result::Result<Self::Upstream, Self::Failure>> + Send;
-    /// Whether `failure` parks the hub or backs off.
+    /// Whether `failure` is a rejected credential or transient. The answer
+    /// decides whether the hub parks (a rejected credential from a watched
+    /// source) or backs off, the `DisconnectCause` of the
+    /// `ProviderDisconnected` control it broadcasts, and whether a refused
+    /// subscribe or unsubscribe is answered with `Error::Unauthenticated` or
+    /// `Error::Provider`.
     fn classify(failure: &Self::Failure) -> StreamFailure;
 }
 
@@ -680,9 +685,11 @@ fn event_route_key(ev: &MarketEvent) -> Option<(Instrument, EventKind)> {
 /// The error a subscribe or unsubscribe is answered with when the upstream
 /// refuses `what`.
 fn ack_error<C: Connector>(what: &str, failure: &C::Failure) -> Error {
-    Error::Provider {
-        provider: C::PROVIDER_ID.to_string(),
-        message: format!("{what}: {}", error_chain(failure)),
+    let provider = C::PROVIDER_ID.to_string();
+    let message = format!("{what}: {}", error_chain(failure));
+    match C::classify(failure) {
+        StreamFailure::Unauthenticated => Error::Unauthenticated { provider, message },
+        StreamFailure::Transient => Error::Provider { provider, message },
     }
 }
 
@@ -942,12 +949,12 @@ pub(super) mod tests {
     }
 
     /// Records the upstream calls the hub makes; refuses `add` while
-    /// `refuse_add` is set, and yields `events` in order, then pends.
+    /// `refuse_add` is `Some`, and yields `events` in order, then pends.
     #[derive(Default)]
     struct FakeUpstream {
         adds: usize,
         removals: Vec<PairSet>,
-        refuse_add: bool,
+        refuse_add: Option<Refused>,
         events: VecDeque<std::result::Result<Vec<MarketEvent>, Refused>>,
     }
 
@@ -964,10 +971,10 @@ pub(super) mod tests {
 
         async fn add(&mut self, _subs: &PairSet) -> std::result::Result<(), Refused> {
             self.adds += 1;
-            if self.refuse_add {
-                return Err(Refused(StreamFailure::Transient));
+            match self.refuse_add {
+                Some(refused) => Err(refused),
+                None => Ok(()),
             }
-            Ok(())
         }
 
         async fn remove(&mut self, removal: &PairSet) -> std::result::Result<(), Refused> {
@@ -1369,7 +1376,7 @@ pub(super) mod tests {
         );
         subscribed.expect("s1 subscribes");
 
-        hub.upstream.refuse_add = true;
+        hub.upstream.refuse_add = Some(Refused(StreamFailure::Transient));
         let (refused, ()) = tokio::join!(
             s2.subscribe(instrument.clone(), EventKind::Trade),
             hub.serve_one()
@@ -1397,7 +1404,7 @@ pub(super) mod tests {
         let instrument = aapl();
         let mut hub = FakeHub::new();
         let (session, _rx) = hub.handle();
-        hub.upstream.refuse_add = true;
+        hub.upstream.refuse_add = Some(Refused(StreamFailure::Transient));
         let (refused, ()) = tokio::join!(
             session.subscribe(instrument.clone(), EventKind::Trade),
             hub.serve_one()
@@ -1405,5 +1412,31 @@ pub(super) mod tests {
         assert!(refused.is_err(), "the upstream refused the subscribe");
         assert!(hub.routes.is_empty());
         assert_eq!(hub.subs.trades(), None);
+    }
+
+    /// A subscribe the upstream rejects as a bad credential is answered as
+    /// unauthenticated, like a subscribe to a parked hub.
+    #[tokio::test]
+    async fn a_subscribe_the_upstream_rejects_as_unauthenticated_says_so() {
+        let mut hub = FakeHub::new();
+        hub.upstream.refuse_add = Some(Refused(StreamFailure::Unauthenticated));
+        let (handle, _rx) = hub.handle();
+        let (res, ()) = tokio::join!(handle.subscribe(aapl(), EventKind::Trade), hub.serve_one());
+        assert!(
+            matches!(res, Err(Error::Unauthenticated { ref provider, ref message })
+                if provider == FakeConnector::PROVIDER_ID
+                    && message.starts_with("add_subscriptions:")),
+            "{res:?}"
+        );
+    }
+
+    /// Any other refusal stays a provider error.
+    #[tokio::test]
+    async fn a_subscribe_the_upstream_refuses_otherwise_is_a_provider_error() {
+        let mut hub = FakeHub::new();
+        hub.upstream.refuse_add = Some(Refused(StreamFailure::Transient));
+        let (handle, _rx) = hub.handle();
+        let (res, ()) = tokio::join!(handle.subscribe(aapl(), EventKind::Trade), hub.serve_one());
+        assert!(matches!(res, Err(Error::Provider { .. })));
     }
 }

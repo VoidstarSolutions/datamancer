@@ -695,7 +695,7 @@ fn crypto_snapshot_to_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::alpaca::tests::stream_error;
+    use crate::providers::alpaca::tests::server_error;
     use crate::providers::hub::dispatch_event;
     use crate::providers::hub::tests::{fanout_ids, two_routes};
     use oxidized_alpaca::streaming::StreamErrorCode;
@@ -988,7 +988,10 @@ mod tests {
             StreamFailure::Unauthenticated
         );
         assert_eq!(
-            CryptoConnector::classify(&stream_error(StreamErrorCode::AuthFailed)),
+            CryptoConnector::classify(&server_error(
+                oxidized_alpaca::Error::StreamingError,
+                StreamErrorCode::AuthFailed
+            )),
             StreamFailure::Transient
         );
     }
