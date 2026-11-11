@@ -959,20 +959,25 @@ async fn errors_until(stream: &mut datamancer::EventStream, last: i64) -> usize 
     }
 }
 
+/// Subscribe `client` to `symbol`'s live trades.
+async fn subscribe_live(client: &datamancer::ClientSession, symbol: &str) {
+    client
+        .subscribe(
+            inst(symbol),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+}
+
 async fn two_symbol_client(
     dm: &Datamancer,
 ) -> (datamancer::ClientSession, datamancer::EventStream) {
     let client = dm.client_session();
     for symbol in ["AAPL", "MSFT"] {
-        client
-            .subscribe(
-                inst(symbol),
-                EventKind::Trade,
-                live(),
-                PersistenceOptions::none(),
-            )
-            .await
-            .unwrap();
+        subscribe_live(&client, symbol).await;
     }
     let stream = client.take_events().await.unwrap();
     (client, stream)
@@ -986,15 +991,7 @@ async fn a_provider_error_repeated_after_a_reconnect_is_delivered() {
         .build()
         .unwrap();
     let client = dm.client_session();
-    client
-        .subscribe(
-            inst("AAPL"),
-            EventKind::Trade,
-            live(),
-            PersistenceOptions::none(),
-        )
-        .await
-        .unwrap();
+    subscribe_live(&client, "AAPL").await;
     let mut stream = client.take_events().await.unwrap();
     let [e0, e1] = [fanout("HTTP 403"), fanout("HTTP 403")];
     ctrl.push("AAPL", fanout_error(&e0, 10)).await;
@@ -3745,20 +3742,12 @@ async fn a_subscription_made_while_a_fanout_is_in_flight_gets_it_once() {
         .build()
         .unwrap();
     let client = dm.client_session();
-    let subscribe = |symbol: &'static str| {
-        client.subscribe(
-            inst(symbol),
-            EventKind::Trade,
-            live(),
-            PersistenceOptions::none(),
-        )
-    };
-    subscribe("AAPL").await.unwrap();
+    subscribe_live(&client, "AAPL").await;
     let mut stream = client.take_events().await.unwrap();
     let [unread, delivered, next] = [fanout("unread"), fanout("delivered"), fanout("next")];
     // In flight on AAPL, unread, when MSFT subscribes; MSFT carries it too.
     ctrl.push("AAPL", fanout_error(&unread, 10)).await;
-    subscribe("MSFT").await.unwrap();
+    subscribe_live(&client, "MSFT").await;
     ctrl.push("MSFT", fanout_error(&unread, 10)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     ctrl.push("MSFT", trade("MSFT", 200)).await;
@@ -3770,7 +3759,7 @@ async fn a_subscription_made_while_a_fanout_is_in_flight_gets_it_once() {
     assert_eq!(errors_until(&mut stream, 300).await, 1);
     ctrl.push("MSFT", trade("MSFT", 400)).await;
     assert_eq!(errors_until(&mut stream, 400).await, 0);
-    subscribe("GOOG").await.unwrap();
+    subscribe_live(&client, "GOOG").await;
     ctrl.push("GOOG", fanout_error(&delivered, 20)).await;
     ctrl.push("GOOG", trade("GOOG", 500)).await;
     assert_eq!(errors_until(&mut stream, 500).await, 0);
@@ -3821,15 +3810,7 @@ async fn adv_an_undelivered_older_fanout_on_a_joined_backfill_is_delivered() {
 
     // The client subscribes AAPL; the provider then fans `new` out to both.
     let client = dm.client_session();
-    client
-        .subscribe(
-            inst("AAPL"),
-            EventKind::Trade,
-            live(),
-            PersistenceOptions::none(),
-        )
-        .await
-        .unwrap();
+    subscribe_live(&client, "AAPL").await;
     let mut stream = client.take_events().await.unwrap();
     let new = fanout("new error");
     ctrl.push("AAPL", fanout_error(&new, 20)).await;
@@ -3839,15 +3820,7 @@ async fn adv_an_undelivered_older_fanout_on_a_joined_backfill_is_delivered() {
 
     // The client joins MSFT while its backfill is in flight, then the
     // backfill ends and MSFT's buffer (`old`, then `new`) is flushed.
-    client
-        .subscribe(
-            inst("MSFT"),
-            EventKind::Trade,
-            live(),
-            PersistenceOptions::none(),
-        )
-        .await
-        .unwrap();
+    subscribe_live(&client, "MSFT").await;
     gate.notify_one();
     ctrl.push("MSFT", trade("MSFT", 200)).await;
     assert_eq!(
@@ -3872,21 +3845,13 @@ async fn adv_an_older_fanout_first_seen_on_a_later_subscription_is_delivered() {
         .build()
         .unwrap();
     let client = dm.client_session();
-    let subscribe = |symbol: &'static str| {
-        client.subscribe(
-            inst(symbol),
-            EventKind::Trade,
-            live(),
-            PersistenceOptions::none(),
-        )
-    };
-    subscribe("AAPL").await.unwrap();
+    subscribe_live(&client, "AAPL").await;
     let mut stream = client.take_events().await.unwrap();
     let [older, newer] = [fanout("older"), fanout("newer")];
     ctrl.push("AAPL", fanout_error(&newer, 20)).await;
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 1);
-    subscribe("MSFT").await.unwrap();
+    subscribe_live(&client, "MSFT").await;
     // Still in flight on MSFT's session when the client joined it.
     ctrl.push("MSFT", fanout_error(&older, 10)).await;
     ctrl.push("MSFT", fanout_error(&newer, 20)).await;
