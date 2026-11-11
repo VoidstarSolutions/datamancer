@@ -1406,8 +1406,9 @@ struct ClientController {
     backlog: VecDeque<(MarketEvent, String)>,
     ring_capacity: usize,
     seen_provider_state: HashMap<String, ConnState>,
-    /// Each provider's last delivered `ProviderError`: its text and `rx_ts`.
-    last_provider_error: HashMap<String, (String, Timestamp)>,
+    /// Each provider's last delivered `ProviderError`: its text, its `rx_ts`
+    /// and the substream that delivered it.
+    last_provider_error: HashMap<String, (String, Timestamp, (Instrument, EventKind))>,
     /// Per-client introspection state read by the diagnostics snapshot.
     stats: Arc<ClientStats>,
 }
@@ -1603,9 +1604,6 @@ impl ClientController {
                     if !self.note_conn(provider, ConnState::Connected) {
                         return;
                     }
-                    // A reconnect starts the provider's errors afresh; a
-                    // copy of the connect on another substream does not.
-                    self.last_provider_error.remove(provider);
                 }
                 ControlKind::ProviderDisconnected { provider, .. } => {
                     if !self.note_conn(provider, ConnState::Disconnected) {
@@ -1613,7 +1611,7 @@ impl ClientController {
                     }
                 }
                 ControlKind::ProviderError { provider, message } => {
-                    if self.duplicate_error(provider, message, c.rx_ts) {
+                    if self.duplicate_error(&key, provider, message, c.rx_ts) {
                         return;
                     }
                 }
@@ -1637,18 +1635,26 @@ impl ClientController {
     /// Returns true when this `ProviderError` is another substream's copy of
     /// the last one delivered for the provider (suppress it): the same text
     /// with the same `rx_ts`, as a provider's fan-out to every substream
-    /// carries. A later error with the same text, such as a second fetch
-    /// failing the way the first did, has its own `rx_ts` and is delivered.
-    fn duplicate_error(&mut self, provider: &str, message: &str, rx_ts: Timestamp) -> bool {
+    /// carries, arriving on a substream other than the one that delivered
+    /// it. The same error again on the delivering substream is a new one.
+    fn duplicate_error(
+        &mut self,
+        key: &(Instrument, EventKind),
+        provider: &str,
+        message: &str,
+        rx_ts: Timestamp,
+    ) -> bool {
         if self
             .last_provider_error
             .get(provider)
-            .is_some_and(|(last, at)| last == message && *at == rx_ts)
+            .is_some_and(|(last, at, from)| last == message && *at == rx_ts && from != key)
         {
             true
         } else {
-            self.last_provider_error
-                .insert(provider.to_string(), (message.to_string(), rx_ts));
+            self.last_provider_error.insert(
+                provider.to_string(),
+                (message.to_string(), rx_ts, key.clone()),
+            );
             false
         }
     }

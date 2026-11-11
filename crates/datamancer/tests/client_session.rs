@@ -3532,3 +3532,69 @@ async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
     let _ = other.close().await;
     let _ = client.close().await;
 }
+
+async fn two_symbol_client(
+    dm: &Datamancer,
+) -> (datamancer::ClientSession, datamancer::EventStream) {
+    let client = dm.client_session();
+    for symbol in ["AAPL", "MSFT"] {
+        client
+            .subscribe(
+                inst(symbol),
+                EventKind::Trade,
+                live(),
+                PersistenceOptions::none(),
+            )
+            .await
+            .unwrap();
+    }
+    let stream = client.take_events().await.unwrap();
+    (client, stream)
+}
+
+/// One error, then one reconnect, each fanned out to both substreams; AAPL's
+/// copies are read before MSFT's. MSFT's copy of the pre-reconnect error is
+/// "another substream's copy" and must be suppressed.
+#[tokio::test]
+async fn a_pre_reconnect_error_copy_after_the_reconnect_is_dropped() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
+    let connected = || {
+        provider_control(
+            ControlKind::ProviderConnected {
+                provider: "fake".to_string(),
+            },
+            12,
+        )
+    };
+    let disconnected = || {
+        provider_control(
+            ControlKind::ProviderDisconnected {
+                provider: "fake".to_string(),
+                reason: "reset".to_string(),
+                cause: datamancer::DisconnectCause::Error,
+            },
+            11,
+        )
+    };
+    ctrl.push("AAPL", provider_error("HTTP 403", 10)).await;
+    ctrl.push("AAPL", disconnected()).await;
+    ctrl.push("AAPL", connected()).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1);
+    // MSFT's copies of the same error and the same reconnect.
+    ctrl.push("MSFT", provider_error("HTTP 403", 10)).await;
+    ctrl.push("MSFT", disconnected()).await;
+    ctrl.push("MSFT", connected()).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        0,
+        "the second substream's copy of one error is dropped"
+    );
+    let _ = client.close().await;
+}
