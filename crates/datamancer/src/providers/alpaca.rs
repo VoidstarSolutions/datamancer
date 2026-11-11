@@ -2491,7 +2491,7 @@ mod tests {
         }
     }
 
-    fn fanout_ids(rx: &mut mpsc::Receiver<MarketEvent>) -> Vec<datamancer_core::FanoutId> {
+    fn fanout_ids(rx: &mut mpsc::Receiver<MarketEvent>) -> Vec<FanoutId> {
         let mut ids = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             match ev {
