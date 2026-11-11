@@ -783,8 +783,6 @@ impl Config {
                 "[server].shutdown_timeout_secs must be at least 1".to_string(),
             ));
         }
-        // The exit deadline is `now + shutdown_timeout`, which panics on an
-        // `Instant` overflow; refuse a value that could reach it.
         if self.server.shutdown_timeout_secs > MAX_SHUTDOWN_TIMEOUT_SECS {
             return Err(DaemonError::ConfigInvalid(format!(
                 "[server].shutdown_timeout_secs must be at most {MAX_SHUTDOWN_TIMEOUT_SECS}"

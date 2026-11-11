@@ -2280,10 +2280,17 @@ impl ExitDeadlines {
     fn from_now(shutdown_timeout: Duration) -> Self {
         let now = tokio::time::Instant::now();
         Self {
-            steps: now + shutdown_timeout / 2,
-            exit: now + shutdown_timeout,
+            steps: deadline_after(now, shutdown_timeout / 2),
+            exit: deadline_after(now, shutdown_timeout),
         }
     }
+}
+
+/// `now + timeout`, or a deadline too far out ever to arrive when that sum
+/// would overflow an `Instant`.
+fn deadline_after(now: tokio::time::Instant, timeout: Duration) -> tokio::time::Instant {
+    const FAR: Duration = Duration::from_hours(30 * 365 * 24);
+    now.checked_add(timeout).unwrap_or_else(|| now + FAR)
 }
 
 /// The deadline of one bounded web or WS drain step: 5 s from now, or
@@ -2342,6 +2349,13 @@ fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_exit_deadline_past_instant_range_does_not_panic() {
+        let now = tokio::time::Instant::now();
+        let deadlines = super::ExitDeadlines::from_now(Duration::MAX);
+        assert!(deadlines.exit > now && deadlines.steps > now);
+    }
+
     use super::*;
 
     /// The effective prefix is the configured value scoped to this process,
