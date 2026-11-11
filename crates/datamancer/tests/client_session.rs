@@ -3680,3 +3680,28 @@ async fn same_text_errors_interleaved_copies_are_dropped() {
     );
     let _ = client.close().await;
 }
+
+/// Two distinct errors, each fanned out to both substreams; AAPL's channel
+/// is drained before MSFT's. MSFT's copies must be dropped.
+#[tokio::test]
+async fn distinct_errors_interleaved_copies_are_dropped() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
+    ctrl.push("AAPL", provider_error("error A", 10)).await;
+    ctrl.push("AAPL", provider_error("error B", 20)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 2);
+    ctrl.push("MSFT", provider_error("error A", 10)).await;
+    ctrl.push("MSFT", provider_error("error B", 20)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        0,
+        "MSFT's copies of errors already delivered on AAPL are dropped"
+    );
+    let _ = client.close().await;
+}
