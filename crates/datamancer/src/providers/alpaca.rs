@@ -37,9 +37,10 @@
 //! reconnects — re-applying the aggregate subscription set. A
 //! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast to
 //! every active sink so consumers see the gap window in the event stream. A
-//! rejected credential pair (`402`) parks instead of retrying until the
-//! credentials rotate; a `406` or any other server error is transient and
-//! backs off (see `classify_stream_failure` for the upstream caveat).
+//! rejected credential pair (`402`) parks until the credentials rotate when
+//! they come from a watched source, and backs off like any other failure
+//! otherwise; a `406` or any other server error is transient and backs off
+//! (see `classify_stream_failure` for the upstream caveat).
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1845,11 +1846,12 @@ pub(super) mod tests {
         wrap(e)
     }
 
-    /// `402 auth failed` is the only server error that parks the hub; a
-    /// `406 connection limit exceeded` (another connection holds the slot),
-    /// `407 slow client` and subscribe-level rejections back off instead.
-    /// The payload-less connect-time `StreamingAuth` parks (see the
-    /// classifier's docs for the upstream limitation).
+    /// `402 auth failed` is the only server error read as a rejected
+    /// credential; a `406 connection limit exceeded` (another connection
+    /// holds the slot), `407 slow client` and the other server codes are
+    /// transient. The payload-less connect-time `StreamingAuth` is a
+    /// rejected credential too (see the classifier's docs for the upstream
+    /// limitation).
     #[test]
     fn stream_failures_park_on_402_and_back_off_on_406() {
         let mid_stream = oxidized_alpaca::Error::StreamingError;
