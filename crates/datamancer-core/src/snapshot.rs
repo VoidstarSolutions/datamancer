@@ -159,25 +159,6 @@ pub struct ProviderSurfaces {
 }
 
 impl ProviderSurfaces {
-    /// Surfaces with these outcomes. Outside this crate,
-    /// [`with_history`](Self::with_history) and [`with_live`](Self::with_live)
-    /// on a [`Default`] value name each surface, so the two cannot be swapped.
-    ///
-    /// ```
-    /// use datamancer_core::{ProviderSurfaces, SurfaceOutcome, Timestamp};
-    ///
-    /// let surfaces = ProviderSurfaces::new(
-    ///     SurfaceOutcome::ok(Timestamp(1)),
-    ///     SurfaceOutcome::Unknown,
-    /// );
-    /// assert_eq!(surfaces.history, SurfaceOutcome::ok(Timestamp(1)));
-    /// assert_eq!(surfaces.live, SurfaceOutcome::Unknown);
-    /// ```
-    #[must_use]
-    pub const fn new(history: SurfaceOutcome, live: SurfaceOutcome) -> Self {
-        Self { history, live }
-    }
-
     /// These surfaces with `history` as the history surface's outcome.
     ///
     /// # Arguments
@@ -650,7 +631,8 @@ mod tests {
         let surfaces = ProviderSurfaces::default()
             .with_history(history.clone())
             .with_live(live.clone());
-        assert_eq!(surfaces, ProviderSurfaces::new(history.clone(), live));
+        assert_eq!(surfaces.history, history);
+        assert_eq!(surfaces.live, live);
         let only_history = ProviderSurfaces::default().with_history(history.clone());
         assert_eq!(only_history.history, history);
         assert_eq!(only_history.live, SurfaceOutcome::Unknown);
