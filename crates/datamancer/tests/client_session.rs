@@ -943,6 +943,25 @@ async fn errors_until(stream: &mut datamancer::EventStream, last: i64) -> usize 
     }
 }
 
+async fn two_symbol_client(
+    dm: &Datamancer,
+) -> (datamancer::ClientSession, datamancer::EventStream) {
+    let client = dm.client_session();
+    for symbol in ["AAPL", "MSFT"] {
+        client
+            .subscribe(
+                inst(symbol),
+                EventKind::Trade,
+                live(),
+                PersistenceOptions::none(),
+            )
+            .await
+            .unwrap();
+    }
+    let stream = client.take_events().await.unwrap();
+    (client, stream)
+}
+
 #[tokio::test]
 async fn a_provider_error_repeated_after_a_reconnect_is_delivered() {
     let (provider, ctrl) = FakeProvider::new("fake", false);
@@ -1003,19 +1022,7 @@ async fn a_connected_copy_between_two_error_copies_keeps_the_second_dropped() {
         .provider_arc(provider)
         .build()
         .unwrap();
-    let client = dm.client_session();
-    for symbol in ["AAPL", "MSFT"] {
-        client
-            .subscribe(
-                inst(symbol),
-                EventKind::Trade,
-                live(),
-                PersistenceOptions::none(),
-            )
-            .await
-            .unwrap();
-    }
-    let mut stream = client.take_events().await.unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
     let [e0] = fanout_ids();
     let connected = || {
         provider_control(
@@ -1051,19 +1058,7 @@ async fn a_later_error_with_the_same_text_is_delivered_and_a_copy_is_not() {
         .provider_arc(provider)
         .build()
         .unwrap();
-    let client = dm.client_session();
-    for symbol in ["AAPL", "MSFT"] {
-        client
-            .subscribe(
-                inst(symbol),
-                EventKind::Trade,
-                live(),
-                PersistenceOptions::none(),
-            )
-            .await
-            .unwrap();
-    }
-    let mut stream = client.take_events().await.unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
     let [e0] = fanout_ids();
     // One provider error fanned out to both substreams: one copy each.
     ctrl.push("AAPL", fanout_error("HTTP 403", e0, 10)).await;
@@ -3594,25 +3589,6 @@ async fn a_retried_backfill_failing_the_same_way_is_delivered() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let _ = client.close().await;
-}
-
-async fn two_symbol_client(
-    dm: &Datamancer,
-) -> (datamancer::ClientSession, datamancer::EventStream) {
-    let client = dm.client_session();
-    for symbol in ["AAPL", "MSFT"] {
-        client
-            .subscribe(
-                inst(symbol),
-                EventKind::Trade,
-                live(),
-                PersistenceOptions::none(),
-            )
-            .await
-            .unwrap();
-    }
-    let stream = client.take_events().await.unwrap();
-    (client, stream)
 }
 
 /// One error, then one reconnect, each fanned out to both substreams; AAPL's
