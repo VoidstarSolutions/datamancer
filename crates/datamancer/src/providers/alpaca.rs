@@ -557,11 +557,16 @@ impl Provider for AlpacaProvider {
     }
 }
 
-/// Classify a connect-time or mid-stream error from `oxidized_alpaca`.
+/// Classify a connect-time, subscribe or mid-stream error from
+/// `oxidized_alpaca`.
 ///
 /// `406 connection limit exceeded` is transient: another connection on the
 /// same key pair holds the slot, which clears when it closes. Only
-/// `402 auth failed` means the credentials themselves are rejected.
+/// `402 auth failed` means the credentials themselves are rejected, whether
+/// it arrives mid-stream (`Error::StreamingError`) or as the server's
+/// refusal of a subscribe (`Error::StreamingSubscribe`). Any other code on
+/// either variant, `401 not authenticated` included, is transient.
+///
 /// Limitation to know about: at **connect** time `oxidized_alpaca` 0.0.10
 /// (and 0.0.11) collapses every non-`authenticated` auth response into the
 /// payload-less `Error::StreamingAuth` and only logs the envelope, so a 406
@@ -573,7 +578,8 @@ impl Provider for AlpacaProvider {
 pub(super) fn classify_stream_failure(err: &oxidized_alpaca::Error) -> StreamFailure {
     match err {
         oxidized_alpaca::Error::StreamingAuth => StreamFailure::Unauthenticated,
-        oxidized_alpaca::Error::StreamingError(e) => match e.code {
+        oxidized_alpaca::Error::StreamingError(e)
+        | oxidized_alpaca::Error::StreamingSubscribe(e) => match e.code {
             StreamErrorCode::AuthFailed => StreamFailure::Unauthenticated,
             _ => StreamFailure::Transient,
         },
@@ -1825,13 +1831,18 @@ pub(super) mod tests {
         assert_ne!(a[0], a[1]);
     }
 
-    /// A mid-stream server error envelope carrying `code`, as the stream
-    /// delivers it.
-    pub(in crate::providers) fn stream_error(code: StreamErrorCode) -> oxidized_alpaca::Error {
+    /// A server error envelope carrying `code`, wrapped the way the library
+    /// reports it: `oxidized_alpaca::Error::StreamingError` mid-stream, or
+    /// `oxidized_alpaca::Error::StreamingSubscribe` when a subscribe is
+    /// refused.
+    pub(in crate::providers) fn server_error(
+        wrap: fn(oxidized_alpaca::streaming::StreamError) -> oxidized_alpaca::Error,
+        code: StreamErrorCode,
+    ) -> oxidized_alpaca::Error {
         let e: oxidized_alpaca::streaming::StreamError =
             serde_json::from_value(serde_json::json!({ "code": code, "msg": "server says" }))
                 .expect("documented code");
-        oxidized_alpaca::Error::StreamingError(e)
+        wrap(e)
     }
 
     /// `402 auth failed` is the only server error that parks the hub; a
@@ -1841,22 +1852,22 @@ pub(super) mod tests {
     /// classifier's docs for the upstream limitation).
     #[test]
     fn stream_failures_park_on_402_and_back_off_on_406() {
-        use oxidized_alpaca::streaming::StreamError;
-        let server_error = |code: u16| {
-            let e: StreamError =
-                serde_json::from_str(&format!(r#"{{"code":{code},"msg":"server says {code}"}}"#))
-                    .expect("documented code");
-            oxidized_alpaca::Error::StreamingError(e)
-        };
+        let mid_stream = oxidized_alpaca::Error::StreamingError;
         assert_eq!(
-            classify_stream_failure(&server_error(402)),
+            classify_stream_failure(&server_error(mid_stream, StreamErrorCode::AuthFailed)),
             StreamFailure::Unauthenticated
         );
-        for code in [406_u16, 407, 405, 409, 400] {
+        for code in [
+            StreamErrorCode::ConnectionLimitExceeded,
+            StreamErrorCode::SlowClient,
+            StreamErrorCode::SymbolLimitExceeded,
+            StreamErrorCode::InsufficientSubscription,
+            StreamErrorCode::InvalidSyntax,
+        ] {
             assert_eq!(
-                classify_stream_failure(&server_error(code)),
+                classify_stream_failure(&server_error(mid_stream, code)),
                 StreamFailure::Transient,
-                "code {code}"
+                "code {code:?}"
             );
         }
         assert_eq!(
@@ -1869,5 +1880,27 @@ pub(super) mod tests {
             )),
             StreamFailure::Transient
         );
+    }
+
+    /// A subscribe the server refuses with `402 auth failed` reports a
+    /// rejected credential; any other refusal, `401 not authenticated`
+    /// included, is transient.
+    #[test]
+    fn stock_subscribe_refused_with_402_is_unauthenticated() {
+        let refused = oxidized_alpaca::Error::StreamingSubscribe;
+        assert_eq!(
+            StockConnector::classify(&server_error(refused, StreamErrorCode::AuthFailed)),
+            StreamFailure::Unauthenticated
+        );
+        for code in [
+            StreamErrorCode::ConnectionLimitExceeded,
+            StreamErrorCode::NotAuthenticated,
+        ] {
+            assert_eq!(
+                StockConnector::classify(&server_error(refused, code)),
+                StreamFailure::Transient,
+                "code {code:?}"
+            );
+        }
     }
 }
