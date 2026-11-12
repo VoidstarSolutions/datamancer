@@ -310,7 +310,8 @@ pub struct DaemonGuard {
     child: Child,
     control: PathBuf,
     /// Set once the child has been waited on (`kill_abruptly`, or a
-    /// `shutdown_within` that saw it exit): `Drop` then has nothing to stop.
+    /// `shutdown_within` or `try_wait` that saw it exit): `Drop` then has
+    /// nothing to stop.
     reaped: bool,
 }
 
@@ -326,8 +327,27 @@ impl DaemonGuard {
     }
 
     /// The daemon's control endpoint.
+    #[allow(dead_code)] // not every suite reads it back
     pub fn control_endpoint(&self) -> &Path {
         &self.control
+    }
+
+    /// The daemon's process id, for a test that signals it directly.
+    #[allow(dead_code)] // only the SIGTERM test signals the daemon itself
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Non-blocking exit check, for a test that stops the daemon itself and
+    /// asserts on how it exited. Once this reports an exit the guard treats
+    /// the child as reaped and `Drop` does nothing further.
+    #[allow(dead_code)] // only the SIGTERM test waits on the daemon itself
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
     }
 
     /// Simulate a crash: kill the daemon outright and reap it, so it never
