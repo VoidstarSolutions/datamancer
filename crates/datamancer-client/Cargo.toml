@@ -59,5 +59,9 @@ tempfile = "3"
 [target.'cfg(windows)'.dependencies]
 datamancer-winsec = { path = "../datamancer-winsec", version = "0.10.0", optional = true }
 
+[[example]]
+name = "backfill_tape"
+required-features = ["iceoryx2"]
+
 [lints]
 workspace = true

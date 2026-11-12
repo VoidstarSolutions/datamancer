@@ -183,6 +183,16 @@ transport error. In both cases the client has asked the daemon to drop the
 subscription; events the session sent before that, or all of them if that
 request failed, still reach the event stream.
 
+`examples/backfill_tape.rs` (feature `iceoryx2`) is that subscription as a
+runnable tape against a running daemon: it prints each event tagged history
+or live by its `source_ts` against the daemon's reply, every in-band control,
+every `seq` hole, and a summary, and its header says how to read them:
+
+```text
+cargo run -p datamancer-client --features iceoryx2 --example backfill_tape -- \
+    /path/to/control.sock alpaca equity AAPL trade 90 25
+```
+
 When starting from discovery instead of a hand-written spec, use
 `SubscriptionSpec::new` to close the loop — it converts the core vocabulary
 `Client::instruments` returns into the wire vocabulary `subscribe` takes:
