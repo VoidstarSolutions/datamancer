@@ -3,8 +3,9 @@
 //! an unowned and a disabled provider, health while trades flow, a removed
 //! and a reconfigured provider reaching open sessions, shutdown with a
 //! stalled consumer, a third client backfill waiting under
-//! `max_concurrent_backfills`, and, with feature `ws`, the backfill seam over
-//! WS. The daemon runs with `[provider.scripted]` as its only provider, a
+//! `max_concurrent_backfills`, a stalled query's slot and the daemon
+//! answering behind it, and, with feature `ws`, the backfill seam over WS.
+//! The daemon runs with `[provider.scripted]` as its only provider, a
 //! credential store in the test's tempdir, and no `ALPACA_*` variables, so
 //! the suite needs no network and no credentials.
 //!
@@ -25,6 +26,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::{Conn, Daemon};
+use datamancer::transport::{DataServiceName, DataSubscriber, TransportError};
 use datamancer::{ControlKind, MarketEvent};
 use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 
@@ -540,6 +542,419 @@ fn subscribe_refuses_a_backfill_older_than_the_limit() {
     );
     assert_eq!(reply["ok"], false, "{reply}");
     assert_eq!(reply["code"], "backfill_too_old", "{reply}");
+}
+
+/// `open-query` for `symbol`'s trades over a fixed window.
+fn open_trade_query(conn: &mut Conn, symbol: &str) -> (u64, DataServiceName) {
+    let reply = conn.request(&format!(
+        r#"{{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"{symbol}","kind":"trade","from":1000000000,"to":2000000000}}"#
+    ));
+    assert_eq!(reply["ok"], true, "open-query rejected: {reply}");
+    let service = reply["service"].as_str().expect("service name");
+    let name = service
+        .parse()
+        .unwrap_or_else(|e| panic!("not a data-service name: {service}: {e}"));
+    (reply["query"].as_u64().expect("query id"), name)
+}
+
+/// Every trade price a query delivers, read to the end of its stream, which
+/// must arrive within 30 s and follow a terminal `SessionClosing`.
+fn drain_trade_query(subscriber: &mut DataSubscriber) -> Vec<f64> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut prices = Vec::new();
+    let mut closing = false;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the stream did not end within 30 s, after {} trades",
+            prices.len()
+        );
+        let events = match subscriber.poll() {
+            Ok(events) => events,
+            Err(TransportError::ServiceClosed) => break,
+            Err(e) => panic!("poll: {e}"),
+        };
+        for event in events {
+            assert!(!closing, "{event:?} after SessionClosing");
+            match event {
+                MarketEvent::Trade(t) => prices.push(t.price.to_f64()),
+                MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing => closing = true,
+                MarketEvent::Control(_) => {}
+                other => panic!("unexpected event on a trade query: {other:?}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(closing, "the stream ended without SessionClosing");
+    prices
+}
+
+/// Poll `list-queries` until `id` is gone, within 30 s.
+fn wait_until_reaped(daemon: &Daemon, id: u64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let listed = common::round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
+        if !listed["queries"]
+            .as_array()
+            .expect("queries array")
+            .contains(&serde_json::json!(id))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "query {id} never self-reaped: {listed}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A scripted daemon for the query tests: one query slot, a memory cache and
+/// no fetch delay.
+fn spawn_query_daemon(dir: &Path, prints: u32) -> Daemon {
+    spawn_scripted_daemon(
+        dir,
+        &format!("history_delay_ms = 0\nhistory_prints = {prints}\n"),
+        "[iceoryx2]\nmax_queries = 1\n\n[cache]\nbackend = \"memory\"\n",
+    )
+}
+
+/// The scripted provider's upstream history fetches so far.
+fn scripted_history_fetches(daemon: &Daemon) -> u64 {
+    let reply = common::round_trip(daemon.socket(), r#"{"op":"snapshot"}"#);
+    reply["snapshot"]["providers"]
+        .as_array()
+        .expect("providers array")
+        .iter()
+        .find(|provider| provider["provider"] == "scripted")
+        .unwrap_or_else(|| panic!("no scripted provider: {reply}"))["history_fetches"]
+        .as_u64()
+        .expect("history_fetches")
+}
+
+/// Warm the cache with a query of `prints` trades, then run it again with the
+/// attach delayed well past a cached read's end: every trade still arrives,
+/// then `SessionClosing`, then the end of the stream.
+fn assert_a_cached_query_survives_a_late_attach(prints: u32) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_query_daemon(dir.path(), prints);
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("node");
+    let mut conn = Conn::connect(daemon.socket());
+    let expected: Vec<f64> = (1..=prints).map(f64::from).collect();
+
+    let (warm, service) = open_trade_query(&mut conn, "AAPL");
+    let mut subscriber = DataSubscriber::open(&node, &service).expect("subscriber");
+    assert_eq!(drain_trade_query(&mut subscriber), expected);
+    wait_until_reaped(&daemon, warm);
+    let fetches = scripted_history_fetches(&daemon);
+    assert!(fetches > 0, "the first query must reach the provider");
+
+    let (_, service) = open_trade_query(&mut conn, "AAPL");
+    std::thread::sleep(Duration::from_millis(300));
+    let mut subscriber = DataSubscriber::open(&node, &service).expect("subscriber");
+    assert_eq!(drain_trade_query(&mut subscriber), expected);
+    assert_eq!(
+        scripted_history_fetches(&daemon),
+        fetches,
+        "the window was not served from the cache"
+    );
+}
+
+/// More trades than the data service's history and subscriber buffer hold.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_cached_query_is_held_for_a_late_attach() {
+    assert_a_cached_query_survives_a_late_attach(100);
+}
+
+/// Few enough trades that the whole query fits in one burst.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_short_cached_query_is_held_for_a_late_attach() {
+    assert_a_cached_query_survives_a_late_attach(3);
+}
+
+/// A query nobody attaches to holds its slot for the grace alone: the cap
+/// refuses a second query meanwhile, the first is then reaped on its own with
+/// its service gone, so a late attach fails, and the slot serves a new query.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_query_nobody_attaches_to_releases_its_slot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_query_daemon(dir.path(), 3);
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("node");
+    let mut conn = Conn::connect(daemon.socket());
+
+    let (abandoned, service) = open_trade_query(&mut conn, "AAPL");
+    let refused = conn.request(
+        r#"{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade","from":1000000000,"to":2000000000}"#,
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["code"], "service_cap_exceeded", "{refused}");
+
+    wait_until_reaped(&daemon, abandoned);
+    assert!(
+        DataSubscriber::open(&node, &service).is_err(),
+        "attaching to a reaped query must fail"
+    );
+
+    let (_, service) = open_trade_query(&mut conn, "MSFT");
+    let mut subscriber = DataSubscriber::open(&node, &service).expect("subscriber");
+    assert_eq!(drain_trade_query(&mut subscriber), [1.0, 2.0, 3.0]);
+}
+
+/// A query waiting for its client does not hold up shutdown. The query is
+/// still in flight long after its fetch ended, and the daemon then exits well
+/// inside what is left of the grace.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn shutdown_does_not_wait_for_a_query_to_be_attached() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut daemon = spawn_query_daemon(dir.path(), 3);
+    let mut conn = Conn::connect(daemon.socket());
+    let (id, _) = open_trade_query(&mut conn, "AAPL");
+    std::thread::sleep(Duration::from_millis(300));
+    let listed = common::round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
+    assert!(
+        listed["queries"]
+            .as_array()
+            .expect("queries array")
+            .contains(&serde_json::json!(id)),
+        "the query must be waiting for its client: {listed}"
+    );
+
+    assert!(
+        daemon.shutdown_within(Duration::from_secs(4)),
+        "the daemon is still up"
+    );
+}
+
+/// More trades than a query service's history and its subscriber's buffer
+/// hold, so a subscriber that holds its port and does not read stalls the
+/// query's pump in its send.
+const STALL_PRINTS: u32 = 500;
+
+/// A scripted daemon for the stalled-query tests: `max_queries` query slots,
+/// a memory cache, [`STALL_PRINTS`] trades per query and a 2 s
+/// `shutdown_timeout_secs`.
+fn spawn_stall_daemon(dir: &Path, max_queries: usize) -> Daemon {
+    common::spawn_daemon_with_server(
+        dir,
+        common::unique_prefix(),
+        &format!("[provider.scripted]\nhistory_delay_ms = 0\nhistory_prints = {STALL_PRINTS}\n"),
+        "shutdown_timeout_secs = 2",
+        &format!("[iceoryx2]\nmax_queries = {max_queries}\n\n[cache]\nbackend = \"memory\"\n"),
+        common::hermetic_command,
+    )
+}
+
+/// One request on a connection of its own; `None` if no reply arrives within
+/// `timeout`.
+fn request_within(socket: &Path, request: &str, timeout: Duration) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).expect("connect socket");
+    stream
+        .set_read_timeout(Some(timeout))
+        .expect("read timeout");
+    stream.write_all(request.as_bytes()).expect("write");
+    stream.write_all(b"\n").expect("write nl");
+    let mut reply = String::new();
+    match BufReader::new(stream).read_line(&mut reply) {
+        Ok(n) if n > 0 => Some(serde_json::from_str(&reply).expect("parse reply")),
+        _ => None,
+    }
+}
+
+/// Whether `list-queries` names `id`.
+fn is_listed(daemon: &Daemon, id: u64) -> bool {
+    let listed = common::round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
+    listed["queries"]
+        .as_array()
+        .expect("queries array")
+        .contains(&serde_json::json!(id))
+}
+
+/// A live count of the publishers on `service`.
+fn publisher_count(
+    node: &iceoryx2::node::Node<ipc_threadsafe::Service>,
+    service: &DataServiceName,
+) -> impl Fn() -> usize {
+    let name: iceoryx2::prelude::ServiceName = service
+        .to_string()
+        .as_str()
+        .try_into()
+        .expect("service name");
+    let data = node
+        .service_builder(&name)
+        .publish_subscribe::<datamancer::transport::DataPayload>()
+        .open()
+        .expect("data service");
+    move || {
+        use iceoryx2::service::port_factory::PortFactory as _;
+        data.dynamic_config().number_of_publishers()
+    }
+}
+
+/// Waits up to 5 s for `publishers` to reach zero.
+fn assert_no_publisher_soon(publishers: impl Fn() -> usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while publishers() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the query's pump still holds its publisher"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A query whose subscriber holds its port and stops reading frees its
+/// `max_queries` slot on `cancel-query`: the cancel answers `ok` at once, the
+/// query leaves `list-queries`, a second cancel answers `unknown_query`, and
+/// a new query opens and is served in full while the stalled subscriber
+/// still holds its port.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_cancelled_stalled_query_frees_its_slot_at_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_stall_daemon(dir.path(), 1);
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("node");
+    let mut conn = Conn::connect(daemon.socket());
+
+    let (id, service) = open_trade_query(&mut conn, "AAPL");
+    let _stalled = DataSubscriber::open(&node, &service).expect("subscriber");
+    let publishers = publisher_count(&node, &service);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        is_listed(&daemon, id),
+        "the stalled query must be in flight"
+    );
+    assert_eq!(publishers(), 1, "the pump publishes");
+
+    let cancel = format!(r#"{{"op":"cancel-query","query":{id}}}"#);
+    let cancelled = request_within(daemon.socket(), &cancel, Duration::from_secs(2))
+        .expect("cancel-query did not answer");
+    assert_eq!(cancelled["ok"], true, "{cancelled}");
+    assert!(!is_listed(&daemon, id), "a cancelled query is still listed");
+    let again = conn.request(&cancel);
+    assert_eq!(again["code"], "unknown_query", "{again}");
+    assert_no_publisher_soon(publishers);
+
+    let reply = conn.request(
+        r#"{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade","from":1000000000,"to":2000000000}"#,
+    );
+    assert_eq!(
+        reply["ok"], true,
+        "the cancelled query kept its slot: {reply}"
+    );
+    let service: DataServiceName = reply["service"]
+        .as_str()
+        .expect("service name")
+        .parse()
+        .expect("data-service name");
+    let mut subscriber = DataSubscriber::open(&node, &service).expect("subscriber");
+    assert_eq!(
+        drain_trade_query(&mut subscriber).len(),
+        STALL_PRINTS as usize
+    );
+}
+
+/// A query whose subscriber holds its port and stops reading frees its
+/// `max_queries` slot when its connection ends: the query leaves
+/// `list-queries` and a new one opens.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_stalled_query_frees_its_slot_when_its_connection_ends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_stall_daemon(dir.path(), 1);
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("node");
+    let mut opener = Conn::connect(daemon.socket());
+    let (id, service) = open_trade_query(&mut opener, "AAPL");
+    let _stalled = DataSubscriber::open(&node, &service).expect("subscriber");
+    let publishers = publisher_count(&node, &service);
+    // Nothing reports a pump parked on the full queue; this outlasts filling it.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        is_listed(&daemon, id),
+        "the stalled query must be in flight"
+    );
+    assert_eq!(publishers(), 1, "the pump publishes");
+
+    drop(opener);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while is_listed(&daemon, id) {
+        assert!(
+            Instant::now() < deadline,
+            "a stalled query kept its slot after its connection ended"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_no_publisher_soon(publishers);
+
+    let mut conn = Conn::connect(daemon.socket());
+    let reply = conn.request(
+        r#"{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade","from":1000000000,"to":2000000000}"#,
+    );
+    assert_eq!(reply["ok"], true, "the ended query kept its slot: {reply}");
+}
+
+/// With every `max_queries` slot held by a query whose subscriber holds its
+/// port and does not read, the daemon still answers `ping`. The queries number
+/// the test machine's parallelism plus one, so they outnumber the daemon
+/// runtime's workers even if it has fewer than this machine reports.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn ping_answers_with_every_query_stalled() {
+    let workers = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stalled_queries = workers + 1;
+    let daemon = spawn_stall_daemon(dir.path(), stalled_queries);
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("node");
+    let mut conn = Conn::connect(daemon.socket());
+
+    let mut stalled = Vec::new();
+    for i in 0..stalled_queries {
+        let (_, service) = open_trade_query(&mut conn, &format!("Q{i}"));
+        stalled.push(DataSubscriber::open(&node, &service).expect("subscriber"));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+
+    let ping = request_within(daemon.socket(), r#"{"op":"ping"}"#, Duration::from_secs(5))
+        .expect("ping did not answer with every query stalled");
+    assert_eq!(ping["ok"], true, "{ping}");
+}
+
+/// A query whose subscriber holds its port and stops reading does not keep
+/// the daemon from exiting on `shutdown`: `shutdown_timeout_secs` (2 s here)
+/// bounds the whole exit, so it is gone within 4 s.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn shutdown_exits_with_a_stalled_query_consumer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut daemon = spawn_stall_daemon(dir.path(), 1);
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("node");
+    let mut conn = Conn::connect(daemon.socket());
+    let (id, service) = open_trade_query(&mut conn, "AAPL");
+    let _stalled = DataSubscriber::open(&node, &service).expect("subscriber");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(is_listed(&daemon, id), "the query must still be in flight");
+
+    assert!(
+        daemon.shutdown_within(Duration::from_secs(4)),
+        "the daemon did not exit within 4 s of shutdown"
+    );
 }
 
 /// The next trade on `events`, skipping controls.

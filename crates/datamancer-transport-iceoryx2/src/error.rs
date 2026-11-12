@@ -6,6 +6,10 @@
 //! [`datamancer_core::Error`]; [`TransportError`] converts into it via
 //! [`std::io::Error`] so no `datamancer-core` change is needed.
 
+use iceoryx2::service::builder::publish_subscribe::{
+    PublishSubscribeOpenError, PublishSubscribeOpenOrCreateError,
+};
+
 /// An error originating in the iceoryx2 transport.
 ///
 /// `#[non_exhaustive]`: a consumer matches with a wildcard arm, so a variant
@@ -17,12 +21,16 @@ pub enum TransportError {
     BadServiceName(String),
     /// Creating or opening an iceoryx2 service/port failed.
     Service(String),
-    /// The named service exists on the host but is marked for destruction and
-    /// no live node references it: a previous owner was killed while removing
-    /// it, and iceoryx2's dead-node cleanup never visits such a service.
-    /// Opening it fails until the stale resources are removed (see the daemon
-    /// README, "Recovering from a crashed predecessor").
+    /// The named service exists on the host but is marked for destruction.
+    /// Either its owner is removing it, which passes on its own, or a previous
+    /// owner was killed while removing it: iceoryx2's dead-node cleanup never
+    /// visits such a service, and opening it fails until the stale resources
+    /// are removed (see the daemon README, "Recovering from a crashed
+    /// predecessor").
     StaleService(String),
+    /// The service has no publisher left and every sample it sent has been
+    /// received: nothing further can arrive.
+    ServiceClosed,
     /// Loaning or sending a sample failed.
     Send(String),
     /// An instrument could not be interned for transport (tuple too long).
@@ -40,10 +48,10 @@ impl std::fmt::Display for TransportError {
             Self::Service(m) => write!(f, "iceoryx2 service error: {m}"),
             Self::StaleService(name) => write!(
                 f,
-                "iceoryx2 service {name} is marked for destruction with no live owner \
-                 (a previous owner was killed while removing it); it cannot be opened \
-                 until its stale resources are removed"
+                "iceoryx2 service {name} is marked for destruction: its owner is removing \
+                 it, or was killed while doing so and its stale resources must be removed"
             ),
+            Self::ServiceClosed => write!(f, "iceoryx2 service has no publisher left"),
             Self::Send(m) => write!(f, "iceoryx2 send error: {m}"),
             Self::Interning(m) => write!(f, "symbol interning error: {m}"),
             Self::Unsupported(m) => write!(f, "unsupported event for transport: {m}"),
@@ -53,21 +61,28 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// Classify a publish-subscribe `open_or_create` failure on service `name`:
+/// Classify a publish-subscribe `open` failure on service `name`:
 /// `IsMarkedForDestruction` is [`TransportError::StaleService`]; everything
-/// else, `SystemInFlux` included (a transient race, not a stale service),
-/// keeps its debug text as [`TransportError::Service`].
+/// else keeps its debug text as [`TransportError::Service`].
+pub(crate) fn open_error(name: &str, e: PublishSubscribeOpenError) -> TransportError {
+    match e {
+        PublishSubscribeOpenError::IsMarkedForDestruction => {
+            TransportError::StaleService(name.to_string())
+        }
+        other => TransportError::Service(format!("{other:?}")),
+    }
+}
+
+/// Classify a publish-subscribe `open_or_create` failure on service `name`:
+/// an open failure as [`open_error`] does; anything else, `SystemInFlux`
+/// included (a transient race, not a stale service), keeps its debug text as
+/// [`TransportError::Service`].
 pub(crate) fn open_or_create_error(
     name: &str,
-    e: iceoryx2::service::builder::publish_subscribe::PublishSubscribeOpenOrCreateError,
+    e: PublishSubscribeOpenOrCreateError,
 ) -> TransportError {
-    use iceoryx2::service::builder::publish_subscribe::{
-        PublishSubscribeOpenError, PublishSubscribeOpenOrCreateError,
-    };
     match e {
-        PublishSubscribeOpenOrCreateError::PublishSubscribeOpenError(
-            PublishSubscribeOpenError::IsMarkedForDestruction,
-        ) => TransportError::StaleService(name.to_string()),
+        PublishSubscribeOpenOrCreateError::PublishSubscribeOpenError(e) => open_error(name, e),
         other => TransportError::Service(format!("{other:?}")),
     }
 }
@@ -83,9 +98,9 @@ pub type Result<T, E = TransportError> = std::result::Result<T, E>;
 
 #[cfg(test)]
 mod tests {
-    use super::{TransportError, open_or_create_error};
-    use iceoryx2::service::builder::publish_subscribe::{
-        PublishSubscribeOpenError, PublishSubscribeOpenOrCreateError,
+    use super::{
+        PublishSubscribeOpenError, PublishSubscribeOpenOrCreateError, TransportError,
+        open_or_create_error,
     };
 
     #[test]
