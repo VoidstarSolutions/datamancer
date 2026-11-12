@@ -193,9 +193,11 @@ A daemon built with the off-by-default `scripted-provider` feature also has
 serves scripted trades on both surfaces, for instruments naming `scripted`
 only, with no network or credentials. Its knobs are `history_prints`,
 `history_delay_ms`, `live_interval_ms` (greater than 0), `latest`,
-`latest_delay_ms` and `failing_symbol` (history requests for that symbol
-fail). Removed and then configured again, it resumes its open sessions'
-trades. A daemon built without the feature rejects the section as unknown.
+`latest_delay_ms`, `failing_symbol` (history requests for that symbol fail)
+and `connect_delay_ms` (how long a live subscribe takes to return; nothing is
+emitted before it). Removed and then configured again, it resumes its open
+sessions' trades. A daemon built without the feature rejects the section as
+unknown.
 
 Validation fails fast on the remaining cross-section invariants: a startup
 session naming a provider this binary lacks is refused; one using a cache preset

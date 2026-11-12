@@ -190,14 +190,17 @@ fn subscribe_live_backfill_serves_history_then_buffered_prints_then_live() {
             Seen::Gap => unreachable!(),
         })
         .collect();
-    // History first: prices 1..=5 at ascending source_ts inside the window.
+    // History first: prices 1..=5 at ascending source_ts inside the window
+    // (the last one sits at the live edge, past the request time, and every
+    // one precedes the first live print).
+    let first_live_ts = trades[5].1;
     for (i, (price, ts, seq)) in trades.iter().take(5).enumerate() {
         assert!(
             (price - (1.0 + i as f64)).abs() < 1e-9,
             "history {i}: {trades:?}"
         );
         assert!(
-            *ts >= from && *ts < subscribed_at,
+            *ts >= from && *ts < first_live_ts,
             "history {i} ts: {trades:?}"
         );
         assert_eq!(*seq, i as u64, "history seq: {trades:?}");
@@ -228,6 +231,102 @@ fn subscribe_live_backfill_serves_history_then_buffered_prints_then_live() {
     );
 
     drop((subscriber, second, first, node));
+}
+
+/// The seam on a cold provider socket: the scripted provider's
+/// `subscribe` returns only after `connect_delay_ms` (the lazy connect, auth
+/// and acknowledgement a first subscriber waits for) and emits nothing
+/// before then. The daemon's reply waits for that return, the backfill's
+/// live edge is fixed after it (the scripted history's last print sits at
+/// `edge - 1`, so the edge is readable off the stream), every live print is
+/// at or after the edge, `seq` has no hole but the provider's connect
+/// control, and no `Gap` is emitted: no uncovered window between the history
+/// and the first live print.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "a handful of scripted prints; the indices are tiny"
+)]
+fn subscribe_live_backfill_fixes_its_edge_after_a_cold_socket_connects() {
+    const CONNECT_DELAY_NS: i64 = 500_000_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    // 3 history prints after a 400 ms wait, a live print every 50 ms, and a
+    // 500 ms "connect" before the first subscribe returns.
+    let daemon = spawn_scripted_daemon(
+        dir.path(),
+        "history_prints = 3\nhistory_delay_ms = 400\nlive_interval_ms = 50\nconnect_delay_ms = 500\n",
+        "",
+    );
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+    let mut subscriber = conn.open_client("cold", &node);
+    let from = now_nanos() - 60_000_000_000;
+    let subscribed_at = now_nanos();
+    let reply = conn.request(&format!(
+        r#"{{"op":"subscribe","client":"cold","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live_backfill","backfill_from":{from}}}"#
+    ));
+    let replied_at = now_nanos();
+    assert_eq!(reply["ok"], true, "subscribe rejected: {reply}");
+    assert_eq!(reply["scope"], "live_backfill", "{reply}");
+    // The reply waited for the provider's acknowledgement.
+    assert!(
+        replied_at - subscribed_at >= CONNECT_DELAY_NS,
+        "the subscribe must wait for the cold socket: {subscribed_at} -> {replied_at}"
+    );
+
+    // 3 history + at least 4 live prints.
+    let seen = collect(&mut subscriber, 7, Duration::from_secs(10));
+    assert!(seen.len() >= 7, "too few events: {seen:?}");
+    assert!(
+        !seen.iter().any(Seen::is_gap),
+        "a cold socket is not loss, no Gap: {seen:?}"
+    );
+    let trades: Vec<(f64, i64, u64)> = seen
+        .iter()
+        .map(|s| match s {
+            Seen::Trade(p, ts, seq) => (*p, *ts, *seq),
+            Seen::Gap => unreachable!(),
+        })
+        .collect();
+    for (i, (price, ts, seq)) in trades.iter().take(3).enumerate() {
+        assert!(
+            (price - (1.0 + i as f64)).abs() < 1e-9,
+            "history {i}: {trades:?}"
+        );
+        assert!(*ts >= from, "history {i} ts: {trades:?}");
+        assert_eq!(*seq, i as u64, "history seq: {trades:?}");
+    }
+    // The live edge, read off the last history print: fixed after the
+    // provider acknowledged the pair (at or after request + delay) and
+    // before the reply went out.
+    let edge = trades[2].1 + 1;
+    assert!(
+        edge >= subscribed_at + CONNECT_DELAY_NS,
+        "the live edge must follow the acknowledgement: edge {edge}, request {subscribed_at}"
+    );
+    assert!(
+        edge <= replied_at,
+        "the live edge is fixed before the reply: edge {edge}, reply {replied_at}"
+    );
+    // Every live print is at or after the edge, in order; slot 3 is the
+    // provider's `ProviderConnected`, which the data plane does not carry.
+    let live = &trades[3..];
+    for (i, (price, ts, seq)) in live.iter().enumerate() {
+        assert!(
+            (price - (100.0 + i as f64)).abs() < 1e-9,
+            "live {i}: {trades:?}"
+        );
+        assert!(
+            *ts >= edge,
+            "live {i} ts before the edge {edge}: {trades:?}"
+        );
+        assert_eq!(*seq, 4 + i as u64, "live seq: {trades:?}");
+    }
+    drop((subscriber, conn, node));
 }
 
 /// `subscribe` pure-live: `latest` seeds the stream with the scripted print

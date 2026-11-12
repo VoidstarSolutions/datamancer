@@ -37,17 +37,24 @@ struct FakeProvider {
     fetched: Arc<StdMutex<Vec<(i64, i64)>>>,
     gate: Option<Arc<Notify>>,
     fail_at: Option<i64>,
+    /// How long `LiveHandle::subscribe` takes to return: a cold socket's
+    /// connect, auth and acknowledgement.
+    connect_delay: Duration,
+    /// Wall clock (epoch ns) at which `subscribe` returned, if it has.
+    acked_at: Arc<StdMutex<Option<i64>>>,
 }
 
 struct FakeHandles {
     state: Arc<Mutex<FakeState>>,
     fetched: Arc<StdMutex<Vec<(i64, i64)>>>,
+    acked_at: Arc<StdMutex<Option<i64>>>,
 }
 
 impl FakeProvider {
     fn new(id: &str) -> (Self, FakeHandles) {
         let state = Arc::new(Mutex::new(FakeState::default()));
         let fetched = Arc::new(StdMutex::new(Vec::new()));
+        let acked_at = Arc::new(StdMutex::new(None));
         (
             Self {
                 id: id.to_string(),
@@ -55,9 +62,23 @@ impl FakeProvider {
                 fetched: fetched.clone(),
                 gate: None,
                 fail_at: None,
+                connect_delay: Duration::ZERO,
+                acked_at: acked_at.clone(),
             },
-            FakeHandles { state, fetched },
+            FakeHandles {
+                state,
+                fetched,
+                acked_at,
+            },
         )
+    }
+
+    /// Model a provider that connects lazily on the first subscribe: the
+    /// subscribe returns only after `delay`, like a hub waiting for its
+    /// socket to connect, authenticate and have the pair acknowledged.
+    fn with_connect_delay(mut self, delay: Duration) -> Self {
+        self.connect_delay = delay;
+        self
     }
 
     /// Hold the fetch open until the gate fires. Releases exactly one fetch
@@ -88,6 +109,11 @@ impl FakeHandles {
     fn fetched(&self) -> Vec<(i64, i64)> {
         self.fetched.lock().unwrap().clone()
     }
+
+    /// The wall clock at which the provider acknowledged the subscription.
+    fn acked_at(&self) -> Option<i64> {
+        *self.acked_at.lock().unwrap()
+    }
 }
 
 #[async_trait]
@@ -102,6 +128,8 @@ impl Provider for FakeProvider {
         self.state.lock().await.sink = Some(sink);
         Ok(Box::new(FakeLiveHandle {
             state: self.state.clone(),
+            connect_delay: self.connect_delay,
+            acked_at: self.acked_at.clone(),
         }))
     }
     async fn fetch_history(
@@ -141,11 +169,15 @@ impl Provider for FakeProvider {
 
 struct FakeLiveHandle {
     state: Arc<Mutex<FakeState>>,
+    connect_delay: Duration,
+    acked_at: Arc<StdMutex<Option<i64>>>,
 }
 
 #[async_trait]
 impl LiveHandle for FakeLiveHandle {
     async fn subscribe(&self, _i: Instrument, _k: EventKind) -> Result<()> {
+        tokio::time::sleep(self.connect_delay).await;
+        *self.acked_at.lock().unwrap() = Some(wall_now());
         Ok(())
     }
     async fn unsubscribe(&self, _i: Instrument, _k: EventKind) -> Result<()> {
@@ -161,6 +193,18 @@ impl LiveHandle for FakeLiveHandle {
 
 fn inst(symbol: &str) -> Instrument {
     Instrument::new(ProviderId::from_static("fake"), AssetClass::Equity, symbol)
+}
+
+/// The wall clock as epoch nanoseconds, the way the session samples its
+/// live edge.
+fn wall_now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("fits")
 }
 
 fn trade(ts: i64) -> MarketEvent {
@@ -397,6 +441,60 @@ async fn stitched_session_splices_cache_provider_and_live_in_order() {
             from_source_ts: Timestamp(901),
             to_source_ts: Timestamp(1000),
         }]
+    );
+    let _ = session.close().await;
+}
+
+/// The seam on a cold provider socket: the provider's `subscribe` returns
+/// only after a connect delay (nothing flows before it), and the backfill's
+/// history window ends at or after that return, so the history reaches the
+/// point from which the live side is known to deliver; the first live print
+/// then follows the history with contiguous `seq` and no `Gap`.
+#[tokio::test]
+async fn backfill_edge_follows_the_providers_subscription_ack() {
+    const CONNECT_DELAY: Duration = Duration::from_millis(300);
+    let (provider, handles) = FakeProvider::new("fake");
+    let provider = provider.with_connect_delay(CONNECT_DELAY);
+    handles.set_history(vec![trade(100)]).await;
+
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider))
+        .build()
+        .unwrap();
+    let requested_at = wall_now();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::live_backfill(Timestamp(0)),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = session.take_events().await.unwrap();
+    // The first print the venue sends once the pair is active.
+    let first_live = wall_now();
+    handles.push_live(trade(first_live)).await;
+
+    let (data, gaps) = drain_data(&mut stream, 2).await;
+    assert_eq!(data, vec![(100, 0), (first_live, 1)]);
+    assert!(gaps.is_empty(), "a cold socket is not loss: {gaps:?}");
+
+    // The provider acknowledged only after the delay, and the one history
+    // fetch's upper edge is at or after that acknowledgement, never before:
+    // the history runs up to where the live side's coverage begins.
+    let acked_at = handles.acked_at().expect("subscribe returned");
+    assert!(
+        acked_at - requested_at >= i64::try_from(CONNECT_DELAY.as_nanos()).unwrap(),
+        "the ack must wait for the connect: {requested_at} -> {acked_at}"
+    );
+    let fetched = handles.fetched();
+    assert_eq!(fetched.len(), 1, "{fetched:?}");
+    assert_eq!(fetched[0].0, 0);
+    assert!(
+        fetched[0].1 >= acked_at,
+        "history edge {} precedes the ack {acked_at}",
+        fetched[0].1
     );
     let _ = session.close().await;
 }

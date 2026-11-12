@@ -36,14 +36,13 @@ pub enum LiveScope {
     /// the live edge: see [`Error::BackfillFromNotInPast`](crate::Error::BackfillFromNotInPast).
     /// Build it with [`LiveScope::backfill`].
     ///
-    /// The live edge is the local clock read after the provider's subscribe
-    /// returns, and nothing dedupes at the seam. An event between the start of
-    /// live delivery and that reading can arrive twice, once in the history and
-    /// once live. With clock skew, a lagging history endpoint or a provider
-    /// that returns before the venue acknowledges the pair, events at the edge
-    /// can be missing with no [`Gap`](crate::ControlKind::Gap). A `Gap` reports
-    /// a failed fetch, a buffer overflow or a subscriber that stops pacing the
-    /// replay.
+    /// The live edge is the local clock read once the provider has
+    /// acknowledged the subscription, and nothing dedupes at the seam. An
+    /// event between the provider's acknowledgement and that reading can
+    /// arrive twice, once in the history and once live. With clock skew or a
+    /// lagging history endpoint, events at the edge can be missing with no
+    /// [`Gap`](crate::ControlKind::Gap). A `Gap` reports a failed fetch, a
+    /// buffer overflow or a subscriber that stops pacing the replay.
     ///
     /// With a tap log, live arrivals reach it at the seam. An arrival the seam
     /// ring evicts, or one still buffered when the session closes before the
