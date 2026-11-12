@@ -4,7 +4,10 @@
 //! The single-instance lock is per-user host-global: these tests cannot run
 //! alongside a real datamancerd or in parallel with `daemon_e2e`.
 
-use std::path::PathBuf;
+#![cfg(unix)]
+
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use datamancer_client::app::{AppHandle, EnsureConfig};
@@ -12,7 +15,7 @@ use datamancer_client::app::{AppHandle, EnsureConfig};
 /// Minimal daemon config in a tempdir; socket path returned alongside.
 /// Mirrors `daemon_e2e.rs`'s fixture (same provider + `[server]` sections,
 /// plus `[diagnostics]`) — overrides `admin_socket` to the tempdir.
-fn write_config(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+fn write_config(dir: &Path) -> (PathBuf, PathBuf) {
     let socket = dir.join("control.sock");
     let config = dir.join("config.toml");
     std::fs::write(
@@ -37,9 +40,32 @@ publish_interval_ms = 200
     (config, socket)
 }
 
-fn ensure_cfg(dir: &std::path::Path, name: &str) -> EnsureConfig {
+/// `text` as one POSIX shell word.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// A launcher for the daemon under test with its credential store pinned to a
+/// `credentials.json` in `dir`: the facade spawns with this process's
+/// environment, so the pin rides on the binary it is told to run.
+fn write_pinned_launcher(dir: &Path) -> PathBuf {
+    let launcher = dir.join("datamancerd-pinned");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nexport DATAMANCER_CREDENTIALS_FILE={}\nexec {} \"$@\"\n",
+            shell_quote(&dir.join("credentials.json").display().to_string()),
+            shell_quote(env!("CARGO_BIN_EXE_datamancerd")),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    launcher
+}
+
+fn ensure_cfg(dir: &Path, name: &str) -> EnsureConfig {
     let (config, socket) = write_config(dir);
-    let mut cfg = EnsureConfig::new(env!("CARGO_BIN_EXE_datamancerd"), name);
+    let mut cfg = EnsureConfig::new(write_pinned_launcher(dir), name);
     cfg.config_path = Some(config);
     cfg.control_socket = Some(socket);
     cfg.log_path = Some(dir.join("daemon.log"));
@@ -76,6 +102,7 @@ async fn ensure_spawns_daemon_and_health_reports_version() {
         health.daemon.version.as_deref(),
         Some(handle.daemon_version())
     );
+    assert_eq!(health.daemon.credential_backend.as_deref(), Some("file"));
     assert!(
         !health.providers.is_empty(),
         "configured provider must appear"

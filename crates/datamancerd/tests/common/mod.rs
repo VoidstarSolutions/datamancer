@@ -22,12 +22,19 @@ use std::time::{Duration, Instant};
 /// retries) goes to the daemon's inherited stderr at `trace`, so a rejected
 /// open is diagnosable from the `--nocapture` output (#96). Set here once so
 /// every suite's daemon logs the same way.
+///
+/// The credential store is pinned to a `credentials.json` beside the config;
+/// the `ALPACA_*` env fallback still applies.
 pub fn daemon_command(config_path: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_datamancerd"));
     command
         .arg("--config")
         .arg(config_path)
-        .env("IOX2_LOG_LEVEL", "trace");
+        .env("IOX2_LOG_LEVEL", "trace")
+        .env(
+            "DATAMANCER_CREDENTIALS_FILE",
+            config_path.with_file_name("credentials.json"),
+        );
     command
 }
 
@@ -44,19 +51,13 @@ pub const ALPACA_ENV: [&str; 4] = [
 ];
 
 /// [`daemon_command`] for a daemon that must touch nothing outside its test:
-/// its credential store is `credentials.json` beside `config_path`, and no
-/// `ALPACA_*` variable reaches it.
+/// no `ALPACA_*` variable reaches it.
 #[allow(
     dead_code,
     reason = "not every suite that includes this module uses it"
 )]
 pub fn hermetic_command(config_path: &Path) -> Command {
     let mut command = daemon_command(config_path);
-    let store = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("credentials.json");
-    command.env("DATAMANCER_CREDENTIALS_FILE", store);
     for name in ALPACA_ENV {
         command.env_remove(name);
     }
