@@ -100,6 +100,13 @@ jobs:
             exit 1
           fi
           cargo test -p datamancerd --all-features --test scripted_e2e -- --ignored --test-threads=1
+          health=health_reports_the_history_and_live_surfaces_apart
+          found=$(cargo test -p datamancerd --all-features --test health_observability_e2e "$health" -- --ignored --exact --list | grep -c ': test$' || true)
+          if [ "$found" -ne 1 ]; then
+            echo "expected the ignored test $health, found $found"
+            exit 1
+          fi
+          cargo test -p datamancerd --all-features --test health_observability_e2e "$health" -- --ignored --exact --test-threads=1
       # The iceoryx2 runtime tests, all #[ignore]d.
       - name: iceoryx2 transport runtime
         timeout-minutes: 10

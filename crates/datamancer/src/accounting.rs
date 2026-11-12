@@ -23,7 +23,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use datamancer_core::{
-    ConnectionState, Control, ControlKind, DisconnectCause, Error, MarketEvent, StreamConnection,
+    ConnectionState, Control, ControlKind, DisconnectCause, Error, MarketEvent, ProviderSurfaces,
+    StreamConnection, SurfaceOutcome, Timestamp,
 };
 
 use crate::client_session::ConnectionChange;
@@ -52,6 +53,7 @@ pub(crate) struct ProviderAccounting {
     /// cleared on the next successful connect. Sticky so a provider whose last
     /// substream has gone keeps reporting the rejection.
     auth_failed: std::sync::atomic::AtomicBool,
+    surfaces: std::sync::Mutex<ProviderSurfaces>,
 }
 
 impl Default for ProviderAccounting {
@@ -68,6 +70,7 @@ impl Default for ProviderAccounting {
             ever_connected: std::sync::atomic::AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
             auth_failed: std::sync::atomic::AtomicBool::new(false),
+            surfaces: std::sync::Mutex::new(ProviderSurfaces::default()),
         }
     }
 }
@@ -126,11 +129,19 @@ impl ProviderAccounting {
 
     /// Fold one control **received from the provider** (before any buffering
     /// or delivery), together with the phase transition the owning substream
-    /// recorded for it. Connect/disconnect counters move only on a real
-    /// transition — a duplicate connect is `ConnectionChange::None` and counts
-    /// nothing — while the auth classification and the error text are taken
-    /// from every control that carries them.
-    pub(crate) fn record_provider_control(&self, kind: &ControlKind, change: ConnectionChange) {
+    /// recorded for it, stamped with the control's receipt (`rx_ts`).
+    /// Connect/disconnect counters move only on a real transition — a
+    /// duplicate connect is `ConnectionChange::None` and counts nothing —
+    /// while the auth classification and the error text are taken from every
+    /// control that carries them. The live surface moves on every connect and
+    /// on every disconnect but a deliberate `Disabled` drop; a `ProviderError`
+    /// frame leaves it alone.
+    pub(crate) fn record_provider_control(
+        &self,
+        kind: &ControlKind,
+        change: ConnectionChange,
+        at: Timestamp,
+    ) {
         if let ConnectionChange::Connected { reconnect } = change {
             self.ever_connected.store(true, Ordering::Relaxed);
             self.auth_failed.store(false, Ordering::Relaxed);
@@ -139,14 +150,32 @@ impl ProviderAccounting {
             }
         }
         match kind {
-            ControlKind::ProviderDisconnected { reason, cause, .. }
-                if *cause == DisconnectCause::Unauthenticated =>
-            {
-                self.auth_failed.store(true, Ordering::Relaxed);
-                self.record_error(reason);
+            ControlKind::ProviderConnected { .. } => {
+                self.record_live_outcome(SurfaceOutcome::ok(at));
+            }
+            ControlKind::ProviderDisconnected { reason, cause, .. } => {
+                if *cause == DisconnectCause::Unauthenticated {
+                    self.auth_failed.store(true, Ordering::Relaxed);
+                    self.record_error(reason);
+                }
+                if *cause != DisconnectCause::Disabled {
+                    self.record_live_outcome(SurfaceOutcome::failing(at, reason.clone()));
+                }
             }
             ControlKind::ProviderError { message, .. } => self.record_error(message),
             _ => {}
+        }
+    }
+
+    pub(crate) fn record_history_outcome(&self, outcome: SurfaceOutcome) {
+        if let Ok(mut surfaces) = self.surfaces.lock() {
+            replace_unless_older(&mut surfaces.history, outcome);
+        }
+    }
+
+    pub(crate) fn record_live_outcome(&self, outcome: SurfaceOutcome) {
+        if let Ok(mut surfaces) = self.surfaces.lock() {
+            replace_unless_older(&mut surfaces.live, outcome);
         }
     }
 
@@ -160,14 +189,36 @@ impl ProviderAccounting {
 
     /// Record a failed live open (`start_live`/`subscribe` returned `Err`, so
     /// no controller and no substream exist to carry the evidence). The error
-    /// text becomes `last_error`; an [`Error::Unauthenticated`] also sets the
-    /// sticky auth-rejection flag, so a provider that never connected because
-    /// it has no usable credentials reads `Unauthenticated`, not `Unknown`.
-    pub(crate) fn record_open_failure(&self, error: &Error) {
-        if let Error::Unauthenticated { .. } = error {
-            self.auth_failed.store(true, Ordering::Relaxed);
+    /// text becomes `last_error` and the live surface's error; an
+    /// [`Error::Unauthenticated`] also sets the sticky auth-rejection flag, so
+    /// a provider that never connected because it has no usable credentials
+    /// reads `Unauthenticated`, not `Unknown`. [`Error::ProviderDisabled`] is
+    /// no attempt and records nothing.
+    pub(crate) fn record_open_failure(&self, error: &Error, at: Timestamp) {
+        match error {
+            Error::ProviderDisabled { .. } => return,
+            Error::Unauthenticated { .. } => self.auth_failed.store(true, Ordering::Relaxed),
+            _ => {}
         }
-        self.record_error(&error.to_string());
+        let message = error.to_string();
+        self.record_error(&message);
+        self.record_live_outcome(SurfaceOutcome::failing(at, message));
+    }
+}
+
+/// A provider's sessions fold its controls at their own pace, so an outcome
+/// can reach a surface after a newer one; the newest stays. Outcomes are
+/// ordered by wall clock, so a backward clock step hides outcomes until one
+/// is stamped past the held one. A creator's `Ok` is stamped when its
+/// subscribe returns, so a disconnect in the instant between the provider's
+/// ack and that stamp can be ordered before it.
+fn replace_unless_older(surface: &mut SurfaceOutcome, outcome: SurfaceOutcome) {
+    let concluded = |outcome: &SurfaceOutcome| match outcome {
+        SurfaceOutcome::Ok { at, .. } | SurfaceOutcome::Failing { at, .. } => Some(*at),
+        _ => None,
+    };
+    if concluded(&outcome) >= concluded(surface) {
+        *surface = outcome;
     }
 }
 
@@ -245,6 +296,10 @@ impl ProviderAccounting {
     pub(crate) fn last_error(&self) -> Option<String> {
         self.last_error.lock().ok().and_then(|s| s.clone())
     }
+
+    pub(crate) fn surfaces(&self) -> ProviderSurfaces {
+        self.surfaces.lock().map(|s| s.clone()).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -252,7 +307,8 @@ mod tests {
     use super::{ConnectionChange, ProviderAccounting};
     use datamancer_core::{
         AssetClass, ConnectionState, Control, ControlKind, DisconnectCause, GapSpan, Instrument,
-        MarketEvent, Price, ProviderId, Seq, StreamConnection, Timestamp, Trade,
+        MarketEvent, Price, ProviderId, ProviderSurfaces, Seq, StreamConnection, SurfaceOutcome,
+        Timestamp, Trade,
     };
 
     fn trade() -> MarketEvent {
@@ -365,18 +421,21 @@ mod tests {
         a.record_provider_control(
             &connected(),
             ConnectionChange::Connected { reconnect: false },
+            Timestamp(1),
         );
         assert_eq!(a.reconnects(), 0, "a first connect is not a reconnect");
         // A duplicate connect while already up is no transition: nothing moves.
-        a.record_provider_control(&connected(), ConnectionChange::None);
+        a.record_provider_control(&connected(), ConnectionChange::None, Timestamp(1));
         assert_eq!(a.reconnects(), 0);
         a.record_provider_control(
             &disconnected("ws closed", DisconnectCause::Error),
             ConnectionChange::Disconnected,
+            Timestamp(1),
         );
         a.record_provider_control(
             &connected(),
             ConnectionChange::Connected { reconnect: true },
+            Timestamp(1),
         );
         assert_eq!(a.reconnects(), 1);
     }
@@ -388,6 +447,7 @@ mod tests {
         a.record_provider_control(
             &disconnected("auth rejected", DisconnectCause::Unauthenticated),
             ConnectionChange::Disconnected,
+            Timestamp(1),
         );
         assert_eq!(a.connection_state([]), ConnectionState::Unauthenticated);
         assert_eq!(a.last_error(), Some("auth rejected".to_string()));
@@ -396,6 +456,7 @@ mod tests {
         a.record_provider_control(
             &connected(),
             ConnectionChange::Connected { reconnect: true },
+            Timestamp(1),
         );
         assert_eq!(a.connection_state([up()]), ConnectionState::Connected);
         assert_eq!(a.connection_state([]), ConnectionState::Disconnected);
@@ -407,9 +468,114 @@ mod tests {
         a.record_provider_control(
             &disconnected("ws closed", DisconnectCause::Error),
             ConnectionChange::Disconnected,
+            Timestamp(1),
         );
         assert_eq!(a.connection_state([]), ConnectionState::Unknown);
         assert_eq!(a.last_error(), None);
+    }
+
+    fn failing(at: i64, error: &str) -> SurfaceOutcome {
+        SurfaceOutcome::failing(Timestamp(at), error)
+    }
+
+    fn ok(at: i64) -> SurfaceOutcome {
+        SurfaceOutcome::ok(Timestamp(at))
+    }
+
+    #[test]
+    fn history_outcomes_land_on_the_history_surface_only() {
+        let a = ProviderAccounting::default();
+        assert_eq!(a.surfaces(), ProviderSurfaces::default());
+        a.record_history_outcome(failing(10, "HTTP 401"));
+        let s = a.surfaces();
+        assert_eq!(s.history, failing(10, "HTTP 401"));
+        assert_eq!(s.live, SurfaceOutcome::Unknown, "live untouched");
+        assert_eq!(a.last_error(), None, "detail is the controller's to set");
+        a.record_history_outcome(ok(20));
+        assert_eq!(a.surfaces().history, ok(20));
+    }
+
+    /// Controllers fold what a provider broadcasts at their own pace, so an
+    /// outcome can arrive after a newer one.
+    #[test]
+    fn an_outcome_older_than_the_one_held_is_ignored() {
+        let a = ProviderAccounting::default();
+        a.record_live_outcome(ok(20));
+        a.record_live_outcome(failing(10, "stale disconnect"));
+        assert_eq!(a.surfaces().live, ok(20));
+        a.record_live_outcome(failing(20, "same instant"));
+        assert_eq!(a.surfaces().live, failing(20, "same instant"));
+        a.record_live_outcome(ok(30));
+        a.record_provider_control(
+            &disconnected("stale", DisconnectCause::Error),
+            ConnectionChange::Disconnected,
+            Timestamp(25),
+        );
+        assert_eq!(a.surfaces().live, ok(30));
+
+        a.record_history_outcome(ok(50));
+        a.record_history_outcome(failing(40, "stale fetch"));
+        assert_eq!(a.surfaces().history, ok(50));
+    }
+
+    #[test]
+    fn live_outcomes_follow_connects_faults_and_open_failures() {
+        let a = ProviderAccounting::default();
+        let refused = datamancer_core::Error::Unauthenticated {
+            provider: "p".to_string(),
+            message: "no credentials".to_string(),
+        };
+        a.record_open_failure(
+            &datamancer_core::Error::ProviderDisabled {
+                provider: "p".to_string(),
+            },
+            Timestamp(4),
+        );
+        assert_eq!(a.surfaces().live, SurfaceOutcome::Unknown);
+        assert_eq!(a.last_error(), None);
+        a.record_open_failure(&refused, Timestamp(5));
+        let s = a.surfaces();
+        assert_eq!(s.live, failing(5, &refused.to_string()));
+        assert_eq!(s.history, SurfaceOutcome::Unknown);
+        // A connect clears it.
+        a.record_provider_control(
+            &connected(),
+            ConnectionChange::Connected { reconnect: false },
+            Timestamp(6),
+        );
+        assert_eq!(a.surfaces().live, ok(6));
+        // A duplicate connect is still a successful attempt.
+        a.record_provider_control(&connected(), ConnectionChange::None, Timestamp(7));
+        assert_eq!(a.surfaces().live, ok(7));
+        // A fault disconnect fails it with the reason.
+        a.record_provider_control(
+            &disconnected("ws closed", DisconnectCause::Error),
+            ConnectionChange::Disconnected,
+            Timestamp(8),
+        );
+        assert_eq!(a.surfaces().live, failing(8, "ws closed"));
+        // A provider error frame is not an outcome on either surface.
+        a.record_provider_control(
+            &ControlKind::ProviderError {
+                provider: "p".to_string(),
+                message: "boom".to_string(),
+            },
+            ConnectionChange::None,
+            Timestamp(9),
+        );
+        assert_eq!(a.surfaces().live, failing(8, "ws closed"));
+        // A deliberate disable is not an attempt: untouched.
+        a.record_provider_control(
+            &connected(),
+            ConnectionChange::Connected { reconnect: true },
+            Timestamp(10),
+        );
+        a.record_provider_control(
+            &disconnected("disabled", DisconnectCause::Disabled),
+            ConnectionChange::Disconnected,
+            Timestamp(11),
+        );
+        assert_eq!(a.surfaces().live, ok(10));
     }
 
     #[test]
@@ -434,6 +600,7 @@ mod tests {
                 message: "boom".to_string(),
             },
             ConnectionChange::None,
+            Timestamp(1),
         );
         assert_eq!(a.last_error(), Some("boom".to_string()));
     }

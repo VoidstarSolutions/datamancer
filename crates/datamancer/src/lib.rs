@@ -44,9 +44,9 @@ pub use datamancer_core::{
     GapSpan, HealthView, HistoricalCache, HistoryRequest, Instrument, InstrumentCapabilities,
     InstrumentEntry, InstrumentInfo, LatencySummary, LiveHandle, LiveScope, Liveness, MarketEvent,
     Price, Provider, ProviderHealth, ProviderId, ProviderMetrics, ProviderSnapshot, ProviderState,
-    Quantity, Quote, REPLAY_STALL_LIMIT, ReplayRequest, ReplaySource, Result, ResumeBufferSnapshot,
-    ScopeMismatch, ScopeName, Seq, StreamConnection, StreamHealth, Subscribed, SubscriptionRef,
-    Surface, SystemSnapshot, TapLog, Timestamp, Trade,
+    ProviderSurfaces, Quantity, Quote, REPLAY_STALL_LIMIT, ReplayRequest, ReplaySource, Result,
+    ResumeBufferSnapshot, ScopeMismatch, ScopeName, Seq, StreamConnection, StreamHealth,
+    Subscribed, SubscriptionRef, Surface, SurfaceOutcome, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 #[cfg(feature = "provider-alpaca")]
 pub use providers::{

@@ -66,7 +66,7 @@ use datamancer_core::{
     Control, ControlKind, Error, EventKind, EventSink, GapSpan, HealthView, HistoricalCache,
     HistoryRequest, Instrument, InstrumentEntry, InstrumentInfo, LiveHandle, LiveScope,
     MarketEvent, Provider, ProviderId, ProviderSnapshot, PublishOutcome, Quote, ReplayRequest,
-    Result, Seq, Subscribed, Surface, SystemSnapshot, TapLog, Timestamp, Trade,
+    Result, Seq, Subscribed, Surface, SurfaceOutcome, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -678,15 +678,16 @@ impl Datamancer {
         let live = match provider.start_live(provider_tx).await {
             Ok(live) => live,
             Err(e) => {
-                accounting.record_open_failure(&e);
+                accounting.record_open_failure(&e, wall_clock_ts());
                 return Err(e);
             }
         };
         accounting.record_subscribe();
         if let Err(e) = live.subscribe(instrument, kind).await {
-            accounting.record_open_failure(&e);
+            accounting.record_open_failure(&e, wall_clock_ts());
             return Err(e);
         }
+        accounting.record_live_outcome(SurfaceOutcome::ok(wall_clock_ts()));
         tokio::spawn(controller.run_live(
             live,
             scope.backfill_from(),
@@ -971,6 +972,7 @@ impl Datamancer {
                 .with_rate_limit_hits(rate_limit_hits)
                 .with_enabled(enabled)
                 .with_active_subscriptions(u32::try_from(active).unwrap_or(u32::MAX))
+                .with_surfaces(acc.surfaces())
             })
             .collect();
 
@@ -1659,17 +1661,17 @@ impl Controller {
         // a fetch failure surfaces as an in-band `ProviderError` instead of an
         // empty, success-looking result.
         let error_ts = max_data_ts.unwrap_or(from);
-        match fetch_task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                self.emit_provider_error(error_ts, provider_error_message(&e))
-                    .await;
-            }
-            Err(join_err) if join_err.is_cancelled() => {}
-            Err(join_err) => {
-                self.emit_provider_error(error_ts, format!("fetch task panicked: {join_err}"))
-                    .await;
-            }
+        let mut io = ReplayIo {
+            cmd_rx: &mut cmd_rx,
+            remove_rx: None,
+            live_rx: None,
+            pending: None,
+        };
+        let Some(conclusion) = self.conclude_fetch(&mut io, fetch_task).await else {
+            return;
+        };
+        if let FetchConclusion::Failed(message) = conclusion {
+            self.emit_provider_error(error_ts, message).await;
         }
 
         self.finish_historical(&mut cmd_rx).await;
@@ -1822,23 +1824,18 @@ impl Controller {
         true
     }
 
-    /// Join a drained fetch while serving. `None` when the session closed;
-    /// otherwise the fetch's failure, if it had one.
+    /// Join a drained fetch while serving, and record how it concluded on the
+    /// history surface. `None` when the session closed.
     async fn conclude_fetch(
         &mut self,
         io: &mut ReplayIo<'_>,
         mut fetch: JoinHandle<Result<()>>,
-    ) -> Option<Option<String>> {
+    ) -> Option<FetchConclusion> {
         let Some(joined) = self.serving(io, &mut fetch).await else {
             fetch.abort();
             return None;
         };
-        Some(match joined {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(provider_error_message(&e)),
-            Err(join_err) if join_err.is_cancelled() => None,
-            Err(join_err) => Some(format!("fetch task panicked: {join_err}")),
-        })
+        Some(record_fetch(&self.accounting, joined))
     }
 
     /// Hold a replay until every pacing referrer has room, serving meanwhile.
@@ -1904,7 +1901,10 @@ impl Controller {
             // the cache).
             self.emit(ev).await;
         }
-        fetched.error = self.conclude_fetch(io, fetch_task).await?;
+        fetched.error = match self.conclude_fetch(io, fetch_task).await? {
+            FetchConclusion::Failed(message) => Some(message),
+            FetchConclusion::Succeeded | FetchConclusion::Cancelled => None,
+        };
         Some(fetched)
     }
 
@@ -2572,7 +2572,8 @@ impl Controller {
     fn note_provider_arrival(&self, ev: &MarketEvent) {
         if let MarketEvent::Control(c) = ev {
             let change = self.stats.record_connection(c);
-            self.accounting.record_provider_control(&c.kind, change);
+            self.accounting
+                .record_provider_control(&c.kind, change, c.rx_ts);
         }
     }
 
@@ -2729,6 +2730,42 @@ impl Drop for BackfillingGuard {
 enum Segment {
     Covered { from: Timestamp, to: Timestamp },
     Gap { from: Timestamp, to: Timestamp },
+}
+
+/// How a joined `fetch_history` task ended.
+enum FetchConclusion {
+    Succeeded,
+    Failed(String),
+    Cancelled,
+}
+
+/// Record how a joined `fetch_history` task concluded on the history surface.
+/// A cancelled fetch concluded nothing and a fetch refused with
+/// [`Error::ProviderDisabled`] is no attempt: neither records anything.
+fn record_fetch(
+    accounting: &ProviderAccounting,
+    joined: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> FetchConclusion {
+    let conclusion = match joined {
+        Ok(Err(e @ Error::ProviderDisabled { .. })) => {
+            return FetchConclusion::Failed(provider_error_message(&e));
+        }
+        Ok(Ok(())) => FetchConclusion::Succeeded,
+        Ok(Err(e)) => FetchConclusion::Failed(provider_error_message(&e)),
+        Err(join_err) if join_err.is_cancelled() => FetchConclusion::Cancelled,
+        Err(join_err) => FetchConclusion::Failed(format!("fetch task panicked: {join_err}")),
+    };
+    let at = wall_clock_ts();
+    match &conclusion {
+        FetchConclusion::Succeeded => {
+            accounting.record_history_outcome(SurfaceOutcome::ok(at));
+        }
+        FetchConclusion::Failed(error) => {
+            accounting.record_history_outcome(SurfaceOutcome::failing(at, error.clone()));
+        }
+        FetchConclusion::Cancelled => {}
+    }
+    conclusion
 }
 
 /// Outcome of streaming a planned segment sequence.
@@ -3525,5 +3562,52 @@ mod persistence_options_tests {
         assert!(stacked.read_cache && stacked.write_cache && stacked.write_tap_log);
         // uses_cache() still reflects only the cache axes.
         assert!(!PersistenceOptions::none().with_tap_log(true).uses_cache());
+    }
+}
+
+#[cfg(test)]
+mod conclude_fetch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_cancelled_fetch_records_nothing() {
+        let accounting = ProviderAccounting::default();
+        let task = tokio::spawn(std::future::pending::<Result<()>>());
+        task.abort();
+        let conclusion = record_fetch(&accounting, task.await);
+        assert!(matches!(conclusion, FetchConclusion::Cancelled));
+        assert_eq!(accounting.surfaces().history, SurfaceOutcome::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_fetch_refused_as_disabled_records_nothing() {
+        let accounting = ProviderAccounting::default();
+        accounting.record_history_outcome(SurfaceOutcome::ok(Timestamp(1)));
+        let task = tokio::spawn(async {
+            Err(Error::ProviderDisabled {
+                provider: "p".to_string(),
+            })
+        });
+        let conclusion = record_fetch(&accounting, task.await);
+        assert!(matches!(
+            conclusion,
+            FetchConclusion::Failed(message) if message == "provider disabled"
+        ));
+        assert_eq!(
+            accounting.surfaces().history,
+            SurfaceOutcome::ok(Timestamp(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicked_fetch_fails_the_history_surface() {
+        let accounting = ProviderAccounting::default();
+        let task = tokio::spawn(async { panic!("boom") });
+        let conclusion = record_fetch(&accounting, task.await);
+        assert!(matches!(conclusion, FetchConclusion::Failed(_)));
+        assert!(matches!(
+            accounting.surfaces().history,
+            SurfaceOutcome::Failing { error, .. } if error.starts_with("fetch task panicked")
+        ));
     }
 }

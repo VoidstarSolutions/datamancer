@@ -192,10 +192,10 @@ A daemon built with the off-by-default `scripted-provider` feature also has
 `[provider.scripted]`, a scripted test provider (`src/scripted.rs`) that
 serves scripted trades on both surfaces, for instruments naming `scripted`
 only, with no network or credentials. Its knobs are `history_prints`,
-`history_delay_ms`, `live_interval_ms` (greater than 0), `latest` and
-`latest_delay_ms`. Removed and then configured again, it resumes its open
-sessions' trades. A daemon built without the feature rejects the section as
-unknown.
+`history_delay_ms`, `live_interval_ms` (greater than 0), `latest`,
+`latest_delay_ms` and `failing_symbol` (history requests for that symbol
+fail). Removed and then configured again, it resumes its open sessions'
+trades. A daemon built without the feature rejects the section as unknown.
 
 Validation fails fast on the remaining cross-section invariants: a startup
 session naming a provider this binary lacks is refused; one using a cache preset
@@ -651,6 +651,46 @@ is no WS equivalent; WS consumers reduce their own `snapshot` reply
 client-side. `AppHandle::health()` sends this op rather than reducing
 `snapshot` itself, so the `HealthView.schema_version` field is the daemon's,
 not a client-side guess.
+
+Each provider entry also carries `surfaces`: `history` and `live`, each the
+outcome of the newest concluded attempt on it, tagged by `state`:
+
+| `state` | Fields | Meaning |
+|---|---|---|
+| `unknown` | none | No attempt has concluded. A state this build does not know reads the same. |
+| `ok` | `at` | The last attempt succeeded, at that wall-clock time. |
+| `failing` | `at`, `error` | The last attempt ended in `error`; the next success clears it. |
+
+`history` is recorded where the daemon joins every `fetch_history` call (queries
+and backfills alike); a fetch refused because the provider is disabled is not an
+attempt and leaves it untouched. `live` follows the open outcomes (an accepted
+subscribe, a refused one, a failed start) and the in-band connect/disconnect
+controls. Every disconnect but a deliberate disable moves it, so a provider's
+own hot-apply drop (a credential rotation, a settings change) reads `failing`
+until its reconnect lands, as the provider `state` reads `disconnected` for the
+same moment. The disable itself is not an attempt and leaves it untouched, and a
+provider error frame stays on `detail`. Nothing is inferred from silence: an
+unused surface is `unknown`, never `ok`. `history` moves when a fetch concludes,
+so during a long paced fetch it shows the last concluded attempt.
+
+Surfaces are per provider, not per symbol, and report the newest attempt by any
+session: a symbol that keeps failing alternates `failing` and `ok` as other
+symbols succeed. Attempts are ordered by wall clock, so a backward clock step
+hides outcomes until one is stamped past the held one, and a creator's `ok` is
+stamped when its subscribe returns, so a disconnect in the instant between the
+provider's ack and that stamp can be ordered before it. A view from a daemon
+that predates the field reads both `unknown`.
+
+```jsonc
+"providers": [{
+  "provider": "alpaca", "state": "connected",
+  "detail": "HTTP 401 from the history endpoint",
+  "surfaces": {
+    "history": {"state": "failing", "at": 1762380000000000000, "error": "HTTP 401 from the history endpoint"},
+    "live":    {"state": "ok",      "at": 1762379990000000000}
+  }
+}]
+```
 
 ### `datamancer/health` push plane (iceoryx2)
 
