@@ -22,7 +22,7 @@ pub enum Request {
     /// Register a client and create its per-client data-plane service.
     OpenClient {
         client: String,
-        /// Live-only subscriptions, made before the client opens.
+        /// Live-only subscriptions, made before the reply.
         #[serde(default)]
         subscriptions: Vec<SubscriptionSpec>,
     },
@@ -38,7 +38,8 @@ pub enum Request {
         #[serde(flatten)]
         spec: UnsubscribeSpec,
     },
-    /// Tear down a client (graceful).
+    /// Tear down a client (graceful). The reply comes when the teardown starts;
+    /// the client counts toward `max_clients` until it ends.
     CloseClient { client: String },
     /// Open a bounded historical query. Ungated (a read, like `snapshot`).
     /// Not a subscription: it needs no prior `open-client`, opens its own

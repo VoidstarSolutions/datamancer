@@ -19,6 +19,7 @@ use crate::ws::conn::handle_connection;
 /// shutdown fires; in-flight connections are then signalled to tear down (each
 /// runs its `session.close()` → tap-log flush → clean WS Close), and their tasks
 /// are drained under a bound shorter than the supervisor's own drain timeout.
+/// Returns whether that bound aborted a connection.
 ///
 /// # Errors
 ///
@@ -29,7 +30,7 @@ pub async fn serve(
     credential_backend: &'static str,
     diag_interval: Duration,
     shutdown: impl Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let addr: SocketAddr = format!("{}:{}", cfg.bind, cfg.port).parse().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -108,12 +109,14 @@ pub async fn serve(
     }
 
     // New accepts have stopped (the accept loop broke). Signal every live
-    // connection to tear down, then drain their tasks under a bound shorter than
-    // the supervisor's 5s `ws_task` await so this returns before that fires.
+    // connection to tear down, then drain their tasks under a 3 s bound. On a
+    // short `shutdown_timeout_secs` the supervisor's `ws_task` await can fire
+    // first; the supervisor then counts the connections as aborted.
     let _ = conn_shutdown_tx.send(());
-    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+    let drained = tokio::time::timeout(Duration::from_secs(3), async {
         while conns.join_next().await.is_some() {}
     })
-    .await;
-    Ok(())
+    .await
+    .is_ok();
+    Ok(!drained)
 }

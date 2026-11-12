@@ -4,10 +4,11 @@
 //! and a reconfigured provider reaching open sessions, shutdown with a
 //! stalled consumer, a third client backfill waiting under
 //! `max_concurrent_backfills`, a stalled query's slot and the daemon
-//! answering behind it, and, with feature `ws`, the backfill seam over WS.
-//! The daemon runs with `[provider.scripted]` as its only provider, a
-//! credential store in the test's tempdir, and no `ALPACA_*` variables, so
-//! the suite needs no network and no credentials.
+//! answering behind it, the daemon answering while a subscribe waits for a
+//! cold provider, and, with feature `ws`, the backfill seam over WS. The
+//! daemon runs with `[provider.scripted]` as its only provider, a credential
+//! store in the test's tempdir, and no `ALPACA_*` variables, so the suite
+//! needs no network and no credentials.
 //!
 //! The daemon tests need a live **iceoryx2 runtime** and are `#[ignore]`d;
 //! they share the daemon's single-instance lock, so run them one at a time:
@@ -1249,8 +1250,8 @@ fn shutdown_exits_with_a_stalled_client_consumer() {
 }
 
 /// A client whose subscriber holds its port and stops reading leaves no pump
-/// behind once it is closed: nothing publishes on its data service within 2 s
-/// of the `close-client` reply, round after round.
+/// behind once it is closed: `close-client` answers at once, and nothing
+/// publishes on its data service within 5 s of the reply, round after round.
 #[test]
 #[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
 fn a_closed_client_with_a_stalled_consumer_leaves_no_pump() {
@@ -1285,9 +1286,16 @@ fn a_closed_client_with_a_stalled_consumer_leaves_no_pump() {
         let publishers = || data.dynamic_config().number_of_publishers();
         assert_eq!(publishers(), 1, "round {round}: the pump publishes");
 
+        let started = Instant::now();
         let reply = conn.request(&format!(r#"{{"op":"close-client","client":"{client}"}}"#));
+        let took = started.elapsed();
         assert_eq!(reply["ok"], true, "close-client rejected: {reply}");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        assert!(
+            took < Duration::from_secs(2),
+            "round {round}: close-client answered after {took:?}"
+        );
+        // The close gives the stalled reader its 2 s, then aborts the pump.
+        let deadline = Instant::now() + Duration::from_secs(5);
         while publishers() > 0 {
             assert!(
                 Instant::now() < deadline,
@@ -1296,6 +1304,662 @@ fn a_closed_client_with_a_stalled_consumer_leaves_no_pump() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+/// How long the scripted provider takes to connect in the cold-subscribe
+/// tests.
+const COLD_CONNECT: Duration = Duration::from_secs(3);
+
+/// A scripted daemon whose every subscribe waits [`COLD_CONNECT`] for the
+/// provider.
+fn spawn_cold_daemon(dir: &Path) -> Daemon {
+    spawn_scripted_daemon(dir, "connect_delay_ms = 3000\n", "")
+}
+
+/// A `subscribe` of `client` to scripted `symbol` trades.
+fn subscribe_line(client: &str, symbol: &str) -> String {
+    format!(
+        r#"{{"op":"subscribe","client":"{client}","provider":"scripted","asset_class":"equity","symbol":"{symbol}","kind":"trade"}}"#
+    )
+}
+
+/// Send `request` on `conn` from a thread of its own; the thread returns the
+/// reply, or `None` if the connection closed first, and how long it took.
+fn request_in_background(
+    conn: Conn,
+    request: String,
+) -> std::thread::JoinHandle<(Option<serde_json::Value>, Duration)> {
+    std::thread::spawn(move || {
+        let mut conn = conn;
+        let started = Instant::now();
+        let reply = conn.try_request(&request);
+        (reply, started.elapsed())
+    })
+}
+
+/// Wait until the scripted provider has been asked for `count` subscribes,
+/// which each happen before the provider's connect. Every read is a `snapshot`
+/// of its own that must answer within a second, so a daemon that stops
+/// answering fails here.
+fn wait_for_subscribes(socket: &Path, count: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // A snapshot the daemon is slow to answer counts as "not yet".
+        if let Some(reply) = request_within(socket, r#"{"op":"snapshot"}"#, Duration::from_secs(1))
+        {
+            let subscribes = reply["snapshot"]["providers"]
+                .as_array()
+                .expect("providers")
+                .iter()
+                .find(|p| p["provider"] == "scripted")
+                .unwrap_or_else(|| panic!("scripted is not enumerated: {reply}"))["subscribes"]
+                .as_u64()
+                .expect("subscribes");
+            if subscribes >= count {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{count} subscribes never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Poll `subscriber` until a `SessionClosing` arrives, or the service closes
+/// or `budget` elapses first. Returns whether it arrived.
+fn saw_session_closing(subscriber: &mut DataSubscriber, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        match subscriber.poll() {
+            Ok(events) => {
+                if events.iter().any(|event| {
+                    matches!(event, MarketEvent::Control(c) if matches!(c.kind, ControlKind::SessionClosing))
+                }) {
+                    return true;
+                }
+            }
+            Err(TransportError::ServiceClosed) => return false,
+            Err(e) => panic!("poll: {e:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// `ping` answers while another client's first subscribe waits for a cold
+/// provider, and that subscribe still answers only once the provider has the
+/// pair.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn ping_answers_during_a_cold_subscribe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_cold_daemon(dir.path());
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+    let _subscriber = conn.open_client("cold", &node);
+    let subscribe = request_in_background(conn, subscribe_line("cold", "AAPL"));
+    wait_for_subscribes(daemon.socket(), 1);
+
+    let ping = request_within(daemon.socket(), r#"{"op":"ping"}"#, Duration::from_secs(1))
+        .expect("ping did not answer during a cold subscribe");
+    assert_eq!(ping["ok"], true, "{ping}");
+
+    let (reply, took) = subscribe.join().expect("subscribe thread");
+    let reply = reply.expect("subscribe reply");
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert!(
+        took >= COLD_CONNECT,
+        "the reply must wait for the provider: {took:?}"
+    );
+}
+
+/// A second client's subscribe to another pair, sent while the first
+/// client's subscribe waits for a cold provider, waits for its own connect
+/// only.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn another_clients_subscribe_is_not_held_by_a_cold_subscribe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_cold_daemon(dir.path());
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut first = Conn::connect(daemon.socket());
+    let _first_subscriber = first.open_client("first", &node);
+    let mut second = Conn::connect(daemon.socket());
+    let _second_subscriber = second.open_client("second", &node);
+
+    let held = request_in_background(first, subscribe_line("first", "AAPL"));
+    wait_for_subscribes(daemon.socket(), 1);
+    let started = Instant::now();
+    let reply = second.request(&subscribe_line("second", "MSFT"));
+    let took = started.elapsed();
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert!(
+        took < COLD_CONNECT + Duration::from_secs(2),
+        "the second subscribe waited behind the first: {took:?}"
+    );
+
+    let (reply, _) = held.join().expect("subscribe thread");
+    assert_eq!(reply.expect("first reply")["ok"], true);
+}
+
+/// `open-client` with an initial subscription to a cold provider answers once
+/// the provider has the pair, and `ping` answers meanwhile.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn open_client_with_a_cold_subscription_leaves_the_actor_answering() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_cold_daemon(dir.path());
+    let conn = Conn::connect(daemon.socket());
+    let open = request_in_background(
+        conn,
+        r#"{"op":"open-client","client":"cold","subscriptions":[{"provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade"}]}"#
+            .to_string(),
+    );
+    wait_for_subscribes(daemon.socket(), 1);
+
+    let ping = request_within(daemon.socket(), r#"{"op":"ping"}"#, Duration::from_secs(1))
+        .expect("ping did not answer during a cold open-client");
+    assert_eq!(ping["ok"], true, "{ping}");
+
+    let (reply, took) = open.join().expect("open-client thread");
+    let reply = reply.expect("open-client reply");
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert!(reply["service"].is_string(), "{reply}");
+    assert!(
+        took >= COLD_CONNECT,
+        "the reply must wait for the provider: {took:?}"
+    );
+}
+
+/// An `open-client` whose second initial subscription is refused answers
+/// that refusal and leaves no client: `list-clients` does not name it and the
+/// name opens again.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_refused_initial_subscription_leaves_no_client() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_cold_daemon(dir.path());
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+
+    let reply = conn.request(
+        r#"{"op":"open-client","client":"refused","subscriptions":[{"provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade"},{"provider":"nobody","asset_class":"equity","symbol":"AAPL","kind":"trade"}]}"#,
+    );
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["code"], "unknown_provider", "{reply}");
+
+    let listed = conn.request(r#"{"op":"list-clients"}"#);
+    assert_eq!(listed["clients"], serde_json::json!([]), "{listed}");
+    let _subscriber = conn.open_client("refused", &node);
+}
+
+/// `shutdown` while a subscribe waits for a cold provider: the daemon exits
+/// in bounded time, and the subscribe answers `ok`, `session_closed` or
+/// `shutting_down`, or its connection closes with the daemon.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn shutdown_exits_with_a_subscribe_in_flight() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut daemon = spawn_cold_daemon(dir.path());
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+    let _subscriber = conn.open_client("cold", &node);
+    let subscribe = request_in_background(conn, subscribe_line("cold", "AAPL"));
+    wait_for_subscribes(daemon.socket(), 1);
+
+    assert!(
+        daemon.shutdown_within(Duration::from_secs(8)),
+        "the daemon did not exit within 8 s of shutdown"
+    );
+    let (reply, _) = subscribe.join().expect("subscribe thread");
+    if let Some(reply) = reply {
+        assert!(
+            reply["ok"] == true
+                || reply["code"] == "session_closed"
+                || reply["code"] == "shutting_down",
+            "{reply}"
+        );
+    }
+}
+
+/// `close-client` while that client's subscribe waits for a cold provider
+/// answers at once, and the subscribe answers `session_closed`.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_client_closed_during_its_subscribe_reports_session_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_cold_daemon(dir.path());
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+    let _subscriber = conn.open_client("closed", &node);
+    let subscribe = request_in_background(conn, subscribe_line("closed", "AAPL"));
+    wait_for_subscribes(daemon.socket(), 1);
+
+    let closed = request_within(
+        daemon.socket(),
+        r#"{"op":"close-client","client":"closed"}"#,
+        Duration::from_secs(1),
+    )
+    .expect("close-client did not answer during the subscribe");
+    assert_eq!(closed["ok"], true, "{closed}");
+
+    let (reply, _) = subscribe.join().expect("subscribe thread");
+    let reply = reply.expect("subscribe reply");
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["code"], "session_closed", "{reply}");
+}
+
+/// An `unsubscribe` waiting behind a cold subscribe of a client is answered
+/// `session_closed` when that client is closed.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_client_closed_behind_a_queued_unsubscribe_reports_session_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_cold_daemon(dir.path());
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+    let _subscriber = conn.open_client("x", &node);
+    let _subscribe = request_in_background(conn, subscribe_line("x", "AAPL"));
+    wait_for_subscribes(daemon.socket(), 1);
+    let unsubscribe = request_in_background(
+        Conn::connect(daemon.socket()),
+        r#"{"op":"unsubscribe","client":"x","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade"}"#
+            .to_string(),
+    );
+    // Nothing reports an unsubscribe queued behind the subscribe.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let closed = request_within(
+        daemon.socket(),
+        r#"{"op":"close-client","client":"x"}"#,
+        Duration::from_secs(1),
+    )
+    .expect("close-client did not answer during the unsubscribe");
+    assert_eq!(closed["ok"], true, "{closed}");
+
+    let (reply, _) = unsubscribe.join().expect("unsubscribe thread");
+    let reply = reply.expect("unsubscribe reply");
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["code"], "session_closed", "{reply}");
+}
+
+/// `ping` answers while one connection's `unsubscribe` of a client waits
+/// behind another connection's cold subscribe of that client.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn ping_answers_while_an_unsubscribe_waits_behind_a_cold_subscribe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_cold_daemon(dir.path());
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+    let _subscriber = conn.open_client("x", &node);
+    let subscribe = request_in_background(conn, subscribe_line("x", "AAPL"));
+    wait_for_subscribes(daemon.socket(), 1);
+    let unsubscribe = request_in_background(
+        Conn::connect(daemon.socket()),
+        r#"{"op":"unsubscribe","client":"x","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade"}"#
+            .to_string(),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    let ping = request_within(daemon.socket(), r#"{"op":"ping"}"#, Duration::from_secs(1))
+        .expect("ping did not answer behind a waiting unsubscribe");
+    assert_eq!(ping["ok"], true, "{ping}");
+
+    let (reply, _) = subscribe.join().expect("subscribe thread");
+    assert_eq!(reply.expect("subscribe reply")["ok"], true);
+    let (reply, took) = unsubscribe.join().expect("unsubscribe thread");
+    let reply = reply.expect("unsubscribe reply");
+    assert_eq!(reply["code"], "not_subscribed", "{reply}");
+    assert!(
+        took >= Duration::from_secs(1),
+        "the unsubscribe must wait behind the subscribe: {took:?}"
+    );
+}
+
+/// [`common::hermetic_command`] with the daemon's log, at `debug`, written to
+/// `daemon.log` beside the config.
+fn logged_command(config_path: &Path) -> std::process::Command {
+    let log = std::fs::File::create(config_path.with_file_name("daemon.log")).expect("log file");
+    let mut command = common::hermetic_command(config_path);
+    command
+        .env("RUST_LOG", "datamancerd=debug")
+        .env("NO_COLOR", "1")
+        .stdout(log);
+    command
+}
+
+/// `shutdown` while a subscribe waits on a provider whose connect now takes a
+/// minute, and a client behind one has been closed: the drain flushes the tap
+/// log without waiting for either client, and the daemon exits inside its 10 s
+/// `shutdown_timeout_secs` with the trades of a session that was streaming in
+/// the log.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn shutdown_flushes_the_tap_log_with_a_subscribe_in_flight() {
+    use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
+    use datamancer::{AssetClass, EventKind, Instrument, ProviderId, ReplayRequest, TapLog as _};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tap_path = dir.path().join("taplog.db");
+    let mut daemon = common::spawn_daemon_with_server(
+        dir.path(),
+        common::unique_prefix(),
+        "[provider.scripted]\nlatest = false\nlive_interval_ms = 20\n",
+        "shutdown_timeout_secs = 10",
+        &format!(
+            "[tap_log]\nbackend = \"embedded\"\npath = \"{}\"\n",
+            tap_path.display()
+        ),
+        logged_command,
+    );
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+    let mut tapped = conn.open_client("tapped", &node);
+    let reply = conn.request(
+        r#"{"op":"subscribe","client":"tapped","provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade","persistence":"tap_only"}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert!(
+        trades_within(&mut tapped, Duration::from_secs(2)) > 0,
+        "the tapped session streams nothing"
+    );
+    let reply = conn.request(
+        r#"{"op":"configure-provider","provider":"scripted","settings":{"latest":false,"live_interval_ms":20,"connect_delay_ms":60000}}"#,
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    let _subscriber = conn.open_client("slow", &node);
+    let _subscribe = request_in_background(conn, subscribe_line("slow", "MSFT"));
+    let mut closing_conn = Conn::connect(daemon.socket());
+    let _closing = closing_conn.open_client("closing", &node);
+    let _closing_subscribe = request_in_background(closing_conn, subscribe_line("closing", "GOOG"));
+    wait_for_subscribes(daemon.socket(), 3);
+    let reply = request_within(
+        daemon.socket(),
+        r#"{"op":"close-client","client":"closing"}"#,
+        Duration::from_secs(2),
+    )
+    .expect("close-client did not answer during the subscribe");
+    assert_eq!(reply["ok"], true, "{reply}");
+
+    assert!(
+        daemon.shutdown_within(Duration::from_secs(9)),
+        "the daemon did not exit within 9 s of shutdown"
+    );
+    let log = std::fs::read_to_string(dir.path().join("daemon.log")).expect("daemon log");
+    let phases = log
+        .lines()
+        .find(|line| line.contains("drain phases"))
+        .unwrap_or_else(|| panic!("no drain phases logged:\n{log}"));
+    let first_flush = phases.find("tap-log-flush");
+    let cut_off = phases.find("client-close-timeout");
+    assert!(
+        first_flush.is_some() && first_flush < cut_off,
+        "the tap log must be flushed before the waiting client is cut off: {phases}"
+    );
+    assert!(!log.contains("drain exceeded timeout"), "{log}");
+
+    let replayed = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async {
+            use futures::StreamExt as _;
+
+            let log = TursoTapLog::open(TursoTapLogConfig::embedded(&tap_path))
+                .await
+                .expect("open tap log");
+            let mut events = log
+                .as_replay_source()
+                .open(ReplayRequest {
+                    instruments: vec![Instrument::new(
+                        ProviderId::from_static("scripted"),
+                        AssetClass::Equity,
+                        "AAPL",
+                    )],
+                    kinds: vec![EventKind::Trade],
+                    from: datamancer::Timestamp(0),
+                    to: datamancer::Timestamp(i64::MAX),
+                })
+                .await
+                .expect("replay");
+            let mut replayed = 0_u64;
+            while events.next().await.is_some() {
+                replayed += 1;
+            }
+            replayed
+        });
+    assert!(replayed > 0, "the tap log holds no trades");
+}
+
+/// A client closed while its subscribe waits on a slow provider counts
+/// toward `max_clients` until its close finishes: with a cap of 2, two such
+/// clients make the next `open-client` `service_cap_exceeded`, and once
+/// their connects return the cap admits a client again.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_client_closed_mid_subscribe_holds_its_slot_until_it_closes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_scripted_daemon(
+        dir.path(),
+        "connect_delay_ms = 3000\n",
+        "[iceoryx2]\nmax_clients = 2\n",
+    );
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut subscribes = Vec::new();
+    let mut ports = Vec::new();
+    for (i, symbol) in ["AAPL", "MSFT"].into_iter().enumerate() {
+        let client = format!("closed-{i}");
+        let mut conn = Conn::connect(daemon.socket());
+        ports.push(conn.open_client(&client, &node));
+        subscribes.push(request_in_background(conn, subscribe_line(&client, symbol)));
+        wait_for_subscribes(daemon.socket(), i as u64 + 1);
+        let closed = round_trip_within(
+            daemon.socket(),
+            &format!(r#"{{"op":"close-client","client":"{client}"}}"#),
+        );
+        assert_eq!(closed["ok"], true, "{closed}");
+    }
+
+    let mut conn = Conn::connect(daemon.socket());
+    let refused = conn.request(r#"{"op":"open-client","client":"third"}"#);
+    assert_eq!(refused["code"], "service_cap_exceeded", "{refused}");
+
+    for subscribe in subscribes {
+        let _ = subscribe.join().expect("subscribe thread");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let reply = conn.request(r#"{"op":"open-client","client":"third"}"#);
+        if reply["ok"] == true {
+            break;
+        }
+        assert_eq!(reply["code"], "service_cap_exceeded", "{reply}");
+        assert!(
+            Instant::now() < deadline,
+            "the closed clients never released their slots"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `close-client` on an idle client ends its stream with `SessionClosing`.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_closed_idle_client_ends_with_session_closing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_scripted_daemon(dir.path(), "latest = false\n", "");
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    let mut conn = Conn::connect(daemon.socket());
+    let mut subscriber = conn.open_client("idle", &node);
+    let closed = conn.request(r#"{"op":"close-client","client":"idle"}"#);
+    assert_eq!(closed["ok"], true, "{closed}");
+    assert!(
+        saw_session_closing(&mut subscriber, Duration::from_secs(5)),
+        "no SessionClosing after close-client"
+    );
+}
+
+/// `close-client` during an `open-client` whose initial subscription waits
+/// for a cold provider answers at once, the open answers `session_closed`,
+/// and the stream ends with `SessionClosing` once the connect returns.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_client_closed_during_its_cold_open_ends_with_session_closing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_cold_daemon(dir.path());
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+    // The opener learns its service only from the reply, which waits on the
+    // connect; client ids are sequential, so the next one's name is known.
+    let reply = Conn::connect(daemon.socket()).request(r#"{"op":"open-client","client":"namer"}"#);
+    let namer = reply["service"].as_str().expect("service name");
+    let service: DataServiceName = namer
+        .rsplit_once('/')
+        .map(|(prefix, _)| format!("{prefix}/1"))
+        .expect("an id after the last slash")
+        .parse()
+        .expect("data-service name");
+    let open = request_in_background(
+        Conn::connect(daemon.socket()),
+        r#"{"op":"open-client","client":"cold","subscriptions":[{"provider":"scripted","asset_class":"equity","symbol":"AAPL","kind":"trade"}]}"#
+            .to_string(),
+    );
+    wait_for_subscribes(daemon.socket(), 1);
+    let mut subscriber = DataSubscriber::open(&node, &service).expect("subscriber");
+
+    let closed = round_trip_within(daemon.socket(), r#"{"op":"close-client","client":"cold"}"#);
+    assert_eq!(closed["ok"], true, "{closed}");
+    let (reply, _) = open.join().expect("open-client thread");
+    let reply = reply.expect("open-client reply");
+    assert_eq!(reply["code"], "session_closed", "{reply}");
+    assert!(
+        saw_session_closing(&mut subscriber, COLD_CONNECT + Duration::from_secs(3)),
+        "no SessionClosing after the connect returned"
+    );
+}
+
+/// A connection's EOF tears down the client it opened, not one since reopened
+/// under that name on another connection: the reopened client stays listed
+/// and keeps streaming.
+#[test]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+fn a_connection_eof_leaves_a_client_reopened_under_its_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_stall_daemon(dir.path(), 2);
+    let node = NodeBuilder::new()
+        .create::<ipc_threadsafe::Service>()
+        .expect("iceoryx2 node");
+
+    // The opener stays armed for `x` after closing it, and for this query,
+    // whose cancel is queued behind the client's teardown.
+    let mut opener = Conn::connect(daemon.socket());
+    let _first = opener.open_client("x", &node);
+    let (query, service) = open_trade_query(&mut opener, "AAPL");
+    let _stalled = DataSubscriber::open(&node, &service).expect("subscriber");
+    let closed = opener.request(r#"{"op":"close-client","client":"x"}"#);
+    assert_eq!(closed["ok"], true, "{closed}");
+
+    let mut reopened = Conn::connect(daemon.socket());
+    let mut subscriber = reopened.open_client("x", &node);
+    subscribe_aapl(&mut reopened, "x");
+
+    drop(opener);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while is_listed(&daemon, query) {
+        assert!(
+            Instant::now() < deadline,
+            "the connection's EOF was never handled"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let listed = reopened.request(r#"{"op":"list-clients"}"#);
+    assert_eq!(listed["clients"], serde_json::json!(["x"]), "{listed}");
+    // Drop what was buffered before the EOF was handled.
+    trades_within(&mut subscriber, Duration::from_millis(500));
+    assert!(
+        trades_within(&mut subscriber, Duration::from_secs(2)) > 0,
+        "the reopened client stopped streaming"
+    );
+}
+
+/// With feature `ws`, a connection still waiting on a provider past the WS
+/// step's limit is aborted, and the drain flushes the tap log again after the
+/// closes, since that connection may release its session after the first
+/// flush.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "ws")]
+#[ignore = "spawns the daemon, needs a live iceoryx2 runtime"]
+async fn shutdown_flushes_the_tap_log_again_after_aborting_a_ws_connection() {
+    use datamancer::{AssetClass, EventKind, Instrument, ProviderId};
+    use datamancer_client::Client as _;
+    use datamancer_client::spec::SubscriptionSpec;
+
+    const PORT: u16 = 19027;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut daemon = common::spawn_daemon_with_server(
+        dir.path(),
+        common::unique_prefix(),
+        "[provider.scripted]\nconnect_delay_ms = 60000\n",
+        "shutdown_timeout_secs = 10",
+        &format!("[ws]\nenabled = true\nbind = \"127.0.0.1\"\nport = {PORT}\n"),
+        logged_command,
+    );
+    let instrument = Instrument::new(
+        ProviderId::from_static("scripted"),
+        AssetClass::Equity,
+        "AAPL",
+    );
+    let spec = SubscriptionSpec::new(&instrument, EventKind::Trade).expect("spec");
+    let (mut client, _events) = connect_ws(PORT).await;
+    let _subscribing = tokio::spawn(async move {
+        let _ = client.subscribe(&spec).await;
+        client
+    });
+    wait_for_subscribes(daemon.socket(), 1);
+
+    assert!(
+        daemon.shutdown_within(Duration::from_secs(9)),
+        "the daemon did not exit within 9 s of shutdown"
+    );
+    let log = std::fs::read_to_string(dir.path().join("daemon.log")).expect("daemon log");
+    let phases = log
+        .lines()
+        .find(|line| line.contains("drain phases"))
+        .unwrap_or_else(|| panic!("no drain phases logged:\n{log}"));
+    assert_eq!(
+        phases.matches("tap-log-flush").count(),
+        2,
+        "the tap log is flushed again after the aborted connection: {phases}"
+    );
+}
+
+/// One request on a connection of its own, answered within a second.
+fn round_trip_within(socket: &Path, request: &str) -> serde_json::Value {
+    request_within(socket, request, Duration::from_secs(1)).expect("no reply within 1 s")
 }
 
 /// With `[server] max_concurrent_backfills = 2`, a third client backfill is not

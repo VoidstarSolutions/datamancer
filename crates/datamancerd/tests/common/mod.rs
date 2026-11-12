@@ -258,6 +258,19 @@ impl Conn {
         serde_json::from_str(&reply).expect("parse reply")
     }
 
+    /// Send one JSON line and read one JSON reply line, or `None` if the
+    /// connection closes first.
+    pub fn try_request(&mut self, line: &str) -> Option<serde_json::Value> {
+        self.writer.write_all(line.as_bytes()).ok()?;
+        self.writer.write_all(b"\n").ok()?;
+        self.writer.flush().ok()?;
+        let mut reply = String::new();
+        match self.reader.read_line(&mut reply) {
+            Ok(n) if n > 0 => Some(serde_json::from_str(&reply).expect("parse reply")),
+            _ => None,
+        }
+    }
+
     /// `open-client` and attach a data-plane subscriber to the advertised
     /// service.
     pub fn open_client(

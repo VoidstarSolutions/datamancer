@@ -223,7 +223,9 @@ pub trait LiveHandle: Send + Sync {
     /// for returning after it.
     async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()>;
 
-    /// Deactivate `(instrument, kind)`. Symmetric with `subscribe`.
+    /// Deactivate `(instrument, kind)` for this handle only. It may arrive
+    /// after another handle's `subscribe` of the same pair, and must leave
+    /// that handle's subscription intact.
     async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()>;
 
     /// Tear down the live connection. Implementations should drop the event
