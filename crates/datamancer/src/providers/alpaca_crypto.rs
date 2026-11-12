@@ -29,17 +29,12 @@
 //! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast
 //! to all active sinks so consumers see the gap window.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datamancer_core::{
-    AssetClass, Bar, BarInterval, Control, ControlKind, DisconnectCause, Error, EventKind,
-    HistoryRequest, Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent,
-    OrderType, Price, Provider, ProviderId, Quantity, Quote, Result, Seq, Surface, TimeInForce,
-    Timestamp, Trade,
+    AssetClass, Bar, BarInterval, Control, ControlKind, Error, EventKind, HistoryRequest,
+    Instrument, InstrumentCapabilities, InstrumentEntry, LiveHandle, MarketEvent, OrderType, Price,
+    Provider, ProviderId, Quantity, Quote, Result, Seq, Surface, TimeInForce, Timestamp, Trade,
 };
 use oxidized_alpaca::{
     AccountType, CryptoFeed, MarketDataClient, TradingClient,
@@ -51,11 +46,14 @@ use oxidized_alpaca::{
         messages::crypto::{CryptoBarEvent, CryptoQuoteEvent, CryptoTradeEvent},
     },
 };
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, watch};
 
 use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
-use super::runtime::{Park, SettingsSource};
+use super::hub::{
+    Connector, HubSlot, PresentCredentials, SharedLiveHandle, StreamFailure, SubscriptionSet,
+    Upstream, wall_clock_ts,
+};
+use super::runtime::SettingsSource;
 use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca crypto provider.
@@ -263,17 +261,10 @@ impl RestState {
 /// Alpaca-backed crypto [`Provider`].
 pub struct AlpacaCryptoProvider {
     cfg: AlpacaCryptoProviderConfig,
-    hub: Arc<Mutex<HubSlot>>,
+    /// The one hub task behind every live session (see the module docs);
+    /// spawned lazily on the first `start_live`.
+    hub: HubSlot<CryptoConnector>,
     rest: std::sync::Mutex<RestState>,
-}
-
-enum HubSlot {
-    Idle,
-    Active {
-        cmd_tx: mpsc::Sender<HubCommand>,
-        #[allow(dead_code)]
-        task: JoinHandle<()>,
-    },
 }
 
 impl AlpacaCryptoProvider {
@@ -297,7 +288,7 @@ impl AlpacaCryptoProvider {
         let rest = std::sync::Mutex::new(state);
         Self {
             cfg,
-            hub: Arc::new(Mutex::new(HubSlot::Idle)),
+            hub: HubSlot::idle(),
             rest,
         }
     }
@@ -316,24 +307,6 @@ impl AlpacaCryptoProvider {
             state.rebuild(&self.cfg);
         }
         state
-    }
-
-    /// Lazily spawn the hub task and return its command channel.
-    async fn ensure_hub(&self) -> mpsc::Sender<HubCommand> {
-        let mut slot = self.hub.lock().await;
-        match &*slot {
-            HubSlot::Active { cmd_tx, .. } => cmd_tx.clone(),
-            HubSlot::Idle => {
-                let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(64);
-                let cfg = self.cfg.clone();
-                let task = tokio::spawn(run_hub_task(cfg, cmd_rx));
-                *slot = HubSlot::Active {
-                    cmd_tx: cmd_tx.clone(),
-                    task,
-                };
-                cmd_tx
-            }
-        }
     }
 }
 
@@ -369,12 +342,10 @@ impl Provider for AlpacaCryptoProvider {
     }
 
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
-        let cmd_tx = self.ensure_hub().await;
-        Ok(Box::new(SharedLiveHandle {
-            cmd_tx,
-            sink,
-            subscribed: Mutex::new(None),
-        }))
+        let cmd_tx = self.hub.ensure(|| CryptoConnector {
+            cfg: self.cfg.clone(),
+        });
+        Ok(Box::new(SharedLiveHandle::new(cmd_tx, sink)))
     }
 
     async fn fetch_history(
@@ -450,140 +421,47 @@ impl Provider for AlpacaCryptoProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Hub command channel and live handle
+// Hub connector
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-enum HubCommand {
-    Subscribe {
-        instrument: Instrument,
-        kind: EventKind,
-        sink: mpsc::Sender<MarketEvent>,
-        ack: oneshot::Sender<Result<()>>,
-    },
-    Unsubscribe {
-        instrument: Instrument,
-        kind: EventKind,
-        /// The asking session's sink: only the route it owns is removed.
-        sink: mpsc::Sender<MarketEvent>,
-        ack: oneshot::Sender<Result<()>>,
-    },
+/// How the hub opens and classifies the crypto market-data stream.
+struct CryptoConnector {
+    cfg: AlpacaCryptoProviderConfig,
 }
 
-struct SharedLiveHandle {
-    cmd_tx: mpsc::Sender<HubCommand>,
-    /// Per-session sink the hub will route events to once subscribed.
-    sink: mpsc::Sender<MarketEvent>,
-    /// Tracks the pair this handle is subscribed to so `close` can clean it
-    /// up. With a per-session handle this is at most one pair.
-    subscribed: Mutex<Option<(Instrument, EventKind)>>,
-}
+impl Connector for CryptoConnector {
+    const PROVIDER_ID: &'static str = PROVIDER_ID;
+    type Settings = AlpacaCryptoSettings;
+    type Failure = oxidized_alpaca::Error;
+    type Upstream = StreamingCryptoClient;
 
-#[async_trait]
-impl LiveHandle for SharedLiveHandle {
-    async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(HubCommand::Subscribe {
-                instrument: instrument.clone(),
-                kind,
-                sink: self.sink.clone(),
-                ack: tx,
-            })
-            .await
-            .map_err(|_| Error::SessionClosed)?;
-        let res = rx.await.map_err(|_| Error::SessionClosed)?;
-        if res.is_ok() {
-            *self.subscribed.lock().await = Some((instrument, kind));
-        }
-        res
+    fn settings(&self) -> &SettingsSource<AlpacaCryptoSettings> {
+        &self.cfg.settings
     }
 
-    async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(HubCommand::Unsubscribe {
-                instrument: instrument.clone(),
-                kind,
-                sink: self.sink.clone(),
-                ack: tx,
-            })
-            .await
-            .map_err(|_| Error::SessionClosed)?;
-        let res = rx.await.map_err(|_| Error::SessionClosed)?;
-        if res.is_ok() {
-            let mut slot = self.subscribed.lock().await;
-            if slot.as_ref() == Some(&(instrument, kind)) {
-                *slot = None;
-            }
-        }
-        res
+    fn credentials(&self) -> &CredentialsSource {
+        &self.cfg.credentials
     }
 
-    async fn close(self: Box<Self>) -> Result<()> {
-        // If the session never explicitly unsubscribed, do it now so the hub
-        // drops the route. The hub itself is shared; its lifetime is tied to
-        // the provider, not any one session.
-        let pair = self.subscribed.lock().await.take();
-        if let Some((instrument, kind)) = pair {
-            let (tx, rx) = oneshot::channel();
-            let _ = self
-                .cmd_tx
-                .send(HubCommand::Unsubscribe {
-                    instrument,
-                    kind,
-                    sink: self.sink.clone(),
-                    ack: tx,
-                })
-                .await;
-            let _ = rx.await;
-        }
-        Ok(())
+    fn reconnect(&self) -> &ReconnectPolicy {
+        &self.cfg.reconnect
     }
-}
 
-// ---------------------------------------------------------------------------
-// Hub task
-// ---------------------------------------------------------------------------
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "single-pass connect / authenticate / subscribe / dispatch / reconnect state machine; extraction would obscure the linear lifecycle"
-)]
-async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receiver<HubCommand>) {
-    let mut routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>> = HashMap::new();
-    let mut subs = CryptoSubscriptionList::new();
-    let mut backoff = cfg.reconnect.initial_backoff_ms;
-
-    'outer: loop {
-        let mut settings_rx = cfg.settings.watch();
-        let Some(settings) = cfg.settings.current() else {
-            // Disabled: park until the settings watch delivers a value. Only a
-            // Watch source can resolve to None, so the receiver is always
-            // present here; exit defensively if it isn't (never busy-loop).
-            let Some(rx) = settings_rx.as_mut() else {
-                return;
-            };
-            if !wait_for_provisioning(rx, &mut cmd_rx, Park::Disabled).await {
-                return;
-            }
-            continue 'outer;
-        };
-
+    async fn connect(
+        &self,
+        settings: &AlpacaCryptoSettings,
+        credentials: PresentCredentials,
+    ) -> std::result::Result<StreamingCryptoClient, oxidized_alpaca::Error> {
         let feed = match settings.venue {
             AlpacaCryptoVenue::Us => CryptoFeed::Us,
             AlpacaCryptoVenue::UsKraken => CryptoFeed::UsKraken,
             AlpacaCryptoVenue::EuKraken => CryptoFeed::EuKraken,
         };
-        // Fresh receiver per connect attempt: `watch()` marks the current
-        // value as seen on the clone (tokio's `Receiver::clone` would
-        // otherwise inherit the stored receiver's stale seen-version), so
-        // the hot-reconnect arm below only fires on rotations that land
-        // *after* this resolution.
-        let mut cred_rx = cfg.credentials.watch();
-        let connect_result = match cfg.credentials.current() {
-            Resolved::Env => StreamingCryptoClient::new(settings.account_type, feed).await,
-            Resolved::Creds(c) => {
+        match credentials {
+            PresentCredentials::Env => {
+                StreamingCryptoClient::new(settings.account_type, feed).await
+            }
+            PresentCredentials::Creds(c) => {
                 StreamingCryptoClient::new_with_credentials(
                     settings.account_type,
                     feed,
@@ -591,489 +469,68 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
                 )
                 .await
             }
-            Resolved::Missing => {
-                // No credentials yet: wait for provisioning instead of
-                // hammering bad auth, then retry the outer loop. Only a
-                // Watch source can resolve to Missing, so the receiver is
-                // always present here; exit defensively if it isn't (never
-                // busy-loop).
-                let Some(rx) = cred_rx.as_mut() else { return };
-                if !wait_for_provisioning(rx, &mut cmd_rx, Park::MissingCredentials).await {
-                    return;
-                }
-                continue 'outer;
-            }
-        };
-
-        let mut client = match connect_result {
-            Ok(client) => {
-                backoff = cfg.reconnect.initial_backoff_ms;
-                broadcast_control(
-                    &routes,
-                    ControlKind::ProviderConnected {
-                        provider: PROVIDER_ID.to_string(),
-                    },
-                )
-                .await;
-                client
-            }
-            Err(err) => {
-                // oxidized_alpaca 0.0.10 returns `Error::StreamingAuth` when
-                // the market-data connect handshake's auth response is not
-                // `Authenticated` (fixed upstream in
-                // fix(streaming): return StreamingAuth on rejected
-                // market-data credentials); this classification consumes it.
-                let unauthenticated = matches!(err, oxidized_alpaca::Error::StreamingAuth);
-                broadcast_control(
-                    &routes,
-                    ControlKind::ProviderDisconnected {
-                        provider: PROVIDER_ID.to_string(),
-                        reason: format!("connect failed: {}", error_chain(&err)),
-                        cause: if unauthenticated {
-                            DisconnectCause::Unauthenticated
-                        } else {
-                            DisconnectCause::Error
-                        },
-                    },
-                )
-                .await;
-                if unauthenticated && let Some(rx) = cred_rx.as_mut() {
-                    // Rejected credentials: retrying cannot help. Park until
-                    // a rotation (set-credentials hot-apply) or disable —
-                    // mirrors the Missing-credentials park above. Static
-                    // sources can't rotate, so they fall through to backoff.
-                    if !wait_for_provisioning(rx, &mut cmd_rx, Park::RejectedCredentials).await {
-                        return;
-                    }
-                    continue 'outer;
-                }
-                if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
-                    return;
-                }
-                continue 'outer;
-            }
-        };
-
-        // Re-apply persistent subscription set on a fresh socket.
-        if !is_empty(&subs)
-            && let Err(err) = client.add_subscriptions(&subs).await
-        {
-            broadcast_error(
-                &routes,
-                format!("re-subscribe failed: {}", error_chain(&err)),
-            )
-            .await;
-        }
-
-        loop {
-            tokio::select! {
-                cmd = cmd_rx.recv() => {
-                    let Some(cmd) = cmd else {
-                        // No outstanding handles can ever issue commands
-                        // again; close the websocket and exit.
-                        let _ = client.shut_down().await;
-                        return;
-                    };
-                    handle_route_command(&mut routes, &mut subs, &mut client, cmd).await;
-                }
-                next = client.next_message() => {
-                    match next {
-                        Ok(msg) => {
-                            for ev in translate_crypto_message(msg) {
-                                dispatch_event(&routes, ev).await;
-                            }
-                        }
-                        Err(err) => {
-                            // oxidized_alpaca 0.0.10: `Error::StreamingError`
-                            // (mid-stream server error envelope). A mid-stream
-                            // `StreamingAuth` is connect-only upstream today;
-                            // handled defensively, mirroring the connect arm.
-                            let unauthenticated =
-                                matches!(err, oxidized_alpaca::Error::StreamingAuth);
-                            broadcast_control(
-                                &routes,
-                                ControlKind::ProviderDisconnected {
-                                    provider: PROVIDER_ID.to_string(),
-                                    reason: format!("websocket: {}", error_chain(&err)),
-                                    cause: if unauthenticated {
-                                        DisconnectCause::Unauthenticated
-                                    } else {
-                                        DisconnectCause::Error
-                                    },
-                                },
-                            )
-                            .await;
-                            drop(client);
-                            if unauthenticated && let Some(rx) = cred_rx.as_mut() {
-                                // Rejected credentials: retrying cannot help.
-                                // Park until a rotation or disable, exactly
-                                // as the connect-time arm does. Static
-                                // sources can't rotate, so they fall through
-                                // to backoff.
-                                if !wait_for_provisioning(rx, &mut cmd_rx, Park::RejectedCredentials)
-                                .await
-                                {
-                                    return;
-                                }
-                                continue 'outer;
-                            }
-                            if !sleep_with_jitter(&mut backoff, &cfg.reconnect, &mut cmd_rx).await {
-                                return;
-                            }
-                            continue 'outer;
-                        }
-                    }
-                }
-                changed = async {
-                    match cred_rx.as_mut() {
-                        Some(rx) => rx.changed().await,
-                        // Unreachable: the arm is guarded on `is_some()`.
-                        None => std::future::pending().await,
-                    }
-                }, if cred_rx.is_some() => {
-                    if changed.is_ok() {
-                        tracing::info!(
-                            provider = PROVIDER_ID,
-                            "credentials changed; reconnecting"
-                        );
-                        // Same in-band control the websocket error path
-                        // broadcasts, then reconnect immediately with the
-                        // new credentials — reset the backoff, this is a
-                        // deliberate rotation, not a failure.
-                        broadcast_control(
-                            &routes,
-                            ControlKind::ProviderDisconnected {
-                                provider: PROVIDER_ID.to_string(),
-                                reason: "credentials rotated".to_string(),
-                                cause: DisconnectCause::Error,
-                            },
-                        )
-                        .await;
-                        let _ = client.shut_down().await;
-                        backoff = cfg.reconnect.initial_backoff_ms;
-                        continue 'outer;
-                    }
-                    // Watch sender dropped: no further rotations can
-                    // arrive. Disable this arm (a closed receiver would
-                    // otherwise resolve immediately and spin the select).
-                    cred_rx = None;
-                }
-                changed = async {
-                    match settings_rx.as_mut() {
-                        Some(rx) => rx.changed().await,
-                        // Unreachable: the arm is guarded on `is_some()`.
-                        None => std::future::pending().await,
-                    }
-                }, if settings_rx.is_some() => {
-                    if changed.is_ok() {
-                        // A disable is deliberate, not a fault: classify it so
-                        // health does not read the dropped streams as Stale.
-                        let (reason, cause) = if cfg.settings.current().is_none() {
-                            ("provider disabled", DisconnectCause::Disabled)
-                        } else {
-                            ("settings changed", DisconnectCause::Error)
-                        };
-                        tracing::info!(provider = PROVIDER_ID, reason, "settings changed; reconnecting");
-                        broadcast_control(
-                            &routes,
-                            ControlKind::ProviderDisconnected {
-                                provider: PROVIDER_ID.to_string(),
-                                reason: reason.to_string(),
-                                cause,
-                            },
-                        )
-                        .await;
-                        let _ = client.shut_down().await;
-                        backoff = cfg.reconnect.initial_backoff_ms;
-                        continue 'outer;
-                    }
-                    settings_rx = None;
-                }
-            }
         }
     }
-}
 
-/// Waits for a `Watch` source (settings or credentials) to deliver a new
-/// value, servicing the command channel meanwhile (close/drop of all
-/// handles exits, subscribe/unsubscribe fail fast with `park`'s error).
-/// Returns `false` if the hub task should exit.
-async fn wait_for_provisioning<T>(
-    rx: &mut watch::Receiver<T>,
-    cmd_rx: &mut mpsc::Receiver<HubCommand>,
-    park: Park,
-) -> bool {
-    loop {
-        tokio::select! {
-            changed = rx.changed() => {
-                if changed.is_ok() {
-                    // The outer loop re-resolves; if the new value is still
-                    // disabled/missing it lands back here rather than spinning.
-                    return true;
-                }
-                // Sender dropped with no value: it can never arrive. Keep
-                // servicing commands so hub shutdown (all handles dropped)
-                // still works.
-                loop {
-                    match cmd_rx.recv().await {
-                        Some(
-                            HubCommand::Subscribe { ack, .. }
-                            | HubCommand::Unsubscribe { ack, .. },
-                        ) => {
-                            let _ = ack.send(Err(park.error(PROVIDER_ID)));
-                        }
-                        None => return false,
-                    }
-                }
-            }
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(
-                        HubCommand::Subscribe { ack, .. }
-                        | HubCommand::Unsubscribe { ack, .. },
-                    ) => {
-                        let _ = ack.send(Err(park.error(PROVIDER_ID)));
-                    }
-                    None => return false,
-                }
-            }
-        }
-    }
-}
-
-async fn dispatch_event(
-    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    ev: MarketEvent,
-) {
-    if let Some(key) = event_route_key(&ev) {
-        if let Some(sink) = routes.get(&key) {
-            let _ = sink.send(ev).await;
-        }
-        return;
-    }
-    // Control / non-routable event: fan out to every active sink so each
-    // session sees provider-level state changes.
-    for sink in routes.values() {
-        let _ = sink.send(ev.clone()).await;
-    }
-}
-
-fn event_route_key(ev: &MarketEvent) -> Option<(Instrument, EventKind)> {
-    match ev {
-        MarketEvent::Trade(t) => Some((t.instrument.clone(), EventKind::Trade)),
-        MarketEvent::Quote(q) => Some((q.instrument.clone(), EventKind::Quote)),
-        MarketEvent::Bar(b) => Some((b.instrument.clone(), EventKind::Bar(b.interval))),
-        _ => None,
-    }
-}
-
-async fn sleep_with_jitter(
-    backoff_ms: &mut u64,
-    policy: &ReconnectPolicy,
-    cmd_rx: &mut mpsc::Receiver<HubCommand>,
-) -> bool {
-    // Full jitter: pick a sleep uniformly in [0, backoff_ms]. See the stock
-    // provider's sleep_with_jitter for the rationale.
-    let delay_ms = if policy.jitter {
-        fastrand::u64(0..=*backoff_ms)
-    } else {
-        *backoff_ms
-    };
-    let delay = Duration::from_millis(delay_ms);
-    *backoff_ms = (*backoff_ms * 2).min(policy.max_backoff_ms);
-
-    tokio::select! {
-        () = tokio::time::sleep(delay) => true,
-        cmd = cmd_rx.recv() => {
-            match cmd {
-                // While disconnected, fail subscribe/unsubscribe immediately so
-                // sessions see a clear error rather than stalling.
-                Some(HubCommand::Subscribe { ack, .. } | HubCommand::Unsubscribe { ack, .. }) => {
-                    let _ = ack.send(Err(Error::Provider {
-                        provider: PROVIDER_ID.to_string(),
-                        message: "provider is reconnecting".to_string(),
-                    }));
-                    true
-                }
-                None => {
-                    // SessionClosing is emitted by Controller::shutdown for each
-                    // session; the hub serves all of them and shouldn't double-emit.
-                    false
-                }
-            }
-        }
-    }
-}
-
-/// The upstream calls a session's subscribe or unsubscribe makes on the
-/// connected socket.
-trait RouteUpstream {
-    /// Apply the aggregate subscription set `subs`.
-    async fn add(&mut self, subs: &CryptoSubscriptionList) -> Result<()>;
-    /// Remove the pairs in `removal`.
-    async fn remove(&mut self, removal: &CryptoSubscriptionList) -> Result<()>;
-}
-
-impl RouteUpstream for StreamingCryptoClient {
-    async fn add(&mut self, subs: &CryptoSubscriptionList) -> Result<()> {
-        self.add_subscriptions(subs)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::Provider {
-                provider: PROVIDER_ID.to_string(),
-                message: format!("add_subscriptions: {}", error_chain(&e)),
-            })
-    }
-
-    async fn remove(&mut self, removal: &CryptoSubscriptionList) -> Result<()> {
-        self.remove_subscriptions(removal)
-            .await
-            .map(|_| ())
-            .map_err(|e| Error::Provider {
-                provider: PROVIDER_ID.to_string(),
-                message: format!("remove_subscriptions: {}", error_chain(&e)),
-            })
-    }
-}
-
-/// Apply one session's subscribe or unsubscribe on the connected socket and
-/// answer it.
-async fn handle_route_command(
-    routes: &mut HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    subs: &mut CryptoSubscriptionList,
-    upstream: &mut impl RouteUpstream,
-    cmd: HubCommand,
-) {
-    match cmd {
-        HubCommand::Subscribe {
-            instrument,
-            kind,
-            sink,
-            ack,
-        } => {
-            let res = subscribe_route(routes, subs, upstream, instrument, kind, sink).await;
-            let _ = ack.send(res);
-        }
-        HubCommand::Unsubscribe {
-            instrument,
-            kind,
-            sink,
-            ack,
-        } => {
-            let res = unsubscribe_route(routes, subs, upstream, instrument, kind, &sink).await;
-            let _ = ack.send(res);
-        }
-    }
-}
-
-/// Route `(instrument, kind)` to `sink` and subscribe it upstream. If the
-/// upstream refuses, a route this one replaced (a session torn down whose
-/// unsubscribe has not arrived yet) is restored, its pair still streaming,
-/// so that session's unsubscribe still removes it; with no such route the
-/// pair is dropped again, so a reconnect does not apply a subscription the
-/// server rejected.
-async fn subscribe_route(
-    routes: &mut HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    subs: &mut CryptoSubscriptionList,
-    upstream: &mut impl RouteUpstream,
-    instrument: Instrument,
-    kind: EventKind,
-    sink: mpsc::Sender<MarketEvent>,
-) -> Result<()> {
-    let key = (instrument, kind);
-    let replaced = routes.insert(key.clone(), sink);
-    apply_pair_to_list(subs, &key.0, kind, true);
-    let res = upstream.add(subs).await;
-    if res.is_err() {
-        if let Some(previous) = replaced {
-            routes.insert(key, previous);
+    /// `oxidized_alpaca` 0.0.10 returns `Error::StreamingAuth` when the
+    /// market-data connect handshake's auth response is not `Authenticated`;
+    /// only that parks. Every other failure, a mid-stream server error
+    /// envelope included, backs off.
+    fn classify(failure: &oxidized_alpaca::Error) -> StreamFailure {
+        if matches!(failure, oxidized_alpaca::Error::StreamingAuth) {
+            StreamFailure::Unauthenticated
         } else {
-            routes.remove(&key);
-            apply_pair_to_list(subs, &key.0, kind, false);
+            StreamFailure::Transient
         }
-        return res;
     }
-    // We are in the connected loop, so the provider is up.
-    // `ProviderConnected` is otherwise only broadcast on the connect *edge*,
-    // which a route that subscribes afterward misses — leaving its connection
-    // state Unknown even as data flows. Tell the freshly-subscribed route the
-    // provider is up.
-    let route = routes.get(&key);
-    broadcast_control_to(
-        route,
-        ControlKind::ProviderConnected {
-            provider: PROVIDER_ID.to_string(),
-        },
-    )
-    .await;
-    broadcast_control_to(
-        route,
-        ControlKind::SubscriptionChanged {
-            provider: PROVIDER_ID.to_string(),
-            instrument: key.0.clone(),
-            kind,
-            active: true,
-        },
-    )
-    .await;
-    res
 }
 
-/// Remove `sink`'s route for `(instrument, kind)`: drop the pair from
-/// `subs`, remove it upstream, then drop the route and tell its sink the
-/// subscription ended. A route that another session's sink holds, or no
-/// route at all, is left alone, upstream included, and the call answers
-/// `Ok`: a session torn down after a successor took its pair cannot cancel
-/// the successor. A failed upstream removal keeps the pair in `subs`, so a
-/// reconnect applies it again.
-async fn unsubscribe_route(
-    routes: &mut HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    subs: &mut CryptoSubscriptionList,
-    upstream: &mut impl RouteUpstream,
-    instrument: Instrument,
-    kind: EventKind,
-    sink: &mpsc::Sender<MarketEvent>,
-) -> Result<()> {
-    let key = (instrument, kind);
-    if !routes
-        .get(&key)
-        .is_some_and(|route| route.same_channel(sink))
-    {
-        return Ok(());
+impl Upstream for StreamingCryptoClient {
+    type Subs = CryptoSubscriptionList;
+    type Failure = oxidized_alpaca::Error;
+
+    async fn add(
+        &mut self,
+        subs: &CryptoSubscriptionList,
+    ) -> std::result::Result<(), oxidized_alpaca::Error> {
+        self.add_subscriptions(subs).await.map(|_| ())
     }
-    let (instrument, kind) = key;
-    apply_pair_to_list(subs, &instrument, kind, false);
-    let mut removal = CryptoSubscriptionList::new();
-    apply_pair_to_list(&mut removal, &instrument, kind, true);
-    let res = upstream.remove(&removal).await;
-    if res.is_ok() {
-        // Drop the route after the upstream ack so any tail events still in
-        // flight are routable.
-        let removed = routes.remove(&(instrument.clone(), kind));
-        broadcast_control_to(
-            removed.as_ref(),
-            ControlKind::SubscriptionChanged {
-                provider: PROVIDER_ID.to_string(),
-                instrument,
-                kind,
-                active: false,
-            },
-        )
-        .await;
-    } else {
-        // The pair is still streaming upstream, so a reconnect must apply it.
-        apply_pair_to_list(subs, &instrument, kind, true);
+
+    async fn remove(
+        &mut self,
+        removal: &CryptoSubscriptionList,
+    ) -> std::result::Result<(), oxidized_alpaca::Error> {
+        self.remove_subscriptions(removal).await.map(|_| ())
     }
-    res
+
+    async fn next_events(
+        &mut self,
+    ) -> std::result::Result<Vec<MarketEvent>, oxidized_alpaca::Error> {
+        self.next_message().await.map(translate_crypto_message)
+    }
+
+    async fn shut_down(self) {
+        let _ = StreamingCryptoClient::shut_down(self).await;
+    }
 }
 
-fn is_empty(list: &CryptoSubscriptionList) -> bool {
-    list.bars.as_ref().is_none_or(Vec::is_empty)
-        && list.daily_bars.as_ref().is_none_or(Vec::is_empty)
-        && list.updated_bars.as_ref().is_none_or(Vec::is_empty)
-        && list.quotes.as_ref().is_none_or(Vec::is_empty)
-        && list.trades.as_ref().is_none_or(Vec::is_empty)
-        && list.orderbooks.as_ref().is_none_or(Vec::is_empty)
+impl SubscriptionSet for CryptoSubscriptionList {
+    fn empty() -> Self {
+        Self::new()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bars.as_ref().is_none_or(Vec::is_empty)
+            && self.daily_bars.as_ref().is_none_or(Vec::is_empty)
+            && self.updated_bars.as_ref().is_none_or(Vec::is_empty)
+            && self.quotes.as_ref().is_none_or(Vec::is_empty)
+            && self.trades.as_ref().is_none_or(Vec::is_empty)
+            && self.orderbooks.as_ref().is_none_or(Vec::is_empty)
+    }
+
+    fn apply(&mut self, instrument: &Instrument, kind: EventKind, add: bool) {
+        apply_pair_to_list(self, instrument, kind, add);
+    }
 }
 
 fn apply_pair_to_list(
@@ -1104,57 +561,6 @@ fn mutate_field(field: &mut Option<Vec<String>>, symbol: &str, add: bool) {
     if list.is_empty() {
         *field = None;
     }
-}
-
-async fn broadcast_control(
-    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    kind: ControlKind,
-) {
-    let now = wall_clock_ts();
-    let ev = MarketEvent::Control(Control {
-        source_ts: now,
-        rx_ts: now,
-        seq: Seq(0),
-        kind,
-    });
-    for sink in routes.values() {
-        let _ = sink.send(ev.clone()).await;
-    }
-}
-
-/// Fan one provider error out to every active sink, every copy carrying the
-/// same fresh fan-out id.
-async fn broadcast_error(
-    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    message: String,
-) {
-    broadcast_control(routes, ControlKind::fanout_error(PROVIDER_ID, message)).await;
-}
-
-async fn broadcast_control_to(sink: Option<&mpsc::Sender<MarketEvent>>, kind: ControlKind) {
-    if let Some(s) = sink {
-        let now = wall_clock_ts();
-        let _ = s
-            .send(MarketEvent::Control(Control {
-                source_ts: now,
-                rx_ts: now,
-                seq: Seq(0),
-                kind,
-            }))
-            .await;
-    }
-}
-
-fn wall_clock_ts() -> Timestamp {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "i64 nanos since epoch representable until year 2262"
-        )]
-        let n = d.as_nanos() as i64;
-        n
-    });
-    Timestamp(nanos)
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,25 +692,13 @@ fn crypto_snapshot_to_event(
         }
     }
 }
-
-/// Walk a `std::error::Error` source chain to a single string. oxidized-alpaca
-/// 0.0.5 has a `{}, 0` thiserror format for its `WebsocketError` variant that
-/// prints the literal `0` instead of the wrapped error, so we extract the
-/// real cause via the source chain.
-fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut parts = vec![err.to_string()];
-    let mut src = err.source();
-    while let Some(e) = src {
-        parts.push(e.to_string());
-        src = e.source();
-    }
-    parts.join(" -> ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datamancer_core::{ErrorOrigin, FanoutId};
+    use crate::providers::alpaca::tests::server_error;
+    use crate::providers::hub::dispatch_event;
+    use crate::providers::hub::tests::{fanout_ids, two_routes};
+    use oxidized_alpaca::streaming::StreamErrorCode;
 
     #[test]
     fn translates_crypto_trade() {
@@ -1340,50 +734,6 @@ mod tests {
             }
             other => panic!("expected Quote, got {other:?}"),
         }
-    }
-
-    fn fanout_ids(rx: &mut mpsc::Receiver<MarketEvent>) -> Vec<FanoutId> {
-        let mut ids = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            match ev {
-                MarketEvent::Control(Control {
-                    kind:
-                        ControlKind::ProviderError {
-                            origin: ErrorOrigin::Fanout(id),
-                            ..
-                        },
-                    ..
-                }) => ids.push(id),
-                other => panic!("expected a fan-out ProviderError, got {other:?}"),
-            }
-        }
-        ids
-    }
-
-    type Routes = HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>;
-
-    fn two_routes() -> (
-        Routes,
-        mpsc::Receiver<MarketEvent>,
-        mpsc::Receiver<MarketEvent>,
-    ) {
-        let (a_tx, a_rx) = mpsc::channel(8);
-        let (b_tx, b_rx) = mpsc::channel(8);
-        let mut routes = HashMap::new();
-        routes.insert((provider_instrument("BTC/USD"), EventKind::Trade), a_tx);
-        routes.insert((provider_instrument("ETH/USD"), EventKind::Quote), b_tx);
-        (routes, a_rx, b_rx)
-    }
-
-    #[tokio::test]
-    async fn every_copy_of_a_broadcast_error_shares_one_distinct_id() {
-        let (routes, mut a_rx, mut b_rx) = two_routes();
-        broadcast_error(&routes, "first".to_string()).await;
-        broadcast_error(&routes, "second".to_string()).await;
-        let a = fanout_ids(&mut a_rx);
-        assert_eq!(a, fanout_ids(&mut b_rx));
-        assert_eq!(a.len(), 2);
-        assert_ne!(a[0], a[1]);
     }
 
     #[tokio::test]
@@ -1431,43 +781,6 @@ mod tests {
                 "crypto history is not wired; {kind:?} must not be advertised"
             );
         }
-    }
-
-    #[test]
-    fn event_route_key_matches_pair() {
-        let now = Timestamp(1);
-        let trade = MarketEvent::Trade(Trade {
-            instrument: provider_instrument("BTC/USD"),
-            source_ts: now,
-            rx_ts: now,
-            seq: Seq(0),
-            price: Price::from_f64_round(1.0),
-            size: Quantity::from_units(1),
-        });
-        assert_eq!(
-            event_route_key(&trade),
-            Some((provider_instrument("BTC/USD"), EventKind::Trade))
-        );
-
-        let bar = MarketEvent::Bar(Bar {
-            instrument: provider_instrument("ETH/USD"),
-            interval: BarInterval::OneMinute,
-            source_ts: now,
-            rx_ts: now,
-            seq: Seq(0),
-            open: Price::ZERO,
-            high: Price::ZERO,
-            low: Price::ZERO,
-            close: Price::ZERO,
-            volume: Quantity::ZERO,
-        });
-        assert_eq!(
-            event_route_key(&bar),
-            Some((
-                provider_instrument("ETH/USD"),
-                EventKind::Bar(BarInterval::OneMinute)
-            ))
-        );
     }
 
     #[tokio::test]
@@ -1658,6 +971,32 @@ mod tests {
     }
 
     #[test]
+    fn crypto_set_counts_updated_bars_and_orderbooks() {
+        let mut set = <CryptoSubscriptionList as SubscriptionSet>::empty();
+        assert!(SubscriptionSet::is_empty(&set));
+        set.updated_bars = Some(vec!["BTC/USD".to_string()]);
+        assert!(!SubscriptionSet::is_empty(&set));
+        set.updated_bars = None;
+        set.orderbooks = Some(vec!["BTC/USD".to_string()]);
+        assert!(!SubscriptionSet::is_empty(&set));
+    }
+
+    #[test]
+    fn crypto_classifies_only_streaming_auth_as_unauthenticated() {
+        assert_eq!(
+            CryptoConnector::classify(&oxidized_alpaca::Error::StreamingAuth),
+            StreamFailure::Unauthenticated
+        );
+        assert_eq!(
+            CryptoConnector::classify(&server_error(
+                oxidized_alpaca::Error::StreamingError,
+                StreamErrorCode::AuthFailed
+            )),
+            StreamFailure::Transient
+        );
+    }
+
+    #[test]
     fn crypto_snapshot_maps_kind_to_event() {
         use oxidized_alpaca::restful::market_data::crypto::CryptoSnapshot;
 
@@ -1694,196 +1033,42 @@ mod tests {
         );
     }
 
-    /// Records the upstream calls a route command makes; refuses `add` while
-    /// `refuse_add` is set.
-    #[derive(Default)]
-    struct FakeUpstream {
-        adds: usize,
-        removals: Vec<CryptoSubscriptionList>,
-        refuse_add: bool,
-    }
-
-    impl RouteUpstream for FakeUpstream {
-        async fn add(&mut self, _subs: &CryptoSubscriptionList) -> Result<()> {
-            self.adds += 1;
-            if self.refuse_add {
-                return Err(Error::Provider {
-                    provider: PROVIDER_ID.to_string(),
-                    message: "refused".to_string(),
-                });
-            }
-            Ok(())
-        }
-
-        async fn remove(&mut self, removal: &CryptoSubscriptionList) -> Result<()> {
-            self.removals.push(removal.clone());
-            Ok(())
-        }
-    }
-
-    /// A connected hub's route state, served one command at a time.
-    struct FakeHub {
-        cmd_tx: mpsc::Sender<HubCommand>,
-        cmd_rx: mpsc::Receiver<HubCommand>,
-        routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-        subs: CryptoSubscriptionList,
-        upstream: FakeUpstream,
-    }
-
-    impl FakeHub {
-        fn new() -> Self {
-            let (cmd_tx, cmd_rx) = mpsc::channel(8);
-            Self {
-                cmd_tx,
-                cmd_rx,
-                routes: HashMap::new(),
-                subs: CryptoSubscriptionList::new(),
-                upstream: FakeUpstream::default(),
-            }
-        }
-
-        /// A session's handle onto this hub and the receiver of its sink.
-        fn handle(&self) -> (Box<SharedLiveHandle>, mpsc::Receiver<MarketEvent>) {
-            let (sink, rx) = mpsc::channel(8);
-            let handle = SharedLiveHandle {
-                cmd_tx: self.cmd_tx.clone(),
-                sink,
-                subscribed: Mutex::new(None),
-            };
-            (Box::new(handle), rx)
-        }
-
-        async fn serve_one(&mut self) {
-            let cmd = self.cmd_rx.recv().await.expect("a command");
-            handle_route_command(&mut self.routes, &mut self.subs, &mut self.upstream, cmd).await;
-        }
-
-        /// Route one trade for `instrument` as the socket would.
-        async fn deliver_trade(&self, instrument: &Instrument) {
-            let now = Timestamp(1);
-            dispatch_event(
-                &self.routes,
-                MarketEvent::Trade(Trade {
-                    instrument: instrument.clone(),
-                    source_ts: now,
-                    rx_ts: now,
-                    seq: Seq(0),
-                    price: Price::from_f64_round(1.0),
-                    size: Quantity::from_units(1),
-                }),
-            )
-            .await;
-        }
-    }
-
-    /// Whether `rx` holds a trade, past any controls.
-    fn has_trade(rx: &mut mpsc::Receiver<MarketEvent>) -> bool {
-        while let Ok(ev) = rx.try_recv() {
-            if matches!(ev, MarketEvent::Trade(_)) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// A session torn down after another session took its pair: its late
-    /// unsubscribe leaves the successor's route, its data and the upstream
-    /// subscription alone, and the successor's own unsubscribe still removes
-    /// all three.
-    #[tokio::test]
-    async fn a_late_unsubscribe_keeps_the_successors_route() {
-        let instrument = provider_instrument("BTC/USD");
-        let mut hub = FakeHub::new();
-        let (s1, _s1_rx) = hub.handle();
-        let (s2, mut s2_rx) = hub.handle();
-        let (subscribed, ()) = tokio::join!(
-            s1.subscribe(instrument.clone(), EventKind::Trade),
-            hub.serve_one()
-        );
-        subscribed.expect("s1 subscribes");
-        let (subscribed, ()) = tokio::join!(
-            s2.subscribe(instrument.clone(), EventKind::Trade),
-            hub.serve_one()
-        );
-        subscribed.expect("s2 subscribes");
-
-        let (closed, ()) = tokio::join!(s1.close(), hub.serve_one());
-        closed.expect("s1 closes");
-        assert!(
-            hub.upstream.removals.is_empty(),
-            "the upstream subscription was removed"
-        );
-        assert_eq!(hub.subs.trades, Some(vec!["BTC/USD".to_string()]));
-        hub.deliver_trade(&instrument).await;
-        assert!(has_trade(&mut s2_rx), "the successor lost its route");
-
-        let (unsubscribed, ()) = tokio::join!(
-            s2.unsubscribe(instrument, EventKind::Trade),
-            hub.serve_one()
-        );
-        unsubscribed.expect("s2 unsubscribes");
-        assert_eq!(hub.upstream.removals.len(), 1);
-        assert!(hub.routes.is_empty());
-        assert_eq!(hub.subs.trades, None);
-        assert!(matches!(
-            s2_rx.try_recv(),
-            Ok(MarketEvent::Control(Control {
-                kind: ControlKind::SubscriptionChanged { active: false, .. },
-                ..
+    /// A `start_live` that panics while it holds the hub slot (here: polled
+    /// once outside a tokio runtime, so the spawn panics) must not take the
+    /// provider down for every later caller: a later `start_live` inside a
+    /// runtime still succeeds.
+    #[test]
+    fn a_panicking_start_live_does_not_poison_later_start_lives() {
+        use std::future::Future;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::task::{Context, Poll, Waker};
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
+            settings: SettingsSource::Watch(rx),
+            ..Default::default()
+        });
+        // Polls `start_live` once by hand; true when it completes with a handle.
+        let poll_once = || {
+            catch_unwind(AssertUnwindSafe(|| {
+                let (sink, _events) = tokio::sync::mpsc::channel(8);
+                let mut fut = std::pin::pin!(p.start_live(sink));
+                let mut cx = Context::from_waker(Waker::noop());
+                matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(_)))
             }))
-        ));
-    }
-
-    /// A successor's subscribe that the upstream refuses restores the route
-    /// it replaced: the old session keeps its data, and its late unsubscribe
-    /// still removes the pair upstream.
-    #[tokio::test]
-    async fn a_refused_successor_restores_the_route_it_replaced() {
-        let instrument = provider_instrument("BTC/USD");
-        let mut hub = FakeHub::new();
-        let (s1, mut s1_rx) = hub.handle();
-        let (s2, _s2_rx) = hub.handle();
-        let (subscribed, ()) = tokio::join!(
-            s1.subscribe(instrument.clone(), EventKind::Trade),
-            hub.serve_one()
+        };
+        assert!(poll_once().is_err(), "a spawn outside a runtime panics");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let later = rt.block_on(async { poll_once() });
+        assert!(
+            matches!(later, Ok(true)),
+            "a later start_live in a runtime must succeed, got {:?}",
+            later.map_err(|e| e
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned()))
         );
-        subscribed.expect("s1 subscribes");
-
-        hub.upstream.refuse_add = true;
-        let (refused, ()) = tokio::join!(
-            s2.subscribe(instrument.clone(), EventKind::Trade),
-            hub.serve_one()
-        );
-        assert!(refused.is_err(), "the upstream refused s2");
-        assert_eq!(hub.subs.trades, Some(vec!["BTC/USD".to_string()]));
-        hub.deliver_trade(&instrument).await;
-        assert!(has_trade(&mut s1_rx), "s1 lost its route");
-
-        let (closed, ()) = tokio::join!(s1.close(), hub.serve_one());
-        closed.expect("s1 closes");
-        assert_eq!(
-            hub.upstream.removals.len(),
-            1,
-            "the pair was left subscribed upstream"
-        );
-        assert!(hub.routes.is_empty());
-        assert_eq!(hub.subs.trades, None);
-    }
-
-    /// A first subscribe the upstream refuses leaves no route, and no pair to
-    /// re-apply on the next connect.
-    #[tokio::test]
-    async fn a_refused_first_subscribe_leaves_nothing_behind() {
-        let instrument = provider_instrument("BTC/USD");
-        let mut hub = FakeHub::new();
-        let (session, _rx) = hub.handle();
-        hub.upstream.refuse_add = true;
-        let (refused, ()) = tokio::join!(
-            session.subscribe(instrument.clone(), EventKind::Trade),
-            hub.serve_one()
-        );
-        assert!(refused.is_err(), "the upstream refused the subscribe");
-        assert!(hub.routes.is_empty());
-        assert_eq!(hub.subs.trades, None);
     }
 }
