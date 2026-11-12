@@ -154,25 +154,33 @@ const num = (n) => Number(val(n));
 const chk = (n) => document.getElementsByName(n)[0].checked;
 const opt = (v) => (v === '' ? undefined : v);
 
+// Starts from the loaded config, so a section or key the form has no field
+// for is saved as loaded.
 function collect() {
-  const cfg = { provider: {} };
+  const cfg = structuredClone(current);
+  cfg.provider = cfg.provider || {};
+  delete cfg.provider.alpaca;
   if (chk('alpaca-on')) {
-    cfg.provider.alpaca = { account_type: val('alpaca-account') };
+    cfg.provider.alpaca = { ...current.provider?.alpaca, account_type: val('alpaca-account') };
     // 'auto' = omit the key: the daemon then follows the stream feed.
     const historyFeed = val('alpaca-history');
-    if (historyFeed !== 'auto') cfg.provider.alpaca.history_feed = historyFeed;
+    if (historyFeed === 'auto') delete cfg.provider.alpaca.history_feed;
+    else cfg.provider.alpaca.history_feed = historyFeed;
   }
-  if (chk('crypto-on')) cfg.provider.alpaca_crypto = { account_type: val('crypto-account'), venue: val('crypto-venue') };
+  delete cfg.provider.alpaca_crypto;
+  if (chk('crypto-on')) cfg.provider.alpaca_crypto = { ...current.provider?.alpaca_crypto,
+    account_type: val('crypto-account'), venue: val('crypto-venue') };
   for (const key of ['cache','tap_log']) {
-    if (chk(`${key}-on`)) cfg[key] = { backend: val(`${key}-backend`), path: opt(val(`${key}-path`)) };
+    delete cfg[key];
+    if (chk(`${key}-on`)) cfg[key] = { ...current[key], backend: val(`${key}-backend`), path: opt(val(`${key}-path`)) };
   }
-  cfg.session = { resume_buffer_events: num('sess-buffer'), adjustment: val('sess-adjust'),
+  cfg.session = { ...cfg.session, resume_buffer_events: num('sess-buffer'), adjustment: val('sess-adjust'),
     query_persistence: val('sess-query'), max_backfill_days: num('sess-backfill') };
-  cfg.server = { admin_socket: val('srv-socket'), service_prefix: val('srv-prefix'), shutdown_timeout_secs: num('srv-timeout'),
+  cfg.server = { ...cfg.server, admin_socket: val('srv-socket'), service_prefix: val('srv-prefix'), shutdown_timeout_secs: num('srv-timeout'),
     max_concurrent_backfills: num('srv-backfills') };
-  cfg.diagnostics = { publish_interval_ms: num('diag-live'), cache_catalog_interval_ms: num('diag-catalog') };
-  cfg.iceoryx2 = { max_clients: num('iox-clients') };
-  cfg.web_ui = { enabled: chk('web-on'), bind: val('web-bind'), port: num('web-port'),
+  cfg.diagnostics = { ...cfg.diagnostics, publish_interval_ms: num('diag-live'), cache_catalog_interval_ms: num('diag-catalog') };
+  cfg.iceoryx2 = { ...cfg.iceoryx2, max_clients: num('iox-clients') };
+  cfg.web_ui = { ...cfg.web_ui, enabled: chk('web-on'), bind: val('web-bind'), port: num('web-port'),
                  assets_dir: opt(val('web-assets')),
                  live_state_cadence_ms: num('web-live'), cache_catalog_cadence_ms: num('web-catalog') };
   cfg.startup_session = [...document.querySelectorAll('.session-row')].map(row => {
@@ -217,3 +225,74 @@ document.addEventListener('click', async (ev) => {
 
 fetch('/api/config').then(r => r.json()).then(show).catch(e => fail(String(e)));
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::JS;
+
+    /// Run the page script under node with a stub DOM whose inputs are all
+    /// empty and unchecked, load `config` as the page's current config, and
+    /// return what the form's save would send. `None` when node is missing.
+    fn collect_under_node(config: &serde_json::Value) -> Option<serde_json::Value> {
+        const HARNESS: &str = r"
+const vm = require('node:vm');
+const fs = require('node:fs');
+const [script, config] = [fs.readFileSync(process.argv[2], 'utf8'), fs.readFileSync(process.argv[3], 'utf8')];
+const input = () => ({ value: '', checked: false });
+const document = {
+  getElementById: () => ({}),
+  getElementsByName: () => [input()],
+  querySelectorAll: () => [],
+  addEventListener: () => {},
+};
+const context = vm.createContext({ document, fetch: () => new Promise(() => {}), structuredClone, console });
+vm.runInContext(script, context);
+process.stdout.write(vm.runInContext(`current = ${config}; JSON.stringify(collect())`, context));
+";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let harness = dir.path().join("harness.js");
+        let script = dir.path().join("settings.js");
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&harness, HARNESS).expect("write harness");
+        std::fs::write(&script, JS).expect("write script");
+        std::fs::write(&config_path, config.to_string()).expect("write config");
+        let output = match std::process::Command::new("node")
+            .arg(&harness)
+            .arg(&script)
+            .arg(&config_path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => panic!("run node: {e}"),
+        };
+        assert!(
+            output.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(serde_json::from_slice(&output.stdout).expect("collect() output is JSON"))
+    }
+
+    /// Saving the form keeps a section it has no field for and still applies
+    /// the fields it has: here the unchecked Alpaca box drops `alpaca`.
+    #[test]
+    fn saving_the_web_form_keeps_sections_it_has_no_field_for() {
+        let config = crate::config::Config::parse(
+            "[provider.alpaca]\naccount_type = \"paper\"\n\n\
+             [log]\nlevel = \"debug\"\nformat = \"json\"\n",
+        )
+        .expect("parse");
+        let loaded = serde_json::to_value(&config).expect("config as JSON");
+        let Some(saved) = collect_under_node(&loaded) else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "node is required for this test in CI"
+            );
+            eprintln!("node not found; skipping");
+            return;
+        };
+        assert_eq!(saved["log"], loaded["log"], "{saved}");
+        assert!(saved["provider"].get("alpaca").is_none(), "{saved}");
+    }
+}

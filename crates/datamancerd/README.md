@@ -34,6 +34,8 @@ and the loss contract per transport.
 cargo run -p datamancerd -- --config datamancerd.toml
 # end-to-end tests need a live iceoryx2 runtime and are #[ignore]d:
 cargo test -p datamancerd --test daemon_e2e -- --ignored
+# the hermetic suite against the scripted provider needs no credentials:
+cargo test -p datamancerd --all-features --test scripted_e2e -- --ignored --test-threads=1
 ```
 
 Provider credentials are **not** in the config. They live in the daemon-owned
@@ -179,9 +181,19 @@ format = "text"                   # text | json
 Compiled-in providers start disabled: the daemon boots with zero providers
 configured, and providers are enabled at runtime via the config service's
 `configure-provider` op (or by uncommenting a `[provider.*]` section and
-restarting). Validation fails fast on the remaining cross-section invariants:
-a startup session naming a provider this binary lacks is refused; one using a
-cache preset requires `[cache]`; one writing the tap log requires `[tap_log]`;
+restarting).
+
+A daemon built with the off-by-default `scripted-provider` feature also has
+`[provider.scripted]`, a scripted test provider (`src/scripted.rs`) that
+serves scripted trades on both surfaces, for instruments naming `scripted`
+only, with no network or credentials. Its knobs are `history_prints`,
+`history_delay_ms`, `live_interval_ms` (greater than 0) and `latest`.
+Removed and then configured again, it resumes its open sessions' trades. A
+daemon built without the feature rejects the section as unknown.
+
+Validation fails fast on the remaining cross-section invariants: a startup
+session naming a provider this binary lacks is refused; one using a cache preset
+requires `[cache]`; one writing the tap log requires `[tap_log]`;
 `scope = live_backfill` requires a parseable `backfill_from`, and `scope = live`
 refuses one. An `always_on` session's start must precede the live edge when it
 opens at boot.
@@ -797,9 +809,10 @@ writes the hub's view of the config back to disk and clobbers the hand edit
   constructed at boot (parked, not literally absent) but starts **disabled**
   unless its `[provider.*]` section is present; a scaffolded/empty config
   enables nothing, so a fresh boot with zero provider sections is a valid,
-  well-defined state (`get-config` returns a fixed-key `provider` table with
-  both provider ids present and `null` values, e.g.
-  `"provider":{"alpaca":null,"alpaca_crypto":null}`).
+  well-defined state (`get-config` returns a `provider` table with every
+  credentialed provider's section key present and `null` values, e.g.
+  `"provider":{"alpaca":null,"alpaca_crypto":null}`; a `scripted-provider`
+  build leaves out `scripted` while its section is absent).
   `configure-provider` enables a provider at runtime; uncommenting the
   section and restarting does the same thing at boot.
 - **`remove-provider` leaves credentials stored.** It only removes the

@@ -34,6 +34,8 @@ mod control;
 mod credentials;
 mod error;
 mod paths;
+#[cfg(feature = "scripted-provider")]
+mod scripted;
 mod server;
 mod shutdown;
 mod single_instance;
