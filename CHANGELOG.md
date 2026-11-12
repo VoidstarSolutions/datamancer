@@ -6,6 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.10.0...v0.11.0) - 2026-11-12
+
+### Added
+
+- *(core)* report a provider's history and live surfaces apart
+- *(client)* [**breaking**] let a subscription opt out of the latest-value seed
+- *(core)* [**breaking**] admit a subscription only where its provider can serve it
+- *(datamancer)* limit how many client backfills fetch at once
+- *(daemon)* [**breaking**] limit how far back a client's backfill may start
+- *(client)* [**breaking**] honor scope live_backfill on subscribe
+- *(alpaca)* [**breaking**] name the REST feed on historical fetches
+- *(transport)* [**breaking**] typed service names replace the string helpers
+- *(transport)* [**breaking**] scope iceoryx2 data services by service_prefix
+- *(daemon)* add a scripted provider and hermetic e2e tests
+- *(datamancerd)* read IOX2_LOG_LEVEL in its own boot step
+- *(datamancerd)* honour IOX2_LOG_LEVEL for the iceoryx2 logger
+
+### Fixed
+
+- *(session)* [**breaking**] pin a backfill's live edge at the provider's ack
+- *(datamancer)* [**breaking**] keep a client answering while its stream is full
+- *(datamancer)* [**breaking**] pace a backfill to its consumers
+- *(session)* leave a real seq hole where the seam ring evicted
+- *(alpaca)* share one stream connection across live sessions
+- *(alpaca)* stream from the production data host on paper
+- *(transport)* [**breaking**] names derive only from a typed boot-scoped prefix
+- *(transport)* SystemInFlux is not a stale service
+- *(datamancerd)* [**breaking**] boot-scoped service names and a typed stale error
+- *(datamancerd)* reject an empty service_prefix before the boot id
+
+### Other
+
+- *(transport)* comment cleanup after the typed-names review
+- *(client)* add a runnable backfill tape example
+- *(daemon)* guard every ws_e2e daemon, fail early without paper creds
+- *(daemon)* pin every spawned test daemon's credential store
+- *(datamancerd)* a query's bars reach a data-plane subscriber
+- *(datamancerd)* trim the boot-scoped prefix docs to the type
+- *(datamancerd)* share one daemon guard between the e2e suites
+- *(datamancerd)* stop e2e daemons gracefully before the next spawn
+
 ## [0.10.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.9.0...v0.10.0) - 2026-10-10
 
 ### Added
