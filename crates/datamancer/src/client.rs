@@ -43,8 +43,8 @@ use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::session::{
-    ClientSessionRegistry, Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions,
-    SessionCommand, default_buffer,
+    Caller, ClientSessionRegistry, Datamancer, EventStream, LiveSessionRegistry,
+    PersistenceOptions, SessionCommand, default_buffer,
 };
 
 // ---------------------------------------------------------------------------
@@ -1442,18 +1442,11 @@ impl ClientController {
         if self.entries.contains_key(&key) {
             return Err(Error::DuplicateSubscription { instrument, kind });
         }
-        self.dm.check_client_backfill(scope)?;
         let Attached {
             guard, rx, outcome, ..
         } = self
             .dm
-            .authoritative(
-                instrument.clone(),
-                kind,
-                scope,
-                options,
-                self.dm.client_backfill_permits(),
-            )
+            .authoritative(instrument.clone(), kind, scope, options, Caller::Client)
             .await?;
         let provider = guard.provider().to_string();
         self.entries.insert(
@@ -1884,15 +1877,24 @@ impl ClientSession {
     ///
     /// - [`Error::DuplicateSubscription`] — `(instrument, kind)` is already in
     ///   this client's set.
-    /// - [`Error::UnsupportedEventKind`] — no provider serves the pair on the
-    ///   surfaces the scope needs (live, plus history under backfill).
+    /// - [`Error::UnknownProvider`] — no registered provider has the
+    ///   instrument's [`provider`](Instrument::provider) id.
     /// - [`Error::PersistenceRequired`] — `options` needs a cache or tap log
     ///   that is not configured, on a joiner as on a creator.
     /// - [`Error::BackfillTooOld`] — a backfill starts before the limit set by
-    ///   [`DatamancerBuilder::max_client_backfill`](crate::DatamancerBuilder::max_client_backfill).
+    ///   [`DatamancerBuilder::max_client_backfill`](crate::DatamancerBuilder::max_client_backfill),
+    ///   on a joiner as on a creator.
     /// - [`Error::BackfillFromNotInPast`] — this subscribe would create a
     ///   session whose backfill starts at or past the live edge. A joiner is
     ///   not checked.
+    /// - [`Error::UnsupportedEventKind`] — this subscribe would create a
+    ///   session and that provider lacks a surface the scope needs (live, plus
+    ///   history under backfill). A joiner is not checked: a
+    ///   [`LiveScope::LiveBackfill`] subscribe on a pair a live-only provider
+    ///   already holds under [`LiveScope::Live`] answers
+    ///   [`Subscribed::Joined`] with that `Live` session.
+    /// - [`Error::ProviderDisabled`] — the session's provider is disabled,
+    ///   whether this subscribe would create or join.
     /// - [`Error::SessionClosed`] — the controller has shut down.
     pub async fn subscribe(
         &self,

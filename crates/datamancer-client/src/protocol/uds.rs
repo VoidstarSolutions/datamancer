@@ -85,8 +85,10 @@ pub enum Request {
     /// Remove stored credentials. The running provider keeps its last
     /// applied credentials until restart (there is no un-apply).
     ClearCredentials { provider: String },
-    /// Return the daemon's current config (TOML as JSON) plus whether any
-    /// cold-classified field diverges from the boot-applied config.
+    /// Return the daemon's current config (TOML as JSON) plus whether it
+    /// takes a restart to fully apply: a cold-classified field differs from
+    /// the boot-applied config, or an `always_on` startup session skipped at
+    /// boot has its provider enabled and stays unopened.
     GetConfig,
     /// Enable (or re-configure) a compiled-in provider. `settings` is the
     /// provider's config-section shape (e.g. `{"account_type":"live"}`);
@@ -151,11 +153,13 @@ pub struct Reply {
     /// Human-readable error detail (on failure).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// The daemon config and cold-field divergence flag (on `get-config`).
+    /// The daemon config (on `get-config`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<serde_json::Value>,
-    /// Flag indicating a cold-classified field requires daemon restart
-    /// to take effect (on config mutations).
+    /// Whether the daemon's config takes a restart to fully apply: a
+    /// cold-classified field differs from the boot config, or an `always_on`
+    /// startup session skipped at boot has its provider enabled and stays
+    /// unopened (on `get-config`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_required: Option<bool>,
     /// Applied scope for a mutating config op (on config mutations).
@@ -304,8 +308,8 @@ impl Reply {
         }
     }
 
-    /// Success carrying the daemon config and its cold-field divergence flag
-    /// (on `get-config`).
+    /// Success carrying the daemon config and whether it takes a restart to
+    /// fully apply (on `get-config`).
     #[must_use]
     pub fn config(config: serde_json::Value, restart_required: bool) -> Self {
         Self {
@@ -320,6 +324,16 @@ impl Reply {
     pub fn applied_live() -> Self {
         Self {
             applied: Some("live".to_string()),
+            ..Self::ok()
+        }
+    }
+
+    /// Success for a mutating config op that applied to the running daemon,
+    /// where the resulting config takes a restart to fully apply.
+    #[must_use]
+    pub fn applied_restart_required() -> Self {
+        Self {
+            applied: Some("restart_required".to_string()),
             ..Self::ok()
         }
     }
@@ -669,6 +683,9 @@ mod tests {
         assert_eq!(applied["applied"], "live");
         assert!(applied.get("config").is_none());
 
+        let restart = serde_json::to_value(Reply::applied_restart_required()).unwrap();
+        assert_eq!(restart["applied"], "restart_required");
+
         let plain = serde_json::to_value(Reply::ok()).unwrap();
         assert!(plain.get("config").is_none());
         assert!(plain.get("restart_required").is_none());
@@ -677,6 +694,7 @@ mod tests {
     #[test]
     fn new_config_codes_are_stable() {
         assert_eq!(crate::codes::RESTART_REQUIRED, "restart_required");
+        assert_eq!(crate::codes::PROVIDER_DISABLED, "provider_disabled");
         assert_eq!(crate::codes::UNKNOWN_CONFIG_FIELD, "unknown_config_field");
         assert_eq!(crate::codes::BACKFILL_NOT_IN_PAST, "backfill_not_in_past");
         assert_eq!(crate::codes::BACKFILL_TOO_OLD, "backfill_too_old");

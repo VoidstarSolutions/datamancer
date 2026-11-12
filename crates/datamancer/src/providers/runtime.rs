@@ -4,7 +4,51 @@
 //! parks), `Some(settings)` = enabled with those settings. `Static` is the
 //! embedder default: always enabled, settings fixed at construction.
 
+use datamancer_core::Error;
 use tokio::sync::watch;
+
+/// The error for a REST call with no client, decided from the settings read
+/// that left it unbuilt: [`Error::ProviderDisabled`] when that read found the
+/// provider disabled, else [`Error::Unauthenticated`].
+pub(super) fn no_rest_client(provider: &str, enabled: bool) -> Error {
+    let provider = provider.to_string();
+    if enabled {
+        Error::Unauthenticated {
+            provider,
+            message: "credentials missing".to_string(),
+        }
+    } else {
+        Error::ProviderDisabled { provider }
+    }
+}
+
+/// Why a provider's streaming task is parked, and so which error a
+/// subscribe or unsubscribe gets meanwhile: a credential park is
+/// [`Error::Unauthenticated`], a disable is [`Error::ProviderDisabled`].
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Park {
+    Disabled,
+    MissingCredentials,
+    RejectedCredentials,
+}
+
+impl Park {
+    /// The error `provider` answers with while parked.
+    pub(super) fn error(self, provider: &str) -> Error {
+        let provider = provider.to_string();
+        match self {
+            Self::Disabled => Error::ProviderDisabled { provider },
+            Self::MissingCredentials => Error::Unauthenticated {
+                provider,
+                message: "waiting for credentials".to_string(),
+            },
+            Self::RejectedCredentials => Error::Unauthenticated {
+                provider,
+                message: "waiting for new credentials after auth rejection".to_string(),
+            },
+        }
+    }
+}
 
 /// Where a provider gets its runtime settings, resolved fresh at every
 /// (re)connect. `None` from a `Watch` source means the provider is disabled.
@@ -13,7 +57,8 @@ pub enum SettingsSource<T> {
     /// Fixed settings; the provider is always enabled. The embedder default.
     Static(T),
     /// Live-updatable source (the daemon's config service). `None` =
-    /// disabled: the streaming task parks and REST calls fail unavailable.
+    /// disabled: the streaming task parks and REST calls fail with
+    /// [`Error::ProviderDisabled`].
     Watch(watch::Receiver<Option<T>>),
 }
 

@@ -14,7 +14,7 @@ use datamancer::providers::{
 use tokio::sync::watch;
 
 use crate::config::{AlpacaCryptoSection, AlpacaSection, Config};
-use crate::config_class::cold_divergence;
+use crate::config_class::restart_divergence;
 use crate::control::{Reply, codes};
 use crate::error::Result;
 
@@ -42,7 +42,7 @@ struct HubState {
 
 pub(crate) struct ConfigHub {
     path: PathBuf,
-    /// Boot-applied config: `cold_divergence(&boot, &current)` non-empty ⇒
+    /// Boot-applied config: `restart_divergence(&boot, &current)` non-empty ⇒
     /// restart required.
     boot: Config,
     state: tokio::sync::Mutex<HubState>,
@@ -99,7 +99,9 @@ impl ConfigHub {
         self.state.lock().await.current.clone()
     }
 
-    /// The current config as JSON plus the cold-field divergence flag.
+    /// The current config as JSON plus whether it takes a restart to fully
+    /// apply: a Cold field differs from boot, or an `always_on` startup
+    /// session skipped at boot has its provider enabled and stays unopened.
     ///
     /// `get-config` is deliberately ungated (same posture as `snapshot`), so
     /// the one secret-shaped field, `[ws].auth_token`, is replaced with
@@ -111,7 +113,7 @@ impl ConfigHub {
     /// those ops can never persist the placeholder in place of the token.
     pub(crate) async fn get_config(&self) -> Reply {
         let state = self.state.lock().await;
-        let restart_required = !cold_divergence(&self.boot, &state.current).is_empty();
+        let restart_required = !restart_divergence(&self.boot, &state.current).is_empty();
         let mut redacted = state.current.clone();
         if let Some(ws) = redacted.ws.as_mut()
             && ws.auth_token.is_some()
@@ -155,7 +157,7 @@ impl ConfigHub {
             Ok(()) => {
                 self.apply(&state.current);
                 tracing::info!(provider, "provider configured and hot-applied");
-                Reply::applied_live()
+                self.applied(&state.current)
             }
             Err(reply) => reply,
         }
@@ -175,21 +177,31 @@ impl ConfigHub {
             Ok(()) => {
                 self.apply(&state.current);
                 tracing::info!(provider, "provider disabled");
-                Reply::applied_live()
+                self.applied(&state.current)
             }
             Err(reply) => reply,
         }
     }
 
+    /// The reply to a provider op that applied `current`: `restart_required`
+    /// exactly when `get-config` reports it for `current`, else `live`.
+    fn applied(&self, current: &Config) -> Reply {
+        if restart_divergence(&self.boot, current).is_empty() {
+            Reply::applied_live()
+        } else {
+            Reply::applied_restart_required()
+        }
+    }
+
     /// Replace the whole config (the web UI's PUT path). Hot provider
-    /// changes apply live; returns whether cold fields now diverge from the
-    /// boot config.
+    /// changes apply live; returns whether the config now takes a restart to
+    /// fully apply, by the rule `get-config` reports.
     pub(crate) async fn apply_full(&self, new: Config) -> Result<bool> {
         let mut state = self.state.lock().await;
         self.save_to_disk(&new).await?;
         state.current = new;
         self.apply(&state.current);
-        Ok(!cold_divergence(&self.boot, &state.current).is_empty())
+        Ok(!restart_divergence(&self.boot, &state.current).is_empty())
     }
 
     /// Atomically persist `candidate` to the config file, off the shared
@@ -352,6 +364,67 @@ mod tests {
         // Persisted atomically:
         let on_disk = Config::load(dir.path().join("config.toml")).expect("reload");
         assert!(on_disk.provider.alpaca.is_some());
+    }
+
+    const SKIPPED_ANCHOR: &str = r#"
+[provider]
+
+[[startup_session]]
+provider = "alpaca"
+asset_class = "equity"
+symbol = "AAPL"
+kind = "trade"
+always_on = true
+"#;
+
+    #[tokio::test]
+    async fn enabling_a_provider_with_a_skipped_anchor_answers_restart_required() {
+        let (hub, sources, _dir) = hub_with(SKIPPED_ANCHOR);
+        let reply = hub
+            .configure_provider("alpaca", serde_json::json!({"account_type": "paper"}))
+            .await;
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(reply.applied.as_deref(), Some(codes::RESTART_REQUIRED));
+        assert!(
+            sources.alpaca.current().is_some(),
+            "the provider still applies live"
+        );
+        assert_eq!(hub.get_config().await.restart_required, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_provider_with_no_skipped_anchor_answers_applied_live() {
+        let (hub, _sources, _dir) = hub_with(SKIPPED_ANCHOR);
+        let reply = hub
+            .configure_provider(
+                alpaca_crypto::PROVIDER_ID,
+                serde_json::json!({"account_type": "paper", "venue": "us"}),
+            )
+            .await;
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(reply.applied.as_deref(), Some("live"));
+        assert_eq!(hub.get_config().await.restart_required, Some(false));
+    }
+
+    #[tokio::test]
+    async fn remove_provider_answers_restart_required_while_a_skipped_anchor_waits() {
+        let (hub, _sources, _dir) = hub_with(SKIPPED_ANCHOR);
+        hub.configure_provider("alpaca", serde_json::json!({"account_type": "paper"}))
+            .await;
+        hub.configure_provider(
+            alpaca_crypto::PROVIDER_ID,
+            serde_json::json!({"account_type": "paper", "venue": "us"}),
+        )
+        .await;
+        let reply = hub.remove_provider(alpaca_crypto::PROVIDER_ID).await;
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(reply.applied.as_deref(), Some(codes::RESTART_REQUIRED));
+        assert_eq!(hub.get_config().await.restart_required, Some(true));
+
+        let reply = hub.remove_provider("alpaca").await;
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(reply.applied.as_deref(), Some("live"));
+        assert_eq!(hub.get_config().await.restart_required, Some(false));
     }
 
     #[tokio::test]

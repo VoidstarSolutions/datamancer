@@ -319,6 +319,37 @@ fn host_global_open_error(what: &str, e: &datamancer::transport::TransportError)
     }
 }
 
+/// Open an `always_on` anchor, or `None` when its provider is disabled.
+async fn open_anchor(
+    dm: &Datamancer,
+    startup: &crate::config::StartupSession,
+) -> Result<Option<Session>> {
+    let opened = dm
+        .session(
+            startup.instrument(),
+            startup.kind.into(),
+            startup.resolve_scope()?.into(),
+            crate::config::persistence_options(startup.persistence),
+        )
+        .await;
+    match opened {
+        Ok(session) => Ok(Some(session)),
+        Err(datamancer::Error::ProviderDisabled { provider }) => {
+            tracing::warn!(
+                %provider,
+                symbol = %startup.symbol,
+                kind = ?startup.kind,
+                "skipping always_on startup session: its provider is disabled; restart after enabling it"
+            );
+            Ok(None)
+        }
+        Err(error @ datamancer::Error::BackfillFromNotInPast { .. }) => Err(
+            DaemonError::ConfigInvalid(format!("startup_session {}: {error}", startup.symbol)),
+        ),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Server {
     /// Build the daemon from a validated [`Config`]: assemble the
     /// [`Datamancer`], create the one process-wide iceoryx2 node, and open the
@@ -396,7 +427,10 @@ impl Server {
                 );
                 continue;
             }
-            anchors.push(open_anchor(&dm, s).await?);
+            if let Some(session) = open_anchor(&dm, s).await? {
+                tracing::info!(symbol = %s.symbol, "anchored always_on startup session");
+                anchors.push(session);
+            }
         }
 
         Ok(Self {
@@ -1355,26 +1389,6 @@ fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(),
     Ok(())
 }
 
-/// Open an `always_on` startup session.
-async fn open_anchor(dm: &Datamancer, s: &crate::config::StartupSession) -> Result<Session> {
-    let session = dm
-        .session(
-            s.instrument(),
-            s.kind.into(),
-            s.resolve_scope()?.into(),
-            crate::config::persistence_options(s.persistence),
-        )
-        .await
-        .map_err(|e| match e {
-            datamancer::Error::BackfillFromNotInPast { .. } => {
-                DaemonError::ConfigInvalid(format!("startup_session {}: {e}", s.symbol))
-            }
-            other => other.into(),
-        })?;
-    tracing::info!(symbol = %s.symbol, "anchored always_on startup session");
-    Ok(session)
-}
-
 /// Pump a client's multiplexed stream into its per-client sink, in arrival
 /// order (`(instrument, seq)`; no cross-symbol order is created). A single
 /// sequential pump preserves the stream's existing order. Unix/macOS only —
@@ -2208,6 +2222,59 @@ mod tests {
             config_hub,
         ));
         (client, task, cmd_rx, dir)
+    }
+
+    async fn runtime_for(config: &Config) -> (Datamancer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_hub, settings) =
+            crate::config_hub::ConfigHub::bootstrap(config.clone(), dir.path().join("config.toml"));
+        let dm = config
+            .clone()
+            .build_runtime(&std::collections::HashMap::new(), settings)
+            .await
+            .expect("runtime")
+            .datamancer;
+        (dm, dir)
+    }
+
+    #[tokio::test]
+    async fn an_anchor_on_a_disabled_provider_is_skipped_and_any_other_failure_aborts() {
+        let anchors = r#"
+[[startup_session]]
+provider = "alpaca"
+asset_class = "equity"
+symbol = "AAPL"
+kind = "trade"
+always_on = true
+
+[[startup_session]]
+provider = "alpaca"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+always_on = true
+"#;
+        let disabled = Config::parse(anchors).expect("a compiled provider with no section parses");
+        let (dm, _dir) = runtime_for(&disabled).await;
+        assert!(
+            open_anchor(&dm, &disabled.startup_session[0])
+                .await
+                .expect("a disabled provider does not abort boot")
+                .is_none()
+        );
+
+        let enabled = Config::parse(&format!(
+            "[provider.alpaca]\naccount_type = \"paper\"\n{anchors}"
+        ))
+        .expect("parse");
+        let (dm, _dir) = runtime_for(&enabled).await;
+        match open_anchor(&dm, &enabled.startup_session[1]).await {
+            Err(DaemonError::Library(datamancer::Error::UnsupportedEventKind { .. })) => {}
+            other => panic!(
+                "an enabled provider that does not serve the pair aborts: {:?}",
+                other.map(|session| session.is_some())
+            ),
+        }
     }
 
     #[tokio::test]

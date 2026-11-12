@@ -4,18 +4,20 @@
 //! with, plus the [`ConfigHub`](crate::config_hub::ConfigHub) that is the
 //! daemon's sole hot-path config writer. `write` delegates the full
 //! validate→persist→apply sequence to the hub — this layer no longer touches
-//! the file directly. `restart_required` is `true` when either the on-disk
-//! file's cold fields diverge from the boot config, or the on-disk file
-//! diverges from what the hub currently has applied (an external hand-edit
-//! the hub hasn't seen yet) — a hand-edited hot field still needs a restart
-//! to take effect, since hand edits are boot-time only.
+//! the file directly. `restart_required` is `true` when the on-disk file
+//! takes a restart against the boot config (a Cold field differs, or an
+//! `always_on` startup session skipped at boot has its provider enabled and
+//! stays unopened), or when the on-disk file differs from what the hub
+//! currently has applied (an external hand-edit the hub hasn't seen yet) — a
+//! hand-edited hot field still needs a restart to take effect, since hand
+//! edits are boot-time only.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
-use crate::config_class::cold_divergence;
+use crate::config_class::restart_divergence;
 use crate::config_hub::ConfigHub;
 use crate::error::{DaemonError, Result};
 
@@ -98,8 +100,8 @@ impl ConfigState {
 
     /// Validate and apply `config` via the hub (the sole hot-path writer):
     /// validate → persist → apply, then recompute the restart flag from the
-    /// hub's cold-divergence verdict. Nothing is written (and the flag is
-    /// unchanged) on failure.
+    /// hub's verdict, the rule `get-config` reports. Nothing is written (and
+    /// the flag is unchanged) on failure.
     ///
     /// Serialized against concurrent `read_disk`/`write` calls: two in-flight
     /// `PUT /api/config` requests would otherwise race the preserve-on-write
@@ -140,14 +142,16 @@ impl ConfigState {
     }
 
     /// Recompute the restart flag for the `read_disk` (display) path: a hand
-    /// edit is flagged whenever its cold fields diverge from the boot config,
-    /// or whenever it diverges at all from what the hub currently has applied
-    /// (an edit the hub hasn't seen — and, being hot-only-at-boot, never will
-    /// apply live — still needs a restart to take effect).
+    /// edit is flagged whenever it takes a restart against the boot config (a
+    /// Cold field differs, or a skipped `always_on` startup session has its
+    /// provider enabled), or whenever it diverges at all from what the hub
+    /// currently has applied (an edit the hub hasn't seen — and, being
+    /// hot-only-at-boot, never will apply live — still needs a restart to take
+    /// effect).
     async fn store_disk_flag(&self, on_disk: &Config) {
         let hub_current = self.inner.hub.current().await;
         let restart_required =
-            !cold_divergence(&self.inner.boot, on_disk).is_empty() || *on_disk != hub_current;
+            !restart_divergence(&self.inner.boot, on_disk).is_empty() || *on_disk != hub_current;
         self.inner
             .restart_required
             .store(restart_required, Ordering::Relaxed);

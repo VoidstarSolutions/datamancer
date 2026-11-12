@@ -24,6 +24,7 @@ pub fn error_code(err: &datamancer::Error) -> &'static str {
         Error::DuplicateSubscription { .. } => codes::DUPLICATE_SUBSCRIPTION,
         Error::NotSubscribed { .. } => codes::NOT_SUBSCRIBED,
         Error::UnknownProvider(_) => codes::UNKNOWN_PROVIDER,
+        Error::ProviderDisabled { .. } => codes::PROVIDER_DISABLED,
         Error::SessionClosed => codes::SESSION_CLOSED,
         Error::EventsAlreadyTaken => codes::EVENTS_ALREADY_TAKEN,
         Error::Storage(_) => codes::STORAGE,
@@ -96,6 +97,12 @@ mod tests {
         assert_eq!(
             error_code(&Error::UnknownProvider("x".to_string())),
             codes::UNKNOWN_PROVIDER
+        );
+        assert_eq!(
+            error_code(&Error::ProviderDisabled {
+                provider: "x".to_string()
+            }),
+            codes::PROVIDER_DISABLED
         );
         assert_eq!(error_code(&Error::SessionClosed), codes::SESSION_CLOSED);
         assert_eq!(

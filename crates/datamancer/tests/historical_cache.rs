@@ -6,7 +6,7 @@
 
 #![cfg(feature = "storage-turso")]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -34,6 +34,7 @@ struct RecordingProvider {
     data: Vec<MarketEvent>,
     fetched: FetchLog,
     fail_at: Option<i64>,
+    disabled: bool,
 }
 
 impl RecordingProvider {
@@ -45,6 +46,7 @@ impl RecordingProvider {
                 data,
                 fetched: fetched.clone(),
                 fail_at: None,
+                disabled: false,
             },
             fetched,
         )
@@ -54,12 +56,21 @@ impl RecordingProvider {
         self.fail_at = Some(ts);
         self
     }
+
+    /// Parked: `enabled` reads false and a fetch is refused.
+    fn disabled(mut self) -> Self {
+        self.disabled = true;
+        self
+    }
 }
 
 #[async_trait]
 impl Provider for RecordingProvider {
     fn id(&self) -> &str {
         &self.id
+    }
+    fn enabled(&self) -> bool {
+        !self.disabled
     }
     fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
         true
@@ -76,6 +87,11 @@ impl Provider for RecordingProvider {
             .lock()
             .unwrap()
             .push((request.from.0, request.to.0));
+        if self.disabled {
+            return Err(datamancer::Error::ProviderDisabled {
+                provider: self.id.clone(),
+            });
+        }
         for ev in &self.data {
             let ts = match ev {
                 MarketEvent::Bar(b) => b.source_ts.0,
@@ -98,6 +114,50 @@ impl Provider for RecordingProvider {
             }
         }
         Ok(())
+    }
+}
+
+/// Records every fetch. Parked while `enabled` is false, and then answers a
+/// fetch with an empty `Ok`; enabled, a fetch never returns.
+struct ParkableProvider {
+    enabled: Arc<AtomicBool>,
+    fetched: FetchLog,
+    /// When set, the next `enabled` read answers as usual and then flips it.
+    flip_after_read: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Provider for ParkableProvider {
+    fn id(&self) -> &'static str {
+        "rec"
+    }
+    fn enabled(&self) -> bool {
+        let enabled = self.enabled.load(Ordering::SeqCst);
+        if self.flip_after_read.swap(false, Ordering::SeqCst) {
+            self.enabled.store(!enabled, Ordering::SeqCst);
+        }
+        enabled
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(NoopLive))
+    }
+    async fn fetch_history(
+        &self,
+        request: HistoryRequest,
+        _sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        let enabled = self.enabled();
+        self.fetched
+            .lock()
+            .unwrap()
+            .push((request.from.0, request.to.0));
+        if !enabled {
+            return Ok(());
+        }
+        std::future::pending().await
     }
 }
 
@@ -418,6 +478,453 @@ async fn failed_gap_fetch_emits_provider_error_control() {
         provider_errors,
         vec!["synthetic mid-fetch failure".to_string()],
         "a failed gap fetch must emit exactly one ProviderError control"
+    );
+}
+
+#[tokio::test]
+async fn disabled_provider_still_serves_a_fully_cached_range() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    cache
+        .store(&key(0, 1000), &[bar(100, 1.0), bar(900, 2.0)])
+        .await
+        .unwrap();
+    let (provider, fetched) = RecordingProvider::new("rec", vec![]);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider.disabled()))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .expect("a cached range needs no provider");
+
+    let (bars, gaps) = drain(&session).await;
+    assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 900]);
+    assert!(gaps.is_empty());
+    assert!(fetched.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn disabled_provider_reports_an_uncached_range_as_a_failed_fetch() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    let (provider, fetched) = RecordingProvider::new("rec", vec![]);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider.disabled()))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .expect("the open is not refused");
+
+    let mut stream = session.take_events().await.unwrap();
+    let mut provider_errors = Vec::new();
+    while let Some(ev) = stream.next().await {
+        if let MarketEvent::Control(c) = ev {
+            match c.kind {
+                ControlKind::ProviderError { message, .. } => provider_errors.push(message),
+                ControlKind::SessionClosing => break,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(provider_errors, vec!["provider disabled".to_string()]);
+    assert!(fetched.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn disabled_provider_serves_the_cached_part_and_gaps_the_rest() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    cache
+        .store(&key(0, 500), &[bar(100, 1.0), bar(400, 2.0)])
+        .await
+        .unwrap();
+    let (provider, fetched) = RecordingProvider::new("rec", vec![]);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider.disabled()))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .expect("part of the range is cached");
+
+    let (bars, gaps) = drain(&session).await;
+    assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![100, 400]);
+    assert_eq!(gaps, vec![(500, 1000)]);
+    assert!(fetched.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_fetch_over_a_leading_hole_still_serves_the_cached_rest() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    cache
+        .store(&key(200, 1000), &[bar(300, 1.0), bar(900, 2.0)])
+        .await
+        .unwrap();
+    let (provider, fetched) = RecordingProvider::new("rec", vec![bar(100, 1.0)]);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider.with_fail_at(50)))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .expect("part of the range is cached");
+
+    let (bars, gaps) = drain(&session).await;
+    assert_eq!(bars.iter().map(|b| b.0).collect::<Vec<_>>(), vec![300, 900]);
+    assert_eq!(gaps, vec![(0, 200)]);
+    assert_eq!(*fetched.lock().unwrap(), vec![(0, 200)]);
+}
+
+#[tokio::test]
+async fn a_failed_fetch_accounts_for_a_cached_island_and_fetches_once() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    cache.store(&key(200, 400), &[bar(300, 1.0)]).await.unwrap();
+    let (provider, fetched) = RecordingProvider::new("rec", vec![bar(100, 1.0)]);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider.with_fail_at(50)))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .expect("part of the range is cached");
+
+    let mut stream = session.take_events().await.unwrap();
+    let mut seen = Vec::new();
+    let mut provider_errors = 0;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            MarketEvent::Bar(b) => seen.push(format!("bar {}", b.source_ts.0)),
+            MarketEvent::Control(c) => match c.kind {
+                ControlKind::Gap { span, .. } => seen.push(format!(
+                    "gap {}..{}",
+                    span.from_source_ts.0, span.to_source_ts.0
+                )),
+                ControlKind::ProviderError { .. } => provider_errors += 1,
+                ControlKind::SessionClosing => break,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    assert_eq!(seen, vec!["gap 0..200", "bar 300", "gap 400..1000"]);
+    assert_eq!(provider_errors, 1);
+    assert_eq!(*fetched.lock().unwrap(), vec![(0, 200)]);
+    let unclaimed = cache.gaps(&key(0, 1000)).await.unwrap();
+    assert_eq!(
+        unclaimed
+            .iter()
+            .map(|g| (g.from_source_ts.0, g.to_source_ts.0))
+            .collect::<Vec<_>>(),
+        vec![(0, 200), (400, 1000)],
+        "only what was stored is claimed"
+    );
+}
+
+#[tokio::test]
+async fn disabled_provider_refuses_a_refresh_it_cannot_serve() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    let (provider, fetched) = RecordingProvider::new("rec", vec![]);
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(provider.disabled()))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+
+    let opened = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::refresh(),
+        )
+        .await;
+    assert!(matches!(
+        opened,
+        Err(datamancer::Error::ProviderDisabled { .. })
+    ));
+    assert!(fetched.lock().unwrap().is_empty());
+}
+
+/// The parked provider here would answer with an empty `Ok`; the fetch is not
+/// asked for. Session `holder` keeps the range's fetch slot, so a parked
+/// session that took the slot would never finish.
+#[tokio::test]
+async fn a_parked_provider_is_not_fetched_and_covers_nothing() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    let enabled = Arc::new(AtomicBool::new(true));
+    let fetched: FetchLog = Arc::new(Mutex::new(Vec::new()));
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(ParkableProvider {
+            enabled: enabled.clone(),
+            fetched: fetched.clone(),
+            flip_after_read: Arc::new(AtomicBool::new(false)),
+        }))
+        .historical_cache_arc(cache.clone())
+        .build()
+        .unwrap();
+    let open = || {
+        dm.session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+    };
+
+    let holder = open().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fetched.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the holder's fetch starts");
+    enabled.store(false, Ordering::SeqCst);
+
+    let parked = open().await.expect("a cached open is not refused");
+    let mut stream = parked.take_events().await.unwrap();
+    let mut gaps = Vec::new();
+    let mut provider_errors = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(ev) = stream.next().await {
+            if let MarketEvent::Control(c) = ev {
+                match c.kind {
+                    ControlKind::Gap { span, .. } => {
+                        gaps.push((span.from_source_ts.0, span.to_source_ts.0));
+                    }
+                    ControlKind::ProviderError { message, .. } => provider_errors.push(message),
+                    ControlKind::SessionClosing => break,
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("the parked session takes no fetch slot");
+
+    assert_eq!(gaps, vec![(0, 1000)]);
+    assert_eq!(provider_errors, vec!["provider disabled".to_string()]);
+    assert_eq!(
+        *fetched.lock().unwrap(),
+        vec![(0, 1000)],
+        "only the holder fetched"
+    );
+    let snap = dm.snapshot().await.unwrap();
+    let rec = snap
+        .providers
+        .iter()
+        .find(|p| p.provider.as_str() == "rec")
+        .expect("a snapshot for the provider");
+    assert_eq!(rec.history_fetches, 1, "only the holder's fetch is counted");
+    let unclaimed = cache.gaps(&key(0, 1000)).await.unwrap();
+    assert_eq!(
+        unclaimed
+            .iter()
+            .map(|g| (g.from_source_ts.0, g.to_source_ts.0))
+            .collect::<Vec<_>>(),
+        vec![(0, 1000)],
+        "nothing is claimed"
+    );
+    drop(holder);
+}
+
+/// The provider is enabled the moment after the replay reads it parked: the
+/// read that skipped the fetch slot also decides the fetch, so the gap is not
+/// fetched without the slot.
+#[tokio::test]
+async fn one_read_decides_both_the_fetch_slot_and_the_fetch() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    let fetched: FetchLog = Arc::new(Mutex::new(Vec::new()));
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(ParkableProvider {
+            enabled: Arc::new(AtomicBool::new(false)),
+            fetched: fetched.clone(),
+            flip_after_read: Arc::new(AtomicBool::new(true)),
+        }))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .expect("a cached open is not refused");
+    let (bars, gaps) = tokio::time::timeout(std::time::Duration::from_secs(5), drain(&session))
+        .await
+        .expect("the parked replay finishes without fetching");
+
+    assert!(bars.is_empty());
+    assert_eq!(gaps, vec![(0, 1000)]);
+    assert!(fetched.lock().unwrap().is_empty());
+}
+
+/// The provider is enabled while a cached prefix replays: the gap after it
+/// reads the provider again and is fetched, not reported as disabled.
+#[tokio::test]
+async fn a_provider_enabled_during_a_cached_prefix_is_fetched_from() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    cache.store(&key(0, 500), &[bar(100, 1.0)]).await.unwrap();
+    let fetched: FetchLog = Arc::new(Mutex::new(Vec::new()));
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(ParkableProvider {
+            enabled: Arc::new(AtomicBool::new(false)),
+            fetched: fetched.clone(),
+            flip_after_read: Arc::new(AtomicBool::new(true)),
+        }))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+        .await
+        .expect("a cached open is not refused");
+    let _stream = session.take_events().await.unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fetched.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the gap after the cached prefix was not fetched");
+    assert_eq!(*fetched.lock().unwrap(), vec![(500, 1000)]);
+}
+
+/// A replay that waited for the fetch slot reads the provider again once it
+/// holds it: parked during the wait, the provider is not fetched from.
+#[tokio::test]
+async fn a_provider_parked_during_the_slot_wait_is_not_fetched() {
+    let cache = Arc::new(TursoCache::open(TursoCacheConfig::Memory).await.unwrap());
+    let flip_after_read = Arc::new(AtomicBool::new(false));
+    let fetched: FetchLog = Arc::new(Mutex::new(Vec::new()));
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(ParkableProvider {
+            enabled: Arc::new(AtomicBool::new(true)),
+            fetched: fetched.clone(),
+            flip_after_read: flip_after_read.clone(),
+        }))
+        .historical_cache_arc(cache)
+        .build()
+        .unwrap();
+    let open = || {
+        dm.session(
+            inst(),
+            EventKind::Bar(BarInterval::OneMinute),
+            Scope::Historical {
+                from: Timestamp(0),
+                to: Timestamp(1000),
+            },
+            PersistenceOptions::cached(),
+        )
+    };
+
+    let holder = open().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fetched.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the holder's fetch starts");
+    // The waiter's read before the slot finds the provider enabled and parks
+    // it.
+    flip_after_read.store(true, Ordering::SeqCst);
+    let waiter = open().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while flip_after_read.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the waiter reads the provider");
+    holder.close().await.unwrap();
+
+    let (bars, gaps) = tokio::time::timeout(std::time::Duration::from_secs(5), drain(&waiter))
+        .await
+        .expect("the waiter finishes");
+    assert!(bars.is_empty());
+    assert_eq!(gaps, vec![(0, 1000)]);
+    assert_eq!(
+        *fetched.lock().unwrap(),
+        vec![(0, 1000)],
+        "only the holder fetched"
     );
 }
 

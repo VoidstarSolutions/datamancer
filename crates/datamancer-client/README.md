@@ -73,7 +73,7 @@ transports and regression-guarded by tests. Treat these as an operator contract:
 | Queries | `unknown_query`, `unsupported_transport`, `unsupported_on_windows` |
 | Credentials / config | `credentials_missing`, `credential_backend_unavailable`, `unknown_config_field`, `restart_required` |
 | Access control | `permission_denied`, `integrity_rejected` |
-| Generic | `unknown_provider`, `bad_request`, `storage`, `config`, `provider`, `shutting_down`, `internal` |
+| Generic | `unknown_provider`, `provider_disabled`, `bad_request`, `storage`, `config`, `provider`, `shutting_down`, `internal` |
 
 `codes.rs` is authoritative; adding or removing one is a breaking change.
 

@@ -55,7 +55,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
-use super::runtime::SettingsSource;
+use super::runtime::{Park, SettingsSource};
 use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca crypto provider.
@@ -203,12 +203,14 @@ impl Default for AlpacaCryptoProviderConfig {
 /// check-and-rebuild.
 struct RestState {
     /// Trading API client, used for the reference-data surface (crypto
-    /// asset catalog). `None` when credentials aren't available —
-    /// `list_instruments` then surfaces a Provider error.
+    /// asset catalog). `None` when disabled or without credentials.
     trading: Option<TradingClient>,
     /// Market-data API client, used for the snapshot/latest surface. `None`
-    /// when credentials aren't available.
+    /// when disabled or without credentials.
     market_data: Option<MarketDataClient>,
+    /// Whether the settings read the clients were built from found the
+    /// provider enabled.
+    enabled: bool,
     /// `Some` only for [`CredentialsSource::Watch`]; `has_changed` on this
     /// cached receiver is the rebuild trigger.
     cred_rx: Option<watch::Receiver<Option<AlpacaCredentials>>>,
@@ -217,25 +219,44 @@ struct RestState {
     settings_rx: Option<watch::Receiver<Option<AlpacaCryptoSettings>>>,
 }
 
-fn build_trading(cfg: &AlpacaCryptoProviderConfig) -> Option<TradingClient> {
-    let settings = cfg.settings.current()?;
-    match cfg.credentials.current() {
-        Resolved::Env => TradingClient::new(settings.account_type).ok(),
-        Resolved::Creds(c) => {
-            TradingClient::new_with_credentials(settings.account_type, c.to_api_key()).ok()
-        }
-        Resolved::Missing => None,
+impl RestState {
+    /// Rebuild both clients from one settings read.
+    fn rebuild(&mut self, cfg: &AlpacaCryptoProviderConfig) {
+        let Some(settings) = cfg.settings.current() else {
+            self.trading = None;
+            self.market_data = None;
+            self.enabled = false;
+            return;
+        };
+        (self.trading, self.market_data) = match cfg.credentials.current() {
+            Resolved::Env => (
+                TradingClient::new(settings.account_type).ok(),
+                MarketDataClient::new(settings.account_type).ok(),
+            ),
+            Resolved::Creds(c) => {
+                let key = c.to_api_key();
+                (
+                    TradingClient::new_with_credentials(settings.account_type, key.clone()).ok(),
+                    MarketDataClient::new_with_credentials(settings.account_type, key).ok(),
+                )
+            }
+            Resolved::Missing => (None, None),
+        };
+        self.enabled = true;
     }
-}
 
-fn build_market_data(cfg: &AlpacaCryptoProviderConfig) -> Option<MarketDataClient> {
-    let settings = cfg.settings.current()?;
-    match cfg.credentials.current() {
-        Resolved::Env => MarketDataClient::new(settings.account_type).ok(),
-        Resolved::Creds(c) => {
-            MarketDataClient::new_with_credentials(settings.account_type, c.to_api_key()).ok()
-        }
-        Resolved::Missing => None,
+    /// The trading client, or the refusal this state decides.
+    fn trading(&self) -> Result<TradingClient> {
+        self.trading
+            .clone()
+            .ok_or_else(|| super::runtime::no_rest_client(PROVIDER_ID, self.enabled))
+    }
+
+    /// The market-data client, or the refusal this state decides.
+    fn market_data(&self) -> Result<MarketDataClient> {
+        self.market_data
+            .clone()
+            .ok_or_else(|| super::runtime::no_rest_client(PROVIDER_ID, self.enabled))
     }
 }
 
@@ -265,12 +286,15 @@ impl AlpacaCryptoProvider {
         // credentials and the settings receiver.
         let cred_rx = cfg.credentials.watch();
         let settings_rx = cfg.settings.watch();
-        let rest = std::sync::Mutex::new(RestState {
-            trading: build_trading(&cfg),
-            market_data: build_market_data(&cfg),
+        let mut state = RestState {
+            trading: None,
+            market_data: None,
+            enabled: false,
             cred_rx,
             settings_rx,
-        });
+        };
+        state.rebuild(&cfg);
+        let rest = std::sync::Mutex::new(state);
         Self {
             cfg,
             hub: Arc::new(Mutex::new(HubSlot::Idle)),
@@ -289,21 +313,9 @@ impl AlpacaCryptoProvider {
         let changed = super::runtime::watch_changed(&mut state.cred_rx)
             | super::runtime::watch_changed(&mut state.settings_rx);
         if changed {
-            state.trading = build_trading(&self.cfg);
-            state.market_data = build_market_data(&self.cfg);
+            state.rebuild(&self.cfg);
         }
         state
-    }
-
-    /// Current trading client (see [`Self::refresh_rest`] for the rebuild rule).
-    fn trading_client(&self) -> Option<TradingClient> {
-        self.refresh_rest().trading.clone()
-    }
-
-    /// Current market-data client (see [`Self::refresh_rest`] for the rebuild
-    /// rule), used for the snapshot/latest surface.
-    fn current_market_data(&self) -> Option<MarketDataClient> {
-        self.refresh_rest().market_data.clone()
     }
 
     /// Lazily spawn the hub task and return its command channel.
@@ -381,10 +393,7 @@ impl Provider for AlpacaCryptoProvider {
         instrument: &Instrument,
         kind: EventKind,
     ) -> Result<Option<MarketEvent>> {
-        let rest = self.current_market_data().ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Market-data client not initialized (Alpaca credentials missing?)".to_string(),
-        })?;
+        let rest = self.refresh_rest().market_data()?;
         let venue = self
             .cfg
             .settings
@@ -410,10 +419,7 @@ impl Provider for AlpacaCryptoProvider {
     }
 
     async fn list_instruments(&self) -> Result<Vec<InstrumentEntry>> {
-        let trading = self.trading_client().ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
-        })?;
+        let trading = self.refresh_rest().trading()?;
         let assets = trading
             .list_assets()
             .status(AlpacaAssetStatus::Active)
@@ -428,10 +434,7 @@ impl Provider for AlpacaCryptoProvider {
     }
 
     async fn capabilities(&self, instrument: &Instrument) -> Result<Option<InstrumentEntry>> {
-        let trading = self.trading_client().ok_or_else(|| Error::Provider {
-            provider: PROVIDER_ID.to_string(),
-            message: "Trading client not initialized (Alpaca credentials missing?)".to_string(),
-        })?;
+        let trading = self.refresh_rest().trading()?;
         let asset = trading
             .get_asset(instrument.symbol())
             .await
@@ -871,38 +874,6 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
     }
 }
 
-/// Why the hub task is parked in [`wait_for_provisioning`], and so which
-/// error a subscribe/unsubscribe gets meanwhile: a credential park is
-/// `Error::Unauthenticated` (retrying cannot help; provisioning can), a
-/// disable is a plain provider error.
-#[derive(Debug, Clone, Copy)]
-enum Park {
-    Disabled,
-    MissingCredentials,
-    RejectedCredentials,
-}
-
-impl Park {
-    fn reason(self) -> &'static str {
-        match self {
-            Self::Disabled => "provider disabled",
-            Self::MissingCredentials => "waiting for credentials",
-            Self::RejectedCredentials => "waiting for new credentials after auth rejection",
-        }
-    }
-
-    fn error(self) -> Error {
-        let message = self.reason().to_string();
-        let provider = PROVIDER_ID.to_string();
-        match self {
-            Self::Disabled => Error::Provider { provider, message },
-            Self::MissingCredentials | Self::RejectedCredentials => {
-                Error::Unauthenticated { provider, message }
-            }
-        }
-    }
-}
-
 /// Waits for a `Watch` source (settings or credentials) to deliver a new
 /// value, servicing the command channel meanwhile (close/drop of all
 /// handles exits, subscribe/unsubscribe fail fast with `park`'s error).
@@ -929,7 +900,7 @@ async fn wait_for_provisioning<T>(
                             HubCommand::Subscribe { ack, .. }
                             | HubCommand::Unsubscribe { ack, .. },
                         ) => {
-                            let _ = ack.send(Err(park.error()));
+                            let _ = ack.send(Err(park.error(PROVIDER_ID)));
                         }
                         None => return false,
                     }
@@ -941,7 +912,7 @@ async fn wait_for_provisioning<T>(
                         HubCommand::Subscribe { ack, .. }
                         | HubCommand::Unsubscribe { ack, .. },
                     ) => {
-                        let _ = ack.send(Err(park.error()));
+                        let _ = ack.send(Err(park.error(PROVIDER_ID)));
                     }
                     None => return false,
                 }
@@ -1348,6 +1319,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_rest_credentials_are_unauthenticated() {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
+            credentials: CredentialsSource::Watch(rx),
+            ..Default::default()
+        });
+        let err = p
+            .list_instruments()
+            .await
+            .expect_err("no credentials, no trading client");
+        assert!(matches!(err, Error::Unauthenticated { .. }), "{err:?}");
+        let err = p
+            .latest(&provider_instrument("BTC/USD"), EventKind::Trade)
+            .await
+            .expect_err("no credentials, no market-data client");
+        assert!(matches!(err, Error::Unauthenticated { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_rest_refusal_is_decided_from_one_snapshot() {
+        let (settings_tx, settings_rx) = tokio::sync::watch::channel(None);
+        let (_creds_tx, creds_rx) = tokio::sync::watch::channel(None);
+        let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
+            settings: SettingsSource::Watch(settings_rx),
+            credentials: CredentialsSource::Watch(creds_rx),
+            ..Default::default()
+        });
+
+        let disabled = p.refresh_rest();
+        settings_tx
+            .send(Some(AlpacaCryptoSettings {
+                account_type: AccountType::Paper,
+                venue: AlpacaCryptoVenue::Us,
+            }))
+            .unwrap();
+        let err = disabled.trading().expect_err("taken while disabled");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
+        drop(disabled);
+
+        let enabled = p.refresh_rest();
+        settings_tx.send(None).unwrap();
+        let err = enabled
+            .market_data()
+            .expect_err("taken without credentials");
+        assert!(matches!(err, Error::Unauthenticated { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn disabled_provider_parks_and_fails_subscribes_fast() {
         let (_tx, rx) = tokio::sync::watch::channel(None);
         let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
@@ -1360,8 +1379,12 @@ mod tests {
             .subscribe(provider_instrument("BTC/USD"), EventKind::Trade)
             .await
             .expect_err("disabled provider must fail subscribes fast");
-        let msg = format!("{err}");
-        assert!(msg.contains("provider disabled"), "msg={msg:?}");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
+        let err = p
+            .list_instruments()
+            .await
+            .expect_err("a disabled provider has no REST client");
+        assert!(matches!(err, Error::ProviderDisabled { .. }), "{err:?}");
         // `start_live` already returns `Box<dyn LiveHandle>`; `close` takes
         // `self: Box<Self>`, so call it directly on the box.
         handle.close().await.expect("close while parked");
