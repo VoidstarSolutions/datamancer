@@ -30,8 +30,8 @@ pub use capabilities::{InstrumentCapabilities, OrderType, TimeInForce};
 pub use credentials::ProviderCredentials;
 pub use error::{Error, Result};
 pub use event::{
-    Bar, BarInterval, Control, ControlKind, DisconnectCause, EventKind, GapSpan, MarketEvent,
-    Quote, Seq, Surface, Timestamp, Trade,
+    Bar, BarInterval, Control, ControlKind, DisconnectCause, ErrorOrigin, EventKind, FanoutId,
+    GapSpan, MarketEvent, Quote, Seq, Surface, Timestamp, Trade,
 };
 pub use health::{
     DaemonHealth, HealthView, LatencySummary, Liveness, ProviderHealth, ProviderState, StreamHealth,

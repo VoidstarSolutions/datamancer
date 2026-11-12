@@ -484,10 +484,7 @@ mod tests {
                 reason: "boom".to_string(),
                 cause: DisconnectCause::Error,
             },
-            ControlKind::ProviderError {
-                provider: "alpaca".to_string(),
-                message: "oops".to_string(),
-            },
+            ControlKind::subscription_error("alpaca", "oops"),
         ] {
             let ev = MarketEvent::Control(Control {
                 source_ts: Timestamp(1),

@@ -27,14 +27,15 @@
 //! controller runs upstream `unsubscribe` + `close` and exits, and the
 //! `Arc<AuthoritativeSession>` drop clears the registry slot.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use datamancer_core::{
-    ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, LiveScope,
-    MarketEvent, Result, Seq, StreamConnection, Subscribed, SubscriptionRef, Timestamp,
+    ClientSessionId, Control, ControlKind, Error, ErrorOrigin, EventKind, FanoutId, GapSpan,
+    Instrument, LiveScope, MarketEvent, Result, Seq, StreamConnection, Subscribed, SubscriptionRef,
+    Timestamp,
 };
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
@@ -826,8 +827,10 @@ impl From<mpsc::error::TrySendError<MarketEvent>> for Refused {
 }
 
 /// Whether `newer` replaces `older` as an owed control: a connect or disconnect
-/// replaces the provider's last one, a `ProviderError` the provider's last
-/// error, and a `SubscriptionChanged` the instrument's.
+/// replaces the provider's last one, a fan-out `ProviderError` the provider's
+/// last fan-out error, and a `SubscriptionChanged` the instrument's. A
+/// subscription error is never replaced, and never replaces one: a client
+/// session always delivers it.
 fn supersedes(newer: &ControlKind, older: &ControlKind) -> bool {
     fn connection_provider(kind: &ControlKind) -> Option<&str> {
         match kind {
@@ -838,8 +841,16 @@ fn supersedes(newer: &ControlKind, older: &ControlKind) -> bool {
     }
     match (newer, older) {
         (
-            ControlKind::ProviderError { provider: a, .. },
-            ControlKind::ProviderError { provider: b, .. },
+            ControlKind::ProviderError {
+                provider: a,
+                origin: ErrorOrigin::Fanout(_),
+                ..
+            },
+            ControlKind::ProviderError {
+                provider: b,
+                origin: ErrorOrigin::Fanout(_),
+                ..
+            },
         ) => a == b,
         (
             ControlKind::SubscriptionChanged { instrument: a, .. },
@@ -1253,6 +1264,33 @@ impl ClientRing {
         evicted
     }
 
+    /// The event the next [`Self::push`] evicts, if the ring is full.
+    fn oldest_if_full(&self) -> Option<&(MarketEvent, String)> {
+        if self.buf.len() == self.capacity {
+            self.buf.front()
+        } else {
+            None
+        }
+    }
+
+    /// Remove the buffered copy of fan-out `id` from `provider`, if any.
+    fn remove_fanout(&mut self, provider: &str, id: FanoutId) -> bool {
+        let found = self.buf.iter().position(|(ev, p)| {
+            p == provider
+                && matches!(
+                    ev,
+                    MarketEvent::Control(Control {
+                        kind: ControlKind::ProviderError {
+                            origin: ErrorOrigin::Fanout(buffered),
+                            ..
+                        },
+                        ..
+                    }) if *buffered == id
+                )
+        });
+        found.and_then(|i| self.buf.remove(i)).is_some()
+    }
+
     /// Current buffered event count.
     pub(crate) fn len(&self) -> usize {
         self.buf.len()
@@ -1406,7 +1444,10 @@ struct ClientController {
     backlog: VecDeque<(MarketEvent, String)>,
     ring_capacity: usize,
     seen_provider_state: HashMap<String, ConnState>,
-    last_provider_error: HashMap<String, String>,
+    /// The fan-out ids delivered per provider, kept for the client's life:
+    /// a substream can carry an old copy at any time, including one it joined
+    /// with in flight.
+    delivered_fanouts: HashMap<String, HashSet<FanoutId>>,
     /// Per-client introspection state read by the diagnostics snapshot.
     stats: Arc<ClientStats>,
 }
@@ -1608,12 +1649,30 @@ impl ClientController {
                         return;
                     }
                 }
-                ControlKind::ProviderError { provider, message } => {
-                    if self.duplicate_error(provider, message) {
-                        return;
+                ControlKind::ProviderError {
+                    origin: ErrorOrigin::Fanout(id),
+                    ..
+                } => {
+                    if !self
+                        .delivered_fanouts
+                        .entry(ring_provider.clone())
+                        .or_default()
+                        .insert(*id)
+                    {
+                        // A copy still in the detached ring is not delivered
+                        // yet: carry this newer copy in its place, so the one
+                        // copy the ring holds is the last to be evicted.
+                        let ClientSink::Detached(ring) = &mut self.sink else {
+                            return;
+                        };
+                        if !ring.remove_fanout(&ring_provider, *id) {
+                            return;
+                        }
                     }
                 }
-                ControlKind::SubscriptionChanged { .. } | ControlKind::Gap { .. } => {}
+                ControlKind::ProviderError { .. }
+                | ControlKind::SubscriptionChanged { .. }
+                | ControlKind::Gap { .. } => {}
             }
         }
         self.deliver(ev, ring_provider).await;
@@ -1627,22 +1686,6 @@ impl ClientController {
                 self.seen_provider_state.insert(provider.to_string(), new);
                 true
             }
-        }
-    }
-
-    /// Returns true when this `ProviderError` exactly repeats the last one for
-    /// the provider (suppress it).
-    fn duplicate_error(&mut self, provider: &str, message: &str) -> bool {
-        if self
-            .last_provider_error
-            .get(provider)
-            .is_some_and(|last| last == message)
-        {
-            true
-        } else {
-            self.last_provider_error
-                .insert(provider.to_string(), message.to_string());
-            false
         }
     }
 
@@ -1670,6 +1713,23 @@ impl ClientController {
             self.sink = ClientSink::Detached(ClientRing::new(self.ring_capacity));
         }
         let (evicted, occupancy) = if let ClientSink::Detached(ring) = &mut self.sink {
+            // A fan-out error the ring evicts was never delivered: forget its
+            // id, so a later copy on another subscription is delivered.
+            if let Some((
+                MarketEvent::Control(Control {
+                    kind:
+                        ControlKind::ProviderError {
+                            origin: ErrorOrigin::Fanout(id),
+                            ..
+                        },
+                    ..
+                }),
+                oldest_provider,
+            )) = ring.oldest_if_full()
+                && let Some(ids) = self.delivered_fanouts.get_mut(oldest_provider)
+            {
+                ids.remove(id);
+            }
             let evicted = ring.push(ev, provider);
             (evicted, ring.len())
         } else {
@@ -1930,7 +1990,7 @@ pub(crate) fn spawn_client(
         backlog: VecDeque::new(),
         ring_capacity,
         seen_provider_state: HashMap::new(),
-        last_provider_error: HashMap::new(),
+        delivered_fanouts: HashMap::new(),
         stats,
     };
     tokio::spawn(controller.run());
@@ -2436,13 +2496,7 @@ mod fanout_tests {
     }
 
     fn provider_error(seq: u64) -> MarketEvent {
-        control(
-            seq,
-            ControlKind::ProviderError {
-                provider: "p".to_string(),
-                message: "re-subscribe failed".to_string(),
-            },
-        )
+        control(seq, ControlKind::fanout_error("p", "re-subscribe failed"))
     }
 
     #[test]

@@ -665,8 +665,9 @@ impl Iceoryx2Client {
     ///
     /// `#[cfg(not(windows))]`: the Windows hybrid `AppHandle` routes admin ops
     /// through `PipeControlClient` (the owner-DACL pipe), not this client, so
-    /// this method has no Windows consumer.
-    #[cfg(not(windows))]
+    /// this method has no Windows consumer. Gated on `app` too, its only
+    /// caller, so an `iceoryx2`-only build carries no dead code.
+    #[cfg(all(feature = "app", not(windows)))]
     pub(crate) async fn control_request(
         &mut self,
         req: &Request,

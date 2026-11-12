@@ -658,12 +658,9 @@ async fn run_hub_task(cfg: AlpacaCryptoProviderConfig, mut cmd_rx: mpsc::Receive
         if !is_empty(&subs)
             && let Err(err) = client.add_subscriptions(&subs).await
         {
-            broadcast_control(
+            broadcast_error(
                 &routes,
-                ControlKind::ProviderError {
-                    provider: PROVIDER_ID.to_string(),
-                    message: format!("re-subscribe failed: {}", error_chain(&err)),
-                },
+                format!("re-subscribe failed: {}", error_chain(&err)),
             )
             .await;
         }
@@ -1125,6 +1122,15 @@ async fn broadcast_control(
     }
 }
 
+/// Fan one provider error out to every active sink, every copy carrying the
+/// same fresh fan-out id.
+async fn broadcast_error(
+    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    message: String,
+) {
+    broadcast_control(routes, ControlKind::fanout_error(PROVIDER_ID, message)).await;
+}
+
 async fn broadcast_control_to(sink: Option<&mpsc::Sender<MarketEvent>>, kind: ControlKind) {
     if let Some(s) = sink {
         let now = wall_clock_ts();
@@ -1174,10 +1180,10 @@ pub(crate) fn translate_crypto_message(msg: CryptoStreamMessage) -> Vec<MarketEv
             source_ts: rx,
             rx_ts: rx,
             seq: Seq(0),
-            kind: ControlKind::ProviderError {
-                provider: PROVIDER_ID.to_string(),
-                message: format!("{:?}: {}", err.code, err.message),
-            },
+            kind: ControlKind::fanout_error(
+                PROVIDER_ID,
+                format!("{:?}: {}", err.code, err.message),
+            ),
         })],
         // Subscription confirmations and orderbook updates aren't part of the
         // canonical MarketEvent surface yet; drop them here.
@@ -1298,6 +1304,7 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datamancer_core::{ErrorOrigin, FanoutId};
 
     #[test]
     fn translates_crypto_trade() {
@@ -1333,6 +1340,66 @@ mod tests {
             }
             other => panic!("expected Quote, got {other:?}"),
         }
+    }
+
+    fn fanout_ids(rx: &mut mpsc::Receiver<MarketEvent>) -> Vec<FanoutId> {
+        let mut ids = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                MarketEvent::Control(Control {
+                    kind:
+                        ControlKind::ProviderError {
+                            origin: ErrorOrigin::Fanout(id),
+                            ..
+                        },
+                    ..
+                }) => ids.push(id),
+                other => panic!("expected a fan-out ProviderError, got {other:?}"),
+            }
+        }
+        ids
+    }
+
+    type Routes = HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>;
+
+    fn two_routes() -> (
+        Routes,
+        mpsc::Receiver<MarketEvent>,
+        mpsc::Receiver<MarketEvent>,
+    ) {
+        let (a_tx, a_rx) = mpsc::channel(8);
+        let (b_tx, b_rx) = mpsc::channel(8);
+        let mut routes = HashMap::new();
+        routes.insert((provider_instrument("BTC/USD"), EventKind::Trade), a_tx);
+        routes.insert((provider_instrument("ETH/USD"), EventKind::Quote), b_tx);
+        (routes, a_rx, b_rx)
+    }
+
+    #[tokio::test]
+    async fn every_copy_of_a_broadcast_error_shares_one_distinct_id() {
+        let (routes, mut a_rx, mut b_rx) = two_routes();
+        broadcast_error(&routes, "first".to_string()).await;
+        broadcast_error(&routes, "second".to_string()).await;
+        let a = fanout_ids(&mut a_rx);
+        assert_eq!(a, fanout_ids(&mut b_rx));
+        assert_eq!(a.len(), 2);
+        assert_ne!(a[0], a[1]);
+    }
+
+    #[tokio::test]
+    async fn every_copy_of_a_stream_error_shares_one_distinct_id() {
+        let (routes, mut a_rx, mut b_rx) = two_routes();
+        for _ in 0..2 {
+            let msg: CryptoStreamMessage =
+                serde_json::from_str(r#"{"T":"error","code":400,"msg":"invalid"}"#).unwrap();
+            for ev in translate_crypto_message(msg) {
+                dispatch_event(&routes, ev).await;
+            }
+        }
+        let a = fanout_ids(&mut a_rx);
+        assert_eq!(a, fanout_ids(&mut b_rx));
+        assert_eq!(a.len(), 2);
+        assert_ne!(a[0], a[1]);
     }
 
     #[test]

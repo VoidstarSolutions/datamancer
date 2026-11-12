@@ -45,6 +45,8 @@ struct Shared {
     subscribe_gate: Option<Arc<tokio::sync::Notify>>,
     /// How many `fetch_history` calls have started.
     fetches: usize,
+    /// When set, `fetch_history` fails with this message.
+    history_error: Option<String>,
 }
 
 struct FakeProvider {
@@ -171,6 +173,12 @@ impl Provider for FakeProvider {
         let (history, gate, pause) = {
             let mut shared = self.shared.lock().await;
             shared.fetches += 1;
+            if let Some(message) = shared.history_error.clone() {
+                return Err(datamancer::Error::Provider {
+                    provider: self.id.clone(),
+                    message,
+                });
+            }
             (
                 shared.history.clone(),
                 shared.history_gate.clone(),
@@ -888,6 +896,166 @@ async fn connection_scoped_control_appears_once_in_multiplex() {
         "ProviderConnected coalesced to one per provider"
     );
     assert_eq!(subs, 2, "per-symbol SubscriptionChanged rides through");
+    let _ = client.close().await;
+}
+
+fn provider_control(kind: ControlKind, rx_ts: i64) -> MarketEvent {
+    MarketEvent::Control(datamancer::Control {
+        source_ts: Timestamp(rx_ts),
+        rx_ts: Timestamp(rx_ts),
+        seq: Seq(0),
+        kind,
+    })
+}
+
+/// A fan-out error from the fake provider; each copy is a clone of it.
+fn fanout(message: &str) -> ControlKind {
+    ControlKind::fanout_error("fake", message)
+}
+
+/// One copy of the fan-out error `kind`.
+fn fanout_error(kind: &ControlKind, rx_ts: i64) -> MarketEvent {
+    provider_control(kind.clone(), rx_ts)
+}
+
+/// An error about the one subscription it arrives on.
+fn subscription_error(message: &str, rx_ts: i64) -> MarketEvent {
+    provider_control(ControlKind::subscription_error("fake", message), rx_ts)
+}
+
+/// The provider's `ProviderConnected`.
+fn connected(rx_ts: i64) -> MarketEvent {
+    provider_control(
+        ControlKind::ProviderConnected {
+            provider: "fake".to_string(),
+        },
+        rx_ts,
+    )
+}
+
+/// The provider's `ProviderDisconnected` after a connection reset.
+fn disconnected(rx_ts: i64) -> MarketEvent {
+    provider_control(
+        ControlKind::ProviderDisconnected {
+            provider: "fake".to_string(),
+            reason: "reset".to_string(),
+            cause: datamancer::DisconnectCause::Error,
+        },
+        rx_ts,
+    )
+}
+
+/// Read until `last` trade's `source_ts`, counting the `ProviderError`s.
+async fn errors_until(stream: &mut datamancer::EventStream, last: i64) -> usize {
+    let mut errors = 0;
+    loop {
+        match next_ev(stream).await {
+            MarketEvent::Trade(t) if t.source_ts.0 == last => return errors,
+            MarketEvent::Control(c) if matches!(c.kind, ControlKind::ProviderError { .. }) => {
+                errors += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Subscribe `client` to `symbol`'s live trades.
+async fn subscribe_live(client: &datamancer::ClientSession, symbol: &str) {
+    client
+        .subscribe(
+            inst(symbol),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn two_symbol_client(
+    dm: &Datamancer,
+) -> (datamancer::ClientSession, datamancer::EventStream) {
+    let client = dm.client_session();
+    for symbol in ["AAPL", "MSFT"] {
+        subscribe_live(&client, symbol).await;
+    }
+    let stream = client.take_events().await.unwrap();
+    (client, stream)
+}
+
+#[tokio::test]
+async fn a_provider_error_repeated_after_a_reconnect_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    subscribe_live(&client, "AAPL").await;
+    let mut stream = client.take_events().await.unwrap();
+    let [e0, e1] = [fanout("HTTP 403"), fanout("HTTP 403")];
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", disconnected(11)).await;
+    ctrl.push("AAPL", connected(12)).await;
+    // Same text, same timestamp, but a second broadcast: its own fan-out id.
+    ctrl.push("AAPL", fanout_error(&e1, 10)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(
+        errors_until(&mut stream, 100).await,
+        2,
+        "the error after the reconnect is a new one"
+    );
+    let _ = client.close().await;
+}
+
+#[tokio::test]
+async fn a_connected_copy_between_two_error_copies_keeps_the_second_dropped() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
+    let e0 = fanout("re-subscribe failed");
+    // A reconnect fanned out to both substreams, then one re-subscribe error
+    // fanned out the same way; AAPL's pair is read before MSFT's.
+    ctrl.push("AAPL", connected(5)).await;
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1);
+    ctrl.push("MSFT", connected(5)).await;
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        0,
+        "the second substream's copy of one error is dropped"
+    );
+    let _ = client.close().await;
+}
+
+#[tokio::test]
+async fn a_later_error_with_the_same_text_is_delivered_and_a_copy_is_not() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
+    let e0 = fanout("HTTP 403");
+    // One provider error fanned out to both substreams: one copy each.
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1, "copies coalesce");
+    // A second failure later, with the same text (a second fetch failing).
+    ctrl.push("MSFT", subscription_error("HTTP 403", 20)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        1,
+        "a later failure with the same text keeps its cause"
+    );
     let _ = client.close().await;
 }
 
@@ -3362,5 +3530,474 @@ async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
         .expect("joins the pure-live session");
     assert!(joined_as(outcome, live(), false), "{outcome:?}");
     let _ = other.close().await;
+    let _ = client.close().await;
+}
+
+/// A retried backfill over the same range that fails the way the first did
+/// is a second fetch failing, and its `ProviderError` must reach the client:
+/// a `Subscription` error is always delivered, and without it the failure is
+/// indistinguishable from an empty range.
+#[tokio::test]
+async fn a_retried_backfill_failing_the_same_way_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.shared.lock().await.history_error = Some("HTTP 403".to_string());
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let mut stream = client.take_events().await.unwrap();
+    for (attempt, sentinel) in [(1usize, 100i64), (2, 200)] {
+        client
+            .subscribe(
+                inst("AAPL"),
+                EventKind::Trade,
+                LiveScope::backfill(Timestamp(0)),
+                PersistenceOptions::none(),
+            )
+            .await
+            .unwrap();
+        wait_for_fetches(&ctrl, attempt).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ctrl.push("AAPL", trade("AAPL", sentinel)).await;
+        assert_eq!(
+            errors_until(&mut stream, sentinel).await,
+            1,
+            "attempt {attempt}: the failed fetch's ProviderError reached the client"
+        );
+        client
+            .unsubscribe(inst("AAPL"), EventKind::Trade)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = client.close().await;
+}
+
+/// One error, then one reconnect, each fanned out to both substreams; AAPL's
+/// copies are read before MSFT's. MSFT's copy of the pre-reconnect error is
+/// a copy of a fan-out the client delivered and must be suppressed.
+#[tokio::test]
+async fn a_pre_reconnect_error_copy_after_the_reconnect_is_dropped() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
+    let e0 = fanout("HTTP 403");
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", disconnected(11)).await;
+    ctrl.push("AAPL", connected(12)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1);
+    // MSFT's copies of the same error and the same reconnect.
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    ctrl.push("MSFT", disconnected(11)).await;
+    ctrl.push("MSFT", connected(12)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        0,
+        "the second substream's copy of one error is dropped"
+    );
+    let _ = client.close().await;
+}
+
+/// Two failures with the same text, each fanned out to both substreams
+/// as two fan-outs; AAPL's channel is drained before MSFT's. MSFT's copies
+/// carry fan-out ids the client already delivered on another instrument
+/// (`datamancer_core::Seq` docs) and must be dropped.
+#[tokio::test]
+async fn same_text_errors_interleaved_copies_are_dropped() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
+    let [e0, e1] = [fanout("re-subscribe failed"), fanout("re-subscribe failed")];
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", fanout_error(&e1, 20)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    let _ = errors_until(&mut stream, 100).await;
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    ctrl.push("MSFT", fanout_error(&e1, 20)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        0,
+        "MSFT's copies of errors already delivered on AAPL are dropped"
+    );
+    let _ = client.close().await;
+}
+
+/// Two distinct errors, each fanned out to both substreams; AAPL's channel
+/// is drained before MSFT's. MSFT's copies must be dropped.
+#[tokio::test]
+async fn distinct_errors_interleaved_copies_are_dropped() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
+    let [e0, e1] = [fanout("error A"), fanout("error B")];
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", fanout_error(&e1, 20)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 2);
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    ctrl.push("MSFT", fanout_error(&e1, 20)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        0,
+        "MSFT's copies of errors already delivered on AAPL are dropped"
+    );
+    let _ = client.close().await;
+}
+
+/// Two backfills on two instruments, both from 0, failing the same way:
+/// each is its own fetch failure, a `Subscription` error, so both reach the
+/// client.
+#[tokio::test]
+async fn adv_two_instruments_backfill_failures_both_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.shared.lock().await.history_error = Some("HTTP 403".to_string());
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let mut stream = client.take_events().await.unwrap();
+    for (n, symbol) in [(1usize, "AAPL"), (2, "MSFT")] {
+        client
+            .subscribe(
+                inst(symbol),
+                EventKind::Trade,
+                LiveScope::backfill(Timestamp(0)),
+                PersistenceOptions::none(),
+            )
+            .await
+            .unwrap();
+        wait_for_fetches(&ctrl, n).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    let (mut errors, mut seen) = (0, 0);
+    while seen < 2 {
+        match next_ev(&mut stream).await {
+            MarketEvent::Trade(t) if t.source_ts.0 == 100 || t.source_ts.0 == 200 => seen += 1,
+            MarketEvent::Control(c) if matches!(c.kind, ControlKind::ProviderError { .. }) => {
+                errors += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        errors, 2,
+        "each instrument's failed backfill keeps its ProviderError"
+    );
+    let _ = client.close().await;
+}
+
+/// 17 distinct fan-outs reach both substreams; AAPL's channel is drained
+/// before MSFT's. However many are in flight, MSFT's copies are dropped.
+#[tokio::test]
+async fn adv_seventeen_interleaved_error_copies_are_dropped() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (client, mut stream) = two_symbol_client(&dm).await;
+    let errors: [ControlKind; 17] = std::array::from_fn(|i| fanout(&format!("error {i}")));
+    for (i, error) in (0i64..).zip(&errors) {
+        ctrl.push("AAPL", fanout_error(error, 10 + i)).await;
+    }
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 17);
+    for (i, error) in (0i64..).zip(&errors) {
+        ctrl.push("MSFT", fanout_error(error, 10 + i)).await;
+    }
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        0,
+        "MSFT's copies of errors already delivered on AAPL are dropped"
+    );
+    let _ = client.close().await;
+}
+
+/// A subscription made while a fan-out is in flight: the fan-out reaches the
+/// client once whichever substream carries it first, before or after the
+/// subscription, and the next fan-out reaches it once too.
+#[tokio::test]
+async fn a_subscription_made_while_a_fanout_is_in_flight_gets_it_once() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    subscribe_live(&client, "AAPL").await;
+    let mut stream = client.take_events().await.unwrap();
+    let [unread, delivered, next] = [fanout("unread"), fanout("delivered"), fanout("next")];
+    // In flight on AAPL, unread, when MSFT subscribes; MSFT carries it too.
+    ctrl.push("AAPL", fanout_error(&unread, 10)).await;
+    subscribe_live(&client, "MSFT").await;
+    ctrl.push("MSFT", fanout_error(&unread, 10)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(errors_until(&mut stream, 200).await, 1);
+    // Delivered from AAPL before GOOG subscribes; GOOG still carries a copy.
+    ctrl.push("AAPL", fanout_error(&delivered, 20)).await;
+    ctrl.push("MSFT", fanout_error(&delivered, 20)).await;
+    ctrl.push("AAPL", trade("AAPL", 300)).await;
+    assert_eq!(errors_until(&mut stream, 300).await, 1);
+    ctrl.push("MSFT", trade("MSFT", 400)).await;
+    assert_eq!(errors_until(&mut stream, 400).await, 0);
+    subscribe_live(&client, "GOOG").await;
+    ctrl.push("GOOG", fanout_error(&delivered, 20)).await;
+    ctrl.push("GOOG", trade("GOOG", 500)).await;
+    assert_eq!(errors_until(&mut stream, 500).await, 0);
+    // The next fan-out reaches all three substreams and the client once.
+    for symbol in ["GOOG", "MSFT", "AAPL"] {
+        ctrl.push(symbol, fanout_error(&next, 30)).await;
+    }
+    ctrl.push("AAPL", trade("AAPL", 600)).await;
+    assert_eq!(errors_until(&mut stream, 600).await, 1);
+    ctrl.push("MSFT", trade("MSFT", 700)).await;
+    assert_eq!(errors_until(&mut stream, 700).await, 0);
+    ctrl.push("GOOG", trade("GOOG", 800)).await;
+    assert_eq!(errors_until(&mut stream, 800).await, 0);
+    let _ = client.close().await;
+}
+
+/// A fan-out the client never delivered must reach it when one of its
+/// subscriptions carries it (`datamancer_core::Seq`: a `ProviderError` is
+/// already delivered only as a copy of a fan-out the client delivered from
+/// another of its subscriptions). Here the older fan-out was sent to MSFT's
+/// route alone, before AAPL's route existed, and sat in MSFT's backfill
+/// buffer; the client joins MSFT after delivering a newer fan-out from AAPL.
+#[tokio::test]
+async fn adv_an_undelivered_older_fanout_on_a_joined_backfill_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_history(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    // Another client opens MSFT with a backfill that waits on the gate.
+    let creator = dm.client_session();
+    creator
+        .subscribe(
+            inst("MSFT"),
+            EventKind::Trade,
+            LiveScope::backfill(Timestamp(0)),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let _creator_stream = creator.take_events().await.unwrap();
+    wait_for_fetches(&ctrl, 1).await;
+    // The provider fans `old` out to its one route, MSFT's: buffered there.
+    let old = fanout("old error");
+    ctrl.push("MSFT", fanout_error(&old, 10)).await;
+
+    // The client subscribes AAPL; the provider then fans `new` out to both.
+    let client = dm.client_session();
+    subscribe_live(&client, "AAPL").await;
+    let mut stream = client.take_events().await.unwrap();
+    let new = fanout("new error");
+    ctrl.push("AAPL", fanout_error(&new, 20)).await;
+    ctrl.push("MSFT", fanout_error(&new, 20)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1, "`new` from AAPL");
+
+    // The client joins MSFT while its backfill is in flight, then the
+    // backfill ends and MSFT's buffer (`old`, then `new`) is flushed.
+    subscribe_live(&client, "MSFT").await;
+    gate.notify_one();
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        1,
+        "`old` was never delivered to this client and must be; `new` is a copy"
+    );
+    let _ = client.close().await;
+    let _ = creator.close().await;
+}
+
+/// `older` was built while only MSFT's route existed (another client's
+/// session), `newer` afterwards for both routes. The client delivered
+/// `newer` from AAPL, then joined MSFT's session while both were still in
+/// flight there. `older` never reached the client from any subscription, so
+/// by the `Seq` contract it is not "already delivered" and must arrive.
+#[tokio::test]
+async fn adv_an_older_fanout_first_seen_on_a_later_subscription_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    subscribe_live(&client, "AAPL").await;
+    let mut stream = client.take_events().await.unwrap();
+    let [older, newer] = [fanout("older"), fanout("newer")];
+    ctrl.push("AAPL", fanout_error(&newer, 20)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    assert_eq!(errors_until(&mut stream, 100).await, 1);
+    subscribe_live(&client, "MSFT").await;
+    // Still in flight on MSFT's session when the client joined it.
+    ctrl.push("MSFT", fanout_error(&older, 10)).await;
+    ctrl.push("MSFT", fanout_error(&newer, 20)).await;
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        1,
+        "`older` was never delivered from any subscription, so it is not a copy"
+    );
+    let _ = client.close().await;
+}
+
+/// A fan-out whose first copy a detached client's resume buffer evicted was
+/// never delivered, so by the `Seq` contract ("already delivered only as a
+/// copy of an `ErrorOrigin::Fanout` whose `FanoutId` the client already
+/// delivered") a later copy on another subscription is not a copy of a
+/// delivered error and must reach the consumer.
+#[tokio::test]
+async fn a_fanout_copy_after_the_first_was_evicted_is_delivered() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(2)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    for symbol in ["AAPL", "MSFT"] {
+        subscribe_live(&client, symbol).await;
+    }
+    // Detached (stream never taken): events go to the per-client ring, cap 2.
+    let e0 = fanout("HTTP 403");
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    ctrl.push("AAPL", trade("AAPL", 101)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // AAPL's copy is evicted by now; MSFT's copy arrives after the eviction
+    // and fits in the ring.
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut stream = client.take_events().await.unwrap();
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        1,
+        "the fan-out was never delivered; MSFT's copy is not a copy of a delivered error"
+    );
+    let _ = client.close().await;
+}
+
+/// MSFT's copy of a fan-out arrives while AAPL's copy is still only buffered
+/// in the detached client's resume ring, then the ring evicts AAPL's copy.
+/// Neither copy was ever delivered, so by the `Seq` contract ("already
+/// delivered only as a copy of an `ErrorOrigin::Fanout` whose `FanoutId` the
+/// client already delivered") MSFT's copy was not a copy of a delivered error
+/// and the fan-out must still reach the consumer.
+#[tokio::test]
+async fn a_fanout_copy_dropped_while_the_first_was_buffered_is_not_lost() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .resume_buffer_events(2)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    for symbol in ["AAPL", "MSFT"] {
+        subscribe_live(&client, symbol).await;
+    }
+    // Detached (stream never taken): events go to the per-client ring, cap 2.
+    let e0 = fanout("HTTP 403");
+    ctrl.push("AAPL", fanout_error(&e0, 10)).await;
+    ctrl.push("AAPL", trade("AAPL", 100)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The ring is [AAPL's copy, trade 100]. MSFT's copy arrives while AAPL's
+    // sits, undelivered, in the ring.
+    ctrl.push("MSFT", fanout_error(&e0, 10)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // One more event fills past capacity and evicts AAPL's copy.
+    ctrl.push("AAPL", trade("AAPL", 101)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut stream = client.take_events().await.unwrap();
+    ctrl.push("MSFT", trade("MSFT", 200)).await;
+    assert_eq!(
+        errors_until(&mut stream, 200).await,
+        1,
+        "the fan-out was never delivered; MSFT's copy was not a copy of a delivered error"
+    );
+    let _ = client.close().await;
+}
+
+/// `ControlKind::subscription_error`: "an error about one subscription, which
+/// a client session always delivers". One that meets a full channel must not
+/// be replaced by a later, unrelated fan-out error on the same provider: the
+/// fan-out has copies elsewhere, the subscription error has none.
+#[tokio::test]
+async fn a_subscription_error_owed_on_a_full_channel_survives_a_later_fanout() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    subscribe_live(&client, "AAPL").await;
+    let mut stream = client.take_events().await.unwrap();
+    // Fill the client's channel and the session-to-client channel without
+    // reading, so the next controls meet a full channel.
+    for ts in 0..2200 {
+        ctrl.push("AAPL", trade("AAPL", ts)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ctrl.push("AAPL", subscription_error("backfill fetch failed", 3000))
+        .await;
+    ctrl.push("AAPL", fanout_error(&fanout("unrelated"), 3001))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Read what is queued, then a sentinel lets the owed controls out.
+    let mut subscription_errors = 0;
+    let mut fanout_errors = 0;
+    let mut sentinel_pushed = false;
+    loop {
+        let ev = match tokio::time::timeout(Duration::from_millis(300), stream.next()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => panic!("stream ended"),
+            Err(_) => {
+                assert!(!sentinel_pushed, "timed out after the sentinel");
+                ctrl.push("AAPL", trade("AAPL", 99_999)).await;
+                sentinel_pushed = true;
+                continue;
+            }
+        };
+        match ev {
+            MarketEvent::Trade(t) if t.source_ts.0 == 99_999 => break,
+            MarketEvent::Control(c) => match c.kind {
+                ControlKind::ProviderError {
+                    origin: datamancer::ErrorOrigin::Subscription,
+                    ..
+                } => subscription_errors += 1,
+                ControlKind::ProviderError { .. } => fanout_errors += 1,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    assert_eq!(fanout_errors, 1, "the fan-out arrives");
+    assert_eq!(
+        subscription_errors, 1,
+        "the subscription error is always delivered"
+    );
     let _ = client.close().await;
 }

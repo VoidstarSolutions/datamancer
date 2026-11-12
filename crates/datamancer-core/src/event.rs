@@ -4,6 +4,8 @@
 //! cover live and historical market data plus in-band [`Control`] entries for
 //! connectivity, subscription state, and gap reporting.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{Instrument, Price, Quantity};
@@ -38,11 +40,19 @@ use crate::{Instrument, Price, Quantity};
 ///     and the other kind's hole has no `Gap` at its slot;
 ///   - a connection control (`ProviderConnected`, `ProviderDisconnected`,
 ///     `ProviderError`) the client has already delivered for that provider,
-///     on another instrument or earlier, is dropped and its slot stays empty;
+///     on another instrument or earlier, is dropped and its slot stays empty.
+///     A [`ControlKind::ProviderError`] is already delivered only as a copy of
+///     an [`ErrorOrigin::Fanout`] whose [`FanoutId`] the client already
+///     delivered, on any of its subscriptions; an
+///     [`ErrorOrigin::Subscription`] error never is;
 ///   - a connection control or `SubscriptionChanged` that a detached client's
 ///     resume buffer evicted is gone and its slot stays empty, with no `Gap`
 ///     since no data was lost; the diagnostics plane still carries the
 ///     provider's connection and the subscription state;
+///   - an [`ErrorOrigin::Fanout`] `ProviderError` that a detached client's
+///     resume buffer still held when a later copy of it arrived, on any of
+///     its subscriptions, is dropped and its slot stays empty: the later copy
+///     takes its place, at the later copy's own slot;
 ///   - a joiner's stream opens with the session's last active
 ///     `SubscriptionChanged`, replayed with its original `seq`, and goes on
 ///     from the session's current `seq`;
@@ -303,10 +313,102 @@ pub enum ControlKind {
         instrument: Instrument,
         span: GapSpan,
     },
-    /// A non-fatal provider error worth surfacing to the consumer.
-    ProviderError { provider: String, message: String },
+    /// A non-fatal provider error worth surfacing to the consumer. Build it
+    /// with [`ControlKind::fanout_error`] for one copy of an error sent to
+    /// every subscription, or [`ControlKind::subscription_error`] for an error
+    /// about this subscription alone; its [`ErrorOrigin`] records which.
+    #[non_exhaustive]
+    ProviderError {
+        /// The provider that reported the error.
+        provider: String,
+        /// The provider's error text.
+        message: String,
+        /// Where the error came from; [`ErrorOrigin::Subscription`] on frames
+        /// that predate the field.
+        #[serde(default = "subscription_origin")]
+        origin: ErrorOrigin,
+    },
     /// The session is closing in response to an explicit `close()`.
     SessionClosing,
+}
+
+impl ControlKind {
+    /// Builds a [`ControlKind::ProviderError`] a provider sends to every
+    /// subscription, with a fresh [`FanoutId`].
+    ///
+    /// Build it once and send a clone to each route: the clones share the id,
+    /// so a client session delivers one of them.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - the provider that reported the error.
+    /// * `message` - the provider's error text.
+    #[must_use]
+    pub fn fanout_error(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::provider_error(provider, message, ErrorOrigin::Fanout(FanoutId::next()))
+    }
+
+    /// Builds a [`ControlKind::ProviderError`] about one subscription, which a
+    /// client session always delivers.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - the provider that reported the error.
+    /// * `message` - the provider's error text.
+    #[must_use]
+    pub fn subscription_error(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::provider_error(provider, message, ErrorOrigin::Subscription)
+    }
+
+    fn provider_error(
+        provider: impl Into<String>,
+        message: impl Into<String>,
+        origin: ErrorOrigin,
+    ) -> Self {
+        Self::ProviderError {
+            provider: provider.into(),
+            message: message.into(),
+            origin,
+        }
+    }
+}
+
+/// Where a [`ControlKind::ProviderError`] came from, which decides whether a
+/// client session delivers it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorOrigin {
+    /// One error a provider sent to every subscription, built by
+    /// [`ControlKind::fanout_error`]. Its copies share the [`FanoutId`], and a
+    /// client session delivers one of them (see [`Seq`]).
+    Fanout(FanoutId),
+    /// An error about this one subscription, built by
+    /// [`ControlKind::subscription_error`]. A client session always delivers
+    /// it, never treating it as a copy of another (see [`Seq`]).
+    Subscription,
+}
+
+fn subscription_origin() -> ErrorOrigin {
+    ErrorOrigin::Subscription
+}
+
+/// The identity of one [`ErrorOrigin::Fanout`] error, shared by its copies.
+///
+/// [`ControlKind::fanout_error`] makes one from a single process-wide
+/// sequence, so no two fan-outs from one process share an id. An id only
+/// identifies copies among fan-outs from the process that made it: a
+/// deserialized id keeps the sender's value, and is not comparable with ids
+/// made elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FanoutId(u64);
+
+impl FanoutId {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -317,7 +419,32 @@ pub struct GapSpan {
 
 #[cfg(test)]
 mod serde_tests {
-    use super::{BarInterval, ControlKind, DisconnectCause, EventKind, GapSpan, Seq, Timestamp};
+    use super::{
+        BarInterval, ControlKind, DisconnectCause, EventKind, FanoutId, GapSpan, Seq, Timestamp,
+    };
+
+    #[test]
+    fn provider_error_origin_defaults_on_old_frames() {
+        let old = r#"{"ProviderError":{"provider":"p","message":"HTTP 403"}}"#;
+        let kind: ControlKind = serde_json::from_str(old).unwrap();
+        assert_eq!(kind, ControlKind::subscription_error("p", "HTTP 403"));
+    }
+
+    #[test]
+    fn provider_error_round_trips_with_its_origin() {
+        for kind in [
+            ControlKind::subscription_error("p", "HTTP 403"),
+            ControlKind::fanout_error("p", "HTTP 403"),
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<ControlKind>(&json).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn fanout_ids_are_distinct() {
+        assert_ne!(FanoutId::next(), FanoutId::next());
+    }
 
     #[test]
     fn provider_disconnected_cause_defaults_on_old_frames() {

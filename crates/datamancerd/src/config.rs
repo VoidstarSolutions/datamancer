@@ -309,8 +309,8 @@ pub struct ServerConfig {
     #[serde(default = "default_service_prefix")]
     pub service_prefix: String,
     /// Seconds the whole exit may take after SIGTERM/SIGINT, every drain step
-    /// and the runtime's own shutdown included. At least 1; the web and WS
-    /// drains take at most half of it.
+    /// and the runtime's own shutdown included. At least 1 and at most
+    /// 86400 (one day); the web and WS drains take at most half of it.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
     /// Client backfills that fetch history at once, UDS and WS together. One
@@ -344,6 +344,9 @@ fn default_admin_socket() -> PathBuf {
 fn default_service_prefix() -> String {
     "datamancerd".to_string()
 }
+
+/// Largest accepted `[server] shutdown_timeout_secs`: one day.
+const MAX_SHUTDOWN_TIMEOUT_SECS: u64 = 86_400;
 
 const fn default_shutdown_timeout() -> u64 {
     30
@@ -779,6 +782,11 @@ impl Config {
             return Err(DaemonError::ConfigInvalid(
                 "[server].shutdown_timeout_secs must be at least 1".to_string(),
             ));
+        }
+        if self.server.shutdown_timeout_secs > MAX_SHUTDOWN_TIMEOUT_SECS {
+            return Err(DaemonError::ConfigInvalid(format!(
+                "[server].shutdown_timeout_secs must be at most {MAX_SHUTDOWN_TIMEOUT_SECS}"
+            )));
         }
         if self.server.max_concurrent_backfills == 0 {
             return Err(DaemonError::ConfigInvalid(
@@ -1302,6 +1310,24 @@ account_type = "paper"
             .expect("parse")
             .validate()
             .expect("one second validates");
+    }
+
+    #[test]
+    fn a_shutdown_timeout_past_the_maximum_is_rejected() {
+        let config = Config::parse(&format!("[server]\nshutdown_timeout_secs = {}\n", i64::MAX))
+            .expect("parse");
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("shutdown_timeout_secs"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid for a huge shutdown timeout, got {other:?}"),
+        }
+        Config::parse(&format!(
+            "[server]\nshutdown_timeout_secs = {MAX_SHUTDOWN_TIMEOUT_SECS}\n"
+        ))
+        .expect("parse")
+        .validate()
+        .expect("the maximum validates");
     }
 
     #[test]

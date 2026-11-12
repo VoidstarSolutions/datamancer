@@ -871,12 +871,9 @@ async fn run_hub_task(cfg: AlpacaProviderConfig, mut cmd_rx: mpsc::Receiver<HubC
         if !is_empty(&subs)
             && let Err(err) = client.add_subscriptions(&subs).await
         {
-            broadcast_control(
+            broadcast_error(
                 &routes,
-                ControlKind::ProviderError {
-                    provider: PROVIDER_ID.to_string(),
-                    message: format!("re-subscribe failed: {}", error_chain(&err)),
-                },
+                format!("re-subscribe failed: {}", error_chain(&err)),
             )
             .await;
         }
@@ -1355,6 +1352,15 @@ async fn broadcast_control(
     }
 }
 
+/// Fan one provider error out to every active sink, every copy carrying the
+/// same fresh fan-out id.
+async fn broadcast_error(
+    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    message: String,
+) {
+    broadcast_control(routes, ControlKind::fanout_error(PROVIDER_ID, message)).await;
+}
+
 /// Send a control to one sink, if present.
 async fn broadcast_control_to(sink: Option<&mpsc::Sender<MarketEvent>>, kind: ControlKind) {
     if let Some(s) = sink {
@@ -1419,10 +1425,10 @@ pub(crate) fn translate_stock_message(msg: StockStreamMessage) -> Vec<MarketEven
             source_ts: rx,
             rx_ts: rx,
             seq: Seq(0),
-            kind: ControlKind::ProviderError {
-                provider: PROVIDER_ID.to_string(),
-                message: format!("{:?}: {}", err.code, err.message),
-            },
+            kind: ControlKind::fanout_error(
+                PROVIDER_ID,
+                format!("{:?}: {}", err.code, err.message),
+            ),
         })],
         // Control envelopes, subscription confirmations, and the auxiliary
         // stock variants are not part of the canonical event surface.
@@ -1744,6 +1750,7 @@ async fn fetch_history_via(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datamancer_core::{ErrorOrigin, FanoutId};
 
     const ALL_STREAM_FEEDS: [AlpacaStreamFeed; 4] = [
         AlpacaStreamFeed::Iex,
@@ -1969,7 +1976,13 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             MarketEvent::Control(Control {
-                kind: ControlKind::ProviderError { provider, message },
+                kind:
+                    ControlKind::ProviderError {
+                        provider,
+                        message,
+                        origin: ErrorOrigin::Fanout(_),
+                        ..
+                    },
                 ..
             }) => {
                 assert_eq!(provider, PROVIDER_ID);
@@ -2472,6 +2485,66 @@ mod tests {
                 }))
             ));
         }
+    }
+
+    fn fanout_ids(rx: &mut mpsc::Receiver<MarketEvent>) -> Vec<FanoutId> {
+        let mut ids = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                MarketEvent::Control(Control {
+                    kind:
+                        ControlKind::ProviderError {
+                            origin: ErrorOrigin::Fanout(id),
+                            ..
+                        },
+                    ..
+                }) => ids.push(id),
+                other => panic!("expected a fan-out ProviderError, got {other:?}"),
+            }
+        }
+        ids
+    }
+
+    type Routes = HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>;
+
+    fn two_routes() -> (
+        Routes,
+        mpsc::Receiver<MarketEvent>,
+        mpsc::Receiver<MarketEvent>,
+    ) {
+        let (a_tx, a_rx) = mpsc::channel(8);
+        let (b_tx, b_rx) = mpsc::channel(8);
+        let mut routes = HashMap::new();
+        routes.insert((provider_instrument("AAPL"), EventKind::Trade), a_tx);
+        routes.insert((provider_instrument("SPY"), EventKind::Quote), b_tx);
+        (routes, a_rx, b_rx)
+    }
+
+    #[tokio::test]
+    async fn every_copy_of_a_broadcast_error_shares_one_distinct_id() {
+        let (routes, mut a_rx, mut b_rx) = two_routes();
+        broadcast_error(&routes, "first".to_string()).await;
+        broadcast_error(&routes, "second".to_string()).await;
+        let a = fanout_ids(&mut a_rx);
+        assert_eq!(a, fanout_ids(&mut b_rx));
+        assert_eq!(a.len(), 2);
+        assert_ne!(a[0], a[1]);
+    }
+
+    #[tokio::test]
+    async fn every_copy_of_a_stream_error_shares_one_distinct_id() {
+        let (routes, mut a_rx, mut b_rx) = two_routes();
+        for _ in 0..2 {
+            let msg: StockStreamMessage =
+                serde_json::from_str(r#"{"T":"error","code":400,"msg":"invalid"}"#).unwrap();
+            for ev in translate_stock_message(msg) {
+                dispatch_event(&routes, ev).await;
+            }
+        }
+        let a = fanout_ids(&mut a_rx);
+        assert_eq!(a, fanout_ids(&mut b_rx));
+        assert_eq!(a.len(), 2);
+        assert_ne!(a[0], a[1]);
     }
 
     #[test]
