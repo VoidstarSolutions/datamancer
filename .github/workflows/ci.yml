@@ -83,6 +83,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: tests (all features)
         run: cargo test --workspace --all-features
+      # The iceoryx2 runtime tests, all #[ignore]d.
+      - name: iceoryx2 transport runtime
+        timeout-minutes: 10
+        run: |
+          cargo test -p datamancer-transport-iceoryx2 --all-features -- --ignored --test-threads=1
+          cargo test -p datamancerd --all-features --bin datamancerd -- --ignored --test-threads=1
 
   features:
     name: feature matrix (cargo-hack)

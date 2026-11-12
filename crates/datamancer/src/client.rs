@@ -11,9 +11,11 @@
 //! # Ordering
 //!
 //! The multiplex **interleaves** — it does not merge-sort. The ordering key is
-//! `(instrument, seq)`: monotonic *within* each instrument (source-stamped, from
-//! Phase 1), arrival-order across instruments. There is no cross-symbol order to
-//! compute, which is what makes the interleave cheap.
+//! `(instrument, kind, seq)`: monotonic *within* each `(instrument, kind)` pair
+//! (source-stamped, from Phase 1), arrival-order across pairs. There is no
+//! cross-pair order to compute, which is what makes the interleave cheap. A
+//! `Gap` names the instrument only, so with two kinds on one instrument it does
+//! not say which kind.
 //!
 //! # Lifecycle
 //!
@@ -28,18 +30,20 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use datamancer_core::{
-    ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, MarketEvent,
-    Result, Seq, StreamConnection, SubscriptionRef, Timestamp,
+    ClientSessionId, Control, ControlKind, Error, EventKind, GapSpan, Instrument, LiveScope,
+    MarketEvent, Result, Seq, StreamConnection, Subscribed, SubscriptionRef, Timestamp,
 };
 use futures::StreamExt as _;
-use tokio::sync::{mpsc, oneshot};
+use futures::stream::FuturesUnordered;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_stream::StreamMap;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::session::{
-    ClientSessionRegistry, Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions, Scope,
+    ClientSessionRegistry, Datamancer, EventStream, LiveSessionRegistry, PersistenceOptions,
     SessionCommand, default_buffer,
 };
 
@@ -69,7 +73,7 @@ pub(crate) struct AuthoritativeSession {
     /// The session's actual scope, shared across every referrer. A second opener
     /// attaches to this (its requested scope is not re-applied), so referrer
     /// handles must report *this*, not their own requested value.
-    pub(crate) scope: Scope,
+    pub(crate) scope: LiveScope,
     /// The session's current persistence options, shared across every referrer
     /// and the source of truth for the synchronous getter. Updated by
     /// [`Self::set_persistence`]; a second opener never re-applies its own
@@ -97,7 +101,7 @@ impl AuthoritativeSession {
         instrument: Instrument,
         kind: EventKind,
         provider_id: String,
-        scope: Scope,
+        scope: LiveScope,
         persistence: PersistenceOptions,
         cmd_tx: mpsc::Sender<SessionCommand>,
         remove_tx: mpsc::UnboundedSender<SubscriberId>,
@@ -130,9 +134,7 @@ impl AuthoritativeSession {
     /// Register a new fan-out subscriber, returning its id and the receiver the
     /// referrer drains. Fails with [`Error::SessionClosed`] if the controller
     /// has already torn down.
-    pub(crate) async fn add_subscriber(
-        &self,
-    ) -> Result<(SubscriberId, mpsc::Receiver<MarketEvent>)> {
+    pub(crate) async fn add_subscriber(&self) -> Result<NewSubscriber> {
         let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::channel(default_buffer());
         let (ack, ack_rx) = oneshot::channel();
@@ -144,8 +146,12 @@ impl AuthoritativeSession {
             })
             .await
             .map_err(|_| Error::SessionClosed)?;
-        ack_rx.await.map_err(|_| Error::SessionClosed)?;
-        Ok((id, rx))
+        let backfill_in_flight = ack_rx.await.map_err(|_| Error::SessionClosed)?;
+        Ok(NewSubscriber {
+            id,
+            rx,
+            backfill_in_flight,
+        })
     }
 
     /// Signal removal of a subscriber. Best-effort and non-blocking — invoked
@@ -213,6 +219,45 @@ impl SubscriberGuard {
 impl Drop for SubscriberGuard {
     fn drop(&mut self) {
         self.authoritative.remove_subscriber(self.id);
+    }
+}
+
+/// Resolves once an attached sink has room.
+async fn sink_room(sink: &ClientSink) {
+    if let ClientSink::Attached(tx) = sink {
+        let _ = tx.reserve().await;
+    }
+}
+
+/// How long closing waits for a consumer to take what it is owed.
+const CLOSE_DELIVERY_WAIT: Duration = Duration::from_secs(2);
+
+/// How many client-local controls may wait behind a drained ring.
+const CONTROL_BACKLOG: usize = 1024;
+
+/// A subscriber the controller has added.
+pub(crate) struct NewSubscriber {
+    pub(crate) id: SubscriberId,
+    pub(crate) rx: mpsc::Receiver<MarketEvent>,
+    pub(crate) backfill_in_flight: bool,
+}
+
+/// One subscriber registered on an [`AuthoritativeSession`].
+pub(crate) struct Attached {
+    pub(crate) session: Arc<AuthoritativeSession>,
+    pub(crate) guard: SubscriberGuard,
+    pub(crate) rx: mpsc::Receiver<MarketEvent>,
+    pub(crate) outcome: Subscribed,
+}
+
+impl Attached {
+    pub(crate) fn joined(session: Arc<AuthoritativeSession>, subscriber: NewSubscriber) -> Self {
+        Self {
+            guard: SubscriberGuard::new(session.clone(), subscriber.id),
+            rx: subscriber.rx,
+            outcome: Subscribed::joined(session.scope, subscriber.backfill_in_flight),
+            session,
+        }
     }
 }
 
@@ -328,6 +373,16 @@ impl LiveStats {
                 | ControlKind::SessionClosing => {}
             },
             _ => {}
+        }
+    }
+
+    /// Record one replayed event: its `seq` position, and a control as
+    /// [`Self::record_event`] does, with no data timestamps.
+    pub(crate) fn record_replay(&self, ev: &MarketEvent) {
+        if matches!(ev, MarketEvent::Control(_)) {
+            self.record_event(ev);
+        } else {
+            self.record_seq(ev);
         }
     }
 
@@ -484,7 +539,8 @@ pub(crate) struct ClientStats {
     id: ClientSessionId,
     /// Resume-buffer capacity (events) — the builder knob, constant per client.
     capacity: usize,
-    /// Current per-client resume-buffer occupancy (0 while attached).
+    /// Current per-client resume-buffer occupancy: the detached ring, or the
+    /// backlog owed to an attached consumer.
     occupancy: AtomicUsize,
     /// Cumulative events evicted from the resume buffer (overflow).
     dropped_events: AtomicU64,
@@ -569,13 +625,99 @@ impl Drop for ClientStats {
 // Fan-out (lives inside the authoritative controller)
 // ---------------------------------------------------------------------------
 
-/// A referrer's bounded channel plus any loss owed to it as a `Gap`. When the
-/// channel is full the dropped event is folded into `pending` (a per-instrument
-/// span) rather than discarded, and the accumulated `Gap` is flushed ahead of
-/// resumed live delivery once the channel drains.
+/// A referrer's bounded channel plus what a full channel left owed to it. A
+/// dropped data event is folded into `pending` (a per-instrument span), and a
+/// dropped control other than a `Gap` is kept in `owed`. Both go out in `seq`
+/// order ahead of the next event once the channel has room.
 struct Referrer {
     tx: mpsc::Sender<MarketEvent>,
     pending: Option<PendingGap>,
+    /// Controls dropped on a full channel, in `seq` order, at most one per
+    /// kind (see [`supersedes`]).
+    owed: Vec<MarketEvent>,
+    /// This referrer does not pace a replay.
+    unpaced: bool,
+    /// The replay's current wait is on this referrer.
+    blocking: bool,
+    /// How long the replay has waited on this referrer since it last freed a
+    /// slot.
+    stalled: Duration,
+    /// How long, in all, the replay has waited on this referrer while another
+    /// referrer had room.
+    held_back: Duration,
+    /// Its channel's free slots when the replay's current wait began.
+    free_at_wait: usize,
+}
+
+impl Referrer {
+    fn new(tx: mpsc::Sender<MarketEvent>) -> Self {
+        Self {
+            tx,
+            pending: None,
+            owed: Vec::new(),
+            unpaced: false,
+            blocking: false,
+            stalled: Duration::ZERO,
+            held_back: Duration::ZERO,
+            free_at_wait: 0,
+        }
+    }
+
+    /// Whether a `Gap` or a control is owed to it.
+    fn owes(&self) -> bool {
+        self.pending.is_some() || !self.owed.is_empty()
+    }
+
+    /// Slots the next event takes: its own, and one for each `Gap` and control
+    /// still owed.
+    fn slots_needed(&self) -> usize {
+        1 + usize::from(self.pending.is_some()) + self.owed.len()
+    }
+
+    /// Record `ev`, which the full channel refused: data and `Gap`s fold into
+    /// the pending `Gap`; another control replaces an owed one it supersedes.
+    fn owe(&mut self, ev: &MarketEvent) {
+        if let MarketEvent::Control(control) = ev
+            && !matches!(control.kind, ControlKind::Gap { .. })
+        {
+            self.owed.retain(|owed| match owed {
+                MarketEvent::Control(older) => !supersedes(&control.kind, &older.kind),
+                _ => true,
+            });
+            self.owed.push(ev.clone());
+        } else {
+            absorb_drop(&mut self.pending, ev);
+        }
+    }
+
+    /// Send what is owed, in `seq` order, until nothing is or the channel
+    /// refuses.
+    fn send_owed(&mut self) -> std::result::Result<(), Refused> {
+        loop {
+            match (&self.pending, self.owed.first()) {
+                (None, None) => return Ok(()),
+                (Some(gap), control)
+                    if control
+                        .and_then(MarketEvent::seq)
+                        .is_none_or(|seq| gap.first_seq <= seq) =>
+                {
+                    self.tx.try_send(gap.to_event()).map_err(Refused::from)?;
+                    self.pending = None;
+                }
+                _ => {
+                    self.tx
+                        .try_send(self.owed[0].clone())
+                        .map_err(Refused::from)?;
+                    self.owed.remove(0);
+                }
+            }
+        }
+    }
+
+    /// Whether its channel is short of the slots the next event takes.
+    fn short(&self) -> bool {
+        self.tx.capacity() < self.slots_needed()
+    }
 }
 
 /// Accumulated, undelivered loss for one backed-up referrer. `FanOut` is
@@ -611,10 +753,8 @@ impl PendingGap {
 
 /// Extract `(instrument, from, to, provider, seq)` for an event that can be
 /// represented as a per-instrument `Gap`. Data events span `[ts, ts+1)`; an
-/// already-`Gap` control contributes its embedded span. Connection-scoped
-/// controls carry no instrument and return `None` — a dropped one is not folded
-/// into a data gap (it is re-derivable from the diagnostics snapshot / on
-/// reconnect).
+/// already-`Gap` control contributes its embedded span. Other controls return
+/// `None`.
 fn gap_coords(ev: &MarketEvent) -> Option<(Instrument, Timestamp, Timestamp, String, Seq)> {
     match ev {
         MarketEvent::Control(Control {
@@ -649,9 +789,49 @@ fn gap_coords(ev: &MarketEvent) -> Option<(Instrument, Timestamp, Timestamp, Str
     }
 }
 
+/// Why a referrer's channel refused a send.
+enum Refused {
+    Full,
+    Closed,
+}
+
+impl From<mpsc::error::TrySendError<MarketEvent>> for Refused {
+    fn from(e: mpsc::error::TrySendError<MarketEvent>) -> Self {
+        match e {
+            mpsc::error::TrySendError::Full(_) => Self::Full,
+            mpsc::error::TrySendError::Closed(_) => Self::Closed,
+        }
+    }
+}
+
+/// Whether `newer` replaces `older` as an owed control: a connect or disconnect
+/// replaces the provider's last one, a `ProviderError` the provider's last
+/// error, and a `SubscriptionChanged` the instrument's.
+fn supersedes(newer: &ControlKind, older: &ControlKind) -> bool {
+    fn connection_provider(kind: &ControlKind) -> Option<&str> {
+        match kind {
+            ControlKind::ProviderConnected { provider }
+            | ControlKind::ProviderDisconnected { provider, .. } => Some(provider),
+            _ => None,
+        }
+    }
+    match (newer, older) {
+        (
+            ControlKind::ProviderError { provider: a, .. },
+            ControlKind::ProviderError { provider: b, .. },
+        ) => a == b,
+        (
+            ControlKind::SubscriptionChanged { instrument: a, .. },
+            ControlKind::SubscriptionChanged { instrument: b, .. },
+        ) => a == b,
+        (ControlKind::SessionClosing, ControlKind::SessionClosing) => true,
+        _ => connection_provider(newer)
+            .is_some_and(|provider| connection_provider(older) == Some(provider)),
+    }
+}
+
 /// Fold a dropped event into a referrer's pending gap (starting one if needed).
-/// A drop with no per-instrument identity (a connection-scoped control) is not
-/// recorded here.
+/// A drop with no per-instrument identity is not recorded here.
 fn absorb_drop(pending: &mut Option<PendingGap>, ev: &MarketEvent) {
     let Some((instrument, from, to, provider, seq)) = gap_coords(ev) else {
         return;
@@ -674,12 +854,34 @@ fn absorb_drop(pending: &mut Option<PendingGap>, ev: &MarketEvent) {
 
 /// The authoritative controller's consumer-facing side: one bounded channel per
 /// referrer. The controller **`try_send`s** so a slow/wedged referrer never
-/// stalls its co-subscribers or the provider. A referrer that closes its
-/// channel is removed; a referrer whose bounded channel is momentarily full has
-/// the dropped event folded into a pending per-instrument `Gap` (surfaced to it
-/// once the channel drains) — never silently lost.
+/// stalls the provider, and its co-subscribers only within the rules below. A
+/// referrer that closes its channel is removed. A referrer whose bounded channel
+/// is full has a dropped data event folded into a pending per-instrument `Gap`,
+/// and a dropped control kept until a newer one of its kind replaces it. Both
+/// reach it in `seq` order and ahead of its next event: in the live phase as
+/// soon as its channel has room, during a replay ahead of the next replayed
+/// event.
+///
+/// A backfill's replay comes at fetch speed, so the controller paces it:
+///
+/// 1. A replay, history or seam flush, sends only when every pacing referrer
+///    has room.
+/// 2. A referrer stops pacing on either of two 30 s clocks
+///    ([`next_wait`](Self::next_wait)). One counts the time since it last freed
+///    a slot. The other sums the waits on it that began with another referrer
+///    already having room, and nothing resets it. Both belong to the referrer,
+///    so a resubscribe, which adds a new one, starts again from zero.
+/// 3. A seam flush that has lost a whole ring stops pacing for referrers full at
+///    that moment ([`stop_pacing_full`](Self::stop_pacing_full)).
+///
+/// A referrer that stops pacing gets a `Gap`.
 pub(crate) struct FanOut {
     subscribers: HashMap<SubscriberId, Referrer>,
+    /// Ends a [`next_wait`](Self::next_wait) when the referrers pacing a replay
+    /// change.
+    pacers_changed: Arc<Notify>,
+    /// Some referrer had room when the replay's current wait began.
+    room_at_wait: bool,
     /// Last per-symbol `SubscriptionChanged { active: true }` (a real,
     /// source-stamped event), replayed to each new subscriber so a late join
     /// sees the subscription state without a fresh provider ack.
@@ -687,14 +889,19 @@ pub(crate) struct FanOut {
     /// Set once the first subscriber is added. Distinguishes "never had a
     /// subscriber yet" (do not tear down) from "last subscriber left".
     had_subscriber: bool,
+    /// A referrer may be owed a `Gap` or a control (see [`Self::owed_room`]).
+    owing: bool,
 }
 
 impl FanOut {
     pub(crate) fn new() -> Self {
         Self {
             subscribers: HashMap::new(),
+            pacers_changed: Arc::new(Notify::new()),
+            room_at_wait: false,
             last_subscription_changed: None,
             had_subscriber: false,
+            owing: false,
         }
     }
 
@@ -704,17 +911,147 @@ impl FanOut {
         if let Some(ev) = &self.last_subscription_changed {
             let _ = sender.try_send(ev.clone());
         }
-        self.subscribers.insert(
-            id,
-            Referrer {
-                tx: sender,
-                pending: None,
-            },
-        );
+        self.subscribers.insert(id, Referrer::new(sender));
+        self.pacers_changed.notify_one();
+    }
+
+    /// Charge `waited` to the referrers the last wait was blocked on and stop
+    /// those that reach `limit` on either clock from pacing: its stall, which
+    /// a slot freed during the wait clears, and its held-back time, charged
+    /// when another referrer had room as the wait began and never cleared.
+    /// `None` when every pacing referrer has room.
+    ///
+    /// Otherwise the next wait, blocked on the pacing referrers short of room.
+    /// It resolves when a referrer short of room gets it, pacing or not, when
+    /// the referrers pacing the replay change, or when a blocking referrer
+    /// reaches `limit`. Any of those can change whom the replay waits on, so
+    /// the caller asks again.
+    pub(crate) fn next_wait(
+        &mut self,
+        waited: Duration,
+        limit: Duration,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let room_at_wait = std::mem::take(&mut self.room_at_wait);
+        let mut pacer_short = false;
+        for referrer in self.subscribers.values_mut() {
+            let free = referrer.tx.capacity();
+            let short = free < referrer.slots_needed();
+            if referrer.blocking {
+                if free > referrer.free_at_wait {
+                    referrer.stalled = Duration::ZERO;
+                } else {
+                    referrer.stalled += waited;
+                }
+                if room_at_wait {
+                    referrer.held_back += waited;
+                }
+                referrer.unpaced |= referrer.stalled >= limit || referrer.held_back >= limit;
+            }
+            let closed = referrer.tx.is_closed();
+            self.room_at_wait |= !closed && !short;
+            referrer.blocking = !closed && short;
+            referrer.free_at_wait = free;
+            pacer_short |= referrer.blocking && !referrer.unpaced;
+        }
+        if !pacer_short {
+            for referrer in self.subscribers.values_mut() {
+                referrer.blocking = false;
+            }
+            return None;
+        }
+        let short: Vec<_> = self
+            .subscribers
+            .values()
+            .filter(|r| r.blocking)
+            .map(|r| (r.tx.clone(), r.slots_needed()))
+            .collect();
+        for referrer in self.subscribers.values_mut() {
+            referrer.blocking &= !referrer.unpaced;
+        }
+        let timer = self
+            .subscribers
+            .values()
+            .filter(|r| r.blocking)
+            .map(|r| {
+                let held_back = if self.room_at_wait {
+                    r.held_back
+                } else {
+                    Duration::ZERO
+                };
+                limit.saturating_sub(r.stalled.max(held_back))
+            })
+            .min();
+        let pacers_changed = self.pacers_changed.clone();
+        Some(async move {
+            let mut room: FuturesUnordered<_> = short
+                .iter()
+                .map(|(tx, slots)| tx.reserve_many(*slots))
+                .collect();
+            tokio::select! {
+                _ = room.next() => {}
+                () = pacers_changed.notified() => {}
+                () = tokio::time::sleep(timer.unwrap_or_default()), if timer.is_some() => {}
+            }
+        })
+    }
+
+    /// A wait that ends when a referrer owed a `Gap` or a control has room for
+    /// one event; `None` when nothing is owed. The caller then calls
+    /// [`Self::flush_owed`].
+    pub(crate) fn owed_room(&mut self) -> Option<impl Future<Output = ()> + Send + 'static> {
+        if !self.owing {
+            return None;
+        }
+        let owing: Vec<_> = self
+            .subscribers
+            .values()
+            .filter(|r| r.owes())
+            .map(|r| r.tx.clone())
+            .collect();
+        if owing.is_empty() {
+            self.owing = false;
+            return None;
+        }
+        Some(async move {
+            let mut room: FuturesUnordered<_> = owing.iter().map(mpsc::Sender::reserve).collect();
+            room.next().await;
+        })
+    }
+
+    /// Send each referrer what it is owed, as far as its channel has room.
+    pub(crate) fn flush_owed(&mut self) {
+        let mut dead: Vec<SubscriberId> = Vec::new();
+        for (id, r) in &mut self.subscribers {
+            if r.owes() && matches!(r.send_owed(), Err(Refused::Closed)) {
+                dead.push(*id);
+            }
+        }
+        for id in dead {
+            self.subscribers.remove(&id);
+        }
+        self.owing = self.subscribers.values().any(Referrer::owes);
+    }
+
+    /// Referrers full now stop pacing this session's replay.
+    pub(crate) fn stop_pacing_full(&mut self) {
+        for referrer in self.subscribers.values_mut() {
+            referrer.unpaced |= referrer.short();
+        }
+        self.pacers_changed.notify_one();
     }
 
     pub(crate) fn remove(&mut self, id: SubscriberId) {
         self.subscribers.remove(&id);
+        self.pacers_changed.notify_one();
+    }
+
+    /// Remove every referrer whose receiver is gone.
+    pub(crate) fn remove_closed(&mut self) {
+        let before = self.subscribers.len();
+        self.subscribers.retain(|_, r| !r.tx.is_closed());
+        if self.subscribers.len() != before {
+            self.pacers_changed.notify_one();
+        }
     }
 
     /// True once a subscriber has been added and the fan-out is now empty —
@@ -742,18 +1079,18 @@ impl FanOut {
         }
         let mut dead: Vec<SubscriberId> = Vec::new();
         for (id, r) in &mut self.subscribers {
-            // Flush any loss owed to this referrer first, so the `Gap` is ordered
-            // ahead of resumed live delivery. If the channel is still full, fold
-            // this event into the pending gap and move on — never stall a
-            // co-subscriber or the provider.
-            if let Some(p) = &r.pending {
-                match r.tx.try_send(p.to_event()) {
-                    Ok(()) => r.pending = None,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        absorb_drop(&mut r.pending, ev);
+            // What a full channel left owed goes first. If the channel is still
+            // full, this event is owed too, and nothing waits: neither a
+            // co-subscriber nor the provider stalls on a slow referrer.
+            if r.owes() {
+                match r.send_owed() {
+                    Ok(()) => {}
+                    Err(Refused::Full) => {
+                        r.owe(ev);
+                        self.owing = true;
                         continue;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(Refused::Closed) => {
                         dead.push(*id);
                         continue;
                     }
@@ -761,10 +1098,10 @@ impl FanOut {
             }
             match r.tx.try_send(ev.clone()) {
                 Ok(()) => {}
-                // A momentarily-full channel means a slow referrer: record the
-                // loss as a per-instrument `Gap` (delivered when it drains)
-                // rather than dropping it silently.
-                Err(mpsc::error::TrySendError::Full(_)) => absorb_drop(&mut r.pending, ev),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    r.owe(ev);
+                    self.owing = true;
+                }
                 Err(mpsc::error::TrySendError::Closed(_)) => dead.push(*id),
             }
         }
@@ -947,9 +1284,9 @@ enum ClientCommand {
     Subscribe {
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<Subscribed>>,
     },
     Unsubscribe {
         instrument: Instrument,
@@ -978,6 +1315,9 @@ struct ClientController {
     streams: StreamMap<(Instrument, EventKind), SubStream>,
     entries: HashMap<(Instrument, EventKind), SubEntry>,
     sink: ClientSink,
+    /// Events owed to the sink ahead of the substreams: a drained ring and the
+    /// client's own controls. The run loop delivers them as the sink has room.
+    backlog: VecDeque<(MarketEvent, String)>,
     ring_capacity: usize,
     seen_provider_state: HashMap<String, ConnState>,
     last_provider_error: HashMap<String, String>,
@@ -996,12 +1336,21 @@ fn substream(rx: mpsc::Receiver<MarketEvent>) -> SubStream {
 impl ClientController {
     async fn run(mut self) {
         loop {
+            let ready = self.sink_ready();
+            let backlogged = !self.backlog.is_empty();
             tokio::select! {
-                maybe = self.streams.next(), if !self.streams.is_empty() => {
+                () = sink_room(&self.sink), if !ready => {}
+                () = std::future::ready(()), if ready && backlogged => {
+                    if let Some((ev, provider)) = self.backlog.pop_front() {
+                        self.deliver(ev, provider).await;
+                        self.sync_occupancy();
+                    }
+                }
+                maybe = self.streams.next(), if ready && !backlogged && !self.streams.is_empty() => {
                     if let Some((key, msg)) = maybe {
                         match msg {
                             SubMsg::Event(ev) => self.route(key, ev).await,
-                            SubMsg::Ended => self.handle_substream_end(key).await,
+                            SubMsg::Ended => self.handle_substream_end(&key),
                         }
                     }
                 }
@@ -1021,6 +1370,14 @@ impl ClientController {
         // teardown when each was the last referrer.
     }
 
+    /// Whether the sink can take an event without waiting.
+    fn sink_ready(&self) -> bool {
+        match &self.sink {
+            ClientSink::Attached(tx) => tx.capacity() > 0 || tx.is_closed(),
+            ClientSink::Detached(_) => true,
+        }
+    }
+
     /// Returns false when the controller should exit.
     async fn handle_command(&mut self, cmd: ClientCommand) -> bool {
         match cmd {
@@ -1031,8 +1388,12 @@ impl ClientController {
                 options,
                 reply,
             } => {
-                let res = self.subscribe(instrument, kind, scope, options).await;
-                let _ = reply.send(res);
+                let res = self
+                    .subscribe(instrument.clone(), kind, scope, options)
+                    .await;
+                if matches!(reply.send(res), Err(Ok(_))) {
+                    let _ = self.unsubscribe(instrument, kind);
+                }
                 true
             }
             ClientCommand::Unsubscribe {
@@ -1040,7 +1401,7 @@ impl ClientController {
                 kind,
                 reply,
             } => {
-                let res = self.unsubscribe(instrument, kind).await;
+                let res = self.unsubscribe(instrument, kind);
                 let _ = reply.send(res);
                 true
             }
@@ -1049,7 +1410,7 @@ impl ClientController {
                     Ok((rx, prior)) => {
                         let _ = reply.send(Ok(rx));
                         if let Some(ring) = prior {
-                            self.flush_ring(ring).await;
+                            self.flush_ring(ring);
                         }
                     }
                     Err(e) => {
@@ -1074,28 +1435,25 @@ impl ClientController {
         &mut self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<()> {
+    ) -> Result<Subscribed> {
         let key = (instrument.clone(), kind);
         if self.entries.contains_key(&key) {
             return Err(Error::DuplicateSubscription { instrument, kind });
         }
-        // Phase 2: client subscriptions are pure-live. A shared authoritative
-        // session has one creation-time scope, so a per-client backfill /
-        // historical join would break the identical-`(seq, source_ts)`
-        // guarantee. Reject the unsupported variants with a clear error.
-        if !matches!(
-            scope,
-            Scope::Live {
-                backfill_from: None
-            }
-        ) {
-            return Err(Error::UnsupportedClientScope);
-        }
-        let (_auth, guard, rx) = self
+        self.dm.check_client_backfill(scope)?;
+        let Attached {
+            guard, rx, outcome, ..
+        } = self
             .dm
-            .authoritative(instrument.clone(), kind, scope, options)
+            .authoritative(
+                instrument.clone(),
+                kind,
+                scope,
+                options,
+                self.dm.client_backfill_permits(),
+            )
             .await?;
         let provider = guard.provider().to_string();
         self.entries.insert(
@@ -1107,10 +1465,10 @@ impl ClientController {
         );
         self.streams.insert(key, substream(rx));
         self.sync_subscriptions();
-        Ok(())
+        Ok(outcome)
     }
 
-    async fn unsubscribe(&mut self, instrument: Instrument, kind: EventKind) -> Result<()> {
+    fn unsubscribe(&mut self, instrument: Instrument, kind: EventKind) -> Result<()> {
         let key = (instrument.clone(), kind);
         let Some(entry) = self.entries.remove(&key) else {
             return Err(Error::NotSubscribed { instrument, kind });
@@ -1123,11 +1481,10 @@ impl ClientController {
         drop(entry);
         self.streams.remove(&key);
         self.sync_subscriptions();
-        self.deliver(
+        self.queue_control(
             subscription_changed(&instrument, kind, &provider, false),
             provider,
-        )
-        .await;
+        );
         Ok(())
     }
 
@@ -1135,18 +1492,17 @@ impl ClientController {
     /// teardown or fan-out removal). Surface a per-symbol
     /// `SubscriptionChanged { active: false }` and drop the entry. If the key is
     /// already gone (explicit unsubscribe handled it), this is a no-op.
-    async fn handle_substream_end(&mut self, key: (Instrument, EventKind)) {
-        let Some(entry) = self.entries.remove(&key) else {
+    fn handle_substream_end(&mut self, key: &(Instrument, EventKind)) {
+        let Some(entry) = self.entries.remove(key) else {
             return;
         };
         let provider = entry.provider.clone();
         drop(entry);
         self.sync_subscriptions();
-        self.deliver(
+        self.queue_control(
             subscription_changed(&key.0, key.1, &provider, false),
             provider,
-        )
-        .await;
+        );
     }
 
     /// Route one substream event into the per-client stream. Per-symbol controls
@@ -1211,6 +1567,15 @@ impl ClientController {
         }
     }
 
+    /// Queue a client-local control. Past [`CONTROL_BACKLOG`] on top of a
+    /// drained ring the consumer has stopped reading, and the control is lost.
+    fn queue_control(&mut self, ev: MarketEvent, provider: String) {
+        if self.backlog.len() < self.ring_capacity.saturating_add(CONTROL_BACKLOG) {
+            self.backlog.push_back((ev, provider));
+            self.sync_occupancy();
+        }
+    }
+
     /// Deliver one event to the client sink (emit-only — never tee; the tap-log
     /// tee already ran once at the authoritative source). On a gone/closed
     /// consumer the sink flips to a detached per-client ring.
@@ -1245,9 +1610,8 @@ impl ClientController {
         }
         let (tx, rx) = mpsc::channel(default_buffer());
         let prior = std::mem::replace(&mut self.sink, ClientSink::Attached(tx));
-        // Attached: nothing sits in the resume buffer. (The drained ring's
-        // cumulative `dropped_events` is retained on `ClientStats`.)
-        self.stats.set_occupancy(0);
+        // The drained ring moves to the backlog, which `flush_ring` counts.
+        // (Its cumulative `dropped_events` is retained on `ClientStats`.)
         Ok((
             rx,
             match prior {
@@ -1267,11 +1631,12 @@ impl ClientController {
     /// (first-evicted-`seq` order), then survivors in arrival order. Replayed
     /// events keep their source-stamped `seq` — the eviction `Gap` rides the
     /// first-evicted slot.
-    async fn flush_ring(&mut self, ring: ClientRing) {
+    fn flush_ring(&mut self, ring: ClientRing) {
         let (gaps, events) = ring.into_parts();
-        for (first_seq, instrument, span, provider) in gaps {
-            self.deliver(
-                MarketEvent::Control(Control {
+        let mut drained: VecDeque<_> = gaps
+            .into_iter()
+            .map(|(first_seq, instrument, span, provider)| {
+                let gap = MarketEvent::Control(Control {
                     source_ts: span.from_source_ts,
                     rx_ts: span.from_source_ts,
                     seq: first_seq,
@@ -1280,18 +1645,28 @@ impl ClientController {
                         instrument,
                         span,
                     },
-                }),
-                provider,
-            )
-            .await;
-        }
-        for (ev, provider) in events {
-            self.deliver(ev, provider).await;
+                });
+                (gap, provider)
+            })
+            .collect();
+        drained.extend(events);
+        drained.append(&mut self.backlog);
+        self.backlog = drained;
+        self.sync_occupancy();
+    }
+
+    /// Report the events owed to an attached consumer as the resume buffer's
+    /// occupancy. A detached client's occupancy is its ring.
+    fn sync_occupancy(&self) {
+        if matches!(self.sink, ClientSink::Attached(_)) {
+            self.stats.set_occupancy(self.backlog.len());
         }
     }
 
+    /// Hand the backlog and a terminal `SessionClosing` to the consumer, for up
+    /// to [`CLOSE_DELIVERY_WAIT`] in all. What it has not taken by then is lost.
     async fn emit_session_closing(&mut self) {
-        self.deliver(
+        self.backlog.push_back((
             MarketEvent::Control(Control {
                 source_ts: wall_clock_ts(),
                 rx_ts: wall_clock_ts(),
@@ -1299,8 +1674,20 @@ impl ClientController {
                 kind: ControlKind::SessionClosing,
             }),
             String::new(),
-        )
-        .await;
+        ));
+        let deadline = tokio::time::Instant::now() + CLOSE_DELIVERY_WAIT;
+        while let Some((ev, provider)) = self.backlog.pop_front() {
+            match &self.sink {
+                ClientSink::Attached(tx) if !tx.is_closed() => {
+                    match tokio::time::timeout_at(deadline, tx.send(ev)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(mpsc::error::SendError(ev))) => self.deliver(ev, provider).await,
+                        Err(_) => return,
+                    }
+                }
+                _ => self.deliver(ev, provider).await,
+            }
+        }
     }
 }
 
@@ -1376,9 +1763,9 @@ impl ClientHandle {
         &self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<()> {
+    ) -> Result<Subscribed> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(ClientCommand::Subscribe {
@@ -1461,6 +1848,7 @@ pub(crate) fn spawn_client(
         streams,
         entries,
         sink: ClientSink::Detached(ClientRing::new(ring_capacity)),
+        backlog: VecDeque::new(),
         ring_capacity,
         seen_provider_state: HashMap::new(),
         last_provider_error: HashMap::new(),
@@ -1476,7 +1864,8 @@ pub(crate) fn spawn_client(
 ///
 /// Determinism is **per symbol only**: each instrument's substream is
 /// `seq`-monotonic (source-stamped); there is no cross-instrument ordering
-/// (arrival order). Subscriptions are pure-live in Phase 2.
+/// (arrival order). Subscriptions are unbounded: pure-live, or a backfill
+/// seamed into the live tail.
 pub struct ClientSession {
     handle: ClientHandle,
 }
@@ -1486,24 +1875,32 @@ impl ClientSession {
         Self { handle }
     }
 
-    /// Add a subscription to this client's set.
+    /// Add a subscription to this client's set and return what it opened.
+    ///
+    /// The pair's authoritative session is created with the first subscriber's
+    /// `scope` and every later subscriber joins it as is.
     ///
     /// # Errors
     ///
     /// - [`Error::DuplicateSubscription`] — `(instrument, kind)` is already in
     ///   this client's set.
-    /// - [`Error::UnsupportedClientScope`] — Phase 2 client subscriptions are
-    ///   pure-live; `Scope::Historical` and `Live { backfill_from: Some(_) }`
-    ///   are rejected.
-    /// - [`Error::UnsupportedEventKind`] — no provider serves the pair.
+    /// - [`Error::UnsupportedEventKind`] — no provider serves the pair on the
+    ///   surfaces the scope needs (live, plus history under backfill).
+    /// - [`Error::PersistenceRequired`] — `options` needs a cache or tap log
+    ///   that is not configured, on a joiner as on a creator.
+    /// - [`Error::BackfillTooOld`] — a backfill starts before the limit set by
+    ///   [`DatamancerBuilder::max_client_backfill`](crate::DatamancerBuilder::max_client_backfill).
+    /// - [`Error::BackfillFromNotInPast`] — this subscribe would create a
+    ///   session whose backfill starts at or past the live edge. A joiner is
+    ///   not checked.
     /// - [`Error::SessionClosed`] — the controller has shut down.
     pub async fn subscribe(
         &self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<()> {
+    ) -> Result<Subscribed> {
         self.handle
             .subscribe(instrument, kind, scope, options)
             .await
@@ -1523,7 +1920,9 @@ impl ClientSession {
     /// Take the multiplexed event stream. Multi-shot: dropping the stream
     /// detaches the consumer (events buffer into the per-client resume ring); a
     /// later call re-attaches, first surfacing one `Gap` per affected instrument
-    /// for anything the buffer evicted.
+    /// for anything the buffer evicted. Events still unread in a dropped
+    /// stream's channel are lost with no `Gap`, and the next stream goes on
+    /// past their `seq` slots: drain before dropping to keep them.
     ///
     /// # Errors
     ///
@@ -1545,7 +1944,9 @@ impl ClientSession {
     }
 
     /// Explicit termination. Emits a single `Control::SessionClosing` then tears
-    /// down every subscription (releasing the authoritative refcounts).
+    /// down every subscription (releasing the authoritative refcounts). A
+    /// consumer that has not read what it is owed within two seconds loses the
+    /// rest, the terminal control included.
     ///
     /// # Errors
     ///
@@ -1613,6 +2014,17 @@ mod live_stats_tests {
         assert_eq!(s.gap_count(), 1);
         // The gap also occupies a seq slot.
         assert_eq!(s.seq_position(), Some(Seq(7)));
+    }
+
+    #[test]
+    fn a_replayed_event_records_position_and_gaps_but_no_timestamps() {
+        let s = LiveStats::new();
+        s.record_replay(&trade(100, 3));
+        assert_eq!(s.seq_position(), Some(Seq(3)));
+        assert_eq!(s.last_source_ts(), None);
+        assert_eq!(s.last_rx_ts(), None);
+        s.record_replay(&gap());
+        assert_eq!(s.gap_count(), 1);
     }
 
     #[test]
@@ -1742,11 +2154,17 @@ mod client_ring_tests {
 
 #[cfg(test)]
 mod fanout_tests {
+    use std::time::Duration;
+
+    use futures::FutureExt as _;
+
     use super::{FanOut, SubscriberId};
     use datamancer_core::{
         AssetClass, ControlKind, Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
     };
     use tokio::sync::mpsc;
+
+    const LIMIT: Duration = Duration::from_secs(30);
 
     fn inst(symbol: &str) -> Instrument {
         Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, symbol)
@@ -1792,5 +2210,377 @@ mod fanout_tests {
             },
             other => panic!("expected a Control::Gap, got {other:?}"),
         }
+    }
+
+    fn control(seq: u64, kind: ControlKind) -> MarketEvent {
+        MarketEvent::Control(datamancer_core::Control {
+            source_ts: Timestamp(0),
+            rx_ts: Timestamp(0),
+            seq: Seq(seq),
+            kind,
+        })
+    }
+
+    fn disconnected(seq: u64) -> MarketEvent {
+        control(
+            seq,
+            ControlKind::ProviderDisconnected {
+                provider: "p".to_string(),
+                reason: "reset".to_string(),
+                cause: datamancer_core::DisconnectCause::Error,
+            },
+        )
+    }
+
+    fn connected(seq: u64) -> MarketEvent {
+        control(
+            seq,
+            ControlKind::ProviderConnected {
+                provider: "p".to_string(),
+            },
+        )
+    }
+
+    fn subscription_changed(seq: u64, active: bool) -> MarketEvent {
+        control(
+            seq,
+            ControlKind::SubscriptionChanged {
+                provider: "p".to_string(),
+                instrument: inst("AAPL"),
+                kind: datamancer_core::EventKind::Trade,
+                active,
+            },
+        )
+    }
+
+    /// A fan-out with one referrer whose channel holds `depth` events and is
+    /// full, plus the receiver and a sender for filling it again.
+    fn full_referrer(depth: usize) -> (FanOut, mpsc::Receiver<MarketEvent>) {
+        let (tx, rx) = mpsc::channel(depth);
+        for _ in 0..depth {
+            tx.try_send(trade(1, 0)).unwrap();
+        }
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), tx);
+        (fanout, rx)
+    }
+
+    /// Empty the channel, fan `next` out, and return what the referrer then
+    /// receives as `(seq, what)`.
+    fn drain_then(
+        fanout: &mut FanOut,
+        rx: &mut mpsc::Receiver<MarketEvent>,
+        next: &MarketEvent,
+    ) -> Vec<(u64, &'static str)> {
+        while rx.try_recv().is_ok() {}
+        fanout.fanout(next);
+        let mut got = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            let what = match &ev {
+                MarketEvent::Control(c) => match c.kind {
+                    ControlKind::Gap { .. } => "gap",
+                    ControlKind::ProviderConnected { .. } => "connected",
+                    ControlKind::ProviderDisconnected { .. } => "disconnected",
+                    ControlKind::ProviderError { .. } => "error",
+                    ControlKind::SubscriptionChanged { active: true, .. } => "active",
+                    ControlKind::SubscriptionChanged { active: false, .. } => "inactive",
+                    _ => "other control",
+                },
+                _ => "data",
+            };
+            got.push((ev.seq().unwrap().0, what));
+        }
+        got
+    }
+
+    #[test]
+    fn a_control_dropped_on_a_full_channel_comes_before_the_next_event() {
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&disconnected(2));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(3, 3)),
+            [(2, "disconnected"), (3, "data")]
+        );
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&subscription_changed(2, false));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(3, 3)),
+            [(2, "inactive"), (3, "data")]
+        );
+    }
+
+    #[test]
+    fn owed_controls_and_a_gap_come_in_seq_order() {
+        let (mut fanout, mut rx) = full_referrer(4);
+        fanout.fanout(&trade(2, 2));
+        fanout.fanout(&disconnected(3));
+        fanout.fanout(&trade(4, 4));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(5, 5)),
+            [(2, "gap"), (3, "disconnected"), (5, "data")]
+        );
+        let (mut fanout, mut rx) = full_referrer(4);
+        fanout.fanout(&subscription_changed(2, false));
+        fanout.fanout(&trade(3, 3));
+        fanout.fanout(&disconnected(4));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(5, 5)),
+            [
+                (2, "inactive"),
+                (3, "gap"),
+                (4, "disconnected"),
+                (5, "data")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newer_owed_control_of_its_kind_replaces_the_older() {
+        let (mut fanout, mut rx) = full_referrer(4);
+        fanout.fanout(&disconnected(2));
+        fanout.fanout(&subscription_changed(3, false));
+        fanout.fanout(&connected(4));
+        fanout.fanout(&subscription_changed(5, true));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(6, 6)),
+            [(4, "connected"), (5, "active"), (6, "data")]
+        );
+    }
+
+    fn provider_error(seq: u64) -> MarketEvent {
+        control(
+            seq,
+            ControlKind::ProviderError {
+                provider: "p".to_string(),
+                message: "re-subscribe failed".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn an_owed_error_leaves_the_owed_connection_state() {
+        let (mut fanout, mut rx) = full_referrer(4);
+        fanout.fanout(&disconnected(2));
+        fanout.fanout(&connected(3));
+        fanout.fanout(&provider_error(4));
+        fanout.fanout(&provider_error(5));
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(6, 6)),
+            [(3, "connected"), (5, "error"), (6, "data")]
+        );
+    }
+
+    #[test]
+    fn owed_controls_left_over_wait_for_the_next_room() {
+        let (mut fanout, mut rx) = full_referrer(1);
+        fanout.fanout(&trade(2, 2));
+        fanout.fanout(&disconnected(3));
+        // Room for the Gap only: the control and the event stay owed.
+        assert_eq!(drain_then(&mut fanout, &mut rx, &trade(4, 4)), [(2, "gap")]);
+        assert_eq!(
+            drain_then(&mut fanout, &mut rx, &trade(5, 5)),
+            [(3, "disconnected")]
+        );
+        assert_eq!(drain_then(&mut fanout, &mut rx, &trade(6, 6)), [(4, "gap")]);
+    }
+
+    #[tokio::test]
+    async fn what_is_owed_goes_out_once_the_channel_has_room() {
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&trade(2, 2));
+        fanout.fanout(&disconnected(3));
+        let room = fanout.owed_room().expect("something is owed");
+        while rx.try_recv().is_ok() {}
+        tokio::time::timeout(Duration::from_secs(1), room)
+            .await
+            .expect("room was not seen");
+        fanout.flush_owed();
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|ev| ev.seq().unwrap().0)
+            .collect();
+        assert_eq!(got, [2, 3], "the Gap, then the disconnect");
+        assert!(fanout.owed_room().is_none(), "nothing is owed");
+    }
+
+    #[tokio::test]
+    async fn a_closed_referrer_that_owes_is_removed_by_the_flush() {
+        let (mut fanout, rx) = full_referrer(2);
+        fanout.fanout(&disconnected(2));
+        let room = fanout.owed_room().expect("something is owed");
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), room)
+            .await
+            .expect("a closed channel ends the wait");
+        fanout.flush_owed();
+        assert_eq!(fanout.subscriber_count(), 0);
+        assert!(fanout.owed_room().is_none(), "nothing is owed");
+    }
+
+    #[tokio::test]
+    async fn a_referrer_owed_a_control_needs_room_for_it() {
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&disconnected(2));
+        rx.recv().await;
+        assert!(
+            fanout.next_wait(Duration::ZERO, LIMIT).is_some(),
+            "the control takes the only free slot"
+        );
+        rx.recv().await;
+        assert!(fanout.next_wait(Duration::ZERO, LIMIT).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_referrer_owed_a_gap_needs_room_for_two() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), tx);
+        let trade = |ts| {
+            datamancer_core::MarketEvent::Trade(datamancer_core::Trade {
+                instrument: datamancer_core::Instrument::new(
+                    datamancer_core::ProviderId::from_static("fake"),
+                    datamancer_core::AssetClass::Equity,
+                    "AAPL",
+                ),
+                source_ts: datamancer_core::Timestamp(ts),
+                rx_ts: datamancer_core::Timestamp(ts),
+                seq: datamancer_core::Seq(0),
+                price: datamancer_core::Price(1),
+                size: datamancer_core::Quantity::from_raw(1),
+            })
+        };
+        for ts in 1..=3 {
+            fanout.fanout(&trade(ts));
+        }
+        rx.recv().await;
+        assert!(
+            fanout.next_wait(Duration::ZERO, LIMIT).is_some(),
+            "the Gap takes the only free slot"
+        );
+        rx.recv().await;
+        assert!(fanout.next_wait(Duration::ZERO, LIMIT).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_slot_free_before_the_wait_is_not_progress() {
+        let (mut fanout, mut rx) = full_referrer(2);
+        fanout.fanout(&trade(3, 3));
+        rx.recv().await;
+        assert!(
+            fanout.next_wait(Duration::ZERO, LIMIT).is_some(),
+            "the Gap takes the only free slot"
+        );
+        assert!(
+            fanout.next_wait(LIMIT, LIMIT).is_none(),
+            "a full wait with nothing read is the limit"
+        );
+    }
+
+    /// The timer on the wait `next_wait` plans: how long it runs with nothing
+    /// else happening, `None` if that is forever.
+    async fn timer(fanout: &mut FanOut, waited: Duration) -> Option<Duration> {
+        let _ = fanout.pacers_changed.notified().now_or_never();
+        let wait = fanout.next_wait(waited, LIMIT).expect("a wait");
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_hours(1), wait)
+            .await
+            .ok()
+            .map(|()| started.elapsed())
+    }
+
+    /// A full channel and one with room, both added to a new fan-out.
+    fn stopped_and_reading() -> (
+        FanOut,
+        tokio::sync::mpsc::Receiver<datamancer_core::MarketEvent>,
+        tokio::sync::mpsc::Receiver<datamancer_core::MarketEvent>,
+    ) {
+        let (full_tx, full_rx) = tokio::sync::mpsc::channel(1);
+        let (room_tx, room_rx) = tokio::sync::mpsc::channel(1);
+        full_tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), full_tx);
+        fanout.add(SubscriberId(2), room_tx);
+        (fanout, full_rx, room_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_full_referrer_stops_pacing_at_the_limit_in_total() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), tx);
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+        assert_eq!(
+            timer(&mut fanout, Duration::from_secs(20)).await,
+            Some(Duration::from_secs(10))
+        );
+        assert!(fanout.next_wait(Duration::from_secs(10), LIMIT).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_referrer_stops_pacing_at_the_limit_in_total() {
+        let (mut fanout, _full, _room) = stopped_and_reading();
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+        assert_eq!(
+            timer(&mut fanout, Duration::from_secs(20)).await,
+            Some(Duration::from_secs(10))
+        );
+        assert!(fanout.next_wait(Duration::from_secs(10), LIMIT).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_join_is_not_charged_for_the_wait_before_it() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), tx);
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+        let (joiner, _joiner_rx) = tokio::sync::mpsc::channel(1);
+        joiner.try_send(trade(1, 1)).unwrap();
+        fanout.add(SubscriberId(2), joiner);
+        assert_eq!(
+            timer(&mut fanout, Duration::from_secs(20)).await,
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            timer(&mut fanout, Duration::from_secs(10)).await,
+            Some(Duration::from_secs(20)),
+            "the joiner is charged from its join"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unpaced_referrer_is_not_waited_on() {
+        let (full_tx, _full) = tokio::sync::mpsc::channel(2);
+        let (room_tx, _room) = tokio::sync::mpsc::channel(1);
+        full_tx.try_send(trade(1, 1)).unwrap();
+        full_tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), full_tx);
+        fanout.add(SubscriberId(2), room_tx);
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+        assert!(
+            fanout.next_wait(LIMIT, LIMIT).is_none(),
+            "the first is charged out"
+        );
+        // The other fills; the replay waits on it alone, from zero.
+        fanout.fanout(&trade(2, 2));
+        assert_eq!(timer(&mut fanout, Duration::ZERO).await, Some(LIMIT));
+    }
+
+    #[tokio::test]
+    async fn room_for_one_of_two_short_referrers_ends_the_wait() {
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(1);
+        let (second_tx, _second_rx) = tokio::sync::mpsc::channel(1);
+        first_tx.try_send(trade(1, 1)).unwrap();
+        second_tx.try_send(trade(1, 1)).unwrap();
+        let mut fanout = FanOut::new();
+        fanout.add(SubscriberId(1), first_tx);
+        fanout.add(SubscriberId(2), second_tx);
+        let _ = fanout.pacers_changed.notified().now_or_never();
+        let wait = fanout.next_wait(Duration::ZERO, LIMIT).expect("a wait");
+        first_rx.recv().await;
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("a wake-up was lost");
     }
 }

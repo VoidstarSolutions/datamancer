@@ -305,14 +305,13 @@ async fn config_service_enables_and_disables_a_provider_live() {
     // 3. Without a configured/enabled provider, the daemon requires
     // configure-provider before data flows: subscribing against a disabled
     // provider must fail rather than silently succeed.
-    let spec = SubscriptionSpec {
-        provider: "alpaca-crypto".to_string(),
-        asset_class: datamancer_client::spec::AssetClassCfg::Crypto,
-        symbol: "BTC/USD".to_string(),
-        kind: datamancer_client::spec::EventKindCfg::Trade,
-        scope: datamancer_client::spec::ScopeCfg::default(),
-        persistence: datamancer_client::spec::PersistenceCfg::default(),
-    };
+    let btc_usd = datamancer_core::Instrument::new(
+        datamancer_core::ProviderId::from_static("alpaca-crypto"),
+        datamancer_core::AssetClass::Crypto,
+        "BTC/USD",
+    );
+    let spec = SubscriptionSpec::new(&btc_usd, datamancer_core::EventKind::Trade)
+        .expect("crypto is on the wire");
     let pre_configure = handle.subscribe(&spec).await;
     match pre_configure {
         Err(ClientError::Control { .. }) => {}

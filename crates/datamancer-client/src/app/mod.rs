@@ -39,7 +39,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use datamancer_core::{
-    HealthView, InstrumentEntry, InstrumentInfo, ProviderCredentials, ProviderId, SystemSnapshot,
+    HealthView, InstrumentEntry, InstrumentInfo, ProviderCredentials, ProviderId, Subscribed,
+    SystemSnapshot,
 };
 
 use crate::Client as _;
@@ -60,7 +61,8 @@ pub use crate::pipe_control::PipeControlError;
 use crate::ws::{WsClient, WsConfig};
 
 /// The multiplexed event stream (same contract as the underlying
-/// [`crate::Client`] impl: `(instrument, seq)`-ordered, loss never silent).
+/// [`crate::Client`] impl: `(instrument, kind, seq)`-ordered, loss never
+/// silent).
 #[cfg(not(windows))]
 pub type AppEvents = <Iceoryx2Client as crate::Client>::Events;
 #[cfg(windows)]
@@ -470,7 +472,7 @@ impl AppHandle {
     pub async fn subscribe(
         &mut self,
         spec: &SubscriptionSpec,
-    ) -> Result<(), ClientError<DataError>> {
+    ) -> Result<Subscribed, ClientError<DataError>> {
         self.data_mut().subscribe(spec).await
     }
 

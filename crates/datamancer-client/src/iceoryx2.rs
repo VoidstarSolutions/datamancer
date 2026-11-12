@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use datamancer_core::{
-    ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, SystemSnapshot,
+    ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, Subscribed,
+    SystemSnapshot,
 };
 use datamancer_transport_iceoryx2::{DataServiceName, DataSubscriber};
 use futures::Stream;
@@ -435,7 +436,10 @@ impl Client for Iceoryx2Client {
         ))
     }
 
-    async fn subscribe(&mut self, spec: &SubscriptionSpec) -> Result<(), ClientError<Self::Error>> {
+    async fn subscribe(
+        &mut self,
+        spec: &SubscriptionSpec,
+    ) -> Result<Subscribed, ClientError<Self::Error>> {
         let reply = self
             .control
             .request(&Request::Subscribe {
@@ -444,7 +448,7 @@ impl Client for Iceoryx2Client {
             })
             .await
             .map_err(ClientError::Transport)?;
-        check(reply).map(|_| ())
+        check(reply).map(|reply| reply.subscribed())
     }
 
     async fn unsubscribe(
@@ -734,6 +738,33 @@ mod tests {
                 assert_eq!(code, codes::DUPLICATE_CLIENT);
             }
             other => panic!("expected Control error, got {other:?}"),
+        }
+    }
+
+    /// A refused subscribe is the refusal, not a created session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subscribe_error_reply_is_not_read_as_created() {
+        use super::Iceoryx2Client;
+        use crate::client::Client as _;
+        use crate::spec::SubscriptionSpec;
+
+        let path = fake_uds(vec![Reply::error(codes::DUPLICATE_CLIENT, "name in use")]);
+        let mut client = Iceoryx2Client {
+            control: ControlHandle::spawn(ControlConn::connect(&path).await.unwrap()),
+            client_name: "c".to_string(),
+            stop: Arc::new(AtomicBool::new(false)),
+            poll_interval: std::time::Duration::from_millis(10),
+            event_buffer: 16,
+            closed: false,
+        };
+        let spec: SubscriptionSpec = serde_json::from_str(
+            r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+        )
+        .unwrap();
+        match client.subscribe(&spec).await {
+            Err(ClientError::Control { code, .. }) => assert_eq!(code, codes::DUPLICATE_CLIENT),
+            other => panic!("expected the refusal, got {other:?}"),
         }
     }
 

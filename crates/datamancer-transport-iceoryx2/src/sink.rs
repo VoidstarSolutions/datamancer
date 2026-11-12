@@ -7,27 +7,41 @@
 //! Interning + POD conversion live entirely here; core `MarketEvent` is
 //! untouched.
 //!
-//! Backpressure is **blocking**: the data service disables safe overflow and
-//! the publisher retries until delivered, so a full subscriber queue stalls the
-//! publisher rather than silently dropping — loss is then accounted by the
-//! core-side resume buffer as a `Control::Gap`.
+//! A client data service takes one subscriber; a second is refused at open
+//! while the first is attached, or after it crashed until iceoryx2 cleans up
+//! the dead node.
+//!
+//! A full subscriber queue makes `publish` wait rather than drop: the data
+//! service disables safe overflow, a sample a full subscriber cannot take is
+//! not delivered, and `publish` sends it again after a short sleep until the
+//! subscriber has room. The wait is an async sleep, so it holds no thread and
+//! dropping the future ends it.
+//!
+//! With no subscriber attached, `publish` sends a sample once and reports it
+//! delivered. The service keeps the last 16 samples as history: a subscriber
+//! that attaches later receives those and nothing before them, a `seq` hole
+//! with no `Gap`. A subscriber that replaces a departed one while a sample is
+//! being sent again can receive that sample twice, from the history and from
+//! the resend.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use datamancer_core::{EventSink, MarketEvent, PublishOutcome, Result as CoreResult};
 use iceoryx2::port::publisher::Publisher;
 use iceoryx2::prelude::{BackpressureStrategy, Node, ipc_threadsafe};
+use iceoryx2::service::port_factory::{PortFactory as _, publish_subscribe::PortFactory};
 
 use crate::error::{Result, TransportError};
 use crate::naming::DataServiceName;
 use crate::payload::{DataPayload, to_pod};
 use crate::symbol_table::{SymbolAnnouncement, SymbolId, SymbolTable};
 
-/// Default over-provisioned subscriber count for the per-client services.
-/// Over-provisioned because service resources are fixed at creation; the
-/// realistic fan-out (a single consumer process, plus the Phase-5 node) is
-/// small.
+/// Subscribers a client data service takes: its one consumer.
+const DATA_MAX_SUBSCRIBERS: usize = 1;
+
+/// Default subscriber count for the per-client announcement service.
 const DEFAULT_MAX_SUBSCRIBERS: usize = 8;
 
 /// Default retained-history depth for late-joiner catch-up on the data plane.
@@ -40,6 +54,13 @@ const DEFAULT_DATA_HISTORY: usize = 16;
 /// ring populated with the whole table, bounding the stranding window for late
 /// joiners to at most this many events (independent of `flush` cadence).
 const REANNOUNCE_INTERVAL: u64 = 256;
+
+/// First wait before a data sample a full subscriber refused is sent again.
+const RESEND_FIRST_WAIT: Duration = Duration::from_millis(1);
+
+/// Longest wait between two sends of a refused data sample; the wait doubles
+/// from [`RESEND_FIRST_WAIT`] up to this.
+const RESEND_MAX_WAIT: Duration = Duration::from_millis(20);
 
 /// Mutable interning state shared behind the sink's lock. `announced` tracks
 /// which interned ids have had their announcement published, so a new symbol is
@@ -55,6 +76,7 @@ pub struct Iceoryx2DataSink {
     /// The data service's name, exactly as created; what the daemon
     /// advertises in its `open-client` / `open-query` reply.
     name: DataServiceName,
+    data_service: PortFactory<ipc_threadsafe::Service, DataPayload, ()>,
     data: Publisher<ipc_threadsafe::Service, DataPayload, ()>,
     announcements: Publisher<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
     state: Mutex<State>,
@@ -83,12 +105,13 @@ impl Iceoryx2DataSink {
         let data_service = node
             .service_builder(&data_name)
             .publish_subscribe::<DataPayload>()
-            // Blocking backpressure: no silent overflow; the publisher retries.
+            // No silent overflow: a full subscriber refuses the sample and
+            // `deliver` sends it again.
             .enable_safe_overflow(false)
             .history_size(DEFAULT_DATA_HISTORY)
             // The subscriber buffer must exceed the history size; over-provision.
             .subscriber_max_buffer_size(DEFAULT_DATA_HISTORY * 2)
-            .max_subscribers(DEFAULT_MAX_SUBSCRIBERS)
+            .max_subscribers(DATA_MAX_SUBSCRIBERS)
             .open_or_create()
             .map_err(|e| crate::error::open_or_create_error(data_name.as_str(), e))?;
         let ann_history = DEFAULT_MAX_SUBSCRIBERS * 64;
@@ -105,7 +128,7 @@ impl Iceoryx2DataSink {
 
         let data = data_service
             .publisher_builder()
-            .backpressure_strategy(BackpressureStrategy::RetryUntilDelivered)
+            .backpressure_strategy(BackpressureStrategy::DiscardData)
             .create()
             .map_err(|e| TransportError::Service(format!("{e:?}")))?;
         let announcements = ann_service
@@ -115,6 +138,7 @@ impl Iceoryx2DataSink {
 
         Ok(Self {
             name,
+            data_service,
             data,
             announcements,
             state: Mutex::new(State {
@@ -146,10 +170,44 @@ impl Iceoryx2DataSink {
         Ok(())
     }
 
+    /// Send one data sample. Returns how many subscribers received it.
+    fn send_data(&self, pod: DataPayload) -> Result<usize> {
+        let sample = self
+            .data
+            .loan_uninit()
+            .map_err(|e| TransportError::Send(format!("{e:?}")))?;
+        sample
+            .write_payload(pod)
+            .send()
+            .map_err(|e| TransportError::Send(format!("{e:?}")))
+    }
+
+    /// Whether a subscriber is connected to the data service.
+    fn has_data_subscriber(&self) -> bool {
+        self.data_service.dynamic_config().number_of_subscribers() > 0
+    }
+
     /// Convert to POD (interning + announce-if-new), then publish on the data
     /// plane. Returns `Ok(true)` if delivered (or deliberately suppressed),
     /// `Ok(false)` if the transport refused it (caller should buffer).
-    fn deliver(&self, ev: &MarketEvent) -> Result<bool> {
+    ///
+    /// While a subscriber is connected and refuses the sample because its
+    /// queue is full, the same sample is sent again after a sleep that starts
+    /// at [`RESEND_FIRST_WAIT`] and doubles up to [`RESEND_MAX_WAIT`]. Whether
+    /// one is connected is read before the first send: with none, the sample
+    /// is sent once and stays in the service's history, where a subscriber
+    /// that attaches later receives it.
+    async fn deliver(&self, ev: &MarketEvent) -> Result<bool> {
+        self.deliver_observed(ev, || {}).await
+    }
+
+    /// [`Self::deliver`], calling `after_first_send` once the sample's first
+    /// send has returned.
+    async fn deliver_observed(
+        &self,
+        ev: &MarketEvent,
+        after_first_send: impl FnOnce() + Send,
+    ) -> Result<bool> {
         let (pod, pending_announcement) = {
             let mut state = self.state.lock().expect("sink state poisoned");
             let Some(pod) = to_pod(ev, &mut state.table)
@@ -196,14 +254,18 @@ impl Iceoryx2DataSink {
                 .insert(pod.symbol.0);
         }
 
-        let sample = self
-            .data
-            .loan_uninit()
-            .map_err(|e| TransportError::Send(format!("{e:?}")))?;
-        let sample = sample.write_payload(pod);
-        sample
-            .send()
-            .map_err(|e| TransportError::Send(format!("{e:?}")))?;
+        // Read before the send: a subscriber that registers after it receives
+        // this sample from the history, so a resend would give it a second
+        // copy.
+        let connected = self.has_data_subscriber();
+        let mut received = self.send_data(pod)?;
+        after_first_send();
+        let mut wait = RESEND_FIRST_WAIT;
+        while received == 0 && connected && self.has_data_subscriber() {
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(RESEND_MAX_WAIT);
+            received = self.send_data(pod)?;
+        }
 
         // Periodically refresh the announcement history ring so a subscriber that
         // joined after a symbol's one-shot announcement aged out can still
@@ -235,14 +297,14 @@ impl Iceoryx2DataSink {
 #[async_trait]
 impl EventSink for Iceoryx2DataSink {
     async fn publish(&self, ev: MarketEvent) -> PublishOutcome {
-        match self.deliver(&ev) {
+        match self.deliver(&ev).await {
             Ok(true) => PublishOutcome::Delivered,
             Ok(false) | Err(_) => PublishOutcome::Rejected(ev),
         }
     }
 
     async fn publish_borrowed(&self, ev: &MarketEvent) -> PublishOutcome {
-        match self.deliver(ev) {
+        match self.deliver(ev).await {
             Ok(true) => PublishOutcome::Delivered,
             Ok(false) | Err(_) => PublishOutcome::Rejected(ev.clone()),
         }
@@ -255,5 +317,80 @@ impl EventSink for Iceoryx2DataSink {
         // symbol referenced by samples still in the data history.
         self.republish_all_announcements()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use datamancer_core::{
+        AssetClass, EventSink, Instrument, MarketEvent, Price, ProviderId, Quantity, Seq,
+        Timestamp, Trade,
+    };
+    use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
+
+    use super::Iceoryx2DataSink;
+    use crate::{DataServiceName, DataSubscriber, ServicePrefix};
+
+    fn trade(seq: u64) -> MarketEvent {
+        let ts = i64::try_from(seq).expect("small");
+        MarketEvent::Trade(Trade {
+            instrument: Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, "AAPL"),
+            source_ts: Timestamp(ts),
+            rx_ts: Timestamp(ts),
+            seq: Seq(seq),
+            price: Price(100),
+            size: Quantity::from_raw(1),
+        })
+    }
+
+    /// A subscriber that attaches between a sample's first send and the
+    /// check for a connected subscriber receives that sample once, from the
+    /// history, and no resend repeats it.
+    #[tokio::test]
+    #[ignore = "needs the iceoryx2 runtime"]
+    async fn a_subscriber_attaching_during_a_send_receives_the_sample_once() {
+        let node = NodeBuilder::new()
+            .create::<ipc_threadsafe::Service>()
+            .expect("node");
+        let prefix = ServicePrefix::new("sink-attach-test")
+            .expect("prefix")
+            .boot_scoped(0, std::process::id())
+            .expect("fits");
+        let sink = Iceoryx2DataSink::new(&node, DataServiceName::new(&prefix, 1)).expect("sink");
+        let attached = Mutex::new(None);
+        let delivered = sink
+            .deliver_observed(&trade(0), || {
+                *attached.lock().expect("lock") =
+                    Some(DataSubscriber::open(&node, sink.data_service_name()).expect("open"));
+            })
+            .await
+            .expect("deliver");
+        assert!(delivered);
+        sink.publish(trade(1)).await;
+        // Republish the announcement the subscriber attached after.
+        sink.flush().await.expect("flush");
+        let mut subscriber = attached.lock().expect("lock").take().expect("attached");
+
+        let mut seqs = Vec::new();
+        for _ in 0..200 {
+            for ev in subscriber.poll().expect("poll") {
+                if let MarketEvent::Trade(t) = ev {
+                    seqs.push(t.seq.0);
+                }
+            }
+            if seqs.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for ev in subscriber.poll().expect("poll") {
+            if let MarketEvent::Trade(t) = ev {
+                seqs.push(t.seq.0);
+            }
+        }
+        assert_eq!(seqs, vec![0, 1]);
     }
 }

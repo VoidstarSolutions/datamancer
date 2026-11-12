@@ -30,7 +30,7 @@
 //! historical read-through machinery, buffering live arrivals and splicing
 //! them in after the backfill output. A healthy seam emits no synthetic
 //! control; `Gap` appears only for real, known loss (fetch failure, buffer
-//! overflow).
+//! overflow, a subscriber that stops pacing the replay).
 //!
 //! Recording (write-through to persistence) is a separate axis. It defaults
 //! to whatever was passed at construction and can be toggled at runtime via
@@ -51,25 +51,28 @@
 
 use crate::accounting::ProviderAccounting;
 use crate::client_session::{
-    AuthoritativeSession, ClientHandle, ClientSession, ClientStats, FanOut, LiveStats,
+    Attached, AuthoritativeSession, ClientHandle, ClientSession, ClientStats, FanOut, LiveStats,
     SubscriberGuard, SubscriberId, spawn_client,
 };
 use crate::fetch_locks::FetchLocks;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use datamancer_core::{
     Adjustment, AuthoritativeSessionSnapshot, Bar, CacheKey, CacheSnapshot, ClientSessionSnapshot,
     Control, ControlKind, Error, EventKind, EventSink, GapSpan, HealthView, HistoricalCache,
-    HistoryRequest, Instrument, InstrumentEntry, InstrumentInfo, LiveHandle, MarketEvent, Provider,
-    ProviderId, ProviderSnapshot, PublishOutcome, Quote, ReplayRequest, Result, Seq, Surface,
-    SystemSnapshot, TapLog, Timestamp, Trade,
+    HistoryRequest, Instrument, InstrumentEntry, InstrumentInfo, LiveHandle, LiveScope,
+    MarketEvent, Provider, ProviderId, ProviderSnapshot, PublishOutcome, Quote, ReplayRequest,
+    Result, Seq, Subscribed, Surface, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 use futures::StreamExt;
 use futures::stream::Stream;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -87,6 +90,14 @@ pub enum Scope {
     Live { backfill_from: Option<Timestamp> },
 }
 
+impl From<LiveScope> for Scope {
+    fn from(scope: LiveScope) -> Self {
+        Self::Live {
+            backfill_from: scope.backfill_from(),
+        }
+    }
+}
+
 /// How a session interacts with the configured persistence layer.
 ///
 /// The two cache axes compose into the full historical option space; the
@@ -99,8 +110,12 @@ pub enum Scope {
 /// | `true`       | `false`       | read-only | serve cache + fetch gaps, don't persist     |
 /// | `false`      | `true`        | refresh   | ignore coverage, re-fetch range, overwrite  |
 ///
-/// `write_tap_log` is independent of scope mode above: when set on a `Live`
-/// session, every data event is teed to the configured [`crate::TapLog`].
+/// `write_tap_log` is independent of scope mode above: when set on a live
+/// session, the data events it receives live are teed to the configured
+/// [`crate::TapLog`]. History a backfill replays is not. During a backfill,
+/// live arrivals reach the tap log at the seam; an arrival the seam ring
+/// evicts, or one still buffered when the session closes before the seam, is
+/// not logged and leaves no mark in the log.
 ///
 /// `#[non_exhaustive]`: later work (resume) adds axes additively. Construct via
 /// the presets and `with_tap_log`, or mutate the public fields on an owned value.
@@ -112,7 +127,7 @@ pub struct PersistenceOptions {
     pub read_cache: bool,
     /// Historical scope: write fetched gap data back to the cache.
     pub write_cache: bool,
-    /// Live scope: tee every data event to the configured tap log.
+    /// Live scope: tee live data events to the configured tap log.
     pub write_tap_log: bool,
 }
 
@@ -182,6 +197,11 @@ pub struct Datamancer {
 }
 
 struct DatamancerInner {
+    /// How far back a client session's backfill may start; `None` for no limit.
+    max_client_backfill: Option<Duration>,
+    /// One permit per client backfill fetching history at once; `None` for no
+    /// limit.
+    client_backfill_permits: Option<Arc<Semaphore>>,
     providers: Vec<Arc<dyn Provider>>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
@@ -250,11 +270,10 @@ impl Datamancer {
     /// Fail-fast on:
     /// - [`Error::UnsupportedEventKind`] — no registered provider serves
     ///   `(instrument, kind)`.
-    /// - [`Error::LiveSessionConflict`] — a live session for this pair is
-    ///   already active (Live scope only; multiple Historical sessions for
-    ///   the same pair are stateless reads and run concurrently).
-    /// - [`Error::PersistenceRequired`] — `options` requires a cache but no
-    ///   [`HistoricalCache`] is configured.
+    /// - [`Error::PersistenceRequired`] — `options` needs a cache or tap log
+    ///   that is not configured.
+    /// - [`Error::BackfillFromNotInPast`] — a live backfill would start at or
+    ///   past the live edge.
     ///
     /// # Panics
     ///
@@ -267,15 +286,9 @@ impl Datamancer {
         scope: Scope,
         options: PersistenceOptions,
     ) -> Result<Session> {
-        if options.uses_cache() && self.inner.historical_cache.is_none() {
-            return Err(Error::PersistenceRequired);
-        }
-        if options.write_tap_log && self.inner.tap_log.is_none() {
-            return Err(Error::PersistenceRequired);
-        }
-
         match scope {
             Scope::Historical { from, to } => {
+                self.check_persistence(options)?;
                 // Historical sessions do not participate in the live registry
                 // (concurrent reads for the same pair run independently) and keep
                 // the single-consumer controller verbatim.
@@ -307,19 +320,27 @@ impl Datamancer {
                     stats: Arc::new(LiveStats::new()),
                     accounting,
                     data_forwarded: false,
+                    backfill_permits: None,
                 };
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
                 Ok(Session {
                     variant: SessionVariant::Historical(HistoricalSession { inner }),
                 })
             }
-            Scope::Live { .. } => {
+            Scope::Live { backfill_from } => {
                 // Live sessions are refcounted referrers onto the shared
                 // authoritative session: a second opener for the same pair shares
-                // it (no longer `LiveSessionConflict`). The single-pair `Session`
-                // is implemented as a one-subscription client referrer.
-                let (authoritative, guard, rx) = self
-                    .authoritative(instrument.clone(), kind, scope, options)
+                // it. The single-pair `Session` is implemented as a one-subscription
+                // client referrer.
+                let scope =
+                    backfill_from.map_or(LiveScope::Live, |from| LiveScope::LiveBackfill { from });
+                let Attached {
+                    session: authoritative,
+                    guard,
+                    rx,
+                    ..
+                } = self
+                    .authoritative(instrument.clone(), kind, scope, options, None)
                     .await?;
                 let provider = authoritative.provider_id.clone();
                 let handle = spawn_client(
@@ -344,27 +365,20 @@ impl Datamancer {
     /// so two concurrent openers cannot both create; the share path adds a
     /// subscriber to the existing session, the create path starts a fresh
     /// provider connection.
+    ///
+    /// A backfill this creates waits for one of `permits`, if given, before it
+    /// fetches history.
     pub(crate) async fn authoritative(
         &self,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-    ) -> Result<(
-        Arc<AuthoritativeSession>,
-        SubscriberGuard,
-        mpsc::Receiver<MarketEvent>,
-    )> {
-        // A backfilling live session seams a historical fetch into the live
-        // tail, so it needs both surfaces from the one provider that will serve
-        // the whole substream.
-        let surfaces: &[Surface] = match scope {
-            Scope::Live {
-                backfill_from: Some(_),
-            } => &[Surface::Live, Surface::History],
-            _ => &[Surface::Live],
-        };
-        let provider = self.route(&instrument, kind, surfaces)?;
+        permits: Option<Arc<Semaphore>>,
+    ) -> Result<Attached> {
+        self.check_persistence(options)?;
+
+        self.route(&instrument, kind, &[Surface::Live])?;
         let key = (instrument.clone(), kind);
 
         // Probe under the lock; if a live session exists, try to share it.
@@ -377,14 +391,48 @@ impl Datamancer {
             map.get(&key).and_then(Weak::upgrade)
         };
         if let Some(existing) = existing
-            && let Ok((id, rx)) = existing.add_subscriber().await
+            && let Ok(subscriber) = existing.add_subscriber().await
         {
-            let guard = SubscriberGuard::new(existing.clone(), id);
-            return Ok((existing, guard, rx));
+            return Ok(Attached::joined(existing, subscriber));
         }
 
-        self.create_authoritative(provider, instrument, kind, scope, options, key)
+        // Only a creator: a backfill needs both surfaces from one provider.
+        let surfaces: &[Surface] = if scope.backfill_from().is_some() {
+            &[Surface::Live, Surface::History]
+        } else {
+            &[Surface::Live]
+        };
+        let provider = self.route(&instrument, kind, surfaces)?;
+        check_backfill_start(scope)?;
+
+        self.create_authoritative(provider, instrument, kind, scope, options, permits)
             .await
+    }
+
+    /// The permits client backfills take to fetch history, if they are limited.
+    pub(crate) fn client_backfill_permits(&self) -> Option<Arc<Semaphore>> {
+        self.inner.client_backfill_permits.clone()
+    }
+
+    /// Refuse a client's backfill older than the configured limit, whether it
+    /// would create the session or join one.
+    pub(crate) fn check_client_backfill(&self, scope: LiveScope) -> Result<()> {
+        if let (Some(limit), Some(from)) = (self.inner.max_client_backfill, scope.backfill_from()) {
+            let limit = i64::try_from(limit.as_nanos()).unwrap_or(i64::MAX);
+            let oldest = Timestamp(wall_clock_ts().0.saturating_sub(limit));
+            if from < oldest {
+                return Err(Error::BackfillTooOld { from, oldest });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_persistence(&self, options: PersistenceOptions) -> Result<()> {
+        check_persistence(
+            options,
+            self.inner.historical_cache.as_ref(),
+            self.inner.tap_log.as_ref(),
+        )
     }
 
     async fn create_authoritative(
@@ -392,14 +440,11 @@ impl Datamancer {
         provider: Arc<dyn Provider>,
         instrument: Instrument,
         kind: EventKind,
-        scope: Scope,
+        scope: LiveScope,
         options: PersistenceOptions,
-        key: (Instrument, EventKind),
-    ) -> Result<(
-        Arc<AuthoritativeSession>,
-        SubscriberGuard,
-        mpsc::Receiver<MarketEvent>,
-    )> {
+        backfill_permits: Option<Arc<Semaphore>>,
+    ) -> Result<Attached> {
+        let key = (instrument.clone(), kind);
         let accounting = self.inner.accounting_for(provider.id());
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(default_buffer());
         let (remove_tx, remove_rx) = mpsc::unbounded_channel::<SubscriberId>();
@@ -434,9 +479,8 @@ impl Datamancer {
             }
         };
         if let Some(winner) = winner {
-            let (id, rx) = winner.add_subscriber().await?;
-            let guard = SubscriberGuard::new(winner.clone(), id);
-            return Ok((winner, guard, rx));
+            let subscriber = winner.add_subscriber().await?;
+            return Ok(Attached::joined(winner, subscriber));
         }
 
         // Pre-seed the opener as the first fan-out subscriber *before* spawning
@@ -454,7 +498,7 @@ impl Datamancer {
         let inner = Arc::new(SessionInner {
             instrument: instrument.clone(),
             kind,
-            scope,
+            scope: scope.into(),
             events_holder: Mutex::new(None),
             persistence: std::sync::Mutex::new(options),
             stream_taken: std::sync::atomic::AtomicBool::new(false),
@@ -475,11 +519,9 @@ impl Datamancer {
             stats,
             accounting: accounting.clone(),
             data_forwarded: false,
+            backfill_permits,
         };
-        let backfill_from = match scope {
-            Scope::Live { backfill_from } => backfill_from,
-            Scope::Historical { .. } => None,
-        };
+        let backfill_from = scope.backfill_from();
         // Pure-live only: fire a non-gating "latest value" fetch concurrently
         // with the live connect. The result is injected as the first data event
         // (immediate UI feedback) unless a real live value wins the race, in
@@ -514,7 +556,12 @@ impl Datamancer {
         ));
 
         let guard = SubscriberGuard::new(authoritative.clone(), first_id);
-        Ok((authoritative, guard, first_rx))
+        Ok(Attached {
+            session: authoritative,
+            guard,
+            rx: first_rx,
+            outcome: Subscribed::created(scope),
+        })
     }
 
     /// Spawn the non-gating `Provider::latest` fetch for a pure-live session
@@ -936,6 +983,8 @@ pub struct DatamancerBuilder {
     historical_cache: Option<Arc<dyn HistoricalCache>>,
     instrument_provider: Vec<(Instrument, String)>,
     resume_buffer_events: Option<usize>,
+    max_client_backfill: Option<Duration>,
+    max_concurrent_client_backfills: Option<std::num::NonZeroUsize>,
     /// Corporate-action adjustment mode. `Adjustment`'s `Default` is `All`, so
     /// `DatamancerBuilder::default()` already yields fully-adjusted bars; call
     /// [`adjustment`](Self::adjustment) to override.
@@ -1011,6 +1060,32 @@ impl DatamancerBuilder {
         self
     }
 
+    /// Limit how far back a [`ClientSession`](crate::ClientSession) subscribe
+    /// may start a backfill. Unlimited by default; a [`Session`] is not limited.
+    /// A zero `limit` refuses every client backfill.
+    #[must_use]
+    pub fn max_client_backfill(mut self, limit: Duration) -> Self {
+        self.max_client_backfill = Some(limit);
+        self
+    }
+
+    /// Limit how many [`ClientSession`](crate::ClientSession) backfills fetch
+    /// history at once. Unlimited by default; a [`Session`] is not limited. A
+    /// backfill past the limit waits for one to finish its history, and so does
+    /// one the cache could serve whole. Meanwhile its live arrivals fill the
+    /// resume buffer, and an overflow is a `Gap`. A subscribe that joins an
+    /// existing session does not count.
+    ///
+    /// # Panics
+    ///
+    /// [`build`](Self::build) panics if `limit` exceeds
+    /// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS).
+    #[must_use]
+    pub fn max_concurrent_client_backfills(mut self, limit: std::num::NonZeroUsize) -> Self {
+        self.max_concurrent_client_backfills = Some(limit);
+        self
+    }
+
     /// Set the corporate-action adjustment mode applied to historical bar
     /// fetches and used to segregate the cache. Defaults to [`Adjustment::All`]
     /// (split + dividend + spin-off). The mode is stamped into both the
@@ -1053,6 +1128,10 @@ impl DatamancerBuilder {
                 historical_cache: self.historical_cache,
                 instrument_provider: self.instrument_provider,
                 live_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                max_client_backfill: self.max_client_backfill,
+                client_backfill_permits: self
+                    .max_concurrent_client_backfills
+                    .map(|limit| Arc::new(Semaphore::new(limit.get()))),
                 resume_buffer_events: self
                     .resume_buffer_events
                     .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),
@@ -1130,9 +1209,9 @@ impl Session {
     /// [`ControlKind::Gap`] reports anything the buffer had to evict, then
     /// the buffered events flow, then live continues. Events still sitting
     /// undelivered in a dropped stream's channel are lost without a gap
-    /// (bounded by the channel buffer); they are never `seq`-stamped, so the
-    /// delivered stream stays contiguous. Drain before dropping if you need
-    /// every event, or record via the tap log.
+    /// (bounded by the channel buffer), so the next stream goes on past their
+    /// `seq` slots. Drain before dropping if you need every event, or record
+    /// via the tap log.
     ///
     /// **Historical scope — single-shot.** The first call returns the
     /// stream; subsequent calls error.
@@ -1251,7 +1330,7 @@ impl Session {
     pub fn scope(&self) -> Scope {
         match &self.variant {
             SessionVariant::Historical(h) => h.inner.scope,
-            SessionVariant::Live(l) => l.authoritative.scope,
+            SessionVariant::Live(l) => l.authoritative.scope.into(),
         }
     }
 }
@@ -1292,7 +1371,8 @@ pub(crate) enum SessionCommand {
     AddSubscriber {
         id: SubscriberId,
         sender: mpsc::Sender<MarketEvent>,
-        ack: oneshot::Sender<()>,
+        /// Answers whether a backfill is running.
+        ack: oneshot::Sender<bool>,
     },
 }
 
@@ -1318,12 +1398,16 @@ enum Sink {
     Detached(EventRing),
 }
 
-/// How a forwarded event reached the controller. Only stats and accounting
-/// read it: every arrival is stamped, teed and delivered the same way.
+/// How a delivered event reached the controller. Only stats and accounting
+/// read it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Arrival {
     /// From the provider's live stream.
     Live,
+    /// Replayed history, from the cache or a fetch, ahead of the live tail. It
+    /// records its `seq` position and any control, a `Gap` included, but no
+    /// timestamps, so a stream's latency and last-event times stay live ones.
+    Replay,
     /// The pure-live latest-value seed, a `Provider::latest` snapshot. It
     /// records its `seq` position but no timestamps (so no latency, and the
     /// stream reads idle until its first live event) and no live `messages`.
@@ -1383,6 +1467,9 @@ struct Controller {
     /// authoritative session. Gates the pure-live "latest value" seed: once a
     /// real live value has been delivered, a late-arriving seed is discarded.
     data_forwarded: bool,
+    /// The permits a backfill waits for before it fetches history; `None` for
+    /// no wait.
+    backfill_permits: Option<Arc<Semaphore>>,
 }
 
 impl Controller {
@@ -1390,22 +1477,38 @@ impl Controller {
     /// **unstamped** (`buffer_live_arrival` does a raw push) so their `seq` is
     /// deferred to here — stamping at the seam places the live arrivals *after*
     /// all backfill segments in canonical order and preserves monotonicity.
-    /// One `Gap` for anything the ring evicted, then the survivors, each through
-    /// `forward` (which stamps **then** tees **then** delivers). Going through
-    /// `forward` rather than `emit` is load-bearing: it persists the
-    /// seam-assigned source `seq` to the tap log verbatim. Teeing here (not at
-    /// receipt) means an event the ring evicted is never teed — correct, since
-    /// it is not delivered either: it is reported as the `Gap` above, so the tap
-    /// log stays a faithful record of the delivered live tail.
-    async fn flush_backfill_pending(&mut self, ring: EventRing) {
-        let (dropped, _dropped_first_seq, events) = ring.into_parts();
-        if let Some(span) = dropped {
-            self.emit_gap(span.from_source_ts, span.from_source_ts, span.to_source_ts)
-                .await;
+    /// Drain the ring, each event through `forward` (which stamps **then** tees
+    /// **then** delivers), so the tap log records the seam-assigned `seq`
+    /// verbatim. An event the ring evicted is never teed: it is not delivered
+    /// either, and is reported as a `Gap`.
+    ///
+    /// Paced like the history before it. Live arrivals join the ring's back
+    /// as it drains. Losing a whole ring in the flush means a consumer
+    /// is slower than the feed: [`Self::serving`] stops it pacing, so the flush
+    /// ends.
+    ///
+    /// A `Gap` takes the first lost event's slot and the rest stay empty. A
+    /// provider control the ring evicted past its cap has no span to report and
+    /// takes no slot.
+    ///
+    /// Returns false if the session closed meanwhile.
+    async fn flush_backfill_pending(&mut self, io: &mut ReplayIo<'_>) -> bool {
+        if let Some(ring) = io.pending.as_deref_mut() {
+            ring.begin_flush();
         }
-        for ev in events {
-            self.forward(ev).await;
+        while io.pending.as_deref().is_some_and(|r| !r.is_drained()) {
+            if !self.pace(io).await || self.serving(io, std::future::ready(())).await.is_none() {
+                return false;
+            }
+            if let Some((span, lost)) = io.pending.as_deref_mut().and_then(EventRing::take_loss) {
+                self.emit_gap(span.from_source_ts, span.from_source_ts, span.to_source_ts)
+                    .await;
+                self.skip_slots(u64::try_from(lost.saturating_sub(1)).unwrap_or(u64::MAX));
+            } else if let Some(ev) = io.pending.as_deref_mut().and_then(EventRing::pop) {
+                self.forward(ev).await;
+            }
         }
+        true
     }
 
     /// Historical scope: spawn the provider's fetch, forward events as they
@@ -1429,8 +1532,13 @@ impl Controller {
             // default single-fetch plumbing is unused here.
             drop(provider_tx);
             drop(provider_rx);
-            self.run_historical_cached(from, to, options, &mut cmd_rx)
-                .await;
+            let mut io = ReplayIo {
+                cmd_rx: &mut cmd_rx,
+                remove_rx: None,
+                live_rx: None,
+                pending: None,
+            };
+            self.run_historical_cached(from, to, options, &mut io).await;
             return;
         }
 
@@ -1583,9 +1691,105 @@ impl Controller {
         .await;
     }
 
+    /// Await `work` while taking commands, removals and live arrivals. `None`
+    /// when the session closed.
+    async fn serving<T>(
+        &mut self,
+        io: &mut ReplayIo<'_>,
+        work: impl Future<Output = T>,
+    ) -> Option<T> {
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                out = &mut work => return Some(out),
+                cmd = io.cmd_rx.recv() => {
+                    if !self.handle_command(cmd).await {
+                        return None;
+                    }
+                }
+                removal = recv_removal(&mut io.remove_rx) => {
+                    if self.backfill_removal_triggers_teardown(removal) {
+                        self.shutdown().await;
+                        return None;
+                    }
+                }
+                ev = recv_live(&mut io.live_rx) => {
+                    if let Some(ev) = &ev {
+                        self.note_provider_arrival(ev);
+                    }
+                    let evicted = Self::buffer_live_arrival(ev, &mut io.live_rx, &mut io.pending);
+                    if evicted
+                        && io.pending.as_deref().is_some_and(EventRing::flush_outrun)
+                        && let Some(fanout) = self.fanout.as_mut()
+                    {
+                        fanout.stop_pacing_full();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Store a fetched batch while serving. `false` when the session closed
+    /// meanwhile; the store still runs to its end, on its own task.
+    async fn store_batch(
+        &mut self,
+        io: &mut ReplayIo<'_>,
+        key: CacheKey,
+        batch: Vec<MarketEvent>,
+    ) -> bool {
+        let Some(cache) = self.historical_cache.clone() else {
+            return true;
+        };
+        let mut store = tokio::spawn(async move { cache.store(&key, &batch).await });
+        let Some(stored) = self.serving(io, &mut store).await else {
+            let instrument = self.inner.instrument.clone();
+            tokio::spawn(async move { log_store_failure(&instrument, store.await) });
+            return false;
+        };
+        log_store_failure(&self.inner.instrument, stored);
+        true
+    }
+
+    /// Join a drained fetch while serving. `None` when the session closed;
+    /// otherwise the fetch's failure, if it had one.
+    async fn conclude_fetch(
+        &mut self,
+        io: &mut ReplayIo<'_>,
+        mut fetch: JoinHandle<Result<()>>,
+    ) -> Option<Option<String>> {
+        let Some(joined) = self.serving(io, &mut fetch).await else {
+            fetch.abort();
+            return None;
+        };
+        Some(match joined {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(provider_error_message(&e)),
+            Err(join_err) if join_err.is_cancelled() => None,
+            Err(join_err) => Some(format!("fetch task panicked: {join_err}")),
+        })
+    }
+
+    /// Hold a replay until every pacing referrer has room, serving meanwhile.
+    /// `false` when the session closed.
+    async fn pace(&mut self, io: &mut ReplayIo<'_>) -> bool {
+        let mut waited = Duration::ZERO;
+        while let Some(wait) = self
+            .fanout
+            .as_mut()
+            .and_then(|fanout| fanout.next_wait(waited, datamancer_core::REPLAY_STALL_LIMIT))
+        {
+            let started = Instant::now();
+            if self.serving(io, wait).await.is_none() {
+                return false;
+            }
+            waited = started.elapsed();
+        }
+        true
+    }
+
     /// Stream a planned segment sequence: covered segments replay from the
     /// cache, gap segments fetch from the provider (forwarded and, when
-    /// `write_cache`, stored back). With a `BackfillSide`, live arrivals are
+    /// `write_cache`, stored back). In a backfill, live arrivals are
     /// teed + buffered concurrently, the segment touching `edge` gets a
     /// conservative coverage claim (history endpoints lag the live feed), and
     /// a failed fetch gaps through to `edge`. On a gap-fetch failure only the
@@ -1599,16 +1803,11 @@ impl Controller {
         &mut self,
         segments: Vec<Segment>,
         options: PersistenceOptions,
-        cmd_rx: &mut mpsc::Receiver<SessionCommand>,
-        live: Option<BackfillSide<'_>>,
+        io: &mut ReplayIo<'_>,
+        edge: Option<Timestamp>,
     ) -> SegmentOutcome {
         let instrument = self.inner.instrument.clone();
         let kind = self.inner.kind;
-        let edge = live.as_ref().map(|l| l.edge);
-        let (mut live_rx, mut pending, mut remove_rx) = match live {
-            Some(l) => (Some(l.provider_rx), Some(l.pending), Some(l.remove_rx)),
-            None => (None, None, None),
-        };
 
         for seg in segments {
             match seg {
@@ -1632,7 +1831,10 @@ impl Controller {
                         from: f,
                         to: t,
                     };
-                    let mut stream = match source.open(req).await {
+                    let Some(opened) = self.serving(io, source.open(req)).await else {
+                        return SegmentOutcome::Closed;
+                    };
+                    let mut stream = match opened {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::warn!(
@@ -1649,30 +1851,17 @@ impl Controller {
                         }
                     };
                     loop {
-                        tokio::select! {
-                            cmd = cmd_rx.recv() => {
-                                if !self.handle_command(cmd).await { return SegmentOutcome::Closed; }
-                            }
-                            removal = recv_removal(&mut remove_rx) => {
-                                if self.backfill_removal_triggers_teardown(removal) {
-                                    self.shutdown().await;
-                                    return SegmentOutcome::Closed;
-                                }
-                            }
-                            ev = recv_live(&mut live_rx) => {
-                                if let Some(ev) = &ev {
-                                    self.note_provider_arrival(ev);
-                                }
-                                Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
-                            }
-                            ev = stream.next() => {
-                                match ev {
-                                    // Replayed data: emit directly, never tee
-                                    // (the tap log captures the live tail only).
-                                    Some(ev) => self.emit(ev).await,
-                                    None => break,
-                                }
-                            }
+                        if !self.pace(io).await {
+                            return SegmentOutcome::Closed;
+                        }
+                        let Some(ev) = self.serving(io, stream.next()).await else {
+                            return SegmentOutcome::Closed;
+                        };
+                        match ev {
+                            // Replayed data: emit directly, never tee (the tap
+                            // log captures the live tail only).
+                            Some(ev) => self.emit(ev).await,
+                            None => break,
                         }
                     }
                 }
@@ -1696,46 +1885,28 @@ impl Controller {
                     let mut batch: Vec<MarketEvent> = Vec::new();
                     let mut max_data_ts: Option<Timestamp> = None;
                     loop {
-                        tokio::select! {
-                            cmd = cmd_rx.recv() => {
-                                if !self.handle_command(cmd).await {
-                                    fetch_task.abort();
-                                    return SegmentOutcome::Closed;
-                                }
-                            }
-                            removal = recv_removal(&mut remove_rx) => {
-                                if self.backfill_removal_triggers_teardown(removal) {
-                                    fetch_task.abort();
-                                    self.shutdown().await;
-                                    return SegmentOutcome::Closed;
-                                }
-                            }
-                            ev = recv_live(&mut live_rx) => {
-                                if let Some(ev) = &ev {
-                                    self.note_provider_arrival(ev);
-                                }
-                                Self::buffer_live_arrival(ev, &mut live_rx, &mut pending);
-                            }
-                            ev = rx.recv() => {
-                                match ev {
-                                    Some(ev) => {
-                                        max_data_ts = max_data_ts.max(data_source_ts(&ev));
-                                        if store { batch.push(ev.clone()); }
-                                        // Fetched data: emit directly, never tee
-                                        // (backfill data belongs to the cache).
-                                        self.emit(ev).await;
-                                    }
-                                    None => break,
-                                }
-                            }
+                        if !self.pace(io).await {
+                            fetch_task.abort();
+                            return SegmentOutcome::Closed;
                         }
+                        let Some(ev) = self.serving(io, rx.recv()).await else {
+                            fetch_task.abort();
+                            return SegmentOutcome::Closed;
+                        };
+                        let Some(ev) = ev else {
+                            break;
+                        };
+                        max_data_ts = max_data_ts.max(data_source_ts(&ev));
+                        if store {
+                            batch.push(ev.clone());
+                        }
+                        // Fetched data: emit directly, never tee (backfill data
+                        // belongs to the cache).
+                        self.emit(ev).await;
                     }
 
-                    let fetch_error = match fetch_task.await {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(provider_error_message(&e)),
-                        Err(join_err) if join_err.is_cancelled() => None,
-                        Err(join_err) => Some(format!("fetch task panicked: {join_err}")),
+                    let Some(fetch_error) = self.conclude_fetch(io, fetch_task).await else {
+                        return SegmentOutcome::Closed;
                     };
                     if fetch_error.is_none() {
                         // A segment ending at the live edge gets a conservative
@@ -1748,9 +1919,7 @@ impl Controller {
                         } else {
                             t
                         };
-                        if options.write_cache
-                            && let Some(cache) = &self.historical_cache
-                        {
+                        if options.write_cache {
                             let store_key = CacheKey {
                                 instrument: instrument.clone(),
                                 kind,
@@ -1758,12 +1927,8 @@ impl Controller {
                                 to: claim_to,
                                 adjustment: self.inner.adjustment,
                             };
-                            if let Err(e) = cache.store(&store_key, &batch).await {
-                                tracing::warn!(
-                                    instrument = %self.inner.instrument,
-                                    error = %e,
-                                    "historical cache store failed; data delivered but not persisted"
-                                );
+                            if !self.store_batch(io, store_key, batch).await {
+                                return SegmentOutcome::Closed;
                             }
                         }
                     } else {
@@ -1771,9 +1936,7 @@ impl Controller {
                         // [f, t); the unfetched remainder is gapped through to
                         // the live edge when one exists.
                         let confirmed_to = confirmed_prefix_end(max_data_ts, f, t);
-                        if options.write_cache
-                            && let Some(cache) = &self.historical_cache
-                        {
+                        if options.write_cache {
                             let store_key = CacheKey {
                                 instrument: instrument.clone(),
                                 kind,
@@ -1781,13 +1944,12 @@ impl Controller {
                                 to: confirmed_to,
                                 adjustment: self.inner.adjustment,
                             };
-                            if let Err(e) = cache.store(&store_key, &batch).await {
-                                tracing::warn!(
-                                    instrument = %self.inner.instrument,
-                                    error = %e,
-                                    "historical cache store failed; data delivered but not persisted"
-                                );
+                            if !self.store_batch(io, store_key, batch).await {
+                                return SegmentOutcome::Closed;
                             }
+                        }
+                        if !self.pace(io).await {
+                            return SegmentOutcome::Closed;
                         }
                         let gap_to = edge.unwrap_or(t);
                         if confirmed_to < gap_to {
@@ -1799,6 +1961,9 @@ impl Controller {
                         // confirmed prefix boundary (matching the gap) so the
                         // control stays ordered after the data already emitted.
                         if let Some(message) = fetch_error {
+                            if !self.pace(io).await {
+                                return SegmentOutcome::Closed;
+                            }
                             self.emit_provider_error(confirmed_to, message).await;
                         }
                         break;
@@ -1821,7 +1986,7 @@ impl Controller {
         from: Timestamp,
         to: Timestamp,
         options: PersistenceOptions,
-        cmd_rx: &mut mpsc::Receiver<SessionCommand>,
+        io: &mut ReplayIo<'_>,
     ) {
         let cache = self
             .historical_cache
@@ -1854,7 +2019,10 @@ impl Controller {
         };
         let mut fetch_guard = None;
         let gaps = if options.read_cache {
-            let initial = cache.gaps(&plan_key).await.unwrap_or_else(|e| {
+            let Some(initial) = self.serving(io, cache.gaps(&plan_key)).await else {
+                return;
+            };
+            let initial = initial.unwrap_or_else(|e| {
                 tracing::warn!(
                     instrument = %self.inner.instrument,
                     error = %e,
@@ -1865,8 +2033,14 @@ impl Controller {
             if initial.is_empty() {
                 initial
             } else {
-                let guard = self.fetch_locks.acquire(&plan_key).await;
-                let regaps = cache.gaps(&plan_key).await.unwrap_or_else(|e| {
+                let locks = self.fetch_locks.clone();
+                let Some(guard) = self.serving(io, locks.acquire(&plan_key)).await else {
+                    return;
+                };
+                let Some(regaps) = self.serving(io, cache.gaps(&plan_key)).await else {
+                    return;
+                };
+                let regaps = regaps.unwrap_or_else(|e| {
                     tracing::warn!(
                         instrument = %self.inner.instrument,
                         error = %e,
@@ -1891,15 +2065,16 @@ impl Controller {
         };
         let segments = tile(from, to, &gaps);
 
-        let outcome = self.stream_segments(segments, options, cmd_rx, None).await;
+        let outcome = self.stream_segments(segments, options, io, None).await;
         // Release the fetch slot (if held) before finishing, so a queued
-        // waiter proceeds as soon as our store has landed.
+        // waiter proceeds. A close leaves the store running, so that waiter may
+        // find the range still uncovered and fetch it again.
         drop(fetch_guard);
         if outcome == SegmentOutcome::Closed {
             return;
         }
 
-        self.finish_historical(cmd_rx).await;
+        self.finish_historical(io.cmd_rx).await;
     }
 
     /// Phases 1–2 of a stitched live session: plan `[from, B)` exactly like
@@ -1932,6 +2107,24 @@ impl Controller {
             from_source_ts: from,
             to_source_ts: edge,
         }];
+        let mut pending = EventRing::seam(self.ring_capacity);
+        // The live lifecycle anchor is the subscriber refcount. Thread the real
+        // removal channel through so a referrer that leaves mid-backfill is
+        // observed immediately and, when the last one goes, the backfill aborts
+        // rather than running to the seam.
+        let mut io = ReplayIo {
+            cmd_rx,
+            remove_rx: Some(remove_rx),
+            live_rx: Some(provider_rx),
+            pending: Some(&mut pending),
+        };
+        let permit = match self.backfill_permits.clone() {
+            Some(permits) => match self.serving(&mut io, permits.acquire_owned()).await {
+                Some(permit) => permit.ok(),
+                None => return false,
+            },
+            None => None,
+        };
         // NOTE: single-flight (see `run_historical_cached`) is deliberately
         // NOT wired here. Backfill is the stitched-live path and out of scope
         // for the cold-sweep coalescer, which only runs over `Scope::Historical`
@@ -1940,6 +2133,7 @@ impl Controller {
         // wire it here.
         let gaps = match (&self.historical_cache, options.read_cache) {
             (Some(cache), true) => {
+                let cache = cache.clone();
                 let plan_key = CacheKey {
                     instrument: self.inner.instrument.clone(),
                     kind: self.inner.kind,
@@ -1947,7 +2141,10 @@ impl Controller {
                     to: edge,
                     adjustment: self.inner.adjustment,
                 };
-                match cache.gaps(&plan_key).await {
+                let Some(planned) = self.serving(&mut io, cache.gaps(&plan_key)).await else {
+                    return false;
+                };
+                match planned {
                     Ok(g) => g,
                     Err(e) => {
                         tracing::warn!(
@@ -1963,24 +2160,10 @@ impl Controller {
         };
         let segments = tile(from, edge, &gaps);
 
-        let mut pending = EventRing::new(self.ring_capacity);
-        // The live lifecycle anchor is the subscriber refcount. Thread the real
-        // removal channel through so a referrer that leaves mid-backfill is
-        // observed immediately and, when the last one goes, the backfill aborts
-        // rather than running to the seam.
         let outcome = self
-            .stream_segments(
-                segments,
-                options,
-                cmd_rx,
-                Some(BackfillSide {
-                    provider_rx,
-                    pending: &mut pending,
-                    remove_rx,
-                    edge,
-                }),
-            )
+            .stream_segments(segments, options, &mut io, Some(edge))
             .await;
+        drop(permit);
         if outcome == SegmentOutcome::Closed {
             return false;
         }
@@ -1989,8 +2172,7 @@ impl Controller {
         // source_ts order) — placing them after all backfill segments in
         // canonical delivery order, keeping `seq` monotonic — then tees the
         // stamped event so the tap log records the seam `seq` verbatim.
-        self.flush_backfill_pending(pending).await;
-        true
+        self.flush_backfill_pending(&mut io).await
     }
 
     /// Live scope (authoritative): subscribe (already done by the caller), run
@@ -2025,10 +2207,22 @@ impl Controller {
             if self.live_should_teardown() {
                 break;
             }
+            let owed_room = self.fanout.as_mut().and_then(FanOut::owed_room);
+            let owing = owed_room.is_some();
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     if !self.handle_command(cmd).await {
                         break;
+                    }
+                }
+                () = async move {
+                    match owed_room {
+                        Some(room) => room.await,
+                        None => std::future::pending().await,
+                    }
+                }, if owing => {
+                    if let Some(fanout) = self.fanout.as_mut() {
+                        fanout.flush_owed();
                     }
                 }
                 id = remove_rx.recv() => {
@@ -2081,9 +2275,12 @@ impl Controller {
         self.fanout.as_ref().is_some_and(FanOut::should_teardown)
     }
 
+    /// Remove `id`, and with it every referrer whose receiver is gone (a join
+    /// cancelled after it was answered).
     fn remove_subscriber(&mut self, id: SubscriberId) {
         if let Some(fanout) = self.fanout.as_mut() {
             fanout.remove(id);
+            fanout.remove_closed();
             self.stats.set_subscribers(fanout.subscriber_count());
         }
     }
@@ -2120,11 +2317,20 @@ impl Controller {
         }
     }
 
-    /// Assign the next source `seq`, advancing the single-writer counter. The
-    /// one site that touches `next_seq`, so `seq` is stamped exactly once per
-    /// event, in this authoritative session's canonical delivery order.
+    /// Assign the next source `seq`, advancing the single-writer counter, so
+    /// `seq` is stamped exactly once per event, in this authoritative
+    /// session's canonical delivery order. With [`Self::skip_slots`] the only
+    /// site that moves `next_seq`.
     fn stamp(&mut self, ev: MarketEvent) -> MarketEvent {
         let seq = Seq(self.next_seq);
+        self.skip_slots(1);
+        stamp_seq(ev, seq)
+    }
+
+    /// Advance the source counter by `n` without stamping anything: the slots
+    /// of events that were lost before they could be stamped (a seam-ring
+    /// overflow), so the hole they leave is as real as a resume-buffer one.
+    fn skip_slots(&mut self, n: u64) {
         // `Seq(u64::MAX)` is reserved as `Seq::SYNTHETIC` and must never be
         // handed to a real event, so the source counter stamps only in
         // `[0, u64::MAX - 1]`. `saturating_add` was wrong here: it caps *at*
@@ -2135,10 +2341,9 @@ impl Controller {
         // synthetic sentinel.
         self.next_seq = self
             .next_seq
-            .checked_add(1)
-            .filter(|&n| n != u64::MAX)
+            .checked_add(n)
+            .filter(|&next| next != u64::MAX)
             .expect("per-symbol source seq exhausted the Seq::SYNTHETIC reservation");
-        stamp_seq(ev, seq)
     }
 
     /// Hand a fully-formed event to the sink; on rejection (consumer dropped
@@ -2147,13 +2352,8 @@ impl Controller {
     /// the ring push, an evicted event is already numbered, so a ring overflow
     /// is a real `seq` hole reported as `Control::Gap`. While detached there is
     /// no other producer into the outbound order, so push order == canonical
-    /// delivery order.
-    async fn deliver(&mut self, ev: MarketEvent) {
-        self.deliver_with(ev, Arrival::Live).await;
-    }
-
-    /// [`deliver`](Self::deliver), with the event's [`Arrival`]: a seed records
-    /// only its `seq` position in the per-symbol stats.
+    /// delivery order. The event's [`Arrival`] chooses what the per-symbol
+    /// stats record.
     async fn deliver_with(&mut self, ev: MarketEvent, arrival: Arrival) {
         // Live authoritative session: fan the stamped event out to every
         // referrer. Each referrer owns its per-client resume buffer, so there is
@@ -2161,6 +2361,7 @@ impl Controller {
         if self.fanout.is_some() {
             match arrival {
                 Arrival::Live => self.stats.record_event(&ev),
+                Arrival::Replay => self.stats.record_replay(&ev),
                 Arrival::Seed => self.stats.record_seed(&ev),
             }
             if let Some(fanout) = self.fanout.as_mut() {
@@ -2189,7 +2390,7 @@ impl Controller {
     /// not tee.
     async fn emit(&mut self, ev: MarketEvent) {
         let ev = self.stamp(ev);
-        self.deliver(ev).await;
+        self.deliver_with(ev, Arrival::Replay).await;
     }
 
     /// Stamp `seq` at the source, tee the (stamped) data event to the tap log
@@ -2245,18 +2446,18 @@ impl Controller {
     /// stub `Seq(0)`. An arrival the ring evicts is reported as a `Gap` at the
     /// seam and is correctly never persisted. A closed live side is parked
     /// (`live_rx = None`); it is surfaced after the backfill completes.
+    ///
+    /// Returns whether the arrival evicted an event.
     fn buffer_live_arrival(
         ev: Option<MarketEvent>,
         live_rx: &mut Option<&mut mpsc::Receiver<MarketEvent>>,
         pending: &mut Option<&mut EventRing>,
-    ) {
-        match ev {
-            Some(ev) => {
-                if let Some(p) = pending.as_mut() {
-                    p.push(ev);
-                }
-            }
-            None => *live_rx = None,
+    ) -> bool {
+        if let Some(ev) = ev {
+            pending.as_mut().is_some_and(|p| p.push(ev))
+        } else {
+            *live_rx = None;
+            false
         }
     }
 
@@ -2295,11 +2496,17 @@ impl Controller {
                 true
             }
             Some(SessionCommand::AddSubscriber { id, sender, ack }) => {
-                if let Some(fanout) = self.fanout.as_mut() {
+                // A join cancelled while this command was queued has dropped its
+                // receiver; one cancelled after it is answered drops the answer.
+                // Neither may stay a referrer.
+                let open = !sender.is_closed();
+                if open && let Some(fanout) = self.fanout.as_mut() {
                     fanout.add(id, sender);
                     self.stats.set_subscribers(fanout.subscriber_count());
                 }
-                let _ = ack.send(());
+                if ack.send(self.stats.backfilling()).is_err() && open {
+                    self.remove_subscriber(id);
+                }
                 true
             }
             Some(SessionCommand::Close(ack)) => {
@@ -2312,12 +2519,11 @@ impl Controller {
     }
 
     fn apply_persistence(&self, options: PersistenceOptions) -> Result<()> {
-        if options.uses_cache() && self.historical_cache.is_none() {
-            return Err(Error::PersistenceRequired);
-        }
-        if options.write_tap_log && self.tap_log.is_none() {
-            return Err(Error::PersistenceRequired);
-        }
+        check_persistence(
+            options,
+            self.historical_cache.as_ref(),
+            self.tap_log.as_ref(),
+        )?;
         *self
             .inner
             .persistence
@@ -2389,21 +2595,36 @@ enum SegmentOutcome {
     Closed,
 }
 
-/// Live-side plumbing threaded through `stream_segments` by the backfill
-/// phase of a stitched session. `None` on the plain historical path.
-struct BackfillSide<'a> {
-    /// Live arrivals during the backfill; teed at receipt and buffered in
-    /// `pending` so they splice in after the backfill output.
-    provider_rx: &'a mut mpsc::Receiver<MarketEvent>,
-    pending: &'a mut EventRing,
-    /// Subscriber-removal signal. Polled during the backfill so a referrer that
-    /// leaves mid-fetch is observed immediately: when the last one goes, the
-    /// backfill aborts rather than running to the seam (which would burn
-    /// provider quota and delay shutdown on a large range).
-    remove_rx: &'a mut mpsc::UnboundedReceiver<SubscriberId>,
-    /// The live boundary `B`: the gap segment touching it gets a
-    /// conservative coverage claim, and a failed fetch gaps through to it.
-    edge: Timestamp,
+/// What a replay serves while it works. A historical session has only commands;
+/// its other fields stay `None`, which pends their arms forever.
+struct ReplayIo<'a> {
+    cmd_rx: &'a mut mpsc::Receiver<SessionCommand>,
+    /// Subscriber-removal signal. When the last referrer goes, the backfill ends.
+    remove_rx: Option<&'a mut mpsc::UnboundedReceiver<SubscriberId>>,
+    /// Live arrivals during the backfill, buffered in `pending` so they splice
+    /// in after the backfill output.
+    live_rx: Option<&'a mut mpsc::Receiver<MarketEvent>>,
+    pending: Option<&'a mut EventRing>,
+}
+
+/// Warn of a batch that was delivered but not persisted.
+fn log_store_failure(
+    instrument: &Instrument,
+    stored: std::result::Result<Result<()>, tokio::task::JoinError>,
+) {
+    match stored {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            %instrument,
+            error = %e,
+            "historical cache store failed; data delivered but not persisted"
+        ),
+        Err(e) => tracing::warn!(
+            %instrument,
+            error = %e,
+            "historical cache store panicked; data delivered but not persisted"
+        ),
+    }
 }
 
 /// Receive from an optional live receiver; pend forever when absent (or
@@ -2487,33 +2708,127 @@ fn tile(from: Timestamp, to: Timestamp, gaps: &[datamancer_core::GapSpan]) -> Ve
 /// eviction (`pop_front`) guarantees the first eviction is the lowest `seq`, so
 /// that is where the hole starts. The backfill `pending` ring pushes unstamped
 /// events and never consults `dropped_first_seq`.
+///
+/// The pending ring ([`EventRing::seam`]) evicts data and `Gap`s only. The
+/// provider's other controls (connect, subscription state, errors) stay, outside
+/// `capacity`, so an overflow cannot take the session's subscription state from
+/// its subscribers; past [`SEAM_CONTROL_CAP`] of them, the oldest goes.
 struct EventRing {
     capacity: usize,
     buf: std::collections::VecDeque<MarketEvent>,
+    /// Keep provider controls out of the eviction of data (the pending ring).
+    keep_controls: bool,
+    /// Kept provider controls in `buf`.
+    controls: usize,
     dropped: Option<GapSpan>,
     /// `seq` of the first event this ring evicted (the hole start), set once on
     /// the first eviction. `None` until an eviction occurs. Read only on the
     /// resume path, whose events are stamped at push.
     dropped_first_seq: Option<Seq>,
+    /// How many evicted events `dropped` covers: data and `Gap`s, no other
+    /// control. Read on the seam path, whose events are stamped at the flush:
+    /// the evicted ones consumed no `seq` at push, so the flush skips their
+    /// slots.
+    lost: usize,
+    /// Evicted events `lost` has counted since the seam flush began; `None`
+    /// before it does.
+    lost_in_flush: Option<usize>,
 }
+
+/// Provider controls a pending ring keeps past its capacity.
+const SEAM_CONTROL_CAP: usize = 64;
 
 impl EventRing {
     fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
             buf: std::collections::VecDeque::new(),
+            keep_controls: false,
+            controls: 0,
             dropped: None,
             dropped_first_seq: None,
+            lost: 0,
+            lost_in_flush: None,
         }
     }
 
-    fn push(&mut self, ev: MarketEvent) {
-        if self.buf.len() == self.capacity
-            && let Some(evicted) = self.buf.pop_front()
-        {
-            self.note_drop(&evicted);
+    /// A backfill's pending ring: like [`Self::new`], but it keeps the
+    /// provider's controls.
+    fn seam(capacity: usize) -> Self {
+        Self {
+            keep_controls: true,
+            ..Self::new(capacity)
+        }
+    }
+
+    /// Whether this ring keeps `ev` out of the eviction of data.
+    fn keeps(&self, ev: &MarketEvent) -> bool {
+        self.keep_controls
+            && matches!(ev, MarketEvent::Control(c) if !matches!(c.kind, ControlKind::Gap { .. }))
+    }
+
+    /// Buffer `ev`, evicting the oldest data event or `Gap` when full. Returns
+    /// whether it did. A kept control evicts only the oldest kept control, past
+    /// [`SEAM_CONTROL_CAP`], and that does not count.
+    fn push(&mut self, ev: MarketEvent) -> bool {
+        if self.keeps(&ev) {
+            self.buf.push_back(ev);
+            self.controls += 1;
+            if self.controls > SEAM_CONTROL_CAP
+                && let Some(at) = self.buf.iter().position(|e| self.keeps(e))
+                && let Some(old) = self.buf.remove(at)
+            {
+                self.controls -= 1;
+                self.note_drop(&old);
+            }
+            return false;
+        }
+        let evicted = (self.buf.len() - self.controls == self.capacity)
+            .then(|| {
+                let at = self.buf.iter().position(|e| !self.keeps(e))?;
+                self.buf.remove(at)
+            })
+            .flatten();
+        if let Some(evicted) = &evicted {
+            self.note_drop(evicted);
         }
         self.buf.push_back(ev);
+        evicted.is_some()
+    }
+
+    /// Evicted events the dropped span covers.
+    #[cfg(test)]
+    fn lost(&self) -> usize {
+        self.lost
+    }
+
+    /// Start counting the loss of the seam flush.
+    fn begin_flush(&mut self) {
+        self.lost_in_flush = Some(0);
+    }
+
+    /// Whether the seam flush has lost a whole ring.
+    fn flush_outrun(&self) -> bool {
+        self.lost_in_flush.is_some_and(|lost| lost >= self.capacity)
+    }
+
+    /// Take the loss so far: the span and how many events it covers.
+    fn take_loss(&mut self) -> Option<(GapSpan, usize)> {
+        let span = self.dropped.take()?;
+        Some((span, std::mem::take(&mut self.lost)))
+    }
+
+    fn pop(&mut self) -> Option<MarketEvent> {
+        let ev = self.buf.pop_front()?;
+        if self.keeps(&ev) {
+            self.controls -= 1;
+        }
+        Some(ev)
+    }
+
+    /// No event and no loss left to report.
+    fn is_drained(&self) -> bool {
+        self.buf.is_empty() && self.dropped.is_none()
     }
 
     /// Extend the dropped span over an evicted event. Data events count via
@@ -2541,6 +2856,10 @@ impl EventRing {
             let Some(ts) = data_source_ts(ev) else { return };
             (ts, Timestamp(ts.0.saturating_add(1)))
         };
+        self.lost += 1;
+        if let Some(lost) = &mut self.lost_in_flush {
+            *lost += 1;
+        }
         match &mut self.dropped {
             Some(span) => {
                 span.from_source_ts = span.from_source_ts.min(from);
@@ -2555,6 +2874,7 @@ impl EventRing {
         }
     }
 
+    #[cfg(test)]
     fn into_parts(
         self,
     ) -> (
@@ -2607,6 +2927,32 @@ fn source_ts(ev: &MarketEvent) -> Option<Timestamp> {
         MarketEvent::Control(c) => Some(c.source_ts),
         _ => None,
     }
+}
+
+/// Check that a backfill in `scope` has something to fetch.
+///
+/// # Errors
+///
+/// [`Error::BackfillFromNotInPast`] when it starts at or past the live edge.
+fn check_backfill_start(scope: LiveScope) -> Result<()> {
+    if let Some(from) = scope.backfill_from() {
+        let edge = wall_clock_ts();
+        if from >= edge {
+            return Err(Error::BackfillFromNotInPast { from, edge });
+        }
+    }
+    Ok(())
+}
+
+fn check_persistence(
+    options: PersistenceOptions,
+    cache: Option<&Arc<dyn HistoricalCache>>,
+    tap_log: Option<&Arc<dyn TapLog>>,
+) -> Result<()> {
+    if (options.uses_cache() && cache.is_none()) || (options.write_tap_log && tap_log.is_none()) {
+        return Err(Error::PersistenceRequired);
+    }
+    Ok(())
 }
 
 fn wall_clock_ts() -> Timestamp {
@@ -2789,6 +3135,7 @@ mod event_ring_tests {
         for ts in [100, 200, 300, 400] {
             ring.push(trade(ts));
         }
+        assert_eq!(ring.lost(), 2, "every evicted print is counted");
         let (dropped, _first, events) = ring.into_parts();
         // 100 and 200 evicted; half-open span keeps 200 inside.
         let span = dropped.expect("overflow must record a span");
@@ -2851,6 +3198,38 @@ mod event_ring_tests {
         assert_eq!(span.from_source_ts.0, 100);
         assert_eq!(span.to_source_ts.0, 301);
         assert_eq!(tss(&events), vec![400]);
+    }
+
+    #[test]
+    fn a_seam_ring_evicts_data_and_keeps_provider_controls() {
+        let mut ring = EventRing::seam(2);
+        ring.push(control(1));
+        for ts in [100, 200, 300] {
+            ring.push(trade(ts));
+        }
+        ring.push(gap_control(2, 400, 401));
+        assert_eq!(ring.lost(), 2, "prints 100 and 200 went");
+        let (dropped, _first, events) = ring.into_parts();
+        let span = dropped.expect("span");
+        assert_eq!((span.from_source_ts.0, span.to_source_ts.0), (100, 201));
+        assert_eq!(tss(&events), vec![1, 300, 2]);
+    }
+
+    #[test]
+    fn a_seam_ring_keeps_the_newest_provider_controls_past_its_cap() {
+        use super::SEAM_CONTROL_CAP;
+        let mut ring = EventRing::seam(1);
+        let cap = i64::try_from(SEAM_CONTROL_CAP).expect("small");
+        for ts in 0..=cap {
+            assert!(!ring.push(control(ts)), "a control evicts no data");
+        }
+        ring.push(trade(1000));
+        assert_eq!(ring.lost(), 0, "an evicted control is no loss");
+        let (dropped, _first, events) = ring.into_parts();
+        assert!(dropped.is_none());
+        let mut expected: Vec<i64> = (1..=cap).collect();
+        expected.push(1000);
+        assert_eq!(tss(&events), expected, "the oldest control went");
     }
 
     #[test]

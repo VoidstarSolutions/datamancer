@@ -2,7 +2,7 @@
 //! `Cfg` selectors and the `(instrument, kind)` + scope/persistence spec that
 //! `subscribe`/`unsubscribe` carry.
 
-use datamancer_core::{AssetClass, BarInterval, EventKind, Instrument, Timestamp};
+use datamancer_core::{AssetClass, BarInterval, EventKind, Instrument, LiveScope, Timestamp};
 use serde::{Deserialize, Serialize};
 
 /// The core value has no wire selector: the daemon's control vocabulary is a
@@ -90,15 +90,6 @@ impl From<EventKind> for EventKindCfg {
     }
 }
 
-/// Startup-session scope selector.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScopeCfg {
-    #[default]
-    Live,
-    LiveBackfill,
-}
-
 /// Persistence-preset selector for a startup session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -120,16 +111,16 @@ pub enum PersistenceCfg {
 /// (the attribute was silently inert via `flatten`). Unknown-key rejection
 /// is the daemon's job — the UDS surface enforces it explicitly server-side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SubscriptionSpec {
     pub provider: String,
     pub asset_class: AssetClassCfg,
     pub symbol: String,
     pub kind: EventKindCfg,
-    /// Scope preference. On conflict with an existing authoritative scope the
-    /// reply returns the *actual* scope rather than erroring (handled server
-    /// side); client subscriptions are pure-live today.
-    #[serde(default)]
-    pub scope: ScopeCfg,
+    /// The scope to open. A `scope` key absent from the wire means live; a
+    /// `scope` and `backfill_from` that disagree fail to parse.
+    #[serde(flatten)]
+    pub scope: LiveScope,
     #[serde(default)]
     pub persistence: PersistenceCfg,
 }
@@ -149,9 +140,16 @@ impl SubscriptionSpec {
             asset_class: instrument.asset_class().try_into()?,
             symbol: instrument.symbol().to_string(),
             kind: kind.into(),
-            scope: ScopeCfg::default(),
+            scope: LiveScope::default(),
             persistence: PersistenceCfg::default(),
         })
+    }
+
+    /// Ask for history from `from`: see [`LiveScope::LiveBackfill`].
+    #[must_use]
+    pub fn with_backfill_from(mut self, from: Timestamp) -> Self {
+        self.scope = LiveScope::LiveBackfill { from };
+        self
     }
 }
 
@@ -250,10 +248,8 @@ impl QuerySpec {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AssetClassCfg, EventKindCfg, PersistenceCfg, ScopeCfg, SubscriptionSpec, UnsubscribeSpec,
-    };
-    use datamancer_core::{AssetClass, EventKind, Instrument, ProviderId};
+    use super::{AssetClassCfg, EventKindCfg, PersistenceCfg, SubscriptionSpec, UnsubscribeSpec};
+    use datamancer_core::{AssetClass, EventKind, Instrument, LiveScope, ProviderId, Timestamp};
 
     /// The Cfg→core→Cfg round trip is the identity over the full kind space:
     /// the wire vocabulary covers exactly `EventKind::enumerate`.
@@ -292,11 +288,86 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec, from_json);
-        assert_eq!(spec.scope, ScopeCfg::Live);
+        assert_eq!(spec.scope, LiveScope::Live);
         assert_eq!(spec.persistence, PersistenceCfg::None);
 
         let unsub = UnsubscribeSpec::new(&instrument, EventKind::Trade).unwrap();
         assert_eq!(UnsubscribeSpec::from(spec), unsub);
+    }
+
+    /// `backfill_from` is absent from a pure-live frame (an older daemon's
+    /// unknown-key rejection never sees it) and rides as a bare integer
+    /// timestamp under `live_backfill`.
+    #[test]
+    fn backfill_from_is_omitted_when_none_and_carried_under_live_backfill() {
+        let instrument = Instrument::new(
+            ProviderId::from_static("alpaca"),
+            AssetClass::Equity,
+            "AAPL",
+        );
+        let live = SubscriptionSpec::new(&instrument, EventKind::Trade).unwrap();
+        let json = serde_json::to_string(&live).unwrap();
+        assert!(!json.contains("backfill_from"), "{json}");
+
+        let backfill = live.clone().with_backfill_from(Timestamp(1_000));
+        assert_eq!(
+            backfill.scope,
+            LiveScope::LiveBackfill {
+                from: Timestamp(1_000)
+            }
+        );
+        let json = serde_json::to_string(&backfill).unwrap();
+        assert_eq!(
+            json,
+            r#"{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live_backfill","backfill_from":1000,"persistence":"none"}"#
+        );
+        let back: SubscriptionSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, backfill);
+    }
+
+    fn parse_scope(fields: &str) -> Result<LiveScope, serde_json::Error> {
+        let frame = format!(
+            r#"{{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade"{fields}}}"#
+        );
+        serde_json::from_str::<SubscriptionSpec>(&frame).map(|spec| spec.scope)
+    }
+
+    #[test]
+    fn scope_fields_parse_to_one_live_scope() {
+        assert_eq!(parse_scope("").unwrap(), LiveScope::Live);
+        assert_eq!(parse_scope(r#","scope":"live""#).unwrap(), LiveScope::Live);
+        assert_eq!(
+            parse_scope(r#","scope":"live","backfill_from":null"#).unwrap(),
+            LiveScope::Live
+        );
+        assert_eq!(
+            parse_scope(r#","scope":"live_backfill","backfill_from":7"#).unwrap(),
+            LiveScope::LiveBackfill { from: Timestamp(7) }
+        );
+    }
+
+    #[test]
+    fn a_disagreeing_scope_pair_does_not_parse() {
+        for fields in [
+            r#","scope":"live_backfill""#,
+            r#","scope":"live_backfill","backfill_from":null"#,
+        ] {
+            let err = parse_scope(fields).unwrap_err().to_string();
+            assert!(
+                err.contains("scope live_backfill requires backfill_from"),
+                "{err}"
+            );
+        }
+        for fields in [
+            r#","scope":"live","backfill_from":7"#,
+            r#","backfill_from":7"#,
+        ] {
+            let err = parse_scope(fields).unwrap_err().to_string();
+            assert!(
+                err.contains("backfill_from requires scope live_backfill"),
+                "{err}"
+            );
+        }
     }
 
     mod query_spec_tests {

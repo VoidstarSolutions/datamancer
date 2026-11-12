@@ -9,9 +9,10 @@
 //! Access control is filesystem permissions on the socket path only. This is
 //! **not** a network-safe surface.
 
-use datamancer_core::{HealthView, SystemSnapshot};
+use datamancer_core::{HealthView, Subscribed, SystemSnapshot};
 use serde::{Deserialize, Serialize};
 
+use super::SubscribedFields;
 use crate::spec::{QueryId, QuerySpec, SubscriptionSpec, UnsubscribeSpec};
 
 /// A control request (one per line).
@@ -21,6 +22,7 @@ pub enum Request {
     /// Register a client and create its per-client data-plane service.
     OpenClient {
         client: String,
+        /// Live-only seeds, subscribed before the client opens.
         #[serde(default)]
         subscriptions: Vec<SubscriptionSpec>,
     },
@@ -110,6 +112,7 @@ pub enum Request {
 /// A control reply (one per line). `ok` discriminates success from error; the
 /// remaining fields are populated per op.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Reply {
     pub ok: bool,
     /// The per-client data-plane service name (on `open-client`).
@@ -161,6 +164,9 @@ pub struct Reply {
     /// The app-facing health view (on `health`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthView>,
+    /// What the subscription opened (on `subscribe`).
+    #[serde(flatten)]
+    pub(crate) subscribed: SubscribedFields,
 }
 
 impl Reply {
@@ -185,6 +191,7 @@ impl Reply {
             restart_required: None,
             applied: None,
             health: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -293,6 +300,7 @@ impl Reply {
             restart_required: None,
             applied: None,
             health: None,
+            subscribed: SubscribedFields::default(),
         }
     }
 
@@ -324,12 +332,30 @@ impl Reply {
             ..Self::ok()
         }
     }
+
+    /// A successful `subscribe` reply.
+    #[must_use]
+    pub fn from_subscribed(subscribed: Subscribed) -> Self {
+        Self {
+            subscribed: subscribed.into(),
+            ..Self::ok()
+        }
+    }
+
+    /// What a successful `subscribe` reply says the subscription opened. Check
+    /// `ok` first: on an error reply, or a reply to another op, this reads as a
+    /// created pure-live session and means nothing.
+    #[must_use]
+    pub fn subscribed(&self) -> Subscribed {
+        Subscribed::from(&self.subscribed)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{AssetClassCfg, EventKindCfg, PersistenceCfg, ScopeCfg};
+    use crate::spec::{AssetClassCfg, EventKindCfg, PersistenceCfg};
+    use datamancer_core::{LiveScope, Timestamp};
 
     #[test]
     fn control_protocol_roundtrip_open_client() {
@@ -340,13 +366,79 @@ mod tests {
                 asset_class: AssetClassCfg::Crypto,
                 symbol: "BTC/USD".to_string(),
                 kind: EventKindCfg::Trade,
-                scope: ScopeCfg::Live,
+                scope: LiveScope::Live,
                 persistence: PersistenceCfg::CachedWithTap,
             }],
         };
         let line = serde_json::to_string(&req).expect("ser");
         let back: Request = serde_json::from_str(&line).expect("de");
         assert_eq!(req, back);
+    }
+
+    /// The documented backfill subscribe parses with its timestamp, and the
+    /// reply that answers it round-trips the actual scope.
+    #[test]
+    fn control_protocol_parses_backfill_subscribe_and_reply_carries_scope() {
+        let line = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":1704067200000000000,"persistence":"cached"}"#;
+        let req: Request = serde_json::from_str(line).expect("de");
+        let Request::Subscribe { spec, .. } = req else {
+            panic!("wrong variant");
+        };
+        let from = Timestamp(1_704_067_200_000_000_000);
+        let backfill = LiveScope::LiveBackfill { from };
+        assert_eq!(spec.scope, backfill);
+
+        let reply = Reply::from_subscribed(Subscribed::created(backfill));
+        let json = serde_json::to_string(&reply).expect("ser");
+        assert_eq!(
+            json,
+            r#"{"ok":true,"scope":"live_backfill","backfill_from":1704067200000000000}"#
+        );
+        let back: Reply = serde_json::from_str(&json).expect("de");
+        assert_eq!(back.subscribed(), Subscribed::created(backfill));
+        assert_eq!(
+            serde_json::to_string(&Reply::from_subscribed(Subscribed::created(
+                LiveScope::Live
+            )))
+            .expect("ser"),
+            r#"{"ok":true,"scope":"live"}"#
+        );
+        let joined = Subscribed::joined(LiveScope::Live, false);
+        let json = serde_json::to_string(&Reply::from_subscribed(joined)).expect("ser");
+        assert_eq!(json, r#"{"ok":true,"scope":"live","joined":true}"#);
+        let back: Reply = serde_json::from_str(&json).expect("de");
+        assert_eq!(back.subscribed(), joined);
+    }
+
+    #[test]
+    fn a_joiner_reply_carries_a_backfill_in_flight() {
+        let in_flight = Subscribed::joined(LiveScope::Live, true);
+        let json = serde_json::to_string(&Reply::from_subscribed(in_flight)).unwrap();
+        assert!(json.contains(r#""backfill_in_flight":true"#), "{json}");
+        let back: Reply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subscribed(), in_flight);
+    }
+
+    #[test]
+    fn a_subscribe_reply_with_no_scope_reads_as_created_live() {
+        let reply: Reply = serde_json::from_str(r#"{"ok":true}"#).expect("de");
+        assert_eq!(reply.subscribed(), Subscribed::created(LiveScope::Live));
+        assert_eq!(
+            serde_json::to_string(&Reply::ok()).expect("ser"),
+            r#"{"ok":true}"#
+        );
+    }
+
+    #[test]
+    fn a_malformed_subscribe_reply_fails_to_parse() {
+        for line in [
+            r#"{"ok":true,"scope":"live_backfill"}"#,
+            r#"{"ok":true,"scope":"live","backfill_from":5}"#,
+            r#"{"ok":true,"backfill_from":5}"#,
+            r#"{"ok":true,"scope":"warp"}"#,
+        ] {
+            assert!(serde_json::from_str::<Reply>(line).is_err(), "{line}");
+        }
     }
 
     #[test]
@@ -586,6 +678,8 @@ mod tests {
     fn new_config_codes_are_stable() {
         assert_eq!(crate::codes::RESTART_REQUIRED, "restart_required");
         assert_eq!(crate::codes::UNKNOWN_CONFIG_FIELD, "unknown_config_field");
+        assert_eq!(crate::codes::BACKFILL_NOT_IN_PAST, "backfill_not_in_past");
+        assert_eq!(crate::codes::BACKFILL_TOO_OLD, "backfill_too_old");
     }
 
     #[test]

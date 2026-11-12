@@ -123,6 +123,7 @@ path = "/var/lib/datamancerd/taplog.db"  # optional; default: <data dir>/taplog.
 resume_buffer_events = 65536
 adjustment = "all"                # raw | split | dividend | spin_off | all
 query_persistence = "cached"      # none | cached | cached_with_tap | read_only | refresh | tap_only
+max_backfill_days = 7             # oldest start a client's live_backfill may ask for
 
 [server]
 # admin_socket defaults to the datamancer-owned well-known path
@@ -138,7 +139,10 @@ query_persistence = "cached"      # none | cached | cached_with_tap | read_only 
 # different prefixes never share a service, and the per-process boot id keeps
 # a restart off its predecessor's names. Non-empty, checked at boot.
 service_prefix = "datamancerd"
+# Seconds the whole exit may take after SIGTERM/SIGINT, every drain step
+# included. At least 1; the web and WS drains take at most half of it.
 shutdown_timeout_secs = 30
+max_concurrent_backfills = 2      # client backfills fetching history at once
 
 [diagnostics]
 publish_interval_ms = 1000
@@ -163,7 +167,7 @@ asset_class = "crypto"            # equity | crypto
 symbol = "BTC/USD"
 kind = "trade"                    # trade | quote | bar1s | bar1m | bar5m | bar15m | bar1h | bar1d
 scope = "live"                    # live | live_backfill
-backfill_from = "2026-06-01T00:00:00Z"   # required iff scope = live_backfill
+# backfill_from = "2026-06-01T00:00:00Z" # required iff scope = live_backfill
 persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only | refresh | tap_only
 always_on = true                  # hold for the process lifetime regardless of clients
 
@@ -178,7 +182,8 @@ configured, and providers are enabled at runtime via the config service's
 restarting). Validation fails fast on the remaining cross-section invariants:
 a startup session using a cache preset requires `[cache]`; one writing the
 tap log requires `[tap_log]`; `scope = live_backfill` requires a parseable
-`backfill_from`.
+`backfill_from`, and `scope = live` refuses one. An `always_on` session's
+start must precede the live edge when it opens at boot.
 
 `[session] query_persistence` is the daemon's single cache policy for every
 `open-query` — queries carry no per-request persistence selector on the wire.
@@ -189,7 +194,12 @@ still serves queries, straight from the provider. `[iceoryx2] max_queries`
 bounds concurrent in-flight historical queries (default 2, small on purpose:
 provider rate limit, not daemon capacity, is the binding constraint) — an
 `open-query` past the cap answers `service_cap_exceeded`, same as `max_clients`
-does for `open-client`.
+does for `open-client`. `[server] max_concurrent_backfills` bounds the client
+backfills that fetch history at once, UDS and WS together (default 2). A
+subscribe past it is not refused: its backfill waits until another's history
+ends, even one the cache could serve whole, and its live arrivals fill the
+resume buffer meanwhile, where an overflow is a `gap`. A subscribe that joins
+an open session does not count, nor does a `[[startup_session]]`.
 
 `[log]` configures the tracing subscriber installed at the very start of
 `main` — before the single-instance lock or config-file resolution/scaffolding
@@ -231,6 +241,13 @@ crashed predecessor's names either, even with the same config (see
 "Recovering from a crashed predecessor" below). There is strictly **one sink
 per client** (never shared), so per-client resume/gap accounting stays
 isolated.
+
+A client data service takes one subscriber; a second is refused at open while
+the first is attached, or after it crashed until iceoryx2 cleans up the dead
+node. A full subscriber makes the client's stream wait for it. With no
+subscriber attached, events go to the service's 16-sample history: a subscriber
+that attaches later receives those and nothing before them, a `seq` hole with
+no `gap`.
 
 A graceful `close-client` or a connection **EOF** tears the client down,
 flushing its sink and releasing its authoritative refcounts.
@@ -418,6 +435,11 @@ One JSON object per line; one reply line per request.
 {"op":"open-client","client":"exec-1","subscriptions":[ /* SubscriptionSpec… */ ]}
   -> {"ok":true,"service":"datamancerd/1729600000-4321/v3/data/0"}
 {"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
+  -> {"ok":true,"scope":"live"}
+{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":<t>,"persistence":"cached"}
+  -> {"ok":true,"scope":"live_backfill","backfill_from":<t>}
+{"op":"subscribe","client":"exec-2","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m"}
+  -> {"ok":true,"scope":"live_backfill","backfill_from":<t>,"joined":true}
 {"op":"unsubscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
 {"op":"close-client","client":"exec-1"}
 {"op":"open-query","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1d","from":1704067200000000000,"to":1704672000000000000}
@@ -450,6 +472,42 @@ One JSON object per line; one reply line per request.
 {"op":"health"}
   -> {"ok":true,"health":{ /* HealthView, schema_version 3, daemon-stamped */ }}
 ```
+
+`subscribe` opens an unbounded subscription:
+
+- `scope` is `live` (the default) or `live_backfill`.
+- `<t>` in the examples above is a start within `[session] max_backfill_days`.
+- `backfill_from` (epoch nanoseconds, inclusive) is required under
+  `live_backfill` and refused under `live`; either disagreement is
+  `bad_request`.
+- A `backfill_from` at or past the live edge is `backfill_not_in_past`, on a
+  subscribe that would create the session.
+- A `backfill_from` more than `[session] max_backfill_days` old is
+  `backfill_too_old`, whether the subscribe would create or join. A
+  `[[startup_session]]` is the operator's and has no such limit; longer history
+  comes from `open-query`.
+- At most `[server] max_concurrent_backfills` created backfills fetch history
+  at once; one past it waits for its turn, with its live arrivals in the resume
+  buffer, where an overflow is a `gap`.
+- With a tap log, live arrivals during a backfill reach it at the seam. An
+  arrival the seam ring evicts, or one still buffered when the session closes
+  before the seam, is not logged and leaves no mark in the log.
+- The reply's `scope` and `backfill_from` are the scope of the pair's shared
+  session, fixed by the subscriber that created it.
+- `"joined":true` marks a subscriber that joined an open session; the creator's
+  reply omits it. A joiner's stream begins where it joined, with no `Gap` for
+  what it missed.
+- `"backfill_in_flight":true` on a joiner's reply means a backfill was running
+  at the join: its stream carries what is left of it, then the buffered live
+  arrivals, then the live tail. A joiner that needs the whole history uses
+  `open-query`, and with the flag set must expect the overlap.
+
+`open-client` seeds follow the same rules and are live-only: any other scope
+is `bad_request`, checked for all seeds before any subscribes. A client that
+wants a backfill subscribes after opening.
+
+How a backfill seams into the live tail is in the
+[library README](../datamancer/README.md#subscriptions).
 
 `open-query` opens a **bounded historical query** over
 `from..to` (inclusive `from`, `to >= from` or `bad_request`) — **ungated**,
@@ -593,8 +651,8 @@ config-service ops (spec cycle 3); see the dedicated section below for
 gating, classification, and semantics.
 
 Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
-(`live_session_conflict`, `unsupported_event_kind`, `persistence_required`,
-`unsupported_client_scope`, `duplicate_subscription`, `not_subscribed`,
+(`unsupported_event_kind`, `persistence_required`, `backfill_not_in_past`,
+`backfill_too_old`, `duplicate_subscription`, `not_subscribed`,
 `unknown_provider`, `unknown_client`, `duplicate_client`,
 `service_cap_exceeded`, `bad_request`, `shutting_down`,
 `credentials_missing`, `credential_backend_unavailable`, `permission_denied`,
@@ -837,7 +895,7 @@ connection identifies the client):
 
 ```jsonc
 {"id":1,"op":"subscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
-  -> {"id":1,"ok":true}
+  -> {"id":1,"ok":true,"scope":"live"}
 {"id":2,"op":"snapshot"}
   -> {"id":2,"ok":true,"snapshot":{ /* SystemSnapshot */ }}
 {"id":3,"op":"unsubscribe","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}
@@ -879,10 +937,10 @@ distinguishes them by the presence of `type` vs. `id`/`ok`. Connection-scoped
 controls (provider connect/disconnect/error) are **not** carried on the event
 stream; read connectivity via the `snapshot` reply instead.
 
-Backpressure is bounded and lossy-on-overrun **by disconnection**: if a remote
-consumer falls behind and the connection's outbound channel
-(`channel_depth`) fills, the connection is torn down rather than silently
-dropping frames on a live connection.
+A full outbound channel (`channel_depth`) holds the stream for up to 30 s. A
+remote consumer that has still not read is disconnected. One that keeps reading
+but falls behind the live feed stays connected, and what it misses arrives as a
+`gap`.
 
 Graceful daemon shutdown tears down live WS connections before the UDS-client
 drain: each connection's `session.close()` emits a terminal
@@ -904,6 +962,8 @@ sink → drop the clients/sinks. The web server (and WS surface) are drained
 first so they stop reporting on / mutating a data plane about to be torn down;
 the tap log flushes **before** the best-effort per-client sink flushes (the
 load-bearing tap-log-before-sink-flush contract) so a stall in those
-best-effort steps cannot lose durable writes. The whole drain is bounded by
-`server.shutdown_timeout_secs` so a disk-stalled tap-log flush cannot hang
-shutdown forever (it is logged and the process force-exits).
+best-effort steps cannot lose durable writes. `server.shutdown_timeout_secs`
+(at least 1) bounds the whole exit, counted from the signal: the web and WS
+drains (5 s each at most, and half the budget together), the drain and the
+runtime's own shutdown share that one deadline, so a disk-stalled tap-log flush
+cannot hang shutdown forever (it is logged and the process force-exits).

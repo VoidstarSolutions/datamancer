@@ -27,9 +27,12 @@ use datamancer::transport::{
     Iceoryx2HealthPublisher, ServicePrefix,
 };
 use datamancer::{
-    AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Scope,
-    Session, TapLog, traits::EventSink,
+    AssetClass, ClientSession, Datamancer, EventKind, HealthView, Instrument, ProviderId, Session,
+    TapLog, traits::EventSink,
 };
+// Named only by the unix `open-client` and `open-query` arms.
+#[cfg(not(windows))]
+use datamancer::{LiveScope, Scope};
 // `Timestamp` only appears in `validate_query_open`'s signature and its
 // tests, both unix/macOS only — importing it unconditionally would be
 // `unused_imports` on Windows.
@@ -130,8 +133,8 @@ impl DrainClient for ClientEntry {
         // Let the pump deliver the remaining stream (incl. `SessionClosing`) into
         // the sink before the later flush, rather than severing it immediately.
         // The session close ends the stream, so the pump finishes on its own;
-        // bound the wait so a wedged pump cannot hang shutdown, aborting only if
-        // it overruns.
+        // bound the wait so a reader that has stopped cannot hang teardown. A
+        // pump waiting on that reader's full queue ends when aborted.
         let mut pump = std::mem::replace(&mut self.pump, tokio::spawn(async {}));
         if tokio::time::timeout(Duration::from_secs(2), &mut pump)
             .await
@@ -191,11 +194,11 @@ struct WebHandles {
 
 #[cfg(feature = "web-ui")]
 impl WebHandles {
-    /// Trigger graceful shutdown: signal the serve task to drain, await it under
-    /// a short bound, then abort the refresh tasks.
-    async fn shutdown(self) {
+    /// Trigger graceful shutdown: signal the serve task to drain, await it for
+    /// at most 5 s and never past `deadline`, then abort the refresh tasks.
+    async fn shutdown(self, deadline: tokio::time::Instant) {
         let _ = self.shutdown.send(());
-        if tokio::time::timeout(Duration::from_secs(5), self.serve)
+        if tokio::time::timeout_at(step_deadline(deadline), self.serve)
             .await
             .is_err()
         {
@@ -393,17 +396,7 @@ impl Server {
                 );
                 continue;
             }
-            let scope = s.resolve_scope()?;
-            let session = dm
-                .session(
-                    s.instrument(),
-                    s.kind.into(),
-                    scope,
-                    crate::config::persistence_options(s.persistence),
-                )
-                .await?;
-            tracing::info!(symbol = %s.symbol, "anchored always_on startup session");
-            anchors.push(session);
+            anchors.push(open_anchor(&dm, s).await?);
         }
 
         Ok(Self {
@@ -467,6 +460,10 @@ impl Server {
 
     /// Run the daemon until a shutdown signal, then drain gracefully.
     ///
+    /// `shutdown_timeout_secs` bounds the whole exit, counted from the signal.
+    /// Returns the instant it runs out, which also bounds the runtime's own
+    /// shutdown.
+    ///
     /// # Errors
     ///
     /// Propagates control-socket bind errors.
@@ -475,7 +472,7 @@ impl Server {
         reason = "one sequential boot-then-select-loop-then-drain shutdown ordering; \
                   splitting the drain steps across functions would scatter load-bearing order"
     )]
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(mut self) -> Result<std::time::Instant> {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(256);
         let accept = self.spawn_control(cmd_tx.clone())?;
 
@@ -547,12 +544,14 @@ impl Server {
         }
 
         self.draining = true;
+        let deadlines = ExitDeadlines::from_now(self.shutdown_timeout);
+        let exit_deadline = deadlines.exit;
 
         // Drain the embedded web server first: stop serving introspection HTTP
         // before tearing down the data plane it reports on.
         #[cfg(feature = "web-ui")]
         if let Some(handles) = web_handles.take() {
-            handles.shutdown().await;
+            handles.shutdown(deadlines.steps).await;
         }
 
         // Stop accepting new WS clients and let in-flight connections tear down.
@@ -561,7 +560,7 @@ impl Server {
             if let Some(trigger) = ws_shutdown {
                 let _ = trigger.send(());
             }
-            if tokio::time::timeout(Duration::from_secs(5), ws_task)
+            if tokio::time::timeout_at(step_deadline(deadlines.steps), ws_task)
                 .await
                 .is_err()
             {
@@ -595,7 +594,7 @@ impl Server {
         // accept loop and connection tasks release theirs.
         drop(cmd_tx);
 
-        if !drain_servicing_late_requests(drain_fut, &mut cmd_rx, self.shutdown_timeout).await {
+        if !drain_servicing_late_requests(drain_fut, &mut cmd_rx, exit_deadline).await {
             tracing::error!("shutdown drain exceeded timeout; forcing exit");
         }
         tracing::debug!(phases = ?recorder.entries(), "drain phases");
@@ -605,7 +604,7 @@ impl Server {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&self.admin_socket);
         tracing::info!("datamancerd shutdown complete");
-        Ok(())
+        Ok(exit_deadline.into_std())
     }
 
     /// Start the embedded web UI if it is configured and enabled: warm both
@@ -1008,6 +1007,9 @@ impl Server {
                 format!("service cap {} exceeded", self.max_clients),
             );
         }
+        if let Some(reply) = validate_seeds(&subscriptions) {
+            return reply;
+        }
 
         let id = self.next_client_id;
         let name = DataServiceName::new(&self.service_prefix, id);
@@ -1021,16 +1023,13 @@ impl Server {
         let sink = Arc::new(sink) as Arc<dyn EventSink>;
 
         let session = self.dm.client_session();
-        // Apply seed subscriptions before taking the stream.
         for spec in subscriptions {
             let instrument = spec_instrument(&spec);
             if let Err(e) = session
                 .subscribe(
                     instrument,
                     spec.kind.into(),
-                    Scope::Live {
-                        backfill_from: None,
-                    },
+                    spec.scope,
                     crate::config::persistence_options(spec.persistence),
                 )
                 .await
@@ -1228,14 +1227,12 @@ impl Server {
             .subscribe(
                 instrument,
                 spec.kind.into(),
-                Scope::Live {
-                    backfill_from: None,
-                },
+                spec.scope,
                 crate::config::persistence_options(spec.persistence),
             )
             .await
         {
-            Ok(()) => Reply::ok(),
+            Ok(subscribed) => Reply::from_subscribed(subscribed),
             Err(e) => reply_from_library_error(&e),
         }
     }
@@ -1316,24 +1313,66 @@ fn validate_query_open(
     None
 }
 
+/// Validate all seeds before subscribing any.
+#[cfg(not(windows))]
+fn validate_seeds(seeds: &[SubscriptionSpec]) -> Option<Reply> {
+    seeds
+        .iter()
+        .find(|seed| seed.scope != LiveScope::Live)
+        .map(|seed| {
+            Reply::error(
+                codes::BAD_REQUEST,
+                format!(
+                    "open-client seed {} is not live; subscribe after opening to backfill",
+                    seed.symbol
+                ),
+            )
+        })
+}
+
 /// Reject a control request that carries unknown top-level JSON keys. `serde`'s
 /// `deny_unknown_fields` cannot cover `Request` directly (it is an
 /// internally-tagged enum, and `Subscribe` `#[serde(flatten)]`s its spec — both
 /// disable the attribute), so compare the input object's keys against the keys
 /// the parsed request round-trips to. Any input key absent from the canonical
-/// form was silently ignored and is reported as an error.
+/// form was silently ignored and is reported as an error. `backfill_from` is
+/// the one declared key the canonical form can leave out, so on a `subscribe`
+/// a `null` there is an absent one.
 fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(), String> {
     let input: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("invalid request: {e}"))?;
     let canonical = serde_json::to_value(request).map_err(|e| format!("invalid request: {e}"))?;
     if let (Some(input), Some(canonical)) = (input.as_object(), canonical.as_object()) {
-        for key in input.keys() {
-            if !canonical.contains_key(key) {
+        for (key, value) in input {
+            let absent_backfill = value.is_null()
+                && key == "backfill_from"
+                && matches!(request, Request::Subscribe { .. });
+            if !absent_backfill && !canonical.contains_key(key) {
                 return Err(format!("unknown field `{key}`"));
             }
         }
     }
     Ok(())
+}
+
+/// Open an `always_on` startup session.
+async fn open_anchor(dm: &Datamancer, s: &crate::config::StartupSession) -> Result<Session> {
+    let session = dm
+        .session(
+            s.instrument(),
+            s.kind.into(),
+            s.resolve_scope()?.into(),
+            crate::config::persistence_options(s.persistence),
+        )
+        .await
+        .map_err(|e| match e {
+            datamancer::Error::BackfillFromNotInPast { .. } => {
+                DaemonError::ConfigInvalid(format!("startup_session {}: {e}", s.symbol))
+            }
+            other => other.into(),
+        })?;
+    tracing::info!(symbol = %s.symbol, "anchored always_on startup session");
+    Ok(session)
 }
 
 /// Pump a client's multiplexed stream into its per-client sink, in arrival
@@ -1342,7 +1381,10 @@ fn reject_unknown_keys(line: &str, request: &Request) -> std::result::Result<(),
 /// this drives the iceoryx2 `open-client` sink; the WS surface has its own
 /// pump (`ws/conn.rs`).
 #[cfg(not(windows))]
-fn spawn_pump(mut stream: datamancer::EventStream, sink: Arc<dyn EventSink>) -> JoinHandle<()> {
+fn spawn_pump<S>(mut stream: S, sink: Arc<dyn EventSink>) -> JoinHandle<()>
+where
+    S: futures::Stream<Item = datamancer::MarketEvent> + Send + Unpin + 'static,
+{
     tokio::spawn(async move {
         while let Some(ev) = stream.next().await {
             match sink.publish(ev).await {
@@ -1918,19 +1960,43 @@ fn spawn_diagnostics(
     })
 }
 
+/// The two deadlines of an exit, counted from the signal.
+struct ExitDeadlines {
+    /// The web and WS drain steps end by here, half the budget.
+    steps: tokio::time::Instant,
+    /// The whole exit ends by here.
+    exit: tokio::time::Instant,
+}
+
+impl ExitDeadlines {
+    fn from_now(shutdown_timeout: Duration) -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            steps: now + shutdown_timeout / 2,
+            exit: now + shutdown_timeout,
+        }
+    }
+}
+
+/// The deadline of one bounded web or WS drain step: 5 s from now, or
+/// `steps_deadline` if that comes first.
+fn step_deadline(steps_deadline: tokio::time::Instant) -> tokio::time::Instant {
+    (tokio::time::Instant::now() + Duration::from_secs(5)).min(steps_deadline)
+}
+
 /// Run `drain_fut` to completion while still servicing `cmd_rx`: the accept
 /// loop is aborted at the start of `drain`, but connection tasks already
 /// spawned may still send a request. Reply `shutting_down` promptly so a
 /// producer never blocks forever on its reply channel (which would otherwise
 /// leave a wedged connection task and could stall a clean exit). Returns
-/// `false` if `shutdown_timeout` was exceeded.
+/// `false` if `deadline` passed first.
 async fn drain_servicing_late_requests(
     drain_fut: impl std::future::Future<Output = ()>,
     cmd_rx: &mut mpsc::Receiver<ServerCommand>,
-    shutdown_timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> bool {
     tokio::pin!(drain_fut);
-    let drained = tokio::time::timeout(shutdown_timeout, async {
+    let drained = tokio::time::timeout_at(deadline, async {
         let mut producers_open = true;
         loop {
             tokio::select! {
@@ -2020,6 +2086,84 @@ mod tests {
         assert!(!text.contains("Recovering"), "{text}");
     }
 
+    /// A pump waiting on a reader that has stopped ends as soon as it is
+    /// aborted and lets go of the sink, round after round, so a torn-down
+    /// client leaves no task or publisher behind.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[ignore = "needs the iceoryx2 runtime"]
+    async fn a_pump_waiting_on_a_stalled_reader_ends_when_aborted() {
+        use datamancer::transport::DataSubscriber;
+        use datamancer::{Price, Quantity, Seq, Trade};
+
+        let node = create_node().expect("node");
+        let prefix = effective_service_prefix("pump-abort-test").expect("prefix");
+        for round in 0..3 {
+            let sink = Arc::new(
+                Iceoryx2DataSink::new(&node, DataServiceName::new(&prefix, round)).expect("sink"),
+            );
+            let _reader = DataSubscriber::open(&node, sink.data_service_name()).expect("reader");
+            let released = Arc::downgrade(&sink);
+            let events = futures::stream::iter((0_i64..).map(|ts| {
+                datamancer::MarketEvent::Trade(Trade {
+                    instrument: Instrument::new(
+                        ProviderId::from_static("fake"),
+                        AssetClass::Equity,
+                        "AAPL",
+                    ),
+                    source_ts: Timestamp(ts),
+                    rx_ts: Timestamp(ts),
+                    seq: Seq(u64::try_from(ts).expect("non-negative")),
+                    price: Price::from_f64_round(1.0),
+                    size: Quantity::from_units(1),
+                })
+            }));
+            let pump = spawn_pump(events, sink as Arc<dyn EventSink>);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !pump.is_finished(),
+                "round {round}: the pump waits on the full queue"
+            );
+
+            pump.abort();
+            let ended = tokio::time::timeout(Duration::from_secs(2), pump)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: the aborted pump is still running"));
+            assert!(ended.expect_err("aborted").is_cancelled(), "round {round}");
+            assert!(
+                released.upgrade().is_none(),
+                "round {round}: the aborted pump still holds the sink"
+            );
+        }
+    }
+
+    /// The web and WS steps, which share one deadline, leave the drain at
+    /// least half of `shutdown_timeout`.
+    #[test]
+    fn the_web_and_ws_steps_leave_the_drain_half_the_budget() {
+        let shutdown_timeout = Duration::from_secs(3);
+        let deadlines = ExitDeadlines::from_now(shutdown_timeout);
+        let left = deadlines.exit - step_deadline(deadlines.steps);
+        assert!(left >= shutdown_timeout / 2, "the drain has {left:?}");
+    }
+
+    /// The drain gets what is left of the exit deadline once the steps before
+    /// it have spent part of it, not a fresh `shutdown_timeout`.
+    #[tokio::test]
+    async fn the_drain_gets_only_what_is_left_of_the_exit_deadline() {
+        let exit_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let started = tokio::time::Instant::now();
+        assert!(
+            !drain_servicing_late_requests(std::future::pending(), &mut cmd_rx, exit_deadline)
+                .await,
+            "a drain that never finishes runs out of time"
+        );
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(1200), "the drain ran {took:?}");
+    }
+
     // The peer-cred gate is Unix-only (Windows uses the pipe owner DACL).
     #[cfg(unix)]
     #[test]
@@ -2030,25 +2174,19 @@ mod tests {
         assert!(!privileged_op_permitted(None, 501));
     }
 
-    /// The `privileged == false` denial **wiring** (not just the predicate).
-    /// `privileged_gate_requires_exact_uid_match` above proves the decision
-    /// function; this proves `serve_connection` actually *honours* it — a gated
-    /// op from an unprivileged peer is rejected with `PERMISSION_DENIED` and,
-    /// crucially, is never forwarded to the actor. A regression that dispatched
-    /// before checking the gate would pass the predicate test but fail here.
-    /// Cross-platform: the gate is transport-agnostic, so this runs on the Linux
-    /// core job as well as the Windows native job (every daemon e2e connects as
-    /// the daemon's own uid, so this is the only coverage of the deny arm).
-    #[tokio::test]
-    async fn serve_connection_denies_gated_ops_when_unprivileged() {
-        // Minimal deps: on the denial path `serve_connection` returns before
-        // `dm` / `hub` / `config_hub` / `cmd_tx` are ever touched — but the
-        // signature still requires them. A provider-less datamancer is cheap and
-        // never connects to anything.
+    /// Serve one in-memory connection.
+    fn spawn_connection(
+        privileged: bool,
+    ) -> (
+        tokio::io::DuplexStream,
+        JoinHandle<()>,
+        mpsc::Receiver<ServerCommand>,
+        tempfile::TempDir,
+    ) {
         let dm = Datamancer::builder()
             .build()
             .expect("build provider-less datamancer");
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServerCommand>(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ServerCommand>(4);
         let dir = tempfile::tempdir().expect("tempdir");
         let store = datamancer_credentials::CredentialStore::with_backend(Box::new(
             datamancer_credentials::FileBackend::new(dir.path().join("creds.json")),
@@ -2058,21 +2196,77 @@ mod tests {
             Config::parse("").expect("empty config parses to defaults"),
             dir.path().join("config.toml"),
         );
-
-        // In-memory duplex: the `server` half feeds `serve_connection`; we drive
-        // the `client` half. Bounded reads are unnecessary — `serve_connection`
-        // replies synchronously per line and we close the stream to end it.
         let (client, server) = tokio::io::duplex(8192);
         let (s_read, s_write) = tokio::io::split(server);
         let task = tokio::spawn(serve_connection(
             s_read,
             s_write,
-            false, // unprivileged peer
+            privileged,
             cmd_tx,
             dm,
             Arc::new(hub),
             config_hub,
         ));
+        (client, task, cmd_rx, dir)
+    }
+
+    #[tokio::test]
+    async fn serve_connection_answers_a_disagreeing_scope_pair_bad_request() {
+        let (client, task, mut cmd_rx, _dir) = spawn_connection(true);
+        let (c_read, mut c_write) = tokio::io::split(client);
+        let mut replies = BufReader::new(c_read).lines();
+
+        for (fields, message) in [
+            (
+                r#""scope":"live_backfill""#,
+                "scope live_backfill requires backfill_from",
+            ),
+            (
+                r#""scope":"live","backfill_from":7"#,
+                "backfill_from requires scope live_backfill",
+            ),
+        ] {
+            let line = format!(
+                r#"{{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade",{fields}}}"#
+            );
+            c_write
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write request");
+            let reply = tokio::time::timeout(Duration::from_secs(5), replies.next_line())
+                .await
+                .expect("a refused pair is answered")
+                .expect("read reply")
+                .expect("reply line present");
+            let reply: Reply = serde_json::from_str(&reply).expect("parse reply");
+            assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
+            let detail = reply.message.expect("message");
+            assert!(detail.contains(message), "{detail}");
+        }
+
+        drop(c_write);
+        drop(replies);
+        task.await.expect("serve_connection task joins");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a frame that does not parse never reaches the actor"
+        );
+    }
+
+    /// The `privileged == false` denial **wiring** (not just the predicate).
+    /// `privileged_gate_requires_exact_uid_match` above proves the decision
+    /// function; this proves `serve_connection` actually *honors* it — a gated
+    /// op from an unprivileged peer is rejected with `PERMISSION_DENIED` and,
+    /// crucially, is never forwarded to the actor. A regression that dispatched
+    /// before checking the gate would pass the predicate test but fail here.
+    /// Cross-platform: the gate is transport-agnostic, so this runs on the Linux
+    /// core job as well as the Windows native job (every daemon e2e connects as
+    /// the daemon's own uid, so this is the only coverage of the deny arm).
+    #[tokio::test]
+    async fn serve_connection_denies_gated_ops_when_unprivileged() {
+        // Bounded reads are unnecessary: `serve_connection` replies
+        // synchronously per line and we close the stream to end it.
+        let (client, task, mut cmd_rx, _dir) = spawn_connection(false);
 
         let (c_read, mut c_write) = tokio::io::split(client);
         let mut replies = BufReader::new(c_read).lines();
@@ -2139,6 +2333,53 @@ mod tests {
             reject_unknown_keys(line, &request).is_ok(),
             "omitted `settings` must round-trip to the canonical `\"settings\":null` form"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_seed_that_is_not_live_is_refused() {
+        let live: SubscriptionSpec = serde_json::from_str(
+            r#"{"provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade"}"#,
+        )
+        .expect("parse");
+        assert!(validate_seeds(std::slice::from_ref(&live)).is_none());
+
+        let backfill = live.clone().with_backfill_from(Timestamp(7));
+        let reply = validate_seeds(&[live, backfill]).expect("refused");
+        assert_eq!(reply.code.as_deref(), Some(codes::BAD_REQUEST));
+    }
+
+    #[test]
+    fn reject_unknown_keys_accepts_a_live_backfill_frame() {
+        let line = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live_backfill","backfill_from":7}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        assert!(reject_unknown_keys(line, &request).is_ok());
+    }
+
+    #[test]
+    fn reject_unknown_keys_reads_a_null_backfill_from_as_absent() {
+        let line = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live","backfill_from":null}"#;
+        let request: Request = serde_json::from_str(line).expect("parse");
+        assert!(
+            reject_unknown_keys(line, &request).is_ok(),
+            "`backfill_from: null` is the absent form, not an unknown field"
+        );
+        let bogus = r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","backfill_from":null,"bogus":1}"#;
+        let request: Request = serde_json::from_str(bogus).expect("parse");
+        assert!(reject_unknown_keys(bogus, &request).is_err());
+    }
+
+    #[test]
+    fn reject_unknown_keys_refuses_a_null_valued_key_the_request_does_not_declare() {
+        for line in [
+            r#"{"op":"ping","bogus":null}"#,
+            r#"{"op":"ping","backfill_from":null}"#,
+            r#"{"op":"configure-provider","provider":"alpaca","acount_type":null}"#,
+            r#"{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","backfil_from":null}"#,
+        ] {
+            let request: Request = serde_json::from_str(line).expect("parse");
+            assert!(reject_unknown_keys(line, &request).is_err(), "{line}");
+        }
     }
 
     #[test]

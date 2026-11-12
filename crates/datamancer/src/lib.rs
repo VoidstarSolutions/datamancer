@@ -42,11 +42,11 @@ pub use datamancer_core::{
     CacheCoverage, CacheKey, CacheSnapshot, ClientSessionId, ClientSessionSnapshot,
     ConnectionState, Control, ControlKind, DaemonHealth, DisconnectCause, Error, EventKind,
     GapSpan, HealthView, HistoricalCache, HistoryRequest, Instrument, InstrumentCapabilities,
-    InstrumentEntry, InstrumentInfo, LatencySummary, LiveHandle, Liveness, MarketEvent, Price,
-    Provider, ProviderHealth, ProviderId, ProviderMetrics, ProviderSnapshot, ProviderState,
-    Quantity, Quote, ReplayRequest, ReplaySource, Result, ResumeBufferSnapshot, Seq,
-    StreamConnection, StreamHealth, SubscriptionRef, Surface, SystemSnapshot, TapLog, Timestamp,
-    Trade,
+    InstrumentEntry, InstrumentInfo, LatencySummary, LiveHandle, LiveScope, Liveness, MarketEvent,
+    Price, Provider, ProviderHealth, ProviderId, ProviderMetrics, ProviderSnapshot, ProviderState,
+    Quantity, Quote, REPLAY_STALL_LIMIT, ReplayRequest, ReplaySource, Result, ResumeBufferSnapshot,
+    ScopeMismatch, ScopeName, Seq, StreamConnection, StreamHealth, Subscribed, SubscriptionRef,
+    Surface, SystemSnapshot, TapLog, Timestamp, Trade,
 };
 #[cfg(feature = "provider-alpaca")]
 pub use providers::{

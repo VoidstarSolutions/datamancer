@@ -525,9 +525,9 @@ async fn slow_consumer_overrun_tears_down_connection() {
         return;
     }
 
-    // Deliberately stop reading for a beat so the pump fills the depth-1 channel
-    // and hits `Rejected`, cancelling the read loop into teardown.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Deliberately stop reading past the sink's 30 s wait so the pump fills the
+    // depth-1 channel and hits `Rejected`, cancelling the read loop into teardown.
+    tokio::time::sleep(Duration::from_mins(1)).await;
 
     // Now the server should be tearing us down: within ~15s the read side must
     // see a Close frame, EOF (`None`), or a transport error. Each read is bounded

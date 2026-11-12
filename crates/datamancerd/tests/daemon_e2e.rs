@@ -219,6 +219,58 @@ fn open_client_creates_a_service_then_closes() {
     );
 }
 
+/// `spawn_daemon` configures neither `[cache]` nor `[tap_log]`.
+#[test]
+#[ignore = "needs a live iceoryx2 runtime"]
+fn subscribe_refuses_persistence_the_daemon_has_no_backend_for() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_daemon(dir.path());
+
+    let stream = UnixStream::connect(daemon.socket()).expect("connect");
+    let mut writer = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    writer
+        .write_all(b"{\"op\":\"open-client\",\"client\":\"exec-1\"}\n")
+        .expect("write");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    let reply: serde_json::Value = serde_json::from_str(&line).expect("parse");
+    assert_eq!(reply["ok"], serde_json::Value::Bool(true), "{reply}");
+
+    for persistence in ["cached", "tap_only", "cached_with_tap"] {
+        let reply = round_trip(
+            daemon.socket(),
+            &format!(
+                r#"{{"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"{persistence}"}}"#
+            ),
+        );
+        assert_eq!(reply["ok"], serde_json::Value::Bool(false), "{reply}");
+        assert_eq!(reply["code"], "persistence_required", "{reply}");
+    }
+}
+
+#[test]
+#[ignore = "spawns the daemon binary and needs a live iceoryx2 runtime"]
+fn subscribe_refuses_a_backfill_older_than_the_limit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = spawn_daemon(dir.path());
+
+    let stream = UnixStream::connect(daemon.socket()).expect("connect");
+    let mut writer = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+    writer
+        .write_all(b"{\"op\":\"open-client\",\"client\":\"exec-1\"}\n")
+        .expect("write");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+
+    let reply = round_trip(
+        daemon.socket(),
+        r#"{"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live_backfill","backfill_from":1}"#,
+    );
+    assert_eq!(reply["code"], "backfill_too_old", "{reply}");
+}
+
 /// A daemon that starts after its predecessor crashed must serve its first
 /// client (#96). The predecessor owns a live data service when it is killed
 /// with SIGKILL; if the kill lands while it is removing a service, that

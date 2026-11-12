@@ -56,11 +56,12 @@ owns the listener and the per-connection orchestrator glue
   the same connection — two writers racing on one `WebSocketStream` half can
   interleave partial frames.
 - **Lossy-on-overrun, by disconnection.** The sink's outbound channel is
-  bounded; `try_send` on a full channel returns `PublishOutcome::Rejected`
-  rather than blocking or silently dropping. The caller (`datamancerd`'s pump)
-  treats a reject as "stop the pump, tear the connection down." There is no
-  drop-oldest/drop-newest buffering inside this crate — overrun is always
-  visible as a disconnect, never a silent gap on a live connection.
+  bounded; `publish` waits 30 s for room, then returns
+  `PublishOutcome::Rejected` rather than silently dropping. The caller
+  (`datamancerd`'s pump) treats a reject as "stop the pump, tear the
+  connection down." There is no drop-oldest/drop-newest buffering inside this
+  crate. A consumer that keeps reading stays connected, and its loss arrives
+  as an upstream `Gap`.
 - **`run_writer` is transport-generic for testability.** It is generic over
   `Sink<Message> + Unpin` rather than hard-coded to a `WebSocketStream` half,
   so the writer's framing/ordering behavior is unit-testable with a plain

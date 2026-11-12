@@ -12,19 +12,21 @@
 //! section, etc.); `Config::into_datamancer` builds the live [`Datamancer`].
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use std::collections::HashMap;
 
 use datamancer::providers::{AccountType, AlpacaHistoryFeed};
 use datamancer::{
-    Adjustment, CredentialsSource, Datamancer, Instrument, PersistenceOptions, ProviderId, Scope,
-    Timestamp,
+    Adjustment, CredentialsSource, Datamancer, Instrument, LiveScope, PersistenceOptions,
+    ProviderId, Timestamp,
     providers::{
         AlpacaCryptoProvider, AlpacaCryptoProviderConfig, AlpacaCryptoVenue, AlpacaProvider,
         AlpacaProviderConfig, alpaca, alpaca_crypto,
     },
     storage::{TursoCache, TursoCacheConfig, TursoTapLog, TursoTapLogConfig},
 };
+use datamancer_core::ScopeName;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DaemonError, Result};
@@ -229,6 +231,9 @@ pub struct SessionConfig {
     /// of them.
     #[serde(default = "default_query_persistence")]
     pub query_persistence: PersistenceCfg,
+    /// How many days back a client's `live_backfill` may start.
+    #[serde(default = "default_max_backfill_days")]
+    pub max_backfill_days: u32,
 }
 
 impl Default for SessionConfig {
@@ -237,8 +242,13 @@ impl Default for SessionConfig {
             resume_buffer_events: default_resume_buffer(),
             adjustment: AdjustmentCfg::default(),
             query_persistence: default_query_persistence(),
+            max_backfill_days: default_max_backfill_days(),
         }
     }
+}
+
+const fn default_max_backfill_days() -> u32 {
+    7
 }
 
 const fn default_resume_buffer() -> usize {
@@ -291,8 +301,16 @@ pub struct ServerConfig {
     /// services are not scoped by it.
     #[serde(default = "default_service_prefix")]
     pub service_prefix: String,
+    /// Seconds the whole exit may take after SIGTERM/SIGINT, every drain step
+    /// and the runtime's own shutdown included. At least 1; the web and WS
+    /// drains take at most half of it.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
+    /// Client backfills that fetch history at once, UDS and WS together. One
+    /// past it waits for another's history to end; a subscribe that joins an
+    /// open session does not count. At least 1.
+    #[serde(default = "default_max_concurrent_backfills")]
+    pub max_concurrent_backfills: usize,
     /// Windows only: when `true`, the control pipe accepts a daemon or client
     /// at any integrity level instead of requiring Medium. Ignored off Windows.
     #[serde(default)]
@@ -305,6 +323,7 @@ impl Default for ServerConfig {
             admin_socket: default_admin_socket(),
             service_prefix: default_service_prefix(),
             shutdown_timeout_secs: default_shutdown_timeout(),
+            max_concurrent_backfills: default_max_concurrent_backfills(),
             allow_any_integrity: false,
         }
     }
@@ -321,6 +340,10 @@ fn default_service_prefix() -> String {
 
 const fn default_shutdown_timeout() -> u64 {
     30
+}
+
+const fn default_max_concurrent_backfills() -> usize {
+    2
 }
 
 /// Diagnostics-plane cadence.
@@ -487,7 +510,7 @@ pub struct StartupSession {
     pub symbol: String,
     pub kind: EventKindCfg,
     #[serde(default)]
-    pub scope: ScopeCfg,
+    pub scope: ScopeName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_from: Option<String>,
     #[serde(default)]
@@ -498,7 +521,7 @@ pub struct StartupSession {
     pub always_on: bool,
 }
 
-pub use datamancer_client::spec::{AssetClassCfg, EventKindCfg, PersistenceCfg, ScopeCfg};
+pub use datamancer_client::spec::{AssetClassCfg, EventKindCfg, PersistenceCfg};
 
 /// Map a persistence preset to the library [`PersistenceOptions`]. Lives here
 /// (not on the moved enum) because the target type is the orchestrator's.
@@ -545,36 +568,32 @@ impl StartupSession {
         )
     }
 
-    /// Resolve the [`Scope`], rejecting `live_backfill` without `backfill_from`
-    /// and an unparseable timestamp.
+    /// Resolve the [`LiveScope`], rejecting `live_backfill` without
+    /// `backfill_from`, `live` with one, and an unparseable timestamp.
     ///
     /// # Errors
     ///
     /// [`DaemonError::ConfigInvalid`] when `live_backfill` lacks a valid
-    /// `backfill_from`.
-    pub fn resolve_scope(&self) -> Result<Scope> {
-        match self.scope {
-            ScopeCfg::Live => Ok(Scope::Live {
-                backfill_from: None,
-            }),
-            ScopeCfg::LiveBackfill => {
-                let raw = self.backfill_from.as_deref().ok_or_else(|| {
-                    DaemonError::ConfigInvalid(format!(
-                        "startup_session {}/{} uses scope=live_backfill but has no backfill_from",
-                        self.symbol, self.provider
-                    ))
-                })?;
-                let ts = parse_rfc3339_nanos(raw).ok_or_else(|| {
+    /// `backfill_from`, or `live` has one.
+    pub fn resolve_scope(&self) -> Result<LiveScope> {
+        let backfill_from = self
+            .backfill_from
+            .as_deref()
+            .map(|raw| {
+                parse_rfc3339_nanos(raw).ok_or_else(|| {
                     DaemonError::ConfigInvalid(format!(
                         "startup_session {} backfill_from {raw:?} is not an RFC3339 timestamp",
                         self.symbol
                     ))
-                })?;
-                Ok(Scope::Live {
-                    backfill_from: Some(ts),
                 })
-            }
-        }
+            })
+            .transpose()?;
+        LiveScope::from_parts(self.scope, backfill_from).map_err(|e| {
+            DaemonError::ConfigInvalid(format!(
+                "startup_session {}/{}: {e}",
+                self.symbol, self.provider
+            ))
+        })
     }
 }
 
@@ -730,8 +749,28 @@ impl Config {
                     s.symbol
                 )));
             }
-            // Surface a scope/backfill mismatch at validate time.
             s.resolve_scope()?;
+        }
+        if self.server.shutdown_timeout_secs == 0 {
+            return Err(DaemonError::ConfigInvalid(
+                "[server].shutdown_timeout_secs must be at least 1".to_string(),
+            ));
+        }
+        if self.server.max_concurrent_backfills == 0 {
+            return Err(DaemonError::ConfigInvalid(
+                "[server].max_concurrent_backfills must be at least 1".to_string(),
+            ));
+        }
+        if self.server.max_concurrent_backfills > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(DaemonError::ConfigInvalid(format!(
+                "[server].max_concurrent_backfills must be at most {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
+        if self.session.max_backfill_days == 0 {
+            return Err(DaemonError::ConfigInvalid(
+                "[session].max_backfill_days must be greater than 0".to_string(),
+            ));
         }
         // A zero publish interval would panic `tokio::time::interval`, which both
         // the iceoryx2 diagnostics ticker (unix) and the WS health-push task
@@ -821,6 +860,18 @@ impl Config {
     ) -> Result<BuiltRuntime> {
         let mut builder = Datamancer::builder()
             .resume_buffer_events(self.session.resume_buffer_events)
+            .max_client_backfill(Duration::from_secs(
+                u64::from(self.session.max_backfill_days) * 86_400,
+            ))
+            .max_concurrent_client_backfills(
+                std::num::NonZeroUsize::new(self.server.max_concurrent_backfills).ok_or_else(
+                    || {
+                        DaemonError::ConfigInvalid(
+                            "[server].max_concurrent_backfills must be at least 1".to_string(),
+                        )
+                    },
+                )?,
+            )
             .adjustment(self.session.adjustment.into());
 
         // Cycle 3: every compiled-in provider is constructed and registered,
@@ -1166,6 +1217,21 @@ account_type = "paper"
     }
 
     #[test]
+    fn a_shutdown_timeout_under_one_second_is_rejected() {
+        let config = Config::parse("[server]\nshutdown_timeout_secs = 0\n").expect("parse");
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("shutdown_timeout_secs"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid for a zero shutdown timeout, got {other:?}"),
+        }
+        Config::parse("[server]\nshutdown_timeout_secs = 1\n")
+            .expect("parse")
+            .validate()
+            .expect("one second validates");
+    }
+
+    #[test]
     fn zero_ws_channel_depth_is_rejected() {
         // `channel_depth = 0` would panic `mpsc::channel` on the first WS
         // connection; validation must reject it up front.
@@ -1287,6 +1353,89 @@ persistence = "tap_only"
     }
 
     #[test]
+    fn config_validation_does_not_read_the_clock_for_a_backfill_start() {
+        let text = r#"
+[provider.alpaca_crypto]
+account_type = "paper"
+
+[[startup_session]]
+provider = "alpaca-crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+scope = "live_backfill"
+backfill_from = "2200-01-01T00:00:00Z"
+"#;
+        let config = Config::parse(text).expect("parse");
+        config
+            .validate()
+            .expect("the anchor's open checks the start");
+    }
+
+    #[test]
+    fn max_concurrent_backfills_past_the_semaphore_limit_is_refused() {
+        let mut config = Config::parse("").expect("parse");
+        config.server.max_concurrent_backfills = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(config.validate().is_ok());
+        config.server.max_concurrent_backfills = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("max_concurrent_backfills"), "{msg}");
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_concurrent_backfills_defaults_to_two_and_refuses_zero() {
+        let mut config = Config::parse("").expect("parse");
+        assert_eq!(config.server.max_concurrent_backfills, 2);
+        config.server.max_concurrent_backfills = 0;
+        match config.validate() {
+            Err(DaemonError::ConfigInvalid(msg)) => {
+                assert!(msg.contains("max_concurrent_backfills"), "{msg}");
+            }
+            other => {
+                panic!("expected ConfigInvalid for zero max_concurrent_backfills, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn max_backfill_days_defaults_to_a_week_and_refuses_zero() {
+        let mut config = Config::parse("").expect("parse");
+        assert_eq!(config.session.max_backfill_days, 7);
+        config.session.max_backfill_days = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_rejects_a_backfill_from_under_scope_live() {
+        let text = r#"
+[provider.alpaca_crypto]
+account_type = "paper"
+
+[[startup_session]]
+provider = "alpaca-crypto"
+asset_class = "crypto"
+symbol = "BTC/USD"
+kind = "trade"
+scope = "live"
+backfill_from = "2024-01-01T00:00:00Z"
+"#;
+        let config = Config::parse(text).expect("parse");
+        match config.validate().expect_err("must reject") {
+            DaemonError::ConfigInvalid(m) => {
+                assert!(
+                    m.contains("backfill_from requires scope live_backfill"),
+                    "{m}"
+                );
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn config_rejects_live_backfill_without_from() {
         let text = r#"
 [provider.alpaca_crypto]
@@ -1370,16 +1519,13 @@ persistence = "none"
         let inst = s.instrument();
         assert_eq!(inst.symbol(), "BTC/USD");
         assert_eq!(inst.provider().as_str(), "alpaca-crypto");
-        let scope = s.resolve_scope().expect("scope");
-        match scope {
-            Scope::Live {
-                backfill_from: Some(ts),
-            } => {
-                // 2026-06-01T00:00:00Z in epoch nanos.
-                assert_eq!(ts.0, 1_780_272_000 * 1_000_000_000);
+        // 2026-06-01T00:00:00Z in epoch nanos.
+        assert_eq!(
+            s.resolve_scope().expect("scope"),
+            LiveScope::LiveBackfill {
+                from: Timestamp(1_780_272_000 * 1_000_000_000)
             }
-            other => panic!("wrong scope: {other:?}"),
-        }
+        );
     }
 
     #[test]

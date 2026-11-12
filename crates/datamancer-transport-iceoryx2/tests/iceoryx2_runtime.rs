@@ -1,14 +1,14 @@
 //! iceoryx2 runtime integration tests.
 //!
 //! These need a live iceoryx2 runtime (shared memory + service discovery), so
-//! they are `#[ignore]`d in CI like `alpaca_real.rs`. Run explicitly with:
+//! they are `#[ignore]`d and CI runs them in a step of their own. Run
+//! explicitly with:
 //!
 //! ```text
 //! cargo test -p datamancer-transport-iceoryx2 --test iceoryx2_runtime -- --ignored
 //! ```
 //!
-//! They compile in normal CI (protecting the runtime API surface) but do not
-//! run. Each test uses a distinct client id / process-unique node so concurrent
+//! Each test uses a distinct client id / process-unique node so concurrent
 //! runs do not collide on service names.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,6 +140,117 @@ async fn flush_drains_before_exit() {
     assert!(received.iter().any(
         |e| matches!(e, MarketEvent::Control(c) if matches!(c.kind, ControlKind::SessionClosing))
     ));
+}
+
+/// A subscriber whose queue is full makes `publish` wait, without holding the
+/// thread: a reader that drains lets the waiting `publish` complete, and a
+/// `publish` dropped while it waits never delivers its sample.
+#[tokio::test]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_full_subscriber_makes_publish_wait_until_it_reads() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let node = node();
+    let sink = Arc::new(Iceoryx2DataSink::new(&node, name(unique_client_id())).expect("sink"));
+    let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
+
+    // Publish until one waits; dropping it at the timeout abandons that sample.
+    let mut filled = 0;
+    loop {
+        let ev = trade("BTC/USD", filled, 100);
+        match tokio::time::timeout(Duration::from_millis(200), sink.publish(ev)).await {
+            Ok(outcome) => {
+                assert!(matches!(
+                    outcome,
+                    datamancer_core::PublishOutcome::Delivered
+                ));
+                filled += 1;
+                assert!(filled < 1000, "publish never waited on the full queue");
+            }
+            Err(_) => break,
+        }
+    }
+
+    // The next publish waits while nobody reads...
+    let waiting = tokio::spawn({
+        let sink = sink.clone();
+        async move { sink.publish(trade("BTC/USD", filled + 1, 100)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !waiting.is_finished(),
+        "publish completed into a full queue"
+    );
+
+    // ...and completes once the reader drains.
+    let mut seqs = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !waiting.is_finished() || seqs.len() < usize::try_from(filled).unwrap() + 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "drain timed out: {seqs:?}"
+        );
+        for ev in sub.poll().expect("poll") {
+            if let MarketEvent::Trade(t) = ev {
+                seqs.push(t.seq.0);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(matches!(
+        waiting.await.expect("publish task"),
+        datamancer_core::PublishOutcome::Delivered
+    ));
+    let mut expected: Vec<u64> = (0..filled).collect();
+    expected.push(filled + 1);
+    assert_eq!(seqs, expected, "the dropped publish delivered nothing");
+}
+
+/// A subscriber that attaches between publishes gets each sample at most
+/// once: what it receives from the history and live is strictly increasing in
+/// `seq`.
+#[tokio::test]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_late_subscriber_receives_strictly_increasing_seqs() {
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(unique_client_id())).expect("sink");
+    for seq in 0..3 {
+        sink.publish(trade("BTC/USD", seq, 100)).await;
+    }
+    let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
+    for seq in 3..6 {
+        sink.publish(trade("BTC/USD", seq, 100)).await;
+    }
+    sink.flush().await.expect("flush");
+
+    let seqs: Vec<u64> = drain_until(&mut sub, 6)
+        .iter()
+        .filter_map(|e| match e {
+            MarketEvent::Trade(t) => Some(t.seq.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5]);
+}
+
+/// A client data service takes one subscriber: a second is refused while
+/// the first is attached, and a new one attaches once it has gone.
+#[tokio::test]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_data_service_refuses_a_second_subscriber() {
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(unique_client_id())).expect("sink");
+    let first = DataSubscriber::open(&node, sink.data_service_name()).expect("first");
+    assert!(
+        DataSubscriber::open(&node, sink.data_service_name()).is_err(),
+        "a second subscriber attached"
+    );
+    drop(first);
+    let mut next = DataSubscriber::open(&node, sink.data_service_name()).expect("reattach");
+    let ev = trade("BTC/USD", 1, 100);
+    sink.publish(ev.clone()).await;
+    assert_eq!(drain_until(&mut next, 1), vec![ev]);
 }
 
 #[tokio::test]

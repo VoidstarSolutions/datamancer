@@ -66,6 +66,8 @@ pub trait HistoricalCache: Send + Sync {
     /// uncovered fringes of the requested range. Backends that track
     /// internal gaps (multi-segment coverage) should override this to
     /// surface mid-range holes that `lookup` cannot.
+    ///
+    /// The future may be dropped before it completes.
     async fn gaps(&self, key: &CacheKey) -> Result<Vec<GapSpan>> {
         let coverage = self.lookup(key).await?;
         let mut spans = Vec::new();
@@ -188,7 +190,7 @@ impl CacheCatalogEntry {
 pub trait ReplaySource: Send + Sync {
     /// Open the stream over `request`. Implementations yield events in
     /// `seq` order; the returned stream completes when the request range is
-    /// exhausted.
+    /// exhausted. The future may be dropped before it completes.
     async fn open(&self, request: ReplayRequest) -> Result<BoxStream<'static, MarketEvent>>;
 }
 
