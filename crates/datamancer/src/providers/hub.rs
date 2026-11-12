@@ -451,11 +451,10 @@ async fn run_hub<C: Connector>(connector: C, mut cmd_rx: mpsc::Receiver<HubComma
                             }
                         }
                         Err(err) => {
-                            // oxidized_alpaca 0.0.10: `Error::StreamingError`
-                            // carries the server's envelope mid-stream, so a
-                            // `402` parks and a `406`/`407` backs off; a
-                            // mid-stream `StreamingAuth` is connect-only
-                            // upstream today and handled the same way.
+                            // The connector's `classify` decides: a failure it
+                            // reads as rejected credentials (for Alpaca, a
+                            // mid-stream `402`) parks below; anything else
+                            // (a `406`/`407`, a dropped socket) backs off.
                             let failure = C::classify(&err);
                             let unauthenticated = failure == StreamFailure::Unauthenticated;
                             tracing::warn!(
@@ -892,6 +891,8 @@ pub(super) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 #[cfg(test)]
 pub(super) mod tests {
     use std::collections::{BTreeSet, VecDeque};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use datamancer_core::{
         AssetClass, Bar, BarInterval, ErrorOrigin, FanoutId, Price, ProviderId, Quantity, Trade,
@@ -963,6 +964,14 @@ pub(super) mod tests {
         fn idle() -> Self {
             Self::default()
         }
+
+        /// An upstream whose first `next_events` fails with `refused`.
+        fn failing_with(refused: Refused) -> Self {
+            Self {
+                events: VecDeque::from([Err(refused)]),
+                ..Self::default()
+            }
+        }
     }
 
     impl Upstream for FakeUpstream {
@@ -998,6 +1007,7 @@ pub(super) mod tests {
         settings: SettingsSource<()>,
         credentials: CredentialsSource,
         reconnect: ReconnectPolicy,
+        connect_count: Arc<AtomicUsize>,
     }
 
     impl FakeConnector {
@@ -1014,11 +1024,31 @@ pub(super) mod tests {
                     max_backoff_ms: 30_000,
                     jitter: false,
                 },
+                connect_count: Arc::default(),
             }
         }
 
         fn never_connects() -> Self {
             Self::scripted(vec![])
+        }
+
+        /// As `scripted`, but credentials come from a `Watch` source that
+        /// starts provisioned; the sender rotates them.
+        fn with_watched_credentials(
+            connects: Vec<std::result::Result<FakeUpstream, Refused>>,
+        ) -> (watch::Sender<Option<AlpacaCredentials>>, Self) {
+            let (creds_tx, creds_rx) = watch::channel(Some(test_credentials()));
+            let connector = Self {
+                credentials: CredentialsSource::Watch(creds_rx),
+                ..Self::scripted(connects)
+            };
+            (creds_tx, connector)
+        }
+
+        /// How many times the hub has called `connect`, readable after the
+        /// connector moves into the hub.
+        fn connect_count(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.connect_count)
         }
     }
 
@@ -1045,6 +1075,7 @@ pub(super) mod tests {
             _settings: &(),
             _credentials: PresentCredentials,
         ) -> impl Future<Output = std::result::Result<FakeUpstream, Refused>> + Send {
+            self.connect_count.fetch_add(1, Ordering::SeqCst);
             let next = self
                 .connects
                 .lock()
@@ -1069,6 +1100,13 @@ pub(super) mod tests {
         let cmd_tx = slot.ensure(|| connector);
         let task = slot.take_task().expect("the hub was spawned");
         (task, cmd_tx)
+    }
+
+    fn test_credentials() -> AlpacaCredentials {
+        AlpacaCredentials {
+            key_id: "test-key".to_string(),
+            secret: "test-secret".to_string(),
+        }
     }
 
     fn instrument(symbol: &str) -> Instrument {
@@ -1101,6 +1139,91 @@ pub(super) mod tests {
             matches!(err, Error::Provider { ref message, .. } if message == "provider is reconnecting")
         );
         drop(hub);
+    }
+
+    /// A mid-stream rejection of the credentials parks the hub: it does not
+    /// reconnect on its own, however long it waits, until they rotate.
+    #[tokio::test(start_paused = true)]
+    async fn a_mid_stream_auth_rejection_parks_until_credentials_rotate() {
+        let (creds_tx, connector) = FakeConnector::with_watched_credentials(vec![
+            Ok(FakeUpstream::failing_with(Refused(
+                StreamFailure::Unauthenticated,
+            ))),
+            Ok(FakeUpstream::idle()),
+        ]);
+        let connects = connector.connect_count();
+        let (_hub, _cmd_tx) = spawn_hub(connector);
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            1,
+            "a parked hub does not reconnect on its own"
+        );
+        creds_tx.send(Some(test_credentials())).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "a rotation reconnects it"
+        );
+    }
+
+    /// A connect refused as unauthenticated with credentials that cannot
+    /// rotate does not park: the routes hear an unauthenticated disconnect,
+    /// and the hub connects again once its backoff elapses.
+    #[tokio::test(start_paused = true)]
+    async fn an_unauthenticated_connect_with_unwatched_credentials_backs_off() {
+        let (settings_tx, settings_rx) = watch::channel(Some(()));
+        let connector = FakeConnector {
+            // A watched settings source, so a settings change can force the
+            // reconnect after the route is in place.
+            settings: SettingsSource::Watch(settings_rx),
+            ..FakeConnector::scripted(vec![
+                Ok(FakeUpstream::idle()),
+                Err(Refused(StreamFailure::Unauthenticated)),
+            ])
+        };
+        assert!(matches!(connector.credentials, CredentialsSource::Env));
+        let connects = connector.connect_count();
+        let (_hub, cmd_tx) = spawn_hub(connector);
+        let (sink, mut rx) = mpsc::channel(8);
+        let handle = SharedLiveHandle::new(cmd_tx, sink);
+        handle
+            .subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("subscribes on the first connection");
+
+        settings_tx.send(Some(())).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(connects.load(Ordering::SeqCst), 2, "the hub reconnected");
+        let mut causes = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let MarketEvent::Control(Control {
+                kind: ControlKind::ProviderDisconnected { cause, .. },
+                ..
+            }) = ev
+            {
+                causes.push(cause);
+            }
+        }
+        assert_eq!(
+            causes,
+            [DisconnectCause::Error, DisconnectCause::Unauthenticated],
+            "the settings change, then the refused connect"
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "the hub waits out its backoff"
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            3,
+            "the hub retries after its backoff instead of parking"
+        );
     }
 
     #[test]
