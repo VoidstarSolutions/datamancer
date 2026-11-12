@@ -5,10 +5,13 @@
 //! *every* surface a scope needs. A backfilling live session needs history and
 //! live from that single provider.
 
+mod common;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use common::joined_as;
 use datamancer::{
     AssetClass, Datamancer, Error, EventKind, Instrument, LiveHandle, LiveScope, MarketEvent,
     PersistenceOptions, Provider, ProviderId, Result, Scope, Subscribed, Surface, Timestamp,
@@ -122,9 +125,7 @@ fn assert_disabled(err: &Error, want: &str) {
     );
 }
 
-const LIVE: Scope = Scope::Live {
-    backfill_from: None,
-};
+const LIVE: Scope = Scope::live();
 
 /// An instrument whose id no test provider owns.
 fn unowned() -> Instrument {
@@ -150,9 +151,7 @@ async fn live_only_provider_serves_a_plain_live_session() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await;
@@ -183,9 +182,7 @@ async fn history_only_provider_is_rejected_for_live() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -202,9 +199,7 @@ async fn backfill_requires_both_surfaces() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::default(),
         )
         .await
@@ -218,7 +213,7 @@ async fn backfill_requires_both_surfaces() {
 #[tokio::test]
 async fn a_backfill_request_joins_an_open_session_without_a_history_surface() {
     let dm = dm(vec![live_only("fake")]);
-    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let backfill = LiveScope::backfill(Timestamp(0));
     let none = PersistenceOptions::none();
 
     let refused = dm
@@ -230,7 +225,7 @@ async fn a_backfill_request_joins_an_open_session_without_a_history_surface() {
 
     let creator = dm.client_session();
     creator
-        .subscribe(instrument(), EventKind::Trade, LiveScope::Live, none)
+        .subscribe(instrument(), EventKind::Trade, LiveScope::default(), none)
         .await
         .expect("live needs only the live surface");
     let joined = dm
@@ -238,7 +233,7 @@ async fn a_backfill_request_joins_an_open_session_without_a_history_surface() {
         .subscribe(instrument(), EventKind::Trade, backfill, none)
         .await
         .expect("a joiner needs no history surface");
-    assert_eq!(joined, Subscribed::joined(LiveScope::Live, false));
+    assert!(joined_as(joined, LiveScope::default(), false), "{joined:?}");
 }
 
 /// Two providers between them cover both surfaces, but the instrument names
@@ -250,9 +245,7 @@ async fn backfill_refuses_to_split_surfaces_across_providers() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::default(),
         )
         .await
@@ -274,9 +267,7 @@ async fn provider_serving_both_surfaces_satisfies_backfill() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::default(),
         )
         .await;
@@ -345,9 +336,7 @@ async fn instrument_provider_id_picks_among_overlapping_providers() {
                 "AAPL",
             ),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -404,7 +393,7 @@ async fn subscribe_to_an_id_no_provider_owns_is_an_unknown_provider() {
         .subscribe(
             unowned(),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::default(),
         )
         .await
@@ -426,9 +415,7 @@ async fn named_provider_that_cannot_serve_is_an_error_not_a_fallthrough() {
         .session(
             Instrument::new(ProviderId::from_static("named"), AssetClass::Equity, "AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -452,9 +439,7 @@ async fn disabled_named_provider_is_an_error_not_a_fallthrough() {
         .session(
             Instrument::new(ProviderId::from_static("named"), AssetClass::Equity, "AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -509,7 +494,7 @@ async fn joiner_on_a_disabled_provider_is_refused_like_a_creator() {
         .subscribe(
             instrument(),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::default(),
         )
         .await
@@ -521,12 +506,15 @@ async fn joiner_on_a_disabled_provider_is_refused_like_a_creator() {
         .subscribe(
             instrument(),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::default(),
         )
         .await
         .expect("joins once enabled");
-    assert_eq!(outcome, Subscribed::joined(LiveScope::Live, false));
+    assert!(
+        joined_as(outcome, LiveScope::default(), false),
+        "{outcome:?}"
+    );
     let _ = client.close().await;
     let _ = holder.close().await;
 }
@@ -542,9 +530,7 @@ async fn backfill_request_joins_a_pair_held_pure_live_by_a_live_only_provider() 
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::default(),
         )
         .await
@@ -554,12 +540,15 @@ async fn backfill_request_joins_a_pair_held_pure_live_by_a_live_only_provider() 
         .subscribe(
             instrument(),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(1) },
+            LiveScope::backfill(Timestamp(1)),
             PersistenceOptions::default(),
         )
         .await
         .expect("joins the pure-live session instead of routing for history");
-    assert_eq!(outcome, Subscribed::joined(LiveScope::Live, false));
+    assert!(
+        joined_as(outcome, LiveScope::default(), false),
+        "{outcome:?}"
+    );
     let _ = client.close().await;
     let _ = holder.close().await;
 }
@@ -621,9 +610,7 @@ async fn a_future_start_on_a_disabled_provider_answers_the_start_refusal() {
         .session(
             instrument(),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(future),
-            },
+            Scope::live_backfill(future),
             PersistenceOptions::default(),
         )
         .await
@@ -760,7 +747,7 @@ async fn a_lost_race_join_on_a_disabled_provider_is_refused() {
     let disable = async {
         fake.enabled.store(false, Ordering::SeqCst);
     };
-    let err = lose_the_race(&dm, &fake, LiveScope::Live, disable)
+    let err = lose_the_race(&dm, &fake, LiveScope::live(), disable)
         .await
         .expect_err("the session's provider is disabled");
     assert_disabled(&err, "fake");
@@ -784,14 +771,9 @@ async fn the_backfill_limit_is_checked_on_a_lost_race_join() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     };
-    let err = lose_the_race(
-        &dm,
-        &fake,
-        LiveScope::LiveBackfill { from },
-        age_past_the_limit,
-    )
-    .await
-    .expect_err("the backfill is now older than the limit");
+    let err = lose_the_race(&dm, &fake, LiveScope::backfill(from), age_past_the_limit)
+        .await
+        .expect_err("the backfill is now older than the limit");
     assert!(
         matches!(err, Error::BackfillTooOld { from: got, .. } if got == from),
         "{err:?}"

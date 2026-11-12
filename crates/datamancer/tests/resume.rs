@@ -231,9 +231,7 @@ async fn overflow_reports_one_gap_and_tap_log_captures_everything() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await
@@ -354,9 +352,7 @@ async fn stitched_session_splices_cache_provider_and_live_in_order() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::cached(),
         )
         .await
@@ -421,9 +417,7 @@ async fn failed_backfill_gaps_to_the_live_edge_and_live_continues() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::cached(),
         )
         .await
@@ -473,9 +467,7 @@ async fn tap_log_captures_only_the_live_tail_of_a_stitched_session() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::cached().with_tap_log(true),
         )
         .await
@@ -535,9 +527,7 @@ async fn tap_log_replay_reproduces_the_source_seq() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await

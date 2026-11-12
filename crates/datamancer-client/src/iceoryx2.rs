@@ -164,6 +164,12 @@ struct ControlHandle {
     tx: tokio::sync::mpsc::UnboundedSender<ControlCmd>,
 }
 
+/// Whether a failed round trip leaves the control connection unusable. A
+/// request or reply line that does not decode leaves the line framing intact.
+fn breaks_the_connection(error: &Iceoryx2ClientError) -> bool {
+    !matches!(error, Iceoryx2ClientError::Codec(_))
+}
+
 impl ControlHandle {
     /// Spawn the task that owns `conn` and returns a handle to it.
     fn spawn(mut conn: ControlConn) -> Self {
@@ -173,7 +179,7 @@ impl ControlHandle {
                 match cmd {
                     ControlCmd::Request { request, reply } => {
                         let result = conn.request(&request).await;
-                        let failed = result.is_err();
+                        let failed = result.as_ref().is_err_and(breaks_the_connection);
                         let _ = reply.send(result);
                         if failed {
                             // The connection is unusable; every later caller
@@ -182,7 +188,11 @@ impl ControlHandle {
                         }
                     }
                     ControlCmd::Fire(request) => {
-                        if conn.request(&request).await.is_err() {
+                        if conn
+                            .request(&request)
+                            .await
+                            .is_err_and(|e| breaks_the_connection(&e))
+                        {
                             break;
                         }
                     }
@@ -440,15 +450,29 @@ impl Client for Iceoryx2Client {
         &mut self,
         spec: &SubscriptionSpec,
     ) -> Result<Subscribed, ClientError<Self::Error>> {
-        let reply = self
+        let reply = match self
             .control
             .request(&Request::Subscribe {
                 client: self.client_name.clone(),
                 spec: spec.clone(),
             })
             .await
-            .map_err(ClientError::Transport)?;
-        check(reply).map(|reply| reply.subscribed())
+        {
+            Ok(reply) => reply,
+            // The daemon answered, but the reply cannot be read, so it may
+            // hold the subscription.
+            Err(e @ Iceoryx2ClientError::Codec(_)) => {
+                let _ = self.unsubscribe(&spec.clone().into()).await;
+                return Err(ClientError::Transport(e));
+            }
+            Err(e) => return Err(ClientError::Transport(e)),
+        };
+        let subscribed = check(reply)?.subscribed();
+        if let Err(e) = spec.check_subscribed(&subscribed) {
+            let _ = self.unsubscribe(&spec.clone().into()).await;
+            return Err(e);
+        }
+        Ok(subscribed)
     }
 
     async fn unsubscribe(
@@ -798,6 +822,77 @@ mod tests {
             "close() must signal the poll task even when the request fails — \
              it consumes the client, so this is the last chance"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reply_with_an_unreadable_scope_unsubscribes_first() {
+        use super::Iceoryx2Client;
+        use crate::client::Client as _;
+        use crate::spec::SubscriptionSpec;
+
+        let subscribed = serde_json::to_string(&Reply::from_subscribed(
+            datamancer_core::Subscribed::created(datamancer_core::LiveScope::live()),
+        ))
+        .unwrap()
+        .replace(r#""scope":"live""#, r#""scope":"live_forever""#);
+        let (path, seen) = fake_uds_lines(vec![
+            subscribed,
+            serde_json::to_string(&Reply::ok()).unwrap(),
+        ]);
+        let mut client = Iceoryx2Client {
+            control: ControlHandle::spawn(ControlConn::connect(&path).await.unwrap()),
+            client_name: "c".to_string(),
+            stop: Arc::new(AtomicBool::new(false)),
+            poll_interval: std::time::Duration::from_millis(10),
+            event_buffer: 16,
+            closed: false,
+        };
+        let spec: SubscriptionSpec = serde_json::from_str(
+            r#"{"provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade"}"#,
+        )
+        .unwrap();
+        match client.subscribe(&spec).await {
+            Err(ClientError::Transport(Iceoryx2ClientError::Codec(_))) => {}
+            other => panic!("expected an unreadable reply, got {other:?}"),
+        }
+        let lines = seen.lock().unwrap().clone();
+        let sent: Vec<Request> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            matches!(sent.as_slice(), [Request::Subscribe { .. }, Request::Unsubscribe { spec, .. }] if spec.symbol == "BTC/USD"),
+            "the client unsubscribes first: {sent:?}"
+        );
+    }
+
+    /// Like [`fake_uds_recording`], with each reply a raw line.
+    #[cfg(unix)]
+    fn fake_uds_lines(replies: Vec<String>) -> (std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut replies = replies.into_iter();
+            while let Ok(Some(line)) = lines.next_line().await {
+                recorder.lock().unwrap().push(line);
+                if let Some(reply) = replies.next()
+                    && write
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        (path, seen)
     }
 
     #[cfg(unix)]

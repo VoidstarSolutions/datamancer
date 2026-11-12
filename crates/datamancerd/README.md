@@ -170,6 +170,7 @@ symbol = "BTC/USD"
 kind = "trade"                    # trade | quote | bar1s | bar1m | bar5m | bar15m | bar1h | bar1d
 scope = "live"                    # live | live_backfill
 # backfill_from = "2026-06-01T00:00:00Z" # required iff scope = live_backfill
+# seed = false                    # live only: no latest-value seed (default true)
 persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only | refresh | tap_only
 always_on = true                  # hold for the process lifetime regardless of clients
 
@@ -187,16 +188,17 @@ A daemon built with the off-by-default `scripted-provider` feature also has
 `[provider.scripted]`, a scripted test provider (`src/scripted.rs`) that
 serves scripted trades on both surfaces, for instruments naming `scripted`
 only, with no network or credentials. Its knobs are `history_prints`,
-`history_delay_ms`, `live_interval_ms` (greater than 0) and `latest`.
-Removed and then configured again, it resumes its open sessions' trades. A
-daemon built without the feature rejects the section as unknown.
+`history_delay_ms`, `live_interval_ms` (greater than 0), `latest` and
+`latest_delay_ms`. Removed and then configured again, it resumes its open
+sessions' trades. A daemon built without the feature rejects the section as
+unknown.
 
 Validation fails fast on the remaining cross-section invariants: a startup
 session naming a provider this binary lacks is refused; one using a cache preset
 requires `[cache]`; one writing the tap log requires `[tap_log]`;
-`scope = live_backfill` requires a parseable `backfill_from`, and `scope = live`
-refuses one. An `always_on` session's start must precede the live edge when it
-opens at boot.
+`scope = live_backfill` requires a parseable `backfill_from` and refuses a
+`seed`, and `scope = live` refuses a `backfill_from`. An `always_on` session's
+start must precede the live edge when it opens at boot.
 
 `[session] query_persistence` is the daemon's single cache policy for every
 `open-query` — queries carry no per-request persistence selector on the wire.
@@ -461,6 +463,8 @@ One JSON object per line; one reply line per request.
   -> {"ok":true,"service":"datamancerd/1729600000-4321/v3/data/0"}
 {"op":"subscribe","client":"exec-1","provider":"alpaca-crypto","asset_class":"crypto","symbol":"BTC/USD","kind":"trade","scope":"live","persistence":"cached_with_tap"}
   -> {"ok":true,"scope":"live"}
+{"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"trade","scope":"live","seed":false}
+  -> {"ok":true,"scope":"live","seed":false}
 {"op":"subscribe","client":"exec-1","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m","scope":"live_backfill","backfill_from":<t>,"persistence":"cached"}
   -> {"ok":true,"scope":"live_backfill","backfill_from":<t>}
 {"op":"subscribe","client":"exec-2","provider":"alpaca","asset_class":"equity","symbol":"AAPL","kind":"bar1m"}
@@ -507,6 +511,12 @@ One JSON object per line; one reply line per request.
 - `backfill_from` (epoch nanoseconds, inclusive) is required under
   `live_backfill` and refused under `live`; either disagreement is
   `bad_request`.
+- `seed` (default `true`, as is `null`) applies under `live`: `true`
+  delivers the provider's latest value as the first data event, if the provider
+  has one and no live print arrives first, and `false` delivers no data event
+  before the first live print. With no `scope`, `seed` is under `live`. Under
+  `live_backfill`, which never seeds, a non-null `seed` is `bad_request` and
+  `null` reads as absent.
 - A `backfill_from` at or past the live edge is `backfill_not_in_past`, on a
   subscribe that would create the session.
 - A `backfill_from` more than `[session] max_backfill_days` old is
@@ -519,19 +529,33 @@ One JSON object per line; one reply line per request.
 - With a tap log, live arrivals during a backfill reach it at the seam. An
   arrival the seam ring evicts, or one still buffered when the session closes
   before the seam, is not logged and leaves no mark in the log.
-- The reply's `scope` and `backfill_from` are the scope of the pair's shared
-  session, fixed by the subscriber that created it.
+- The reply's `scope`, `seed` and `backfill_from` are the scope of the pair's
+  shared session, fixed by the subscriber that created it. An absent `scope`
+  means `live`, and under `live` an absent `seed` means `true`, so a reply
+  carries `seed` only as `false`. An `always_on` startup session under `live`
+  creates its pair's session, seeded unless it sets `seed = false`, when it
+  was not skipped (see Lifecycle anchors). For a skipped one, or any other
+  startup session, the first client to subscribe decides.
 - `"joined":true` marks a subscriber that joined an open session; the creator's
   reply omits it. A joiner's stream begins where it joined, with no `Gap` for
-  what it missed.
+  what it missed. `seed: false` means no seed in this stream, for a creator
+  and a joiner alike.
+- `"seed_pending":true` on a joiner's reply means the session's latest-value
+  seed had not settled at the join: a seeded joiner's first data event is the
+  seed, unless it resolves empty or a live print comes first. A `seed: false`
+  joiner starts after the seed's slot; when the seed settles it is passed the
+  last subscription state and the last `ProviderConnected` or
+  `ProviderDisconnected` it waited through, with their original `seq`.
 - `"backfill_in_flight":true` on a joiner's reply means a backfill was running
   at the join: its stream carries what is left of it, then the buffered live
   arrivals, then the live tail. A joiner that needs the whole history uses
   `open-query`, and with the flag set must expect the overlap.
 
-`open-client` seeds follow the same rules and are live-only: any other scope
-is `bad_request`, checked for all seeds before any subscribes. A client that
-wants a backfill subscribes after opening.
+The `subscriptions` of `open-client` follow the same rules and are live-only:
+`seed` is honored and any other scope is `bad_request`, checked for all of
+them before any subscribes. A client that wants a backfill subscribes after
+opening. An unknown key in a control frame, in an `open-client` `subscriptions`
+element, or in any WS request frame is `bad_request`.
 
 How a backfill seams into the live tail is in the
 [library README](../datamancer/README.md#subscriptions).
@@ -682,19 +706,19 @@ Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 (`unsupported_event_kind`, `persistence_required`, `backfill_not_in_past`,
 `backfill_too_old`, `duplicate_subscription`, `not_subscribed`,
 `unknown_provider`, `provider_disabled` (from `subscribe`, creating or joining,
-`open-client` seeds, `open-query` under a policy that does not read the cache,
-`instruments` filtered to that provider, and `capabilities`), `unknown_client`,
-`duplicate_client`, `service_cap_exceeded`, `bad_request`, `shutting_down`,
-`credentials_missing`, `credential_backend_unavailable`, `permission_denied`,
-`unknown_config_field`, `unknown_query` (`cancel-query` named an id that is
-not in flight), `unsupported_on_windows` (the query ops on a Windows daemon,
-which has no iceoryx2 node), …). These are an operator contract and are
-regression-guarded. (`restart_required` is not an error code — it is the
-boolean `get-config`/`get`/`PUT /api/config` field and the string value a
-mutating config op's `applied` field carries when the config takes a restart
-to fully apply: a cold-classified field differs from the boot config, or an
-`always_on` startup session skipped at boot has its provider enabled and stays
-unopened.)
+`open-client` subscriptions, `open-query` under a policy that does not read the
+cache, `instruments` filtered to that provider, and `capabilities`),
+`unknown_client`, `duplicate_client`, `service_cap_exceeded`, `bad_request`,
+`shutting_down`, `credentials_missing`, `credential_backend_unavailable`,
+`permission_denied`, `unknown_config_field`, `unknown_query` (`cancel-query`
+named an id that is not in flight), `unsupported_on_windows` (the query ops
+on a Windows daemon, which has no iceoryx2 node), …). These are an operator
+contract and are regression-guarded. (`restart_required` is not an error code
+— it is the boolean `get-config`/`get`/`PUT /api/config` field and the string
+value a mutating config op's `applied` field carries when the config takes a
+restart to fully apply: a cold-classified field differs from the boot config,
+or an `always_on` startup session skipped at boot has its provider enabled and
+stays unopened.)
 
 ## Credentials
 

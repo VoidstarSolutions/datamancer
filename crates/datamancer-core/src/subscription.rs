@@ -13,18 +13,28 @@ use crate::Timestamp;
 /// connection up.
 pub const REPLAY_STALL_LIMIT: Duration = Duration::from_secs(30);
 
-/// What a live subscription covers. On the wire it is a `scope` name and,
-/// for a backfill, a `backfill_from`; no `scope` reads as live.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What a live subscription covers. On the wire it is a `scope` name, then
+/// `"seed":false` under an unseeded live or `backfill_from` under a backfill;
+/// no `scope` reads as live, and under live no `seed` reads as seeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "ScopeFields", try_from = "ScopeFields")]
 #[non_exhaustive]
 pub enum LiveScope {
-    /// Purely from "now".
-    #[default]
-    Live,
+    /// Purely from "now". Build it with [`LiveScope::live`] or
+    /// [`LiveScope::unseeded`].
+    #[non_exhaustive]
+    Live {
+        /// `true` on the subscribe that creates the session asks for the
+        /// provider's latest value as the first data event: an attempt, not a
+        /// value, since the provider may have none and a live print that
+        /// arrives first discards it. `false` means no seed in this stream,
+        /// for a creator and a joiner alike.
+        seed: bool,
+    },
     /// History from `from` up to the live edge, then the live arrivals
     /// buffered during the backfill, then the live tail. `from` must precede
     /// the live edge: see [`Error::BackfillFromNotInPast`](crate::Error::BackfillFromNotInPast).
+    /// Build it with [`LiveScope::backfill`].
     ///
     /// The live edge is the local clock read after the provider's subscribe
     /// returns, and nothing dedupes at the seam. An event between the start of
@@ -38,10 +48,18 @@ pub enum LiveScope {
     /// With a tap log, live arrivals reach it at the seam. An arrival the seam
     /// ring evicts, or one still buffered when the session closes before the
     /// seam, is not logged and leaves no mark in the log.
+    #[non_exhaustive]
     LiveBackfill {
         /// Inclusive source-time start of the history.
         from: Timestamp,
     },
+}
+
+impl Default for LiveScope {
+    /// [`LiveScope::DEFAULT`].
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// The name of a [`LiveScope`], without its data.
@@ -66,6 +84,9 @@ pub enum ScopeMismatch {
     /// A start under [`ScopeName::Live`].
     #[error("backfill_from requires scope live_backfill")]
     UnexpectedBackfillFrom,
+    /// A seed choice anywhere but under [`ScopeName::Live`].
+    #[error("seed requires scope live")]
+    UnexpectedSeed,
 }
 
 /// The JSON form of a [`LiveScope`].
@@ -75,17 +96,42 @@ struct ScopeFields {
     scope: Option<ScopeName>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     backfill_from: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seed: Option<bool>,
+}
+
+impl ScopeFields {
+    /// The scope these fields name. An absent `scope` means live.
+    fn parse(self) -> Result<LiveScope, ScopeMismatch> {
+        match (
+            self.scope.unwrap_or_default(),
+            self.backfill_from,
+            self.seed,
+        ) {
+            (ScopeName::Live, None, seed) => Ok(LiveScope::Live {
+                seed: seed.unwrap_or(true),
+            }),
+            (ScopeName::Live, Some(_), _) => Err(ScopeMismatch::UnexpectedBackfillFrom),
+            (ScopeName::LiveBackfill, Some(from), None) => Ok(LiveScope::LiveBackfill { from }),
+            (ScopeName::LiveBackfill, Some(_), Some(_)) => Err(ScopeMismatch::UnexpectedSeed),
+            (ScopeName::LiveBackfill, None, _) => Err(ScopeMismatch::MissingBackfillFrom),
+        }
+    }
 }
 
 impl From<LiveScope> for ScopeFields {
     fn from(scope: LiveScope) -> Self {
-        let name = match scope {
-            LiveScope::Live => ScopeName::Live,
-            LiveScope::LiveBackfill { .. } => ScopeName::LiveBackfill,
-        };
-        Self {
-            scope: Some(name),
-            backfill_from: scope.backfill_from(),
+        match scope {
+            LiveScope::Live { seed } => Self {
+                scope: Some(ScopeName::Live),
+                backfill_from: None,
+                seed: (!seed).then_some(false),
+            },
+            LiveScope::LiveBackfill { from } => Self {
+                scope: Some(ScopeName::LiveBackfill),
+                backfill_from: Some(from),
+                seed: None,
+            },
         }
     }
 }
@@ -94,30 +140,54 @@ impl TryFrom<ScopeFields> for LiveScope {
     type Error = ScopeMismatch;
 
     fn try_from(fields: ScopeFields) -> Result<Self, ScopeMismatch> {
-        Self::from_parts(fields.scope.unwrap_or_default(), fields.backfill_from)
+        fields.parse()
     }
 }
 
 impl LiveScope {
-    /// Build a scope from its name and backfill start.
+    /// A live scope, seeded: what [`Default`] gives.
+    pub const DEFAULT: Self = Self::live();
+
+    /// [`LiveScope::Live`], seeded.
+    #[must_use]
+    pub const fn live() -> Self {
+        Self::Live { seed: true }
+    }
+
+    /// [`LiveScope::Live`] with no latest-value seed.
+    #[must_use]
+    pub const fn unseeded() -> Self {
+        Self::Live { seed: false }
+    }
+
+    /// [`LiveScope::LiveBackfill`] from `from`.
+    #[must_use]
+    pub const fn backfill(from: Timestamp) -> Self {
+        Self::LiveBackfill { from }
+    }
+
+    /// Build a scope from its name, backfill start and seed choice, by the
+    /// wire's rule: a live scope with no seed choice seeds.
     ///
     /// # Errors
     ///
     /// [`ScopeMismatch::MissingBackfillFrom`] for a backfill with no start,
-    /// [`ScopeMismatch::UnexpectedBackfillFrom`] for a start without one.
-    pub const fn from_parts(
+    /// [`ScopeMismatch::UnexpectedBackfillFrom`] for a start without one, and
+    /// [`ScopeMismatch::UnexpectedSeed`] for a seed choice on a backfill.
+    pub fn from_parts(
         name: ScopeName,
         backfill_from: Option<Timestamp>,
+        seed: Option<bool>,
     ) -> Result<Self, ScopeMismatch> {
-        match (name, backfill_from) {
-            (ScopeName::Live, None) => Ok(Self::Live),
-            (ScopeName::LiveBackfill, Some(from)) => Ok(Self::LiveBackfill { from }),
-            (ScopeName::LiveBackfill, None) => Err(ScopeMismatch::MissingBackfillFrom),
-            (ScopeName::Live, Some(_)) => Err(ScopeMismatch::UnexpectedBackfillFrom),
+        ScopeFields {
+            scope: Some(name),
+            backfill_from,
+            seed,
         }
+        .parse()
     }
 
-    /// Parse a scope that may be absent: no `scope` and no `backfill_from`
+    /// Parse a scope that may be absent: no `scope`, `backfill_from` or `seed`
     /// read as `None`.
     ///
     /// # Errors
@@ -127,19 +197,17 @@ impl LiveScope {
         deserializer: D,
     ) -> Result<Option<Self>, D::Error> {
         let fields = ScopeFields::deserialize(deserializer)?;
-        if fields.scope.is_none() && fields.backfill_from.is_none() {
+        if fields.scope.is_none() && fields.backfill_from.is_none() && fields.seed.is_none() {
             return Ok(None);
         }
-        Self::try_from(fields)
-            .map(Some)
-            .map_err(serde::de::Error::custom)
+        fields.parse().map(Some).map_err(serde::de::Error::custom)
     }
 
     /// The start of the backfill, if this scope has one.
     #[must_use]
     pub const fn backfill_from(&self) -> Option<Timestamp> {
         match self {
-            Self::Live => None,
+            Self::Live { .. } => None,
             Self::LiveBackfill { from } => Some(*from),
         }
     }
@@ -165,6 +233,11 @@ pub enum Subscribed {
         /// A backfill was running at the join, so the stream carries what is
         /// left of it, then the buffered live arrivals, then the live tail.
         backfill_in_flight: bool,
+        /// The session's latest-value seed had not settled at the join. A
+        /// seeded joiner's first data event is then the seed, unless it
+        /// resolves empty or a live print comes first; an unseeded joiner
+        /// starts after the seed's slot.
+        seed_pending: bool,
     },
 }
 
@@ -175,13 +248,36 @@ impl Subscribed {
         Self::Created(scope)
     }
 
-    /// A join of a session with this scope.
+    /// A join of a session with this scope, with no backfill in flight and
+    /// the seed settled.
     #[must_use]
-    pub const fn joined(session: LiveScope, backfill_in_flight: bool) -> Self {
+    pub const fn joined(session: LiveScope) -> Self {
         Self::Joined {
             session,
-            backfill_in_flight,
+            backfill_in_flight: false,
+            seed_pending: false,
         }
+    }
+
+    /// This join found a backfill running. No effect on a creation.
+    #[must_use]
+    pub const fn with_backfill_in_flight(mut self) -> Self {
+        if let Self::Joined {
+            backfill_in_flight, ..
+        } = &mut self
+        {
+            *backfill_in_flight = true;
+        }
+        self
+    }
+
+    /// This join found the seed not yet settled. No effect on a creation.
+    #[must_use]
+    pub const fn with_seed_pending(mut self) -> Self {
+        if let Self::Joined { seed_pending, .. } = &mut self {
+            *seed_pending = true;
+        }
+        self
     }
 
     /// The start of the history this subscriber created: `Some` only for a
@@ -211,8 +307,12 @@ mod tests {
     #[test]
     fn live_scope_keeps_its_wire_shape() {
         assert_eq!(
-            serde_json::to_string(&LiveScope::Live).unwrap(),
+            serde_json::to_string(&LiveScope::default()).unwrap(),
             r#"{"scope":"live"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&LiveScope::unseeded()).unwrap(),
+            r#"{"scope":"live","seed":false}"#
         );
         let backfill = LiveScope::LiveBackfill { from: Timestamp(9) };
         let json = serde_json::to_string(&backfill).unwrap();
@@ -222,8 +322,9 @@ mod tests {
     #[test]
     fn live_scope_parses_what_it_serializes() {
         for scope in [
-            LiveScope::Live,
-            LiveScope::LiveBackfill { from: Timestamp(9) },
+            LiveScope::default(),
+            LiveScope::unseeded(),
+            LiveScope::backfill(Timestamp(9)),
         ] {
             let json = serde_json::to_string(&scope).unwrap();
             assert_eq!(serde_json::from_str::<LiveScope>(&json).unwrap(), scope);
@@ -243,17 +344,62 @@ mod tests {
     }
 
     #[test]
+    fn from_parts_reads_by_the_wire_rule() {
+        use super::{ScopeMismatch, ScopeName};
+        assert_eq!(LiveScope::DEFAULT, LiveScope::default());
+        assert_eq!(
+            LiveScope::from_parts(ScopeName::Live, None, None),
+            Ok(LiveScope::live())
+        );
+        assert_eq!(
+            LiveScope::from_parts(ScopeName::Live, None, Some(false)),
+            Ok(LiveScope::unseeded())
+        );
+        assert_eq!(
+            LiveScope::from_parts(ScopeName::LiveBackfill, Some(Timestamp(9)), None),
+            Ok(LiveScope::backfill(Timestamp(9)))
+        );
+        assert_eq!(
+            LiveScope::from_parts(ScopeName::LiveBackfill, Some(Timestamp(9)), Some(true)),
+            Err(ScopeMismatch::UnexpectedSeed)
+        );
+    }
+
+    #[test]
+    fn a_join_says_what_it_found_and_a_creation_finds_nothing() {
+        let live = LiveScope::default();
+        let found = |backfill_in_flight, seed_pending| Subscribed::Joined {
+            session: live,
+            backfill_in_flight,
+            seed_pending,
+        };
+        let joined = Subscribed::joined(live);
+        assert_eq!(joined, found(false, false));
+        assert_eq!(joined.with_backfill_in_flight(), found(true, false));
+        assert_eq!(joined.with_seed_pending(), found(false, true));
+        assert_eq!(
+            joined.with_seed_pending().with_backfill_in_flight(),
+            found(true, true)
+        );
+        let created = Subscribed::created(live);
+        assert_eq!(
+            created.with_backfill_in_flight().with_seed_pending(),
+            created
+        );
+    }
+
+    #[test]
     fn only_a_created_backfill_has_history_of_its_own() {
         let backfill = LiveScope::LiveBackfill { from: Timestamp(9) };
         assert_eq!(
             Subscribed::Created(backfill).history_from(),
             Some(Timestamp(9))
         );
-        assert_eq!(Subscribed::Created(LiveScope::Live).history_from(), None);
-        let joined = Subscribed::Joined {
-            session: backfill,
-            backfill_in_flight: false,
-        };
+        assert_eq!(
+            Subscribed::Created(LiveScope::default()).history_from(),
+            None
+        );
+        let joined = Subscribed::joined(backfill);
         assert_eq!(joined.history_from(), None);
         assert_eq!(joined.session_scope(), backfill);
     }

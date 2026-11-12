@@ -12,8 +12,8 @@ use datamancer::Surface;
 use datamancer::storage::{TursoTapLog, TursoTapLogConfig};
 use datamancer::{
     AssetClass, Bar, BarInterval, Control, ControlKind, Datamancer, EventKind, Instrument,
-    LiveHandle, MarketEvent, PersistenceOptions, Price, Provider, ProviderId, ReplayRequest,
-    Result, Scope, Seq, TapLog, Timestamp, Trade,
+    LiveHandle, LiveScope, MarketEvent, PersistenceOptions, Price, Provider, ProviderId,
+    ReplayRequest, Result, Scope, Seq, Subscribed, TapLog, Timestamp, Trade,
 };
 use datamancer_core::HistoryRequest;
 use futures::StreamExt;
@@ -226,9 +226,7 @@ async fn live_session_assigns_monotonic_seq_and_passes_events_through() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -364,9 +362,7 @@ async fn persist_true_without_persistence_layer_errors() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::cached(),
         )
         .await
@@ -393,9 +389,7 @@ async fn second_live_open_shares_authoritative_session() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -404,9 +398,7 @@ async fn second_live_open_shares_authoritative_session() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -448,9 +440,7 @@ async fn a_live_pair_reopens_after_the_first_session_is_dropped() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -462,9 +452,7 @@ async fn a_live_pair_reopens_after_the_first_session_is_dropped() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -483,9 +471,7 @@ async fn a_live_pair_reopens_after_the_first_session_is_closed() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -496,9 +482,7 @@ async fn a_live_pair_reopens_after_the_first_session_is_closed() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -588,9 +572,7 @@ async fn historical_and_live_sessions_for_same_pair_coexist() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -609,9 +591,7 @@ async fn live_stream_retake_resumes_with_contiguous_seq() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -697,9 +677,7 @@ async fn take_events_twice_concurrently_errors() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -764,9 +742,7 @@ async fn live_session_tees_data_events_to_tap_log() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await
@@ -813,9 +789,7 @@ async fn tap_log_disabled_captures_nothing() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(), // write_tap_log off
         )
         .await
@@ -878,9 +852,7 @@ async fn dropping_the_session_ends_a_held_stream() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -919,9 +891,7 @@ async fn write_tap_log_without_a_log_is_rejected() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await
@@ -960,9 +930,7 @@ async fn seed_wins_when_no_live_data_yet() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1004,9 +972,7 @@ async fn connect_control_does_not_cancel_seed() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1069,9 +1035,7 @@ async fn seed_discarded_when_live_data_wins() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1110,9 +1074,7 @@ async fn no_seed_when_latest_returns_none() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1123,6 +1085,451 @@ async fn no_seed_when_latest_returns_none() {
     let first = stream.next().await.expect("live event");
     assert_eq!(trade_price(&first), 10.0);
     assert_eq!(first.seq(), Some(Seq(0))); // no seed consumed seq 0
+}
+
+const UNSEEDED: LiveScope = LiveScope::unseeded();
+
+/// The next data event, skipping controls.
+async fn next_data(stream: &mut datamancer::EventStream) -> MarketEvent {
+    loop {
+        match stream.next().await.expect("event") {
+            MarketEvent::Control(_) => {}
+            data => break data,
+        }
+    }
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn unseeded_session_delivers_nothing_before_the_first_live_print() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            Scope::Live(UNSEEDED),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.scope(), Scope::Live(UNSEEDED));
+    let mut stream = session.take_events().await.expect("take events");
+
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let first = stream.next().await.expect("live event");
+    assert_eq!(trade_price(&first), 10.0);
+    assert_eq!(first.seq(), Some(Seq(0)));
+    assert_eq!(ctrl.latest_calls().await, 0);
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn a_seeding_joiner_takes_an_unseeded_session_as_it_is() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let opener = dm.client_session();
+    let created = opener
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            UNSEEDED,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created, Subscribed::created(UNSEEDED));
+    let joiner = dm.client_session();
+    let outcome = joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::default(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, Subscribed::joined(UNSEEDED));
+
+    let mut stream = joiner.take_events().await.expect("take events");
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let first = next_data(&mut stream).await;
+    assert_eq!(trade_price(&first), 10.0, "no seed precedes the live print");
+    assert_eq!(first.seq(), Some(Seq(0)));
+    assert_eq!(ctrl.latest_calls().await, 0);
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn a_late_unseeded_joiner_on_a_seeding_session_starts_at_the_next_print() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+
+    let opener = dm.client_session();
+    opener
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::default(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut opener_stream = opener.take_events().await.expect("take events");
+    let seed = next_data(&mut opener_stream).await;
+    assert_eq!(trade_price(&seed), 999.0);
+
+    let joiner = dm.client_session();
+    let outcome = joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            UNSEEDED,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, Subscribed::joined(LiveScope::default()));
+
+    let mut stream = joiner.take_events().await.expect("take events");
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let first = next_data(&mut stream).await;
+    assert_eq!(trade_price(&first), 10.0);
+    assert_eq!(first.seq(), Some(Seq(1)));
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
+}
+
+fn connected() -> MarketEvent {
+    MarketEvent::Control(Control {
+        source_ts: Timestamp(50),
+        rx_ts: Timestamp(50),
+        seq: Seq(0),
+        kind: ControlKind::ProviderConnected {
+            provider: "fake".to_string(),
+        },
+    })
+}
+
+/// A seeding session whose `latest` is held by `gate`, opened by a seeded
+/// client, and a joiner with `joiner_scope` that joins while the seed is
+/// pending. Returns the opener's and joiner's sessions and streams.
+async fn join_while_the_seed_is_pending(
+    ctrl: &FakeController,
+    dm: &Datamancer,
+    joiner_scope: LiveScope,
+) -> (
+    datamancer::ClientSession,
+    datamancer::EventStream,
+    datamancer::ClientSession,
+    datamancer::EventStream,
+) {
+    let opener = dm.client_session();
+    let created = opener
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::default(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created, Subscribed::created(LiveScope::default()));
+    let opener_stream = opener.take_events().await.expect("take events");
+    let joiner = dm.client_session();
+    let outcome = joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            joiner_scope,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Subscribed::joined(LiveScope::default()).with_seed_pending()
+    );
+    let joiner_stream = joiner.take_events().await.expect("take events");
+    // A control while the seed is pending takes the slot before it.
+    ctrl.push_live(connected()).await;
+    (opener, opener_stream, joiner, joiner_stream)
+}
+
+async fn seeding_fake() -> (Datamancer, FakeController, Arc<tokio::sync::Notify>) {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_latest(trade("AAPL", 5, 999.0)).await;
+    ctrl.set_latest_gate(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    (dm, ctrl, gate)
+}
+
+/// A `seed: false` joiner on a seeding session starts after the seed slot:
+/// nothing before it, not the seed, and its `seq` contiguous from there.
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn a_seed_false_joiner_gets_no_seed_and_no_hole() {
+    let (dm, ctrl, gate) = seeding_fake().await;
+    let (opener, mut opener_stream, joiner, mut stream) =
+        join_while_the_seed_is_pending(&ctrl, &dm, UNSEEDED).await;
+    assert_eq!(opener_stream.next().await.unwrap().seq(), Some(Seq(0)));
+    gate.notify_one();
+    let seed = opener_stream.next().await.expect("seed");
+    assert_eq!((trade_price(&seed), seed.seq()), (999.0, Some(Seq(1))));
+
+    ctrl.push_live(connected()).await;
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    ctrl.push_live(trade("AAPL", 101, 11.0)).await;
+    // The connection state it waited through, then not the repeat at seq 2:
+    // the client has already delivered it.
+    let control = stream.next().await.expect("control");
+    assert!(is_connected(&control), "{control:?}");
+    assert_eq!(control.seq(), Some(Seq(0)));
+    let first = stream.next().await.expect("first print");
+    assert_eq!((trade_price(&first), first.seq()), (10.0, Some(Seq(3))));
+    let second = stream.next().await.expect("second print");
+    assert_eq!((trade_price(&second), second.seq()), (11.0, Some(Seq(4))));
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
+}
+
+/// A `seed: false` joiner that waited out the seed is passed the connection
+/// state it missed, with its original `seq`, once the seed settles.
+#[tokio::test]
+async fn a_seed_false_joiner_gets_the_connection_state_it_waited_through() {
+    let (dm, ctrl, gate) = seeding_fake().await;
+    let (opener, mut opener_stream, joiner, mut stream) =
+        join_while_the_seed_is_pending(&ctrl, &dm, UNSEEDED).await;
+    assert_eq!(opener_stream.next().await.unwrap().seq(), Some(Seq(0)));
+    gate.notify_one();
+    assert_eq!(opener_stream.next().await.unwrap().seq(), Some(Seq(1)));
+    let control = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the joiner is passed the connection state")
+        .expect("control");
+    assert!(is_connected(&control), "{control:?}");
+    assert_eq!(control.seq(), Some(Seq(0)));
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
+}
+
+fn is_connected(ev: &MarketEvent) -> bool {
+    matches!(
+        ev,
+        MarketEvent::Control(Control {
+            kind: ControlKind::ProviderConnected { .. },
+            ..
+        })
+    )
+}
+
+/// A seed that resolves empty settles too: a `seed: false` joiner is passed
+/// the next control.
+#[tokio::test]
+async fn a_seed_false_joiner_gets_the_next_control_when_the_seed_resolves_empty() {
+    let (provider, ctrl) = FakeProvider::new("fake");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.set_latest_gate(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let (opener, mut opener_stream, joiner, mut stream) =
+        join_while_the_seed_is_pending(&ctrl, &dm, UNSEEDED).await;
+    assert_eq!(opener_stream.next().await.unwrap().seq(), Some(Seq(0)));
+    gate.notify_one();
+    // The empty seed leaves no trace on the stream, so push until one lands.
+    let mut received = None;
+    for _ in 0..40 {
+        ctrl.push_live(connected()).await;
+        if let Ok(ev) = tokio::time::timeout(Duration::from_millis(50), stream.next()).await {
+            received = ev;
+            break;
+        }
+    }
+    let control = received.expect("a control reaches the joiner once the seed resolves empty");
+    assert!(is_connected(&control), "{control:?}");
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
+}
+
+fn subscription_ack() -> MarketEvent {
+    MarketEvent::Control(Control {
+        source_ts: Timestamp(60),
+        rx_ts: Timestamp(60),
+        seq: Seq(0),
+        kind: ControlKind::SubscriptionChanged {
+            provider: "fake".to_string(),
+            instrument: inst("AAPL"),
+            kind: EventKind::Trade,
+            active: true,
+        },
+    })
+}
+
+/// A `seed: false` joiner that got the cached ack when it joined is not passed
+/// it again when the seed settles.
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn a_seed_false_joiner_after_the_ack_gets_it_once() {
+    let (dm, ctrl, gate) = seeding_fake().await;
+    let opener = dm.client_session();
+    opener
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::default(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut opener_stream = opener.take_events().await.expect("take events");
+    ctrl.push_live(subscription_ack()).await;
+    assert_eq!(opener_stream.next().await.unwrap().seq(), Some(Seq(0)));
+
+    let joiner = dm.client_session();
+    joiner
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            UNSEEDED,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let mut stream = joiner.take_events().await.expect("take events");
+    gate.notify_one();
+    assert_eq!(opener_stream.next().await.unwrap().seq(), Some(Seq(1)));
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+
+    let ack = stream.next().await.expect("cached ack");
+    assert_eq!(ack.seq(), Some(Seq(0)), "{ack:?}");
+    let print = stream.next().await.expect("print");
+    assert_eq!(
+        (trade_price(&print), print.seq()),
+        (10.0, Some(Seq(2))),
+        "{print:?}"
+    );
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
+}
+
+/// A `seed: false` joiner that joins before the subscribe ack still sees it,
+/// once the seed settles.
+#[tokio::test]
+async fn a_seed_false_joiner_before_the_ack_sees_it_once_the_seed_settles() {
+    let (dm, ctrl, gate) = seeding_fake().await;
+    let (opener, mut opener_stream, joiner, mut stream) =
+        join_while_the_seed_is_pending(&ctrl, &dm, UNSEEDED).await;
+    ctrl.push_live(subscription_ack()).await;
+    assert_eq!(opener_stream.next().await.unwrap().seq(), Some(Seq(0)));
+    assert_eq!(opener_stream.next().await.unwrap().seq(), Some(Seq(1)));
+    gate.notify_one();
+    let seed = opener_stream.next().await.expect("seed");
+    assert_eq!(seed.seq(), Some(Seq(2)));
+    let control = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the joiner is passed the connection state")
+        .expect("control");
+    assert!(is_connected(&control), "{control:?}");
+    assert_eq!(control.seq(), Some(Seq(0)));
+    let ack = stream.next().await.expect("ack");
+    assert!(
+        matches!(
+            ack,
+            MarketEvent::Control(Control {
+                kind: ControlKind::SubscriptionChanged { active: true, .. },
+                seq: Seq(1),
+                ..
+            })
+        ),
+        "{ack:?}"
+    );
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn a_seed_true_joiner_still_gets_the_seed() {
+    let (dm, ctrl, gate) = seeding_fake().await;
+    let (opener, _opener_stream, joiner, mut stream) =
+        join_while_the_seed_is_pending(&ctrl, &dm, LiveScope::default()).await;
+    assert_eq!(stream.next().await.unwrap().seq(), Some(Seq(0)));
+    gate.notify_one();
+    let seed = stream.next().await.expect("seed");
+    assert_eq!((trade_price(&seed), seed.seq()), (999.0, Some(Seq(1))));
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    let print = stream.next().await.expect("print");
+    assert_eq!((trade_price(&print), print.seq()), (10.0, Some(Seq(2))));
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
+}
+
+/// With a `latest` that never answers, the first live print settles the seed:
+/// a `seed: false` joiner starts there.
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "trade_price compares exact literal-constructed Price values round-tripped through from_f64_round; no accumulated float error"
+)]
+async fn a_seed_false_joiner_starts_at_the_first_print_when_latest_never_resolves() {
+    let (dm, ctrl, _gate) = seeding_fake().await;
+    let (opener, mut opener_stream, joiner, mut stream) =
+        join_while_the_seed_is_pending(&ctrl, &dm, UNSEEDED).await;
+    assert_eq!(opener_stream.next().await.unwrap().seq(), Some(Seq(0)));
+    ctrl.push_live(trade("AAPL", 100, 10.0)).await;
+    ctrl.push_live(trade("AAPL", 101, 11.0)).await;
+    let control = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first print settles the seed for a joiner awaiting one that never comes")
+        .expect("control");
+    assert!(is_connected(&control), "{control:?}");
+    assert_eq!(control.seq(), Some(Seq(0)));
+    let first = stream.next().await.expect("first print");
+    assert_eq!((trade_price(&first), first.seq()), (10.0, Some(Seq(1))));
+    let second = stream.next().await.expect("second print");
+    assert_eq!((trade_price(&second), second.seq()), (11.0, Some(Seq(2))));
+    let _ = opener.close().await;
+    let _ = joiner.close().await;
 }
 
 #[tokio::test]
@@ -1139,9 +1546,7 @@ async fn no_seed_under_backfill() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: Some(Timestamp(1)),
-            },
+            Scope::live_backfill(Timestamp(1)),
             PersistenceOptions::none(),
         )
         .await
@@ -1176,9 +1581,7 @@ async fn seed_is_teed_to_tap_log() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await
@@ -1261,9 +1664,7 @@ async fn seed_is_not_recorded_as_a_live_arrival() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await
@@ -1319,9 +1720,7 @@ async fn first_live_event_after_seed_sets_live_stats() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            Scope::Live {
-                backfill_from: None,
-            },
+            Scope::live(),
             PersistenceOptions::none(),
         )
         .await

@@ -46,6 +46,11 @@ use crate::{Instrument, Price, Quantity};
 ///   - a joiner's stream opens with the session's last active
 ///     `SubscriptionChanged`, replayed with its original `seq`, and goes on
 ///     from the session's current `seq`;
+///   - a `seed: false` joiner that joins while the latest-value seed is
+///     pending starts after the seed's slot. Of what the session delivers
+///     before the seed settles, it is passed only the last subscription state
+///     and the last `ProviderConnected` or `ProviderDisconnected`, replayed
+///     with their original `seq` when the seed settles;
 ///   - a connection control or `SubscriptionChanged` that met a full consumer
 ///     channel, and was superseded by a newer one for the same provider or
 ///     instrument before the channel had room, is dropped and its slot stays

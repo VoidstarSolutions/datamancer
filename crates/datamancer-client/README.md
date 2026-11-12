@@ -173,7 +173,15 @@ if let Some(from) = client.subscribe(&spec).await?.history_from() {
 }
 ```
 
-A subscribe reply with no `scope` reads as `Subscribed::created(LiveScope::Live)`.
+`SubscriptionSpec::without_seed` declines the latest-value seed;
+`LiveScope::Live` says what a joiner observes. `seed` is on the wire only as
+`false`. A subscribe reply, like a request, reads an absent `scope` as live, so
+a bare reply is `Subscribed::created(LiveScope::DEFAULT)`. A `Created` reply
+whose scope is not the one asked for is `ClientError::ScopeNotHonored`, and a
+reply the client cannot read, such as one naming a scope it does not know, is a
+transport error. In both cases the client has asked the daemon to drop the
+subscription; events the session sent before that, or all of them if that
+request failed, still reach the event stream.
 
 When starting from discovery instead of a hand-written spec, use
 `SubscriptionSpec::new` to close the loop — it converts the core vocabulary

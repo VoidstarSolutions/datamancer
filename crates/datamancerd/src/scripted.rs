@@ -13,8 +13,8 @@
 //!   the pair gets `ProviderDisconnected` and its trades stop, and when it
 //!   comes back, `ProviderConnected` and its trades resume. A subscribe while
 //!   the source is `None` is refused with `ProviderDisabled`.
-//! - `latest` returns one trade priced [`LATEST_PRICE`] at `source_ts` 1 when
-//!   `latest` is set.
+//! - `latest` waits `latest_delay_ms`, then returns one trade priced
+//!   [`LATEST_PRICE`] at `source_ts` 1 when `latest` is set.
 //!
 //! Trades only, on both surfaces, for any symbol that names this provider
 //! (`supports` answers only for instruments carrying [`PROVIDER_ID`]); `enabled`
@@ -54,6 +54,8 @@ pub struct ScriptedSettings {
     pub live_interval_ms: u64,
     /// Whether `latest` returns a value (`true`) or `None`.
     pub latest: bool,
+    /// Milliseconds `latest` waits before answering.
+    pub latest_delay_ms: u64,
 }
 
 impl Default for ScriptedSettings {
@@ -63,6 +65,7 @@ impl Default for ScriptedSettings {
             history_delay_ms: 300,
             live_interval_ms: 50,
             latest: true,
+            latest_delay_ms: 0,
         }
     }
 }
@@ -164,6 +167,7 @@ impl Provider for ScriptedProvider {
         _kind: EventKind,
     ) -> Result<Option<MarketEvent>> {
         let settings = self.settings()?;
+        tokio::time::sleep(Duration::from_millis(settings.latest_delay_ms)).await;
         Ok(settings
             .latest
             .then(|| trade(instrument.clone(), Timestamp(1), LATEST_PRICE)))

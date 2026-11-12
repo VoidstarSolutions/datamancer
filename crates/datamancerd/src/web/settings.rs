@@ -183,12 +183,17 @@ function collect() {
   cfg.web_ui = { ...cfg.web_ui, enabled: chk('web-on'), bind: val('web-bind'), port: num('web-port'),
                  assets_dir: opt(val('web-assets')),
                  live_state_cadence_ms: num('web-live'), cache_catalog_cadence_ms: num('web-catalog') };
+  // A loaded row keeps its keys the form has no field for; `seed` only while
+  // the row stays under live.
   cfg.startup_session = [...document.querySelectorAll('.session-row')].map(row => {
     const i = row.dataset.i;
-    return { provider: val(`ss-provider-${i}`), asset_class: val(`ss-asset-${i}`),
+    const saved = { ...current.startup_session?.[i],
+             provider: val(`ss-provider-${i}`), asset_class: val(`ss-asset-${i}`),
              symbol: val(`ss-symbol-${i}`), kind: val(`ss-kind-${i}`),
              scope: val(`ss-scope-${i}`), backfill_from: opt(val(`ss-backfill-${i}`)),
              persistence: val(`ss-persist-${i}`), always_on: chk(`ss-always-${i}`) };
+    if (saved.scope !== 'live') delete saved.seed;
+    return saved;
   });
   return cfg;
 }
@@ -230,19 +235,26 @@ fetch('/api/config').then(r => r.json()).then(show).catch(e => fail(String(e)));
 mod tests {
     use super::JS;
 
-    /// Run the page script under node with a stub DOM whose inputs are all
-    /// empty and unchecked, load `config` as the page's current config, and
-    /// return what the form's save would send. `None` when node is missing.
-    fn collect_under_node(config: &serde_json::Value) -> Option<serde_json::Value> {
+    /// Run the page script under node with a stub DOM whose inputs hold
+    /// `values` by name and are otherwise empty, all unchecked, with one row
+    /// per loaded startup session; load `config` as the page's current
+    /// config, and return what the form's save would send. `None` when node
+    /// is missing.
+    fn collect_under_node(
+        config: &serde_json::Value,
+        values: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
         const HARNESS: &str = r"
 const vm = require('node:vm');
 const fs = require('node:fs');
 const [script, config] = [fs.readFileSync(process.argv[2], 'utf8'), fs.readFileSync(process.argv[3], 'utf8')];
-const input = () => ({ value: '', checked: false });
+const values = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
+const input = (name) => ({ value: values[name] ?? '', checked: false });
+const rows = (JSON.parse(config).startup_session || []).map((_, i) => ({ dataset: { i: String(i) } }));
 const document = {
   getElementById: () => ({}),
-  getElementsByName: () => [input()],
-  querySelectorAll: () => [],
+  getElementsByName: (name) => [input(name)],
+  querySelectorAll: (selector) => (selector === '.session-row' ? rows : []),
   addEventListener: () => {},
 };
 const context = vm.createContext({ document, fetch: () => new Promise(() => {}), structuredClone, console });
@@ -256,10 +268,13 @@ process.stdout.write(vm.runInContext(`current = ${config}; JSON.stringify(collec
         std::fs::write(&harness, HARNESS).expect("write harness");
         std::fs::write(&script, JS).expect("write script");
         std::fs::write(&config_path, config.to_string()).expect("write config");
+        let values_path = dir.path().join("values.json");
+        std::fs::write(&values_path, values.to_string()).expect("write values");
         let output = match std::process::Command::new("node")
             .arg(&harness)
             .arg(&script)
             .arg(&config_path)
+            .arg(&values_path)
             .output()
         {
             Ok(output) => output,
@@ -284,7 +299,7 @@ process.stdout.write(vm.runInContext(`current = ${config}; JSON.stringify(collec
         )
         .expect("parse");
         let loaded = serde_json::to_value(&config).expect("config as JSON");
-        let Some(saved) = collect_under_node(&loaded) else {
+        let Some(saved) = collect_under_node(&loaded, &serde_json::json!({})) else {
             assert!(
                 std::env::var_os("CI").is_none(),
                 "node is required for this test in CI"
@@ -294,5 +309,36 @@ process.stdout.write(vm.runInContext(`current = ${config}; JSON.stringify(collec
         };
         assert_eq!(saved["log"], loaded["log"], "{saved}");
         assert!(saved["provider"].get("alpaca").is_none(), "{saved}");
+    }
+
+    /// Saving the form keeps a startup session's `seed`, which has no field,
+    /// while the row stays under `live`.
+    #[test]
+    fn saving_the_web_form_keeps_a_startup_session_seed() {
+        let config = crate::config::Config::parse(
+            "[provider.alpaca_crypto]\naccount_type = \"paper\"\n\n\
+             [[startup_session]]\nprovider = \"alpaca-crypto\"\nasset_class = \"crypto\"\n\
+             symbol = \"BTC/USD\"\nkind = \"trade\"\nseed = false\n",
+        )
+        .expect("parse");
+        let loaded = serde_json::to_value(&config).expect("config as JSON");
+        let live = serde_json::json!({ "ss-scope-0": "live" });
+        let backfill = serde_json::json!({ "ss-scope-0": "live_backfill" });
+        let (Some(kept), Some(dropped)) = (
+            collect_under_node(&loaded, &live),
+            collect_under_node(&loaded, &backfill),
+        ) else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "node is required for this test in CI"
+            );
+            eprintln!("node not found; skipping");
+            return;
+        };
+        assert_eq!(kept["startup_session"][0]["seed"], false, "{kept}");
+        assert!(
+            dropped["startup_session"][0].get("seed").is_none(),
+            "a row moved to live_backfill drops its seed: {dropped}"
+        );
     }
 }

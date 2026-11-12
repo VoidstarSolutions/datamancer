@@ -3,6 +3,9 @@
 //! per-instrument resume buffering, connection-scoped control coalescing, and
 //! the synthetic client-local controls.
 
+mod common;
+
+use common::joined_as;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -272,7 +275,7 @@ fn trade(symbol: &str, ts: i64) -> MarketEvent {
 }
 
 fn live() -> LiveScope {
-    LiveScope::Live
+    LiveScope::default()
 }
 
 async fn next_ev(stream: &mut datamancer::EventStream) -> MarketEvent {
@@ -697,9 +700,7 @@ async fn a_cancelled_join_leaves_no_referrer() {
         let mut join = Box::pin(dm.session(
             inst("AAPL"),
             EventKind::Trade,
-            datamancer::Scope::Live {
-                backfill_from: None,
-            },
+            datamancer::Scope::live(),
             PersistenceOptions::none(),
         ));
         assert!(
@@ -1009,7 +1010,7 @@ async fn a_backfill_leaves_the_live_timestamps_alone() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -1055,14 +1056,14 @@ async fn client_subscribe_with_backfill_serves_history_then_buffered_then_live()
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
         .unwrap();
     assert_eq!(
         actual,
-        Subscribed::created(LiveScope::LiveBackfill { from: Timestamp(0) }),
+        Subscribed::created(LiveScope::backfill(Timestamp(0))),
         "the first subscriber creates the session"
     );
     assert_eq!(actual.history_from(), Some(Timestamp(0)));
@@ -1124,7 +1125,7 @@ async fn client_subscribe_with_backfill_leaves_a_real_hole_when_the_seam_ring_ov
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -1199,7 +1200,7 @@ async fn a_seam_overflow_of_prints_leaves_a_hole_for_the_prints_only() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -1269,7 +1270,7 @@ async fn a_backfill_reaches_a_slow_consumer_whole() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -1299,7 +1300,7 @@ async fn a_seam_flush_reaches_a_slow_consumer_whole() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -1356,7 +1357,7 @@ async fn backfilling_client(
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -1381,7 +1382,7 @@ async fn backfill_symbol(dm: &Datamancer, symbol: &str) -> datamancer::ClientSes
         .subscribe(
             inst(symbol),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -1447,9 +1448,7 @@ async fn a_sessions_backfill_is_outside_the_client_limit() {
         .session(
             inst("MSFT"),
             EventKind::Trade,
-            datamancer::Scope::Live {
-                backfill_from: Some(Timestamp(0)),
-            },
+            datamancer::Scope::live_backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -1774,14 +1773,14 @@ async fn assert_replay_over(dm: &Datamancer) {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::none(),
         )
         .await
         .unwrap();
     assert_eq!(
         joined,
-        Subscribed::joined(LiveScope::LiveBackfill { from: Timestamp(0) }, false)
+        Subscribed::joined(LiveScope::backfill(Timestamp(0)))
     );
 }
 
@@ -1873,14 +1872,14 @@ async fn a_replay_goes_on_when_the_reader_it_waits_on_leaves() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::none(),
         )
         .await
         .unwrap();
     assert_eq!(
         joined,
-        Subscribed::joined(LiveScope::LiveBackfill { from: Timestamp(0) }, false)
+        Subscribed::joined(LiveScope::backfill(Timestamp(0)))
     );
     let _ = reader.close().await;
 }
@@ -1910,14 +1909,14 @@ async fn a_join_during_the_flush_gets_the_rest_in_order() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::none(),
         )
         .await
         .unwrap();
     assert_eq!(
         outcome,
-        Subscribed::joined(LiveScope::LiveBackfill { from: Timestamp(0) }, true)
+        Subscribed::joined(LiveScope::backfill(Timestamp(0))).with_backfill_in_flight()
     );
     let mut joined_stream = joiner.take_events().await.unwrap();
     ctrl.push("AAPL", trade("AAPL", 9000)).await;
@@ -1966,14 +1965,14 @@ async fn a_join_during_the_flush_of_a_stopped_creator_reaches_live() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::none(),
         )
         .await
         .unwrap();
     assert_eq!(
         outcome,
-        Subscribed::joined(LiveScope::LiveBackfill { from: Timestamp(0) }, true)
+        Subscribed::joined(LiveScope::backfill(Timestamp(0))).with_backfill_in_flight()
     );
     let mut stream = joiner.take_events().await.unwrap();
     ctrl.push("AAPL", trade("AAPL", 9000)).await;
@@ -2002,7 +2001,7 @@ async fn a_joiner_after_the_backfill_hears_none_is_in_flight() {
         .provider_arc(provider)
         .build()
         .unwrap();
-    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let backfill = LiveScope::backfill(Timestamp(0));
     let none = PersistenceOptions::none();
     let creator = dm.client_session();
     creator
@@ -2016,10 +2015,10 @@ async fn a_joiner_after_the_backfill_hears_none_is_in_flight() {
 
     let joined = dm
         .client_session()
-        .subscribe(inst("AAPL"), EventKind::Trade, LiveScope::Live, none)
+        .subscribe(inst("AAPL"), EventKind::Trade, LiveScope::default(), none)
         .await
         .unwrap();
-    assert_eq!(joined, Subscribed::joined(backfill, false));
+    assert_eq!(joined, Subscribed::joined(backfill));
     let _ = creator.close().await;
 }
 
@@ -2035,7 +2034,7 @@ async fn a_client_backfill_past_the_limit_is_refused() {
         .build()
         .unwrap();
     let none = PersistenceOptions::none();
-    let too_old = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let too_old = LiveScope::backfill(Timestamp(0));
     let refused = |outcome: Result<Subscribed>| {
         assert!(
             matches!(outcome, Err(datamancer::Error::BackfillTooOld { .. })),
@@ -2056,9 +2055,7 @@ async fn a_client_backfill_past_the_limit_is_refused() {
             .as_nanos(),
     )
     .unwrap();
-    let recent = LiveScope::LiveBackfill {
-        from: Timestamp(now - 1_000_000_000),
-    };
+    let recent = LiveScope::backfill(Timestamp(now - 1_000_000_000));
     client
         .subscribe(inst("AAPL"), EventKind::Trade, recent, none)
         .await
@@ -2070,9 +2067,14 @@ async fn a_client_backfill_past_the_limit_is_refused() {
     );
     let _ = client.close().await;
 
-    dm.session(inst("MSFT"), EventKind::Trade, too_old.into(), none)
-        .await
-        .expect("a session is not limited");
+    dm.session(
+        inst("MSFT"),
+        EventKind::Trade,
+        datamancer::Scope::live_backfill(Timestamp(0)),
+        none,
+    )
+    .await
+    .expect("a session is not limited");
 }
 
 /// Live arrivals keep landing while a paced seam flush waits, so the provider
@@ -2092,7 +2094,7 @@ async fn a_paced_seam_flush_keeps_taking_live_arrivals() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -2120,7 +2122,7 @@ async fn a_paced_seam_flush_keeps_taking_live_arrivals() {
         dm.client_session().subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::none(),
         ),
     )
@@ -2155,7 +2157,7 @@ async fn a_slow_consumer_gets_every_survivor_of_a_seam_overflow() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -2229,7 +2231,7 @@ async fn a_slow_reader_cannot_hold_a_co_subscriber_back_for_long() {
         .provider_arc(provider)
         .build()
         .unwrap();
-    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let backfill = LiveScope::backfill(Timestamp(0));
     let none = PersistenceOptions::none();
     let slow = dm.client_session();
     slow.subscribe(inst("AAPL"), EventKind::Trade, backfill, none)
@@ -2274,7 +2276,7 @@ async fn a_late_take_keeps_the_client_answering() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             none,
         )
         .await
@@ -2284,7 +2286,7 @@ async fn a_late_take_keeps_the_client_answering() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     tokio::time::timeout(
         Duration::from_secs(1),
-        client.subscribe(inst("MSFT"), EventKind::Trade, LiveScope::Live, none),
+        client.subscribe(inst("MSFT"), EventKind::Trade, LiveScope::default(), none),
     )
     .await
     .expect("subscribe must not wait on the consumer")
@@ -2312,7 +2314,7 @@ async fn a_late_take_reports_its_backlog_in_occupancy() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -2353,7 +2355,7 @@ async fn an_unsubscribe_control_arrives_with_a_zero_resume_buffer() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::none(),
         )
         .await
@@ -2391,7 +2393,7 @@ async fn a_client_with_an_unread_stream_still_answers() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             none,
         )
         .await
@@ -2401,7 +2403,7 @@ async fn a_client_with_an_unread_stream_still_answers() {
 
     tokio::time::timeout(
         Duration::from_secs(1),
-        client.subscribe(inst("MSFT"), EventKind::Trade, LiveScope::Live, none),
+        client.subscribe(inst("MSFT"), EventKind::Trade, LiveScope::default(), none),
     )
     .await
     .expect("subscribe must not wait on the stream")
@@ -2425,7 +2427,7 @@ async fn a_flush_ends_when_the_feed_outruns_the_consumer() {
         .resume_buffer_events(3000)
         .build()
         .unwrap();
-    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let backfill = LiveScope::backfill(Timestamp(0));
     let none = PersistenceOptions::none();
     let client = dm.client_session();
     client
@@ -2448,10 +2450,10 @@ async fn a_flush_ends_when_the_feed_outruns_the_consumer() {
 
     let joined = dm
         .client_session()
-        .subscribe(inst("AAPL"), EventKind::Trade, LiveScope::Live, none)
+        .subscribe(inst("AAPL"), EventKind::Trade, LiveScope::default(), none)
         .await
         .unwrap();
-    assert_eq!(joined, Subscribed::joined(backfill, false));
+    assert_eq!(joined, Subscribed::joined(backfill));
 }
 
 /// A flush that has lost a whole ring ends with no help from the consumer: the
@@ -2581,7 +2583,7 @@ async fn a_flush_with_room_still_reads_arrivals() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none().with_tap_log(true),
         )
         .await
@@ -2618,7 +2620,7 @@ async fn a_small_flush_overflow_keeps_a_reader_paced() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -2733,7 +2735,7 @@ async fn join_during_cache_wait(gate_store: bool) {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::cached(),
         )
         .await
@@ -2746,7 +2748,7 @@ async fn join_during_cache_wait(gate_store: bool) {
         joiner.subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::Live,
+            LiveScope::default(),
             PersistenceOptions::none(),
         ),
     )
@@ -2785,7 +2787,7 @@ async fn arrivals_during_cache_wait(gate_store: bool) {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::cached(),
         )
         .await
@@ -2831,7 +2833,7 @@ async fn a_close_during_a_held_store_leaves_the_provider_free() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::cached(),
         )
         .await
@@ -2942,7 +2944,7 @@ async fn a_seam_overflow_keeps_the_subscription_state_for_every_subscriber() {
         .subscribe(
             inst("AAPL"),
             EventKind::Trade,
-            LiveScope::LiveBackfill { from: Timestamp(0) },
+            LiveScope::backfill(Timestamp(0)),
             PersistenceOptions::none(),
         )
         .await
@@ -3067,7 +3069,7 @@ async fn client_subscribe_reports_the_shared_sessions_actual_scope() {
         .provider_arc(provider)
         .build()
         .unwrap();
-    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let backfill = LiveScope::backfill(Timestamp(0));
 
     // AAPL: opened with a backfill; a pure-live joiner is told so while the
     // backfill is still in flight.
@@ -3095,7 +3097,7 @@ async fn client_subscribe_reports_the_shared_sessions_actual_scope() {
             )
             .await
             .unwrap(),
-        Subscribed::joined(backfill, true),
+        Subscribed::joined(backfill).with_backfill_in_flight(),
         "a joiner is told the session's scope, not its own request"
     );
     assert_eq!(ctrl.live_starts(), 1, "the pair is shared, not reopened");
@@ -3113,18 +3115,18 @@ async fn client_subscribe_reports_the_shared_sessions_actual_scope() {
             .unwrap(),
         Subscribed::created(live())
     );
-    assert_eq!(
-        second
-            .subscribe(
-                inst("MSFT"),
-                EventKind::Trade,
-                backfill,
-                PersistenceOptions::none()
-            )
-            .await
-            .unwrap(),
-        Subscribed::joined(live(), false),
-        "a backfill request on a pure-live pair comes back pure-live"
+    let outcome = second
+        .subscribe(
+            inst("MSFT"),
+            EventKind::Trade,
+            backfill,
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        joined_as(outcome, live(), false),
+        "a backfill request on a pure-live pair comes back pure-live: {outcome:?}"
     );
 
     gate.notify_waiters();
@@ -3146,7 +3148,7 @@ async fn a_subscriber_joining_mid_backfill_receives_the_remaining_history_then_l
         .provider_arc(provider)
         .build()
         .unwrap();
-    let backfill = LiveScope::LiveBackfill { from: Timestamp(0) };
+    let backfill = LiveScope::backfill(Timestamp(0));
 
     let creator = dm.client_session();
     creator
@@ -3172,7 +3174,10 @@ async fn a_subscriber_joining_mid_backfill_receives_the_remaining_history_then_l
         )
         .await
         .unwrap();
-    assert_eq!(outcome, Subscribed::joined(backfill, true));
+    assert_eq!(
+        outcome,
+        Subscribed::joined(backfill).with_backfill_in_flight()
+    );
     assert_eq!(outcome.history_from(), None);
     let mut joiner_stream = joiner.take_events().await.unwrap();
 
@@ -3239,10 +3244,9 @@ async fn client_subscribe_reports_whether_it_joined() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        joined,
-        Subscribed::joined(live(), false),
-        "the second subscriber joins the open session"
+    assert!(
+        joined_as(joined, live(), false),
+        "the second subscriber joins the open session: {joined:?}"
     );
     let _ = first.close().await;
     let _ = second.close().await;
@@ -3305,7 +3309,7 @@ async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
         .build()
         .unwrap();
     let future = Timestamp(now_nanos() + 3_600_000_000_000);
-    let backfill = LiveScope::LiveBackfill { from: future };
+    let backfill = LiveScope::backfill(future);
 
     let client = dm.client_session();
     let err = client
@@ -3325,7 +3329,7 @@ async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
         .session(
             inst("AAPL"),
             EventKind::Trade,
-            backfill.into(),
+            Scope::Live(backfill),
             PersistenceOptions::none(),
         )
         .await
@@ -3356,7 +3360,7 @@ async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
         )
         .await
         .expect("joins the pure-live session");
-    assert_eq!(outcome, Subscribed::joined(live(), false));
+    assert!(joined_as(outcome, live(), false), "{outcome:?}");
     let _ = other.close().await;
     let _ = client.close().await;
 }
