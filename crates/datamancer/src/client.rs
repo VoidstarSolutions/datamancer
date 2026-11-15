@@ -2077,7 +2077,9 @@ impl ClientSession {
     ///   [`Subscribed::Joined`] with that `Live` session.
     /// - [`Error::ProviderDisabled`] — the session's provider is disabled,
     ///   whether this subscribe would create or join.
-    /// - [`Error::SessionClosed`] — the controller has shut down.
+    /// - [`Error::SessionClosed`] — the controller has shut down, or the
+    ///   pair's session tore down each time this subscribe went to join it;
+    ///   the session itself is still usable then, and a retry is safe.
     pub async fn subscribe(
         &self,
         instrument: Instrument,

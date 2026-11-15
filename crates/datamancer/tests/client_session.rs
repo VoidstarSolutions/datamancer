@@ -420,6 +420,62 @@ async fn a_full_command_queue_refuses_the_next_queued_command() {
     let _ = client.close().await;
 }
 
+/// Two clients' subscribes to a pair a third client is still creating are
+/// not failed by that third client giving up: each looks again and joins
+/// or creates a live session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_joins_survive_the_creator_giving_up() {
+    let mut failures = Vec::new();
+    for round in 0..200 {
+        let (provider, ctrl) = FakeProvider::new("fake", false);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        ctrl.gate_next_subscribe(gate.clone()).await;
+        let dm = Datamancer::builder()
+            .provider_arc(provider)
+            .build()
+            .unwrap();
+        let creator = dm.client_session();
+        let joiners = [dm.client_session(), dm.client_session()];
+        let subscribe = |client: &datamancer::ClientSession| {
+            client
+                .queue_subscribe(
+                    inst("AAPL"),
+                    EventKind::Trade,
+                    live(),
+                    PersistenceOptions::none(),
+                )
+                .expect("queue the subscribe")
+        };
+        let creating = subscribe(&creator);
+        wait_until(|| ctrl.live_starts() == 1).await;
+        let joining = joiners.each_ref().map(subscribe);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The creator's caller gives up; its provider subscribe then returns.
+        drop(creating);
+        gate.notify_one();
+
+        for (i, join) in joining.into_iter().enumerate() {
+            let joined = tokio::time::timeout(Duration::from_secs(5), join)
+                .await
+                .expect("the join was never answered");
+            if let Err(e) = joined {
+                failures.push(format!("round {round} joiner {i}: {e:?}"));
+            }
+        }
+        for client in joiners {
+            let _ = client.close().await;
+        }
+        let _ = creator.close().await;
+    }
+    assert!(
+        failures.is_empty(),
+        "{} joins failed in 200 rounds: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(4)]
+    );
+}
+
 #[tokio::test]
 async fn multiplex_interleaves_two_instruments_in_arrival_order() {
     let (provider, ctrl) = FakeProvider::new("fake", false);

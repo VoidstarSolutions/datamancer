@@ -434,43 +434,80 @@ impl Datamancer {
         options: PersistenceOptions,
         caller: Caller,
     ) -> Result<Attached> {
-        let existing = {
-            let map = self
+        let key = (instrument.clone(), kind);
+        // A session found in the slot can have torn down since: its creator
+        // gave up, say, while another joiner still holds it there. Each
+        // attempt that meets one clears it from the slot, so the next finds a
+        // live session or creates one.
+        for _ in 0..JOIN_ATTEMPTS {
+            let existing = {
+                let map = self
+                    .inner
+                    .live_sessions
+                    .lock()
+                    .expect("live-session registry mutex poisoned");
+                map.get(&key).and_then(Weak::upgrade)
+            };
+            if let Some(existing) = existing {
+                match self.join_live(&key, existing, scope, options, caller).await {
+                    Err(Error::SessionClosed) => {}
+                    joined => return joined,
+                }
+            }
+
+            let provider = self.registered(instrument.provider().as_str())?.clone();
+            self.admit(
+                provider.as_ref(),
+                &instrument,
+                kind,
+                Scope::Live(scope),
+                options,
+                Door::Create,
+                caller,
+            )?;
+
+            match self
+                .create_authoritative(provider, instrument.clone(), kind, scope, options, caller)
+                .await
+            {
+                // The racing winner it joined had torn down; look again.
+                Err(Error::SessionClosed) => {}
+                created => return created,
+            }
+        }
+        Err(Error::SessionClosed)
+    }
+
+    /// Join the live `session` found in `key`'s slot. Admission never answers
+    /// `SessionClosed`; it comes from adding the subscriber alone, when the
+    /// session tore down after it was found. Such a session is taken out of
+    /// the slot, if it still holds it, so the pair's next opener does not
+    /// find a session that can take no subscriber.
+    async fn join_live(
+        &self,
+        key: &(Instrument, EventKind),
+        session: Arc<AuthoritativeSession>,
+        scope: LiveScope,
+        options: PersistenceOptions,
+        caller: Caller,
+    ) -> Result<Attached> {
+        let joined = self
+            .join(Arc::clone(&session), Scope::Live(scope), options, caller)
+            .await;
+        if matches!(joined, Err(Error::SessionClosed)) {
+            let mut map = self
                 .inner
                 .live_sessions
                 .lock()
                 .expect("live-session registry mutex poisoned");
-            map.get(&(instrument.clone(), kind)).and_then(Weak::upgrade)
-        };
-        if let Some(existing) = existing {
-            match self
-                .join(existing, Scope::Live(scope), options, caller)
-                .await
+            if map
+                .get(key)
+                .is_some_and(|slot| std::ptr::eq(slot.as_ptr(), Arc::as_ptr(&session)))
             {
-                // Admission never answers `SessionClosed`; it comes from
-                // `add_subscriber` alone, when the session tore down after the
-                // probe. Fall through to create, which claims the slot once
-                // the old session's last holder has dropped it and joins
-                // whatever still holds it otherwise: a dead session that a
-                // holder keeps in the slot answers `SessionClosed` again.
-                Err(Error::SessionClosed) => {}
-                joined => return joined,
+                map.remove(key);
             }
         }
-
-        let provider = self.registered(instrument.provider().as_str())?.clone();
-        self.admit(
-            provider.as_ref(),
-            &instrument,
-            kind,
-            Scope::Live(scope),
-            options,
-            Door::Create,
-            caller,
-        )?;
-
-        self.create_authoritative(provider, instrument, kind, scope, options, caller)
-            .await
+        joined
     }
 
     /// Admit `existing`'s pair for one more subscriber, then add it.
@@ -617,12 +654,12 @@ impl Datamancer {
             if let Some(winner) = map.get(&key).and_then(Weak::upgrade) {
                 Some(winner)
             } else {
-                map.insert(key, Arc::downgrade(&authoritative));
+                map.insert(key.clone(), Arc::downgrade(&authoritative));
                 None
             }
         };
         if let Some(winner) = winner {
-            return self.join(winner, Scope::Live(scope), options, caller).await;
+            return self.join_live(&key, winner, scope, options, caller).await;
         }
 
         // Pre-seed the opener as the first fan-out subscriber *before* spawning
@@ -1449,6 +1486,10 @@ pub(crate) struct JoinState {
 pub(crate) fn default_buffer() -> usize {
     1024
 }
+
+/// How many times an opener looks again after meeting a session that tore
+/// down under it, before it reports the pair's session as closed.
+const JOIN_ATTEMPTS: usize = 8;
 
 /// Default bound for the detached resume buffer and the backfill pending-live
 /// buffer, in events.
