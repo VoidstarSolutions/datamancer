@@ -294,9 +294,10 @@ fn liveness(
 
 /// When this substream's fault evidence was received, if it has any: the
 /// disconnect it is currently down on. Only the stream's **own** connection
-/// counts. A `ProviderError` is connection-scoped — Alpaca's error frames
-/// name no symbol, and the crypto hub fans every one out to all of its
-/// streams — so it surfaces on the provider (`detail`), never as one stream's
+/// counts. A `ProviderError` sent to every stream is connection-scoped —
+/// Alpaca's error frames name no symbol, and the crypto hub fans every one
+/// out to all of its streams — so it surfaces on the provider (`detail`),
+/// never as one stream's
 /// `Stale`; a stream's own failed backfill fetch is already reported in-band
 /// as a `Gap`. A drop whose cause is `Disabled` is deliberate, not a fault:
 /// the provider reads `Disabled`, and the stream is judged on its data alone.

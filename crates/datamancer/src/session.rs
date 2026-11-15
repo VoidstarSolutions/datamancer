@@ -1862,10 +1862,7 @@ impl Controller {
             source_ts,
             rx_ts: source_ts,
             seq: Seq(0),
-            kind: ControlKind::ProviderError {
-                provider: self.provider.id().to_string(),
-                message,
-            },
+            kind: ControlKind::subscription_error(self.provider.id(), message),
         }))
         .await;
     }
@@ -3032,7 +3029,7 @@ struct EventRing {
 }
 
 /// Provider controls a pending ring keeps past its capacity.
-const SEAM_CONTROL_CAP: usize = 64;
+pub(crate) const SEAM_CONTROL_CAP: usize = 64;
 
 impl EventRing {
     fn new(capacity: usize) -> Self {

@@ -556,10 +556,7 @@ mod tests {
         assert_eq!(a.surfaces().live, failing(8, "ws closed"));
         // A provider error frame is not an outcome on either surface.
         a.record_provider_control(
-            &ControlKind::ProviderError {
-                provider: "p".to_string(),
-                message: "boom".to_string(),
-            },
+            &ControlKind::subscription_error("p", "boom"),
             ConnectionChange::None,
             Timestamp(9),
         );
@@ -595,10 +592,7 @@ mod tests {
         assert_eq!(a.gaps_emitted(), 1);
         assert_eq!(a.last_error(), None);
         a.record_provider_control(
-            &ControlKind::ProviderError {
-                provider: "p".to_string(),
-                message: "boom".to_string(),
-            },
+            &ControlKind::subscription_error("p", "boom"),
             ConnectionChange::None,
             Timestamp(1),
         );

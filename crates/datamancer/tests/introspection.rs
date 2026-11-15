@@ -467,10 +467,7 @@ fn provider_error(id: &str, message: &str) -> MarketEvent {
         source_ts: Timestamp(0),
         rx_ts: Timestamp(0),
         seq: Seq(0),
-        kind: ControlKind::ProviderError {
-            provider: id.to_string(),
-            message: message.to_string(),
-        },
+        kind: ControlKind::subscription_error(id, message),
     })
 }
 

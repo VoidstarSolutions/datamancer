@@ -355,8 +355,8 @@ transport or daemon. It composes three things:
   (subscriber refcount, last source/rx timestamps, `latency_ns =
   rx_ts − source_ts`, per-symbol gap count, seq position, the substream's own
   `connection` phase — `pending`/`up`/`down`, each with the receipt time of the
-  control that entered it; a `ProviderError` is connection-scoped and lands in
-  the provider's `last_error`, not here) and per-client
+  control that entered it; a `ProviderError`, whether sent to every stream or
+  about one subscription, lands in the provider's `last_error`, not here) and per-client
   `ClientSessionSnapshot` (subscriptions + resume-buffer occupancy/drops).
   The timestamps, `latency_ns` and the provider's `messages` describe live
   arrivals only: the pure-live latest-value seed is delivered, teed and takes
@@ -392,7 +392,10 @@ ride one logical client connection:
   `SystemSnapshot` (provider health/connectivity, cache catalog, live state).
   Connection-scoped controls (`ProviderConnected`/`Disconnected`/`ProviderError`)
   are **suppressed** on the data plane and surface here instead; remote consumers
-  read provider connectivity + last-error from `ProviderSnapshot`. Per-symbol
+  read provider connectivity + last-error from `ProviderSnapshot`. A
+  `ProviderError` has two origins, one sent to every subscription and one
+  about a single subscription (a failed backfill fetch); both are suppressed
+  alike, so a remote consumer sees neither in its stream. Per-symbol
   controls (`Gap`, `SubscriptionChanged`) and `SessionClosing` still ride the
   data plane.
 
