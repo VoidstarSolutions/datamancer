@@ -552,11 +552,16 @@ fn subscribe_refuses_a_backfill_older_than_the_limit() {
     assert_eq!(reply["code"], "backfill_too_old", "{reply}");
 }
 
-/// `open-query` for `symbol`'s trades over a fixed window.
-fn open_trade_query(conn: &mut Conn, symbol: &str) -> (u64, DataServiceName) {
-    let reply = conn.request(&format!(
+/// An `open-query` request for `symbol`'s trades over a fixed window.
+fn trade_query(symbol: &str) -> String {
+    format!(
         r#"{{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"{symbol}","kind":"trade","from":1000000000,"to":2000000000}}"#
-    ));
+    )
+}
+
+/// Open a [`trade_query`] for `symbol`, which the daemon must accept.
+fn open_trade_query(conn: &mut Conn, symbol: &str) -> (u64, DataServiceName) {
+    let reply = conn.request(&trade_query(symbol));
     assert_eq!(reply["ok"], true, "open-query rejected: {reply}");
     let service = reply["service"].as_str().expect("service name");
     let name = service
@@ -598,19 +603,8 @@ fn drain_trade_query(subscriber: &mut DataSubscriber) -> Vec<f64> {
 /// Poll `list-queries` until `id` is gone, within 30 s.
 fn wait_until_reaped(daemon: &Daemon, id: u64) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let listed = common::round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
-        if !listed["queries"]
-            .as_array()
-            .expect("queries array")
-            .contains(&serde_json::json!(id))
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "query {id} never self-reaped: {listed}"
-        );
+    while is_listed(daemon, id) {
+        assert!(Instant::now() < deadline, "query {id} never self-reaped");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -696,9 +690,7 @@ fn a_query_nobody_attaches_to_releases_its_slot() {
     let mut conn = Conn::connect(daemon.socket());
 
     let (abandoned, service) = open_trade_query(&mut conn, "AAPL");
-    let refused = conn.request(
-        r#"{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade","from":1000000000,"to":2000000000}"#,
-    );
+    let refused = conn.request(&trade_query("MSFT"));
     assert_eq!(refused["ok"], false, "{refused}");
     assert_eq!(refused["code"], "service_cap_exceeded", "{refused}");
 
@@ -724,13 +716,9 @@ fn shutdown_does_not_wait_for_a_query_to_be_attached() {
     let mut conn = Conn::connect(daemon.socket());
     let (id, _) = open_trade_query(&mut conn, "AAPL");
     std::thread::sleep(Duration::from_millis(300));
-    let listed = common::round_trip(daemon.socket(), r#"{"op":"list-queries"}"#);
     assert!(
-        listed["queries"]
-            .as_array()
-            .expect("queries array")
-            .contains(&serde_json::json!(id)),
-        "the query must be waiting for its client: {listed}"
+        is_listed(&daemon, id),
+        "the query must be waiting for its client"
     );
 
     assert!(
@@ -852,18 +840,7 @@ fn a_cancelled_stalled_query_frees_its_slot_at_once() {
     assert_eq!(again["code"], "unknown_query", "{again}");
     assert_no_publisher_soon(publishers);
 
-    let reply = conn.request(
-        r#"{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade","from":1000000000,"to":2000000000}"#,
-    );
-    assert_eq!(
-        reply["ok"], true,
-        "the cancelled query kept its slot: {reply}"
-    );
-    let service: DataServiceName = reply["service"]
-        .as_str()
-        .expect("service name")
-        .parse()
-        .expect("data-service name");
+    let (_, service) = open_trade_query(&mut conn, "MSFT");
     let mut subscriber = DataSubscriber::open(&node, &service).expect("subscriber");
     assert_eq!(
         drain_trade_query(&mut subscriber).len(),
@@ -906,10 +883,7 @@ fn a_stalled_query_frees_its_slot_when_its_connection_ends() {
     assert_no_publisher_soon(publishers);
 
     let mut conn = Conn::connect(daemon.socket());
-    let reply = conn.request(
-        r#"{"op":"open-query","provider":"scripted","asset_class":"equity","symbol":"MSFT","kind":"trade","from":1000000000,"to":2000000000}"#,
-    );
-    assert_eq!(reply["ok"], true, "the ended query kept its slot: {reply}");
+    open_trade_query(&mut conn, "MSFT");
 }
 
 /// With every `max_queries` slot held by a query whose subscriber holds its

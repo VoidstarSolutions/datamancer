@@ -574,8 +574,8 @@ own short-lived data service
 (`{service_prefix}/{boot_id}/v{WIRE_VERSION}/data/{id}`, the same id space
 and name shape as `open-client`'s per-client services, advertised verbatim in
 the reply's `service`), and pumps the bounded stream into it once a
-subscriber has attached. A query nobody attaches to within 5 s is reaped
-without publishing anything, holding its `max_queries` slot until then.
+subscriber has attached. A query nobody attaches to within a few seconds is
+reaped without publishing anything, holding its `max_queries` slot until then.
 A query that runs to completion ends with a terminal `SessionClosing` control
 on its data stream and the daemon reaps the entry (and the service) on its
 own — no `cancel-query` needed. A provider fetch failure is emitted
@@ -595,7 +595,9 @@ while its subscriber has stopped reading; a stale/finished/unknown id answers
 `cancel-query` — a client-library courtesy, not something the daemon detects:
 the daemon checks for a subscriber only while it waits for the first one, so
 a raw consumer that just drops its subscriber later leaves the query running
-to completion) and
+to completion, and one whose process is killed stays registered until
+iceoryx2's dead-node cleanup, so its query can hold its `max_queries` slot
+until `cancel-query` or EOF on the connection that opened it) and
 **dropping the control connection itself** (EOF on the socket — the daemon
 tracks which in-flight queries each control connection opened and aborts them
 on that connection's teardown, the same way `close-client`/EOF tears down an
