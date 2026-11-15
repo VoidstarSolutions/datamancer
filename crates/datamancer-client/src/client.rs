@@ -91,7 +91,8 @@ pub trait Client: Sized + Send {
     ) -> impl Future<Output = Result<Vec<InstrumentEntry>, ClientError<Self::Error>>> + Send;
 
     /// Graceful close: the daemon emits a terminal `SessionClosing` on the
-    /// event stream and tears the client down.
+    /// event stream and tears the client down. This returns when the teardown
+    /// starts, not when it ends.
     fn close(self) -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
 
     /// A bounded historical event stream. Yields the query's events in source

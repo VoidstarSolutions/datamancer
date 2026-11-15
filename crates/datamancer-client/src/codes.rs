@@ -19,6 +19,10 @@ pub const NOT_SUBSCRIBED: &str = "not_subscribed";
 pub const UNKNOWN_PROVIDER: &str = "unknown_provider";
 /// The underlying session has shut down.
 pub const SESSION_CLOSED: &str = "session_closed";
+/// The client's session already has as many `subscribe` and `unsubscribe`
+/// requests waiting as it queues; this one was not taken. Retry once one of
+/// the client's own requests has answered.
+pub const SESSION_BUSY: &str = "session_busy";
 /// The event stream is already held.
 pub const EVENTS_ALREADY_TAKEN: &str = "events_already_taken";
 /// A storage-layer error.
@@ -33,7 +37,9 @@ pub const PROVIDER_DISABLED: &str = "provider_disabled";
 pub const UNKNOWN_CLIENT: &str = "unknown_client";
 /// A client tried to `open-client` a name already in use.
 pub const DUPLICATE_CLIENT: &str = "duplicate_client";
-/// The iceoryx2 service cap would be exceeded by this subscribe.
+/// A daemon-wide cap would be exceeded: `max_clients` by this `open-client`
+/// (open clients plus closed ones still holding their slots), or the query
+/// cap by this `open-query`.
 pub const SERVICE_CAP_EXCEEDED: &str = "service_cap_exceeded";
 /// The request was malformed or named an unsupported op.
 pub const BAD_REQUEST: &str = "bad_request";

@@ -73,7 +73,7 @@ transports and regression-guarded by tests. Treat these as an operator contract:
 | Group | Codes |
 | --- | --- |
 | Subscription | `duplicate_subscription`, `not_subscribed`, `unsupported_event_kind`, `backfill_too_old`, `backfill_not_in_past`, `persistence_required` |
-| Session / client | `session_closed`, `unknown_client`, `duplicate_client`, `events_already_taken`, `service_cap_exceeded` |
+| Session / client | `session_closed`, `session_busy`, `unknown_client`, `duplicate_client`, `events_already_taken`, `service_cap_exceeded` |
 | Queries | `unknown_query`, `unsupported_transport`, `unsupported_on_windows` |
 | Credentials / config | `credentials_missing`, `credential_backend_unavailable`, `unknown_config_field`, `restart_required` |
 | Access control | `permission_denied`, `integrity_rejected` |

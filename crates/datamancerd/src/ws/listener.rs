@@ -29,6 +29,7 @@ pub async fn serve(
     credential_backend: &'static str,
     diag_interval: Duration,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    sessions: super::WsSessions,
 ) -> std::io::Result<()> {
     let addr: SocketAddr = format!("{}:{}", cfg.bind, cfg.port).parse().map_err(|e| {
         std::io::Error::new(
@@ -86,6 +87,7 @@ pub async fn serve(
                     let dm = dm.clone();
                     let auth_token = auth_token.clone();
                     let conn_shutdown = conn_shutdown_tx.subscribe();
+                    let sessions = sessions.clone();
                     conns.spawn(async move {
                         // Held for the connection's lifetime; releases on drop.
                         let _permit = permit;
@@ -98,6 +100,7 @@ pub async fn serve(
                             credential_backend,
                             diag_interval,
                             conn_shutdown,
+                            sessions,
                         )
                         .await;
                     });
@@ -108,8 +111,10 @@ pub async fn serve(
     }
 
     // New accepts have stopped (the accept loop broke). Signal every live
-    // connection to tear down, then drain their tasks under a bound shorter than
-    // the supervisor's 5s `ws_task` await so this returns before that fires.
+    // connection to tear down, then drain their tasks under a 3 s bound. On a
+    // short `shutdown_timeout_secs` the supervisor's `ws_task` await can fire
+    // first and abort this task. The drain's second tap-log flush covers what
+    // an aborted connection's session releases late.
     let _ = conn_shutdown_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         while conns.join_next().await.is_some() {}
