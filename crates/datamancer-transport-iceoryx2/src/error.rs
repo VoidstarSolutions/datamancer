@@ -21,6 +21,9 @@ pub enum TransportError {
     BadServiceName(String),
     /// Creating or opening an iceoryx2 service/port failed.
     Service(String),
+    /// The named service does not exist on the host: nothing has created it,
+    /// or its owner has already removed it.
+    ServiceNotFound(String),
     /// The named service exists on the host but is marked for destruction.
     /// Either its owner is removing it, which passes on its own, or a previous
     /// owner was killed while removing it: iceoryx2's dead-node cleanup never
@@ -28,11 +31,10 @@ pub enum TransportError {
     /// are removed (see the daemon README, "Recovering from a crashed
     /// predecessor").
     StaleService(String),
-    /// The service has no publisher left and every sample it sent has been
-    /// received: nothing further can arrive.
-    ServiceClosed,
     /// Loaning or sending a sample failed.
     Send(String),
+    /// Receiving a sample failed.
+    Receive(String),
     /// An instrument could not be interned for transport (tuple too long).
     Interning(String),
     /// A `MarketEvent` variant this transport build cannot encode reached the
@@ -46,13 +48,14 @@ impl std::fmt::Display for TransportError {
         match self {
             Self::BadServiceName(m) => write!(f, "invalid iceoryx2 service name: {m}"),
             Self::Service(m) => write!(f, "iceoryx2 service error: {m}"),
+            Self::ServiceNotFound(name) => write!(f, "iceoryx2 service {name} does not exist"),
             Self::StaleService(name) => write!(
                 f,
                 "iceoryx2 service {name} is marked for destruction: its owner is removing \
                  it, or was killed while doing so and its stale resources must be removed"
             ),
-            Self::ServiceClosed => write!(f, "iceoryx2 service has no publisher left"),
             Self::Send(m) => write!(f, "iceoryx2 send error: {m}"),
+            Self::Receive(m) => write!(f, "iceoryx2 receive error: {m}"),
             Self::Interning(m) => write!(f, "symbol interning error: {m}"),
             Self::Unsupported(m) => write!(f, "unsupported event for transport: {m}"),
         }
@@ -62,10 +65,14 @@ impl std::fmt::Display for TransportError {
 impl std::error::Error for TransportError {}
 
 /// Classify a publish-subscribe `open` failure on service `name`:
+/// `DoesNotExist` is [`TransportError::ServiceNotFound`],
 /// `IsMarkedForDestruction` is [`TransportError::StaleService`]; everything
 /// else keeps its debug text as [`TransportError::Service`].
 pub(crate) fn open_error(name: &str, e: PublishSubscribeOpenError) -> TransportError {
     match e {
+        PublishSubscribeOpenError::DoesNotExist => {
+            TransportError::ServiceNotFound(name.to_string())
+        }
         PublishSubscribeOpenError::IsMarkedForDestruction => {
             TransportError::StaleService(name.to_string())
         }
@@ -128,6 +135,28 @@ mod tests {
             PublishSubscribeOpenOrCreateError::SystemInFlux,
         );
         assert!(matches!(&e, TransportError::Service(m) if m.contains("SystemInFlux")));
+    }
+
+    #[test]
+    fn a_service_that_does_not_exist_classifies_as_not_found() {
+        assert_eq!(
+            open_or_create_error(
+                "p/v3/data/0",
+                PublishSubscribeOpenOrCreateError::PublishSubscribeOpenError(
+                    PublishSubscribeOpenError::DoesNotExist
+                )
+            ),
+            TransportError::ServiceNotFound("p/v3/data/0".to_string())
+        );
+    }
+
+    #[test]
+    fn a_receive_failure_does_not_read_as_a_send_failure() {
+        let failure = TransportError::Receive("ExceedsMaxBorrows".to_string());
+        assert_eq!(
+            failure.to_string(),
+            "iceoryx2 receive error: ExceedsMaxBorrows"
+        );
     }
 
     #[test]

@@ -440,10 +440,8 @@ fn open_query_delivers_bars_to_a_subscriber_then_closes() {
             Instant::now() < deadline,
             "the stream did not end within 60 s ({bars} bars so far)"
         );
-        let events = match subscriber.poll() {
-            Ok(events) => events,
-            Err(datamancer::transport::TransportError::ServiceClosed) => break,
-            Err(e) => panic!("poll: {e}"),
+        let datamancer::transport::Polled::Events(events) = subscriber.poll().expect("poll") else {
+            break;
         };
         for event in events {
             match event {

@@ -26,7 +26,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::{Conn, Daemon};
-use datamancer::transport::{DataServiceName, DataSubscriber, TransportError};
+use datamancer::transport::{DataServiceName, DataSubscriber, Polled};
 use datamancer::{ControlKind, MarketEvent};
 use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 
@@ -90,6 +90,14 @@ impl Seen {
     }
 }
 
+/// What one poll of a service that still has its publisher returned.
+fn arrived(subscriber: &mut DataSubscriber) -> Vec<MarketEvent> {
+    match subscriber.poll().expect("poll") {
+        Polled::Events(events) => events,
+        Polled::Closed => panic!("the service closed"),
+    }
+}
+
 /// Poll until `want` data events (gaps count) have been seen or `budget`
 /// elapses.
 fn collect(
@@ -100,7 +108,7 @@ fn collect(
     let deadline = Instant::now() + budget;
     let mut seen = Vec::new();
     while seen.len() < want && Instant::now() < deadline {
-        for event in subscriber.poll().expect("poll") {
+        for event in arrived(subscriber) {
             match event {
                 MarketEvent::Trade(t) => {
                     seen.push(Seen::Trade(t.price.to_f64(), t.source_ts.0, t.seq.0));
@@ -569,10 +577,8 @@ fn drain_trade_query(subscriber: &mut DataSubscriber) -> Vec<f64> {
             "the stream did not end within 30 s, after {} trades",
             prices.len()
         );
-        let events = match subscriber.poll() {
-            Ok(events) => events,
-            Err(TransportError::ServiceClosed) => break,
-            Err(e) => panic!("poll: {e}"),
+        let Polled::Events(events) = subscriber.poll().expect("poll") else {
+            break;
         };
         for event in events {
             assert!(!closing, "{event:?} after SessionClosing");
@@ -1331,7 +1337,7 @@ fn a_third_backfill_waits_for_one_of_two_to_finish() {
     let mut history_at = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(15);
     while history_at.len() < 3 && Instant::now() < deadline {
-        for event in subscriber.poll().expect("poll") {
+        for event in arrived(&mut subscriber) {
             if let MarketEvent::Trade(t) = event
                 && t.price.to_f64() < 100.0
             {

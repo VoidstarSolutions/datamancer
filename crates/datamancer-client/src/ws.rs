@@ -398,7 +398,7 @@ impl Client for WsClient {
     /// WS carries events on the same socket as control replies and its
     /// `EventFrame` has no query id, so queries need a disjoint envelope frame
     /// that does not exist yet. Until then, queries are iceoryx2-only.
-    type Query = futures::stream::Empty<MarketEvent>;
+    type Query = futures::stream::Empty<Result<MarketEvent, ClientError<WsClientError>>>;
 
     async fn query(
         &mut self,

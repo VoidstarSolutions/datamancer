@@ -700,7 +700,7 @@ mod tests {
         // Compile-time proof that the alias names the data client's own stream
         // type: on Windows the WS client's, elsewhere the iceoryx2 client's.
         fn assert_is_market_event_stream<
-            T: futures::Stream<Item = datamancer_core::MarketEvent>,
+            T: futures::Stream<Item = Result<datamancer_core::MarketEvent, ClientError<DataError>>>,
         >() {
         }
         assert_is_market_event_stream::<AppQuery>();

@@ -335,7 +335,7 @@ async fn drain_query(handle: &mut AppHandle, symbol: &str) -> usize {
     let mut closing = false;
     tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(ev) = stream.next().await {
-            match ev {
+            match ev.expect("the query stream ends without an error") {
                 MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing => closing = true,
                 MarketEvent::Control(_) => {}
                 _ => data += 1,

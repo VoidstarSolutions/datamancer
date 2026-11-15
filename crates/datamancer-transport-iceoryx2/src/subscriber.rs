@@ -79,8 +79,24 @@ impl HoldBuffer {
 
 pub use runtime::DataSubscriber;
 
+/// What one [`DataSubscriber::poll`] found.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum Polled {
+    /// The events that became reconstructable since the last poll, in arrival
+    /// order; empty when none did.
+    Events(Vec<MarketEvent>),
+    /// The service has no publisher and everything sent has been received:
+    /// nothing further can arrive. This reads the service's publisher count,
+    /// so it holds only if the publisher existed when the subscriber attached,
+    /// and a killed publisher, which stays counted, never reports it. A sample
+    /// whose announcement never arrived is still held, counted by
+    /// [`DataSubscriber::held_len`], and can no longer be returned.
+    Closed,
+}
+
 mod runtime {
-    use super::HoldBuffer;
+    use super::{HoldBuffer, Polled};
     use crate::error::{Result, TransportError};
     use crate::naming::DataServiceName;
     use crate::payload::DataPayload;
@@ -97,6 +113,10 @@ mod runtime {
         data: Subscriber<ipc_threadsafe::Service, DataPayload, ()>,
         announcements: Subscriber<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
         buffer: HoldBuffer,
+        /// Data samples received and not yet offered to `buffer`.
+        received: Vec<DataPayload>,
+        /// Events reconstructed and not yet returned.
+        ready: Vec<MarketEvent>,
     }
 
     impl DataSubscriber {
@@ -109,10 +129,10 @@ mod runtime {
         ///
         /// # Errors
         ///
-        /// Returns [`TransportError::Service`] if either service does not
-        /// exist or a service or subscriber port cannot be opened, and
-        /// [`TransportError::StaleService`] if a service is marked for
-        /// destruction.
+        /// Returns [`TransportError::ServiceNotFound`] if either service does
+        /// not exist, [`TransportError::StaleService`] if one is marked for
+        /// destruction, and [`TransportError::Service`] if a service or
+        /// subscriber port cannot be opened for another reason.
         pub fn open(node: &Node<ipc_threadsafe::Service>, name: &DataServiceName) -> Result<Self> {
             let (data_name, ann_name) = name.service_names();
 
@@ -141,33 +161,36 @@ mod runtime {
                 data,
                 announcements,
                 buffer: HoldBuffer::new(),
+                received: Vec::new(),
+                ready: Vec::new(),
             })
         }
 
-        /// Drain everything currently available, returning the reconstructable
-        /// logical events in arrival order. Unresolved samples are held for a
-        /// later call.
+        /// Drain everything currently available: [`Polled::Events`] holds the
+        /// reconstructable logical events, and unresolved samples are held for
+        /// a later call. [`Polled::Closed`] is the end of the stream.
         ///
         /// # Errors
         ///
-        /// Returns [`TransportError::ServiceClosed`] once the service has no
-        /// publisher and nothing is left to return, and another
-        /// [`TransportError`] on an iceoryx2 receive failure.
-        pub fn poll(&mut self) -> Result<Vec<MarketEvent>> {
+        /// Returns [`TransportError::Interning`] on a malformed announcement,
+        /// which is consumed: a later call carries on past it. Returns
+        /// [`TransportError::Receive`] on an iceoryx2 receive failure, which
+        /// nothing here clears, so a later call may fail the same way. Either
+        /// way, what the failed call had already received is not lost: a later
+        /// call that succeeds returns it.
+        pub fn poll(&mut self) -> Result<Polled> {
             let closed = self.data_service.dynamic_config().number_of_publishers() == 0;
-            let mut samples = Vec::new();
             while let Some(sample) = self
                 .data
                 .receive()
-                .map_err(|e| TransportError::Send(format!("{e:?}")))?
+                .map_err(|e| TransportError::Receive(format!("{e:?}")))?
             {
-                samples.push(*sample);
+                self.received.push(*sample);
             }
-            let mut events = Vec::new();
             while let Some(sample) = self
                 .announcements
                 .receive()
-                .map_err(|e| TransportError::Send(format!("{e:?}")))?
+                .map_err(|e| TransportError::Receive(format!("{e:?}")))?
             {
                 // Surface a malformed announcement instead of silently dropping
                 // it: discarding leaves every data sample for that symbol held in
@@ -176,15 +199,15 @@ mod runtime {
                     .buffer
                     .apply_announcement(&sample)
                     .map_err(|e| TransportError::Interning(e.to_string()))?;
-                events.extend(resolved);
+                self.ready.extend(resolved);
             }
-            for sample in samples {
-                events.extend(self.buffer.offer(sample));
+            for sample in self.received.drain(..) {
+                self.ready.extend(self.buffer.offer(sample));
             }
-            if closed && events.is_empty() {
-                return Err(TransportError::ServiceClosed);
+            if closed && self.ready.is_empty() {
+                return Ok(Polled::Closed);
             }
-            Ok(events)
+            Ok(Polled::Events(std::mem::take(&mut self.ready)))
         }
 
         /// Number of data samples held awaiting their announcement.

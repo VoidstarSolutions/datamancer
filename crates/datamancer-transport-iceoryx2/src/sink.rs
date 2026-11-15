@@ -359,7 +359,21 @@ mod tests {
     use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 
     use super::Iceoryx2DataSink;
-    use crate::{DataServiceName, DataSubscriber, ServicePrefix};
+    use crate::{DataServiceName, DataSubscriber, Polled, ServicePrefix};
+
+    /// The `seq` of each trade one poll of an open service returned.
+    fn trade_seqs(subscriber: &mut DataSubscriber) -> Vec<u64> {
+        let Polled::Events(events) = subscriber.poll().expect("poll") else {
+            panic!("the service closed");
+        };
+        events
+            .into_iter()
+            .filter_map(|ev| match ev {
+                MarketEvent::Trade(t) => Some(t.seq.0),
+                _ => None,
+            })
+            .collect()
+    }
 
     fn trade(seq: u64) -> MarketEvent {
         let ts = i64::try_from(seq).expect("small");
@@ -403,22 +417,14 @@ mod tests {
 
         let mut seqs = Vec::new();
         for _ in 0..200 {
-            for ev in subscriber.poll().expect("poll") {
-                if let MarketEvent::Trade(t) = ev {
-                    seqs.push(t.seq.0);
-                }
-            }
+            seqs.extend(trade_seqs(&mut subscriber));
             if seqs.len() >= 2 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        for ev in subscriber.poll().expect("poll") {
-            if let MarketEvent::Trade(t) = ev {
-                seqs.push(t.seq.0);
-            }
-        }
+        seqs.extend(trade_seqs(&mut subscriber));
         assert_eq!(seqs, vec![0, 1]);
     }
 }
