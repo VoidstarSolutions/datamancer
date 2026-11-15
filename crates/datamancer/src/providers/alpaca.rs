@@ -37,10 +37,13 @@
 //! reconnects — re-applying the aggregate subscription set. A
 //! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast to
 //! every active sink so consumers see the gap window in the event stream. A
-//! rejected credential pair (`402`) parks until the credentials rotate when
-//! they come from a watched source, and backs off like any other failure
-//! otherwise; a `406` or any other server error is transient and backs off
-//! (see `classify_stream_failure` for the upstream caveat).
+//! credential pair rejected (`402`) at connect or mid-stream parks until the
+//! credentials rotate when they come from a watched source, and backs off
+//! like any other failure otherwise; a `406` or any other server error is
+//! transient and backs off (see `classify_stream_failure` for the upstream
+//! caveat). A `402` that refuses a subscribe is answered to that subscribe as
+//! unauthenticated and does not park; one that refuses the re-subscribe after
+//! a reconnect is broadcast as a provider error, and the stream stays up.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

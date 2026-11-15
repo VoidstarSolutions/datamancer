@@ -26,11 +26,12 @@ use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
 use super::runtime::{Park, SettingsSource};
 use crate::session::ReconnectPolicy;
 
-/// How a streaming failure is handled. A rejected credential pair from a
-/// watched source parks the hub until a rotation (retrying cannot help,
-/// provisioning can); one from a static source, and everything else — a
-/// dropped socket, `406 connection limit exceeded`, `407 slow client` —
-/// backs off.
+/// How a failure to connect, or of the connected stream, is handled. A
+/// rejected credential pair from a watched source parks the hub until a
+/// rotation (retrying cannot help, provisioning can); one from a static
+/// source, and everything else — a dropped socket, `406 connection limit
+/// exceeded`, `407 slow client` — backs off. A refused subscribe is only
+/// answered by its class and never parks the hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StreamFailure {
     Unauthenticated,
@@ -107,12 +108,12 @@ pub(super) trait Connector: Send + Sync + 'static {
         settings: &Self::Settings,
         credentials: PresentCredentials,
     ) -> impl Future<Output = std::result::Result<Self::Upstream, Self::Failure>> + Send;
-    /// Whether `failure` is a rejected credential or transient. The answer
-    /// decides whether the hub parks (a rejected credential from a watched
-    /// source) or backs off, the `DisconnectCause` of the
-    /// `ProviderDisconnected` control it broadcasts, and whether a refused
-    /// subscribe or unsubscribe is answered with `Error::Unauthenticated` or
-    /// `Error::Provider`.
+    /// Whether `failure` is a rejected credential or transient. For a failed
+    /// connect or stream the answer decides whether the hub parks (a rejected
+    /// credential from a watched source) or backs off, and the
+    /// `DisconnectCause` of the `ProviderDisconnected` control it broadcasts.
+    /// For a refused subscribe or unsubscribe it decides only whether the
+    /// answer is `Error::Unauthenticated` or `Error::Provider`.
     fn classify(failure: &Self::Failure) -> StreamFailure;
 }
 
