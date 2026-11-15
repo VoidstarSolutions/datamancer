@@ -28,8 +28,11 @@
 //! `Arc<AuthoritativeSession>` drop clears the registry slot.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use datamancer_core::{
@@ -1474,6 +1477,11 @@ impl ClientController {
                 options,
                 reply,
             } => {
+                // Nobody can receive the answer any more, so the subscribe
+                // would only be undone: do not make it at the provider.
+                if reply.is_closed() {
+                    return true;
+                }
                 let res = self
                     .subscribe(instrument.clone(), kind, scope, options)
                     .await;
@@ -1815,6 +1823,58 @@ type InitialSubscription = (
     String,
 );
 
+/// The answer to a command a [`ClientSession`] has queued. The command took
+/// its place in the session's order when it was queued, not when this is
+/// awaited.
+///
+/// # Cancel safety
+///
+/// Dropping this does not withdraw an unsubscribe. Dropping it before the
+/// session has answered a subscribe undoes that subscribe: one the session
+/// has not started is never made, and one it is making is removed again.
+/// Once the session has answered, the subscription stays, awaited or not.
+/// The two cannot be told apart from outside, so a caller that gives up on a
+/// subscribe checks [`ClientSession::subscriptions`] or unsubscribes the
+/// pair.
+///
+/// # Errors
+///
+/// Resolves to the command's own errors, or [`Error::SessionClosed`] if the
+/// session shut down before answering, or if this is polled again after it
+/// resolved.
+#[derive(Debug)]
+#[must_use = "dropping the answer loses it, and undoes a subscribe not yet answered"]
+pub struct Queued<T>(Option<oneshot::Receiver<Result<T>>>);
+
+impl<T> Queued<T> {
+    /// Hand `command` to the session on `queue` without waiting, and return
+    /// its answer.
+    fn of(
+        queue: &mpsc::Sender<ClientCommand>,
+        command: impl FnOnce(oneshot::Sender<Result<T>>) -> ClientCommand,
+    ) -> Result<Self> {
+        let (tx, rx) = oneshot::channel();
+        match queue.try_send(command(tx)) {
+            Ok(()) => Ok(Self(Some(rx))),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(Error::SessionBusy),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::SessionClosed),
+        }
+    }
+}
+
+impl<T> Future for Queued<T> {
+    type Output = Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(answer) = self.0.as_mut() else {
+            return Poll::Ready(Err(Error::SessionClosed));
+        };
+        let answer = std::task::ready!(Pin::new(answer).poll(cx));
+        self.0 = None;
+        Poll::Ready(answer.map_err(|_| Error::SessionClosed)?)
+    }
+}
+
 /// Internal handle to a spawned [`ClientController`]. Shared by the public
 /// [`ClientSession`] and the retained single-pair [`crate::Session`] on its live
 /// path.
@@ -1836,6 +1896,34 @@ impl ClientHandle {
             .map_err(|_| Error::SessionClosed)?;
         let receiver = rx.await.map_err(|_| Error::SessionClosed)??;
         Ok(EventStream::new(receiver))
+    }
+
+    pub(crate) fn queue_subscribe(
+        &self,
+        instrument: Instrument,
+        kind: EventKind,
+        scope: LiveScope,
+        options: PersistenceOptions,
+    ) -> Result<Queued<Subscribed>> {
+        Queued::of(&self.cmd_tx, |reply| ClientCommand::Subscribe {
+            instrument,
+            kind,
+            scope,
+            options,
+            reply,
+        })
+    }
+
+    pub(crate) fn queue_unsubscribe(
+        &self,
+        instrument: Instrument,
+        kind: EventKind,
+    ) -> Result<Queued<()>> {
+        Queued::of(&self.cmd_tx, |reply| ClientCommand::Unsubscribe {
+            instrument,
+            kind,
+            reply,
+        })
     }
 
     pub(crate) async fn subscribe(
@@ -1959,6 +2047,14 @@ impl ClientSession {
     /// The pair's authoritative session is created with the first subscriber's
     /// `scope` and every later subscriber joins it as is.
     ///
+    /// # Cancel safety
+    ///
+    /// Not cancel safe. Dropping this future before the session has answered
+    /// leaves no subscription. Dropping it after the session has answered,
+    /// which the caller cannot tell apart, leaves the subscription in place:
+    /// after a timeout, check [`subscriptions`](Self::subscriptions) or
+    /// [`unsubscribe`](Self::unsubscribe) the pair.
+    ///
     /// # Errors
     ///
     /// - [`Error::DuplicateSubscription`] — `(instrument, kind)` is already in
@@ -1994,6 +2090,39 @@ impl ClientSession {
             .await
     }
 
+    /// Queue a subscribe without waiting, so a caller can fix the order of
+    /// its commands without waiting for each to finish. On `Ok` the subscribe
+    /// has its place in the session's order, and the returned [`Queued`]
+    /// resolves to what [`subscribe`](Self::subscribe) returns, errors
+    /// included; it undoes the subscribe if it is dropped before the session
+    /// has answered.
+    ///
+    /// # Arguments
+    ///
+    /// * `instrument` - the instrument to subscribe to.
+    /// * `kind` - which of its event kinds.
+    /// * `scope` - live only, or a backfill seamed into the live tail.
+    /// * `options` - whether the subscription reads the cache and writes the
+    ///   tap log.
+    ///
+    /// # Errors
+    ///
+    /// Nothing was queued:
+    ///
+    /// - [`Error::SessionBusy`] — the session cannot take one more command
+    ///   until it has answered one.
+    /// - [`Error::SessionClosed`] — the controller has shut down.
+    pub fn queue_subscribe(
+        &self,
+        instrument: Instrument,
+        kind: EventKind,
+        scope: LiveScope,
+        options: PersistenceOptions,
+    ) -> Result<Queued<Subscribed>> {
+        self.handle
+            .queue_subscribe(instrument, kind, scope, options)
+    }
+
     /// Remove a subscription. Emits a client-local
     /// `SubscriptionChanged { active: false }` for the symbol.
     ///
@@ -2003,6 +2132,27 @@ impl ClientSession {
     /// - [`Error::SessionClosed`] — the controller has shut down.
     pub async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
         self.handle.unsubscribe(instrument, kind).await
+    }
+
+    /// Queue an unsubscribe without waiting; see
+    /// [`queue_subscribe`](Self::queue_subscribe). On `Ok` the returned
+    /// [`Queued`] resolves to what [`unsubscribe`](Self::unsubscribe) returns,
+    /// errors included; dropping it leaves the unsubscribe in place.
+    ///
+    /// # Arguments
+    ///
+    /// * `instrument` - the instrument to unsubscribe from.
+    /// * `kind` - which of its event kinds.
+    ///
+    /// # Errors
+    ///
+    /// Nothing was queued:
+    ///
+    /// - [`Error::SessionBusy`] — the session cannot take one more command
+    ///   until it has answered one.
+    /// - [`Error::SessionClosed`] — the controller has shut down.
+    pub fn queue_unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<Queued<()>> {
+        self.handle.queue_unsubscribe(instrument, kind)
     }
 
     /// Take the multiplexed event stream. Multi-shot: dropping the stream

@@ -320,6 +320,106 @@ async fn wait_until(mut cond: impl FnMut() -> bool) {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Queued commands take effect in the order they were queued, whichever
+/// answer is awaited first.
+#[tokio::test]
+async fn queued_commands_apply_in_the_order_they_were_queued() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+
+    let subscribed = client
+        .queue_subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .expect("queue the subscribe");
+    let unsubscribed = client
+        .queue_unsubscribe(inst("AAPL"), EventKind::Trade)
+        .expect("queue the unsubscribe");
+
+    unsubscribed
+        .await
+        .expect("the unsubscribe follows the subscribe");
+    subscribed.await.expect("the subscribe was applied first");
+    assert!(client.subscriptions().await.is_empty());
+    let _ = client.close().await;
+}
+
+/// Adversarial review probe: a `Queued` the session refused can be polled
+/// again after it resolved (it answers `SessionClosed`); one the session
+/// answered cannot.
+#[tokio::test]
+async fn a_queued_answer_polled_again_reports_a_closed_session() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let mut unsubscribed = client
+        .queue_unsubscribe(inst("AAPL"), EventKind::Trade)
+        .expect("queue the unsubscribe");
+    let first = (&mut unsubscribed).await;
+    assert!(
+        matches!(first, Err(datamancer::Error::NotSubscribed { .. })),
+        "{first:?}"
+    );
+    let again = (&mut unsubscribed).await;
+    assert!(again.is_err(), "{again:?}");
+    let _ = client.close().await;
+}
+
+/// A session takes as many queued commands as its queue holds and refuses
+/// the next at the call; the ones it took are unaffected.
+#[tokio::test]
+async fn a_full_command_queue_refuses_the_next_queued_command() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_next_subscribe(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let queue = |symbol: String| {
+        client.queue_subscribe(
+            inst(&symbol),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+    };
+
+    // The first waits on the provider; the session holds the rest queued.
+    let first = queue("FIRST".to_string()).expect("queue the first");
+    wait_until(|| ctrl.live_starts() == 1).await;
+    let mut taken = Vec::new();
+    let refusal = loop {
+        match queue(format!("S{}", taken.len())) {
+            Ok(next) => taken.push(next),
+            Err(refusal) => break refusal,
+        }
+        assert!(taken.len() < 100_000, "the queue never filled");
+    };
+
+    assert!(
+        matches!(refusal, datamancer::Error::SessionBusy),
+        "{refusal:?}"
+    );
+    gate.notify_one();
+    first.await.expect("the first subscribe");
+    for subscribe in taken {
+        subscribe.await.expect("a queued subscribe");
+    }
+    let _ = client.close().await;
+}
+
 #[tokio::test]
 async fn multiplex_interleaves_two_instruments_in_arrival_order() {
     let (provider, ctrl) = FakeProvider::new("fake", false);

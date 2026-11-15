@@ -34,6 +34,11 @@ pub enum Error {
     #[error("session closed")]
     SessionClosed,
 
+    /// The session already holds as many queued commands as it can; the
+    /// command was not queued. Retry once an earlier one has been answered.
+    #[error("session has too many commands queued")]
+    SessionBusy,
+
     /// A client session already holds a subscription for `(instrument, kind)`.
     /// Subscribe once per pair; demux is a consumer concern.
     #[error("client already subscribed to {kind:?} on {instrument}")]
