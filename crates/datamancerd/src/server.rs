@@ -145,29 +145,45 @@ impl DrainClient for ClientEntry {
     }
 }
 
-/// One in-flight historical query.
-///
-/// The `Session` is held here so cancellation can **close** it. Dropping the
-/// handle is *not* enough: the historical controller holds its own
-/// `Arc<SessionInner>`, so its `cmd_tx` clone stays alive and the in-flight
-/// provider fetch keeps paging into a detached ring. Only
-/// `Session::close()` — which sends `SessionCommand::Close` — reaches the
-/// controller's `fetch_task.abort()`. Cancelling a query therefore removes
-/// the entry, aborts the pump (which ends at once, even mid-publish to a
-/// subscriber that has stopped reading), drops the sink (releasing the
-/// service) and spawns the session close.
+/// One in-flight historical query. Dropping it cancels the query: the pump
+/// ends at once, even mid-publish to a subscriber that has stopped reading,
+/// the sink goes (releasing the service), and the session is closed.
 #[cfg(not(windows))]
 struct QueryEntry {
-    session: datamancer::Session,
+    session: Option<datamancer::Session>,
     #[allow(dead_code)] // held to keep the service alive for the pump's lifetime
     sink: Arc<dyn EventSink>,
     pump: JoinHandle<()>,
     service: String,
 }
 
+#[cfg(not(windows))]
+impl Drop for QueryEntry {
+    fn drop(&mut self) {
+        self.pump.abort();
+        if let Some(session) = self.session.take() {
+            close_query_session(session);
+        }
+    }
+}
+
 /// How long a query waits for its client to attach before it is reaped.
 #[cfg(not(windows))]
 const QUERY_ATTACH_GRACE: Duration = Duration::from_secs(5);
+
+/// How a query's pump ended.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryOutcome {
+    /// Everything up to the terminal `SessionClosing` was published.
+    Completed,
+    /// No client attached within [`QUERY_ATTACH_GRACE`]; nothing was published.
+    Expired,
+    /// The sink refused an event part-way through.
+    Rejected,
+    /// The pump panicked.
+    Panicked,
+}
 
 /// A command handed to the server actor by a control connection.
 enum ServerCommand {
@@ -178,9 +194,12 @@ enum ServerCommand {
     },
     /// A control connection for `client` hit EOF (emergency teardown).
     Disconnect { client: String },
-    /// A query's pump reached the end of its stream; reap the entry.
+    /// A query's pump ended on its own; reap the entry.
     #[cfg(not(windows))]
-    QueryFinished { query: QueryId },
+    QueryFinished {
+        query: QueryId,
+        outcome: QueryOutcome,
+    },
     /// A control connection hit EOF; cancel every query it opened. Unconditional
     /// (not `#[cfg(not(windows))]`) because `serve_connection` — the shared,
     /// platform-agnostic connection loop — is what sends it; on Windows
@@ -909,17 +928,9 @@ impl Server {
                 self.teardown_client(&client).await;
             }
             #[cfg(not(windows))]
-            ServerCommand::QueryFinished { query } => {
+            ServerCommand::QueryFinished { query, outcome } => {
                 if let Some(entry) = self.queries.remove(&query) {
-                    tracing::debug!(query, service = %entry.service, "query completed");
-                    // The pump reports here on three paths: a clean drain (the
-                    // controller has already shut itself down, so this close is
-                    // a no-op), a sink rejection mid-range and an attach grace
-                    // expiry (the fetch may still be paging). Only `close()`
-                    // actually aborts that fetch — dropping the handle would
-                    // leave it burning provider rate limit with nobody
-                    // consuming it.
-                    close_query_session(entry.session);
+                    tracing::debug!(query, service = %entry.service, ?outcome, "query finished");
                 }
             }
             ServerCommand::CancelQueries { queries } => {
@@ -1161,7 +1172,7 @@ impl Server {
         self.queries.insert(
             id,
             QueryEntry {
-                session,
+                session: Some(session),
                 sink,
                 pump,
                 service: service.clone(),
@@ -1185,27 +1196,18 @@ impl Server {
         )
     }
 
-    /// Cancel an in-flight query: abort the pump, close the `Session` (which is
-    /// what actually kills the provider fetch) and release the data service
-    /// and the `max_queries` slot, all at once, whether or not a subscriber is
-    /// reading.
-    ///
-    /// The close is *spawned*, never awaited: `cancel_query` runs on the daemon
-    /// actor, and awaiting a session shutdown there would stall every other
-    /// control op behind it.
+    /// Cancel an in-flight query, releasing its data service and its
+    /// `max_queries` slot at once, whether or not a subscriber is reading.
     #[cfg(not(windows))]
     fn cancel_query(&mut self, query: QueryId) -> Reply {
-        match self.queries.remove(&query) {
-            Some(entry) => {
-                entry.pump.abort();
-                close_query_session(entry.session);
-                tracing::debug!(query, "query cancelled");
-                Reply::ok()
-            }
-            None => Reply::error(
+        if self.queries.remove(&query).is_some() {
+            tracing::debug!(query, "query cancelled");
+            Reply::ok()
+        } else {
+            Reply::error(
                 codes::UNKNOWN_QUERY,
                 format!("no in-flight query {query} (already finished or cancelled)"),
-            ),
+            )
         }
     }
 
@@ -1241,9 +1243,7 @@ impl Server {
     /// `cmd_tx` clone.
     #[cfg(not(windows))]
     fn abort_all_queries(&mut self) {
-        for (id, entry) in self.queries.drain() {
-            entry.pump.abort();
-            close_query_session(entry.session);
+        for (id, _) in self.queries.drain() {
             tracing::debug!(query = id, "aborted in-flight query for shutdown");
         }
     }
@@ -1459,12 +1459,14 @@ where
 /// answers with `fetch_task.abort()` — that is the only path that actually
 /// cancels the fetch. It is spawned rather than awaited because every caller
 /// runs on the daemon actor, where an inline await would block all other
-/// control ops.
+/// control ops; with no runtime left to spawn on, the fetch is ending with it.
 #[cfg(not(windows))]
 fn close_query_session(session: datamancer::Session) {
-    tokio::spawn(async move {
-        let _ = session.close().await;
-    });
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            let _ = session.close().await;
+        });
+    }
 }
 
 /// Pump a query's bounded stream into its own sink, then tell the actor to reap
@@ -1473,9 +1475,41 @@ fn close_query_session(session: datamancer::Session) {
 /// to call `cancel-query`.
 ///
 /// Nothing is published before a subscriber attaches; see `open_query`'s
-/// "Attach race". The pump reports however it ends, a panic included, so a
-/// query cannot keep its `max_queries` slot past its pump; an aborted pump
-/// does not report, since whoever aborts it removes the entry.
+/// "Attach race".
+#[cfg(not(windows))]
+fn spawn_query_pump(
+    stream: datamancer::EventStream,
+    sink: Arc<Iceoryx2DataSink>,
+    query: QueryId,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+) -> JoinHandle<()> {
+    spawn_reporting(pump_query(stream, sink, query), query, cmd_tx)
+}
+
+/// Run `pumped` and report how it ended as [`ServerCommand::QueryFinished`], a
+/// panic included, so a query cannot keep its `max_queries` slot past its
+/// pump. An aborted task reports nothing.
+#[cfg(not(windows))]
+fn spawn_reporting(
+    pumped: impl Future<Output = QueryOutcome> + Send + 'static,
+    query: QueryId,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let outcome = std::panic::AssertUnwindSafe(pumped)
+            .catch_unwind()
+            .await
+            .unwrap_or(QueryOutcome::Panicked);
+        if outcome != QueryOutcome::Completed {
+            tracing::warn!(query, ?outcome, "query ended early");
+        }
+        let _ = cmd_tx
+            .send(ServerCommand::QueryFinished { query, outcome })
+            .await;
+    })
+}
+
+/// Publish a query's stream into `sink` once a subscriber has attached.
 ///
 /// # Why this stops at `SessionClosing` rather than reading to `None`
 ///
@@ -1485,51 +1519,36 @@ fn close_query_session(session: datamancer::Session) {
 /// shuts down (`Controller::finish_historical`). Reading to `None` therefore
 /// deadlocks — the pump would wait for a close that only the pump's own drop
 /// can trigger — and the entry would never be reaped, permanently consuming a
-/// `max_queries` slot. So the pump publishes the terminal control, breaks, and
-/// drops the stream, which lets the controller finish.
+/// `max_queries` slot. So the pump publishes the terminal control and returns,
+/// dropping the stream, which lets the controller finish.
 #[cfg(not(windows))]
-fn spawn_query_pump(
+async fn pump_query(
     mut stream: datamancer::EventStream,
     sink: Arc<Iceoryx2DataSink>,
     query: QueryId,
-    cmd_tx: mpsc::Sender<ServerCommand>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let pumped = std::panic::AssertUnwindSafe(async move {
-            if !sink.wait_for_subscriber(QUERY_ATTACH_GRACE).await {
-                tracing::warn!(query, "no client attached to query; reaping it");
-                return;
-            }
-            while let Some(ev) = stream.next().await {
-                let terminal = matches!(
-                    &ev,
-                    datamancer::MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing
-                );
-                match sink.publish(ev).await {
-                    PublishOutcome::Delivered => {}
-                    PublishOutcome::Rejected(_) => {
-                        tracing::warn!(query, "query sink rejected event; stopping pump");
-                        break;
-                    }
-                }
-                if terminal {
-                    break;
-                }
-            }
-            // Drop the stream before reporting: the controller is parked on
-            // `tx.closed()` and only this drop releases it.
-            drop(stream);
-            if let Err(e) = sink.flush().await {
-                tracing::warn!(query, error = %e, "final query sink flush failed");
-            }
-        })
-        .catch_unwind()
-        .await;
-        if pumped.is_err() {
-            tracing::warn!(query, "query pump panicked");
+) -> QueryOutcome {
+    if !sink.wait_for_subscriber(QUERY_ATTACH_GRACE).await {
+        return QueryOutcome::Expired;
+    }
+    let mut outcome = QueryOutcome::Completed;
+    while let Some(ev) = stream.next().await {
+        let terminal = matches!(
+            &ev,
+            datamancer::MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing
+        );
+        if let PublishOutcome::Rejected(_) = sink.publish(ev).await {
+            outcome = QueryOutcome::Rejected;
+            break;
         }
-        let _ = cmd_tx.send(ServerCommand::QueryFinished { query }).await;
-    })
+        if terminal {
+            break;
+        }
+    }
+    drop(stream);
+    if let Err(e) = sink.flush().await {
+        tracing::warn!(query, error = %e, "final query sink flush failed");
+    }
+    outcome
 }
 
 /// Accept control connections and spawn a reader per connection.
@@ -2197,6 +2216,36 @@ mod tests {
                 "round {round}: the aborted pump still holds the sink"
             );
         }
+    }
+
+    #[cfg(not(windows))]
+    async fn reported_end(
+        pumped: impl Future<Output = QueryOutcome> + Send + 'static,
+    ) -> QueryOutcome {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        spawn_reporting(pumped, 7, cmd_tx);
+        match cmd_rx.recv().await {
+            Some(ServerCommand::QueryFinished { query: 7, outcome }) => outcome,
+            _ => panic!("the pump did not report query 7's end"),
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_query_pump_reports_how_it_ended() {
+        assert_eq!(
+            reported_end(async { QueryOutcome::Expired }).await,
+            QueryOutcome::Expired
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_query_pump_that_panics_still_reports_its_end() {
+        assert_eq!(
+            reported_end(async { panic!("pump failure") }).await,
+            QueryOutcome::Panicked
+        );
     }
 
     /// The web and WS steps, which share one deadline, leave the drain at
