@@ -1304,6 +1304,16 @@ account_type = "paper"
             .expect("one second validates");
     }
 
+    /// No upper limit: the exit deadline is computed without overflow, so
+    /// the largest value is as safe as any other.
+    #[test]
+    fn the_largest_shutdown_timeout_validates() {
+        Config::parse(&format!("[server]\nshutdown_timeout_secs = {}\n", i64::MAX))
+            .expect("parse")
+            .validate()
+            .expect("the largest timeout validates");
+    }
+
     #[test]
     fn zero_ws_channel_depth_is_rejected() {
         // `channel_depth = 0` would panic `mpsc::channel` on the first WS

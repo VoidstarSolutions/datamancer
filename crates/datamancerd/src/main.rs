@@ -157,20 +157,44 @@ fn run(args: Args) -> Result<()> {
 
 /// How long the runtime's own shutdown may take at `now`: what is left of the
 /// exit deadline `run` returned, or all of `shutdown_timeout` after a failed
-/// boot, which never reached a deadline.
+/// boot, which never reached a deadline. Never more than [`server::FAR`],
+/// which the runtime can add to an `Instant`.
 fn runtime_shutdown_budget(
     exit_deadline: Option<std::time::Instant>,
     shutdown_timeout: Duration,
     now: std::time::Instant,
 ) -> Duration {
-    exit_deadline.map_or(shutdown_timeout, |deadline| {
-        deadline.saturating_duration_since(now)
-    })
+    exit_deadline
+        .map_or(shutdown_timeout, |deadline| {
+            deadline.saturating_duration_since(now)
+        })
+        .min(server::FAR)
 }
 
 #[cfg(test)]
 mod main_tests {
     use super::*;
+
+    /// The config sets no upper limit on `shutdown_timeout_secs`
+    /// (`the_largest_shutdown_timeout_validates`). After a failed boot `run`
+    /// hands the whole timeout to the runtime's shutdown.
+    #[test]
+    fn a_failed_boot_with_the_largest_timeout_shuts_down_without_panicking() {
+        let config = Config::parse(&format!("[server]\nshutdown_timeout_secs = {}\n", i64::MAX))
+            .expect("parse");
+        config.validate().expect("the largest timeout validates");
+        let shutdown_timeout = Duration::from_secs(config.server.shutdown_timeout_secs);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // What `run` does when `Server::bootstrap` returned an error.
+        runtime.shutdown_timeout(runtime_shutdown_budget(
+            None,
+            shutdown_timeout,
+            std::time::Instant::now(),
+        ));
+    }
 
     #[test]
     fn the_runtime_gets_what_is_left_of_the_exit_deadline() {
