@@ -2047,6 +2047,11 @@ impl ClientSession {
     /// The pair's authoritative session is created with the first subscriber's
     /// `scope` and every later subscriber joins it as is.
     ///
+    /// A subscribe that creates the session waits for the pair's previous
+    /// session, if one is still tearing down, to finish unsubscribing at the
+    /// provider. After 30 s of that it fails with [`Error::Provider`], and
+    /// can be retried.
+    ///
     /// # Cancel safety
     ///
     /// Not cancel safe. Dropping this future before the session has answered
@@ -2077,6 +2082,9 @@ impl ClientSession {
     ///   [`Subscribed::Joined`] with that `Live` session.
     /// - [`Error::ProviderDisabled`] — the session's provider is disabled,
     ///   whether this subscribe would create or join.
+    /// - [`Error::Provider`] — the provider refused or failed the subscribe,
+    ///   or the pair's previous session was still unsubscribing there after
+    ///   30 s; the second can be retried.
     /// - [`Error::SessionClosed`] — the controller has shut down, or the
     ///   pair's session tore down each time this subscribe went to join it;
     ///   the session itself is still usable then, and a retry is safe.

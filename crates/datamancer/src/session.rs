@@ -54,7 +54,7 @@ use crate::client_session::{
     Attached, AuthoritativeSession, ClientHandle, ClientSession, ClientStats, FanOut, LiveStats,
     SubscriberGuard, SubscriberId, spawn_client,
 };
-use crate::fetch_locks::FetchLocks;
+use crate::fetch_locks::{FetchLocks, KeyedLocks};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -70,7 +70,7 @@ use datamancer_core::{
 };
 use futures::StreamExt;
 use futures::stream::Stream;
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -268,6 +268,12 @@ struct DatamancerInner {
     /// Per-`CacheKey` single-flight registry: at most one outstanding
     /// provider fetch per key (see `fetch_locks`).
     fetch_locks: FetchLocks,
+    /// One turn at the provider per live pair: a pair's session holds it from
+    /// before its subscribe until its unsubscribe has returned, so the pair's
+    /// next session subscribes only after that.
+    live_turns: KeyedLocks<(Instrument, EventKind)>,
+    /// Notified each time a live session claims its pair's slot.
+    slot_claimed: tokio::sync::Notify,
     /// Per-provider call/throughput accounting, keyed by provider id. Cloned
     /// into each controller so the cold-site and stream-derived counters land
     /// on the same handle the diagnostics snapshot reads.
@@ -384,6 +390,7 @@ impl Datamancer {
                     data_forwarded: false,
                     backfill_permits: None,
                     seed_pending: false,
+                    _live_turn: None,
                 };
                 tokio::spawn(controller.run_historical(from, to, provider_tx, provider_rx, cmd_rx));
                 Ok(Session {
@@ -466,8 +473,13 @@ impl Datamancer {
                 caller,
             )?;
 
+            // Another opener claimed the slot while this one waited for the
+            // pair's turn: look again, and join it.
+            let Some(turn) = self.live_turn(&key, provider.id()).await? else {
+                continue;
+            };
             match self
-                .create_authoritative(provider, instrument.clone(), kind, scope, options, caller)
+                .create_authoritative(provider, key.clone(), scope, options, caller, turn)
                 .await
             {
                 // The racing winner it joined had torn down; look again.
@@ -476,6 +488,51 @@ impl Datamancer {
             }
         }
         Err(Error::SessionClosed)
+    }
+
+    /// Take `key`'s turn at `provider`, waiting up to [`LIVE_TURN_LIMIT`] for
+    /// the pair's previous session to finish unsubscribing there. `None` if
+    /// another opener claimed the pair's slot meanwhile: that session holds
+    /// the turn now, and is the one to join.
+    ///
+    /// The turn is taken before the slot is claimed, so each opener waits on
+    /// the previous session for itself and none waits on another opener's
+    /// wait.
+    async fn live_turn(
+        &self,
+        key: &(Instrument, EventKind),
+        provider: &str,
+    ) -> Result<Option<OwnedMutexGuard<()>>> {
+        let deadline = tokio::time::Instant::now() + LIVE_TURN_LIMIT;
+        loop {
+            let claimed = self.inner.slot_claimed.notified();
+            tokio::pin!(claimed);
+            claimed.as_mut().enable();
+            let occupied = self
+                .inner
+                .live_sessions
+                .lock()
+                .expect("live-session registry mutex poisoned")
+                .get(key)
+                .is_some_and(|slot| slot.strong_count() > 0);
+            if occupied {
+                return Ok(None);
+            }
+            tokio::select! {
+                turn = self.inner.live_turns.acquire(key) => return Ok(Some(turn)),
+                () = &mut claimed => {}
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(Error::Provider {
+                        provider: provider.to_string(),
+                        message: format!(
+                            "the previous session for {} is still unsubscribing after {} s",
+                            key.0,
+                            LIVE_TURN_LIMIT.as_secs()
+                        ),
+                    });
+                }
+            }
+        }
     }
 
     /// Join the live `session` found in `key`'s slot. Admission never answers
@@ -618,13 +675,13 @@ impl Datamancer {
     async fn create_authoritative(
         &self,
         provider: Arc<dyn Provider>,
-        instrument: Instrument,
-        kind: EventKind,
+        key: (Instrument, EventKind),
         scope: LiveScope,
         options: PersistenceOptions,
         caller: Caller,
+        live_turn: OwnedMutexGuard<()>,
     ) -> Result<Attached> {
-        let key = (instrument.clone(), kind);
+        let (instrument, kind) = key.clone();
         let accounting = self.inner.accounting_for(provider.id());
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(default_buffer());
         let (remove_tx, remove_rx) = mpsc::unbounded_channel::<SubscriberId>();
@@ -661,6 +718,8 @@ impl Datamancer {
         if let Some(winner) = winner {
             return self.join_live(&key, winner, scope, options, caller).await;
         }
+        // Openers still waiting for the pair's turn join this session.
+        self.inner.slot_claimed.notify_waiters();
 
         // Pre-seed the opener as the first fan-out subscriber *before* spawning
         // the controller, so events emitted during a creation-time backfill (a
@@ -700,6 +759,7 @@ impl Datamancer {
             data_forwarded: false,
             backfill_permits: self.backfill_permits(caller),
             seed_pending: false,
+            _live_turn: Some(live_turn),
         };
         // A seeded session fires a non-gating "latest value" fetch concurrently
         // with the live connect. The result is injected as the first data event
@@ -1230,6 +1290,8 @@ impl DatamancerBuilder {
                     .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),
                 adjustment: self.adjustment,
                 fetch_locks: FetchLocks::default(),
+                live_turns: KeyedLocks::default(),
+                slot_claimed: tokio::sync::Notify::new(),
                 provider_accounting,
                 client_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }),
@@ -1487,6 +1549,10 @@ pub(crate) fn default_buffer() -> usize {
     1024
 }
 
+/// How long a pair's new session waits for the pair's previous session to
+/// finish unsubscribing at the provider before its subscribe fails.
+const LIVE_TURN_LIMIT: Duration = Duration::from_secs(30);
+
 /// How many times an opener looks again after meeting a session that tore
 /// down under it, before it reports the pair's session as closed.
 const JOIN_ATTEMPTS: usize = 8;
@@ -1581,6 +1647,9 @@ struct Controller {
     /// by a data event. An unseeded subscriber added meanwhile starts after
     /// the seed's slot.
     seed_pending: bool,
+    /// A live session's turn at the provider for its pair, held until the
+    /// controller ends, which is after its unsubscribe there has returned.
+    _live_turn: Option<OwnedMutexGuard<()>>,
 }
 
 impl Controller {
