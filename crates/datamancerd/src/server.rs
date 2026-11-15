@@ -169,10 +169,6 @@ struct QueryEntry {
 #[cfg(not(windows))]
 const QUERY_ATTACH_GRACE: Duration = Duration::from_secs(5);
 
-/// How often a waiting query checks for its client.
-#[cfg(not(windows))]
-const QUERY_ATTACH_POLL: Duration = Duration::from_millis(5);
-
 /// A command handed to the server actor by a control connection.
 enum ServerCommand {
     /// A parsed control request plus the channel to reply on.
@@ -1471,20 +1467,6 @@ fn close_query_session(session: datamancer::Session) {
     });
 }
 
-/// Wait until `sink` has a subscriber; `false` if [`QUERY_ATTACH_GRACE`] passes
-/// first.
-#[cfg(not(windows))]
-async fn wait_for_subscriber(sink: &Iceoryx2DataSink) -> bool {
-    let deadline = tokio::time::Instant::now() + QUERY_ATTACH_GRACE;
-    while !sink.has_subscriber() {
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(QUERY_ATTACH_POLL).await;
-    }
-    true
-}
-
 /// Pump a query's bounded stream into its own sink, then tell the actor to reap
 /// the entry. Unlike the client pump, this one **must** report its exit: a
 /// completed query has to release its data service without the consumer having
@@ -1514,7 +1496,7 @@ fn spawn_query_pump(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let pumped = std::panic::AssertUnwindSafe(async move {
-            if !wait_for_subscriber(&sink).await {
+            if !sink.wait_for_subscriber(QUERY_ATTACH_GRACE).await {
                 tracing::warn!(query, "no client attached to query; reaping it");
                 return;
             }

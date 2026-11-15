@@ -12,6 +12,7 @@
 //! runs do not collide on service names.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use datamancer_core::{
     AssetClass, CacheSnapshot, ConnectionState, Control, ControlKind, EventSink, HealthView,
@@ -78,7 +79,7 @@ fn drain_until(sub: &mut DataSubscriber, expected: usize) -> Vec<MarketEvent> {
         if out.len() >= expected {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
     }
     out
 }
@@ -149,7 +150,6 @@ async fn flush_drains_before_exit() {
 #[ignore = "needs the iceoryx2 runtime"]
 async fn a_full_subscriber_makes_publish_wait_until_it_reads() {
     use std::sync::Arc;
-    use std::time::Duration;
 
     let node = node();
     let sink = Arc::new(Iceoryx2DataSink::new(&node, name(unique_client_id())).expect("sink"));
@@ -317,17 +317,48 @@ fn opening_a_service_nobody_created_fails() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 #[ignore = "needs the iceoryx2 runtime"]
-async fn a_sink_sees_its_subscriber_attach_and_leave() {
+async fn a_sink_waits_until_its_subscriber_attaches() {
+    const WITHIN: Duration = Duration::from_secs(5);
+    const JUST_INSIDE: Duration = Duration::from_millis(4_900);
     let client = unique_client_id();
     let node = node();
     let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
-    assert!(!sink.has_subscriber());
-    let sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
-    assert!(sink.has_subscriber());
+    let started = tokio::time::Instant::now();
+
+    let (attached, sub) = tokio::join!(sink.wait_for_subscriber(WITHIN), async {
+        tokio::time::sleep(JUST_INSIDE).await;
+        DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber")
+    });
+
+    assert!(attached, "an attach just inside the wait is seen");
+    assert!(started.elapsed() < WITHIN);
     drop(sub);
-    assert!(!sink.has_subscriber());
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_sink_stops_waiting_when_no_subscriber_attaches() {
+    const WITHIN: Duration = Duration::from_secs(5);
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    let started = tokio::time::Instant::now();
+
+    assert!(!sink.wait_for_subscriber(WITHIN).await);
+    assert_eq!(started.elapsed(), WITHIN);
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_sink_does_not_count_a_subscriber_that_left() {
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    drop(DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber"));
+
+    assert!(!sink.wait_for_subscriber(Duration::from_millis(50)).await);
 }
 
 #[tokio::test]
@@ -380,7 +411,7 @@ async fn diagnostics_subscriber_reconstructs_snapshot() {
             received = Some(s);
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(received, Some(snapshot));
 }
@@ -422,7 +453,7 @@ async fn health_subscriber_reconstructs_view() {
             received = Some(v);
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(received, Some(view));
 }

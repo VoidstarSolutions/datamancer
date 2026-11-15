@@ -55,6 +55,10 @@ const DEFAULT_DATA_HISTORY: usize = 16;
 /// joiners to at most this many events (independent of `flush` cadence).
 const REANNOUNCE_INTERVAL: u64 = 256;
 
+/// How often a wait for a subscriber looks for one: iceoryx2 0.10 has no
+/// attach event to wait on.
+const ATTACH_POLL: Duration = Duration::from_millis(5);
+
 /// First wait before a data sample a full subscriber refused is sent again.
 const RESEND_FIRST_WAIT: Duration = Duration::from_millis(1);
 
@@ -159,12 +163,26 @@ impl Iceoryx2DataSink {
         &self.name
     }
 
-    /// Whether a subscriber is attached to both the data and the announcement
-    /// service, so it receives everything published from here on.
-    #[must_use]
-    pub fn has_subscriber(&self) -> bool {
-        self.data_service.dynamic_config().number_of_subscribers() > 0
-            && self.ann_service.dynamic_config().number_of_subscribers() > 0
+    /// Wait for a subscriber to attach to both the data and the announcement
+    /// service. Returns `true` once one has, and it then receives everything
+    /// published from here on, resolving a symbol announced before it
+    /// attached only once [`flush`](EventSink::flush) has republished the
+    /// announcements; returns `false` if none has after `within`.
+    ///
+    /// # Arguments
+    ///
+    /// * `within` - how long to wait for the attach.
+    pub async fn wait_for_subscriber(&self, within: Duration) -> bool {
+        let attached = async {
+            while !self.has_subscriber() {
+                tokio::time::sleep(ATTACH_POLL).await;
+            }
+        };
+        tokio::time::timeout(within, attached).await.is_ok()
+    }
+
+    fn has_subscriber(&self) -> bool {
+        self.has_data_subscriber() && self.ann_service.dynamic_config().number_of_subscribers() > 0
     }
 
     /// Publish one announcement sample.
