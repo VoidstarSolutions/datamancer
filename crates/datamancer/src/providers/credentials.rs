@@ -89,6 +89,30 @@ pub enum CredentialsSource {
     Watch(tokio::sync::watch::Receiver<Option<AlpacaCredentials>>),
 }
 
+/// The credentials a streaming connect is made with. A source with none yet
+/// never reaches a connect: the hub parks on [`CredentialsRead::Missing`].
+pub(crate) enum PresentCredentials {
+    /// Read the environment pair for the configured account type.
+    Env,
+    /// Use these.
+    Creds(AlpacaCredentials),
+}
+
+/// A [`CredentialsSource`] read for one connect: the credentials to connect
+/// with and, for a `Watch` source, the receiver on which a rotation arrives
+/// after this read; or no credentials yet, with the receiver that delivers
+/// them. A read never leaves a caller holding a value without the receiver
+/// that goes with it.
+pub(crate) enum CredentialsRead {
+    /// Credentials to connect with; `rx` is `Some` for a `Watch` source.
+    Present {
+        credentials: PresentCredentials,
+        rx: Option<tokio::sync::watch::Receiver<Option<AlpacaCredentials>>>,
+    },
+    /// A `Watch` source with no value yet.
+    Missing(tokio::sync::watch::Receiver<Option<AlpacaCredentials>>),
+}
+
 /// One resolution of a [`CredentialsSource`].
 #[derive(Debug, Clone)]
 pub(crate) enum Resolved {
@@ -134,11 +158,76 @@ impl CredentialsSource {
             _ => None,
         }
     }
+
+    /// Read the source for one connect (see [`CredentialsRead`]). For a
+    /// `Watch` source the value and the seen-marker come from one
+    /// `borrow_and_update` on the returned clone, so the receiver reports
+    /// exactly the rotations that land after this read.
+    pub(crate) fn read(&self) -> CredentialsRead {
+        match self {
+            Self::Env => CredentialsRead::Present {
+                credentials: PresentCredentials::Env,
+                rx: None,
+            },
+            Self::Static(c) => CredentialsRead::Present {
+                credentials: PresentCredentials::Creds(c.clone()),
+                rx: None,
+            },
+            Self::Watch(rx) => {
+                let mut rx = rx.clone();
+                let value = rx.borrow_and_update().clone();
+                match value {
+                    Some(c) => CredentialsRead::Present {
+                        credentials: PresentCredentials::Creds(c),
+                        rx: Some(rx),
+                    },
+                    None => CredentialsRead::Missing(rx),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AlpacaCredentials, CredentialsSource, Resolved};
+    use super::{
+        AlpacaCredentials, CredentialsRead, CredentialsSource, PresentCredentials, Resolved,
+    };
+
+    /// A read of a watched source carries the receiver with its value, and
+    /// that receiver reports only a rotation after the read; a source with
+    /// no value yet hands over the receiver alone.
+    #[test]
+    fn a_read_carries_the_receiver_its_value_came_from() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let source = CredentialsSource::Watch(rx);
+        let CredentialsRead::Missing(missing_rx) = source.read() else {
+            panic!("no credentials yet");
+        };
+        assert!(!missing_rx.has_changed().unwrap());
+        tx.send(Some(creds("k1"))).unwrap();
+        assert!(missing_rx.has_changed().unwrap());
+
+        let CredentialsRead::Present {
+            credentials: PresentCredentials::Creds(c),
+            rx: Some(present_rx),
+        } = source.read()
+        else {
+            panic!("credentials present, with a receiver");
+        };
+        assert_eq!(c.key_id, "k1");
+        assert!(!present_rx.has_changed().unwrap(), "the read value is seen");
+        tx.send(Some(creds("k2"))).unwrap();
+        assert!(present_rx.has_changed().unwrap());
+
+        assert!(matches!(
+            CredentialsSource::Env.read(),
+            CredentialsRead::Present {
+                credentials: PresentCredentials::Env,
+                rx: None
+            }
+        ));
+    }
 
     fn creds(key: &str) -> AlpacaCredentials {
         AlpacaCredentials {

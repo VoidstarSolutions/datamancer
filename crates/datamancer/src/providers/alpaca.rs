@@ -73,10 +73,9 @@ use oxidized_alpaca::{
 };
 use tokio::sync::{mpsc, watch};
 
-use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
+use super::credentials::{AlpacaCredentials, CredentialsSource, PresentCredentials, Resolved};
 use super::hub::{
-    Connector, HubSlot, HubSources, PresentCredentials, StreamFailure, SubscriptionSet, Upstream,
-    wall_clock_ts,
+    Connector, HubSlot, HubSources, StreamFailure, SubscriptionSet, Upstream, wall_clock_ts,
 };
 use super::runtime::SettingsSource;
 use crate::session::ReconnectPolicy;
@@ -456,16 +455,10 @@ impl Provider for AlpacaProvider {
             return false;
         }
         match surface {
-            // The equity websocket streams trades, quotes, and only minute and
-            // daily bars, all decoded as equities.
+            // The equity websocket streams the kinds the subscription list has
+            // a symbol list for, all decoded as equities.
             Surface::Live => {
-                instrument.asset_class() == AssetClass::Equity
-                    && match kind {
-                        EventKind::Trade
-                        | EventKind::Quote
-                        | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
-                        EventKind::Bar(_) => false,
-                    }
+                instrument.asset_class() == AssetClass::Equity && SymbolLists::carries(kind)
             }
             // The REST bar surface is wider than the streamed one: `stock_bars`
             // accepts every interval `fetch_history_via` maps except one-second,
@@ -722,6 +715,18 @@ pub(super) struct SymbolLists<'a> {
 }
 
 impl<'a> SymbolLists<'a> {
+    /// Whether the stream carries `kind`: trades, quotes, and minute and
+    /// daily bars. Both providers answer `supports` for the live surface
+    /// from this, so a pair they promise is one `insert` has a list for.
+    pub(super) const fn carries(kind: EventKind) -> bool {
+        matches!(
+            kind,
+            EventKind::Trade
+                | EventKind::Quote
+                | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay)
+        )
+    }
+
     /// Add `instrument` to the list for `kind`, once.
     pub(super) fn insert(self, instrument: &Instrument, kind: EventKind) {
         if let Some(field) = self.list(kind) {
@@ -744,8 +749,9 @@ impl<'a> SymbolLists<'a> {
         }
     }
 
-    /// The list for `kind`; `None` for a bar interval the stream does not
-    /// carry, which `supports` already refused.
+    /// The list for `kind`; `None` for a bar interval [`carries`] refuses.
+    ///
+    /// [`carries`]: Self::carries
     fn list(self, kind: EventKind) -> Option<&'a mut Option<Vec<String>>> {
         match kind {
             EventKind::Trade => Some(self.trades),

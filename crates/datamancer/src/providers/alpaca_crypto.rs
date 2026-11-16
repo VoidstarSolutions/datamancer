@@ -55,10 +55,9 @@ use oxidized_alpaca::{
 use tokio::sync::{mpsc, watch};
 
 use super::alpaca::SymbolLists;
-use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
+use super::credentials::{AlpacaCredentials, CredentialsSource, PresentCredentials, Resolved};
 use super::hub::{
-    Connector, HubSlot, HubSources, PresentCredentials, StreamFailure, SubscriptionSet, Upstream,
-    wall_clock_ts,
+    Connector, HubSlot, HubSources, StreamFailure, SubscriptionSet, Upstream, wall_clock_ts,
 };
 use super::runtime::SettingsSource;
 use crate::session::ReconnectPolicy;
@@ -336,12 +335,7 @@ impl Provider for AlpacaCryptoProvider {
             return false;
         }
         match surface {
-            Surface::Live => match kind {
-                EventKind::Trade
-                | EventKind::Quote
-                | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
-                EventKind::Bar(_) => false,
-            },
+            Surface::Live => SymbolLists::carries(kind),
             // No historical surface is wired yet: `oxidized_alpaca` exposes only
             // `crypto_latest_*`, not the historical crypto trade/quote
             // endpoints, and `fetch_history` below errors unconditionally.

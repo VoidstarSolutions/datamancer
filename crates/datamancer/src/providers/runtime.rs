@@ -22,35 +22,6 @@ pub(super) fn no_rest_client(provider: &str, enabled: bool) -> Error {
     }
 }
 
-/// Why a provider's streaming task is parked, and so which error a
-/// subscribe gets meanwhile: a credential park is
-/// [`Error::Unauthenticated`], a disable is [`Error::ProviderDisabled`]. An
-/// unsubscribe is applied without a connection and succeeds.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum Park {
-    Disabled,
-    MissingCredentials,
-    RejectedCredentials,
-}
-
-impl Park {
-    /// The error `provider` answers with while parked.
-    pub(super) fn error(self, provider: &str) -> Error {
-        let provider = provider.to_string();
-        match self {
-            Self::Disabled => Error::ProviderDisabled { provider },
-            Self::MissingCredentials => Error::Unauthenticated {
-                provider,
-                message: "waiting for credentials".to_string(),
-            },
-            Self::RejectedCredentials => Error::Unauthenticated {
-                provider,
-                message: "waiting for new credentials after auth rejection".to_string(),
-            },
-        }
-    }
-}
-
 /// Where a provider gets its runtime settings, resolved fresh at every
 /// (re)connect. `None` from a `Watch` source means the provider is disabled.
 #[derive(Clone, Debug)]
@@ -63,12 +34,51 @@ pub enum SettingsSource<T> {
     Watch(watch::Receiver<Option<T>>),
 }
 
+/// A [`SettingsSource`] read for one connect: the settings to connect with
+/// and, for a `Watch` source, the receiver on which a change arrives after
+/// this read; or, disabled, the receiver that delivers the re-enable. A read
+/// never leaves a caller holding a value without the receiver that goes
+/// with it.
+pub(crate) enum SettingsRead<T> {
+    /// Enabled with these settings; `rx` is `Some` for a `Watch` source.
+    Enabled {
+        settings: T,
+        rx: Option<watch::Receiver<Option<T>>>,
+    },
+    /// A `Watch` source that is disabled.
+    Disabled(watch::Receiver<Option<T>>),
+}
+
 impl<T: Clone> SettingsSource<T> {
     /// The current settings, or `None` when a `Watch` source is disabled.
     pub fn current(&self) -> Option<T> {
         match self {
             Self::Static(s) => Some(s.clone()),
             Self::Watch(rx) => rx.borrow().clone(),
+        }
+    }
+
+    /// Read the source for one connect (see [`SettingsRead`]). For a `Watch`
+    /// source the value and the seen-marker come from one
+    /// `borrow_and_update` on the returned clone, so the receiver reports
+    /// exactly the changes that land after this read.
+    pub(crate) fn read(&self) -> SettingsRead<T> {
+        match self {
+            Self::Static(s) => SettingsRead::Enabled {
+                settings: s.clone(),
+                rx: None,
+            },
+            Self::Watch(rx) => {
+                let mut rx = rx.clone();
+                let value = rx.borrow_and_update().clone();
+                match value {
+                    Some(settings) => SettingsRead::Enabled {
+                        settings,
+                        rx: Some(rx),
+                    },
+                    None => SettingsRead::Disabled(rx),
+                }
+            }
         }
     }
 
@@ -117,7 +127,42 @@ pub(crate) fn watch_changed<T>(rx_slot: &mut Option<watch::Receiver<T>>) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingsSource, watch_changed};
+    use super::{SettingsRead, SettingsSource, watch_changed};
+
+    /// A read of a watched source carries the receiver with its value, and
+    /// that receiver reports only a change after the read; a disabled source
+    /// hands over the receiver alone.
+    #[test]
+    fn a_read_carries_the_receiver_its_value_came_from() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let source = SettingsSource::Watch(rx);
+        let SettingsRead::Disabled(disabled_rx) = source.read() else {
+            panic!("disabled");
+        };
+        assert!(!disabled_rx.has_changed().unwrap());
+        tx.send(Some(1_u32)).unwrap();
+        assert!(disabled_rx.has_changed().unwrap());
+
+        let SettingsRead::Enabled {
+            settings,
+            rx: Some(enabled_rx),
+        } = source.read()
+        else {
+            panic!("enabled, with a receiver");
+        };
+        assert_eq!(settings, 1);
+        assert!(!enabled_rx.has_changed().unwrap(), "the read value is seen");
+        tx.send(Some(2)).unwrap();
+        assert!(enabled_rx.has_changed().unwrap());
+
+        assert!(matches!(
+            SettingsSource::Static(7_u32).read(),
+            SettingsRead::Enabled {
+                settings: 7,
+                rx: None
+            }
+        ));
+    }
 
     #[test]
     fn static_source_is_always_enabled() {
