@@ -32,8 +32,8 @@
 //! reconnect, or mid-stream, parks until the credentials rotate when they
 //! come from a watched source, and backs off like any other failure
 //! otherwise; a `406` or any other server error is transient and backs off.
-//! A parked hub still hears a disable, and a session that closes while the
-//! hub is parked or backing off takes its pair with it.
+//! A parked or backing-off hub still hears a disable, and a session that
+//! closes while the hub is parked or backing off takes its pair with it.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

@@ -668,7 +668,25 @@ impl<C: Connector> Hub<C> {
         if unauthenticated && let Some(rx) = cred_rx {
             return self.park(rx, settings_rx, Park::RejectedCredentials).await;
         }
-        self.back_off().await
+        self.back_off(settings_rx).await
+    }
+
+    /// Tell the routes the provider was disabled, when the settings change
+    /// that woke a park or a backoff was a disable: there is no connection
+    /// whose end would tell them, and the next cycle parks disabled.
+    async fn broadcast_a_disable(&self) {
+        let (reason, cause) = self.settings_change();
+        if cause == DisconnectCause::Disabled {
+            broadcast_control(
+                &self.routes,
+                ControlKind::ProviderDisconnected {
+                    provider: C::PROVIDER_ID.to_string(),
+                    reason: reason.to_string(),
+                    cause,
+                },
+            )
+            .await;
+        }
     }
 
     /// What a settings change means for the routes: a disable is deliberate,
@@ -685,9 +703,7 @@ impl<C: Connector> Hub<C> {
     /// Park until `rx` delivers a new value or, under `settings_rx`, the
     /// settings change, answering every command meanwhile with `park`'s
     /// error. The next cycle resolves the sources again; a value still
-    /// disabled or missing lands back here rather than spinning. A disable
-    /// while parked is told to the routes here, since there is no connection
-    /// whose end would tell them.
+    /// disabled or missing lands back here rather than spinning.
     async fn park<T>(
         &mut self,
         rx: &mut watch::Receiver<T>,
@@ -709,18 +725,7 @@ impl<C: Connector> Hub<C> {
                 }
                 changed = watch_change(settings_rx.as_deref_mut()), if settings_rx.is_some() => {
                     if changed.is_ok() {
-                        let (reason, cause) = self.settings_change();
-                        if cause == DisconnectCause::Disabled {
-                            broadcast_control(
-                                &self.routes,
-                                ControlKind::ProviderDisconnected {
-                                    provider: C::PROVIDER_ID.to_string(),
-                                    reason: reason.to_string(),
-                                    cause,
-                                },
-                            )
-                            .await;
-                        }
+                        self.broadcast_a_disable().await;
                         return Next::Reconnect;
                     }
                     settings_rx = None;
@@ -738,8 +743,10 @@ impl<C: Connector> Hub<C> {
 
     /// Sleep out the current backoff, doubling it for the next time, and
     /// answer commands meanwhile without cutting the sleep short: a command
-    /// is no reason to try the server again sooner.
-    async fn back_off(&mut self) -> Next {
+    /// is no reason to try the server again sooner. A settings change is,
+    /// being a reconfiguration rather than a retry: it ends the sleep and
+    /// the next cycle connects with the new settings, or parks disabled.
+    async fn back_off(&mut self, mut settings_rx: Option<&mut SettingsRx<C::Settings>>) -> Next {
         // Full jitter: pick a sleep uniformly in [0, backoff_ms]. With many
         // providers reconnecting after a shared upstream blip this avoids
         // synchronized retry storms; without it every one retries on the same
@@ -756,6 +763,13 @@ impl<C: Connector> Hub<C> {
         loop {
             tokio::select! {
                 () = &mut sleep => return Next::Reconnect,
+                changed = watch_change(settings_rx.as_deref_mut()), if settings_rx.is_some() => {
+                    if changed.is_ok() {
+                        self.broadcast_a_disable().await;
+                        return Next::Reconnect;
+                    }
+                    settings_rx = None;
+                }
                 cmd = self.cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
                         return Next::Exit;
@@ -1574,6 +1588,41 @@ pub(super) mod tests {
                 Err(Error::ProviderDisabled { .. })
             ),
             "a subscribe answers disabled, not rejected credentials"
+        );
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert_eq!(hub.connects(), 2, "disabled: no connect");
+
+        hub.change_settings().await;
+        assert_eq!(hub.connects(), 3, "re-enabled: connects again");
+    }
+
+    /// A disable that lands while the hub backs off reaches the routes too,
+    /// and ends the backoff: the next cycle parks disabled, where a subscribe
+    /// answers disabled, and a re-enable connects again.
+    #[tokio::test(start_paused = true)]
+    async fn a_backing_off_hub_notices_a_disable() {
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![
+            Err(Refused(StreamFailure::Transient)),
+            Ok(FakeUpstream::idle()),
+        ])
+        .await;
+        hub.change_settings().await;
+        assert_eq!(hub.connects(), 2, "the reconnect failed; backing off");
+        control_kinds(&mut hub.rx);
+
+        hub.settings_tx.send(None).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            disconnect_causes(&mut hub.rx),
+            [DisconnectCause::Disabled],
+            "the disable reaches the routes of a backing-off hub"
+        );
+        assert!(
+            matches!(
+                hub.another_subscribe().await,
+                Err(Error::ProviderDisabled { .. })
+            ),
+            "a subscribe answers disabled, not reconnecting"
         );
         tokio::time::sleep(Duration::from_hours(1)).await;
         assert_eq!(hub.connects(), 2, "disabled: no connect");

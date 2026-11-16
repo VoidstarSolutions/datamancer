@@ -43,9 +43,10 @@
 //! otherwise; a `406` or any other server error is transient and backs off
 //! (see `classify_stream_failure` for the upstream caveat). A `402` that
 //! refuses a session's own subscribe is answered to that subscribe as
-//! unauthenticated and does not park. A parked hub still hears a disable,
-//! and a session that closes while the hub is parked or backing off takes
-//! its pair with it rather than leaving it for the next connect.
+//! unauthenticated and does not park. A parked or backing-off hub still
+//! hears a disable, and a session that closes while the hub is parked or
+//! backing off takes its pair with it rather than leaving it for the next
+//! connect.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
