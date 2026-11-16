@@ -104,11 +104,12 @@ pub(super) trait Connector: Send + Sync + 'static {
         credentials: PresentCredentials,
     ) -> impl Future<Output = std::result::Result<Self::Upstream, FailureOf<Self>>> + Send;
     /// Whether `failure` is a rejected credential or transient. For a failed
-    /// connect or stream the answer decides whether the hub parks (a rejected
+    /// connect or stream, and for the hub's own re-subscribe on a fresh
+    /// connection, the answer decides whether the hub parks (a rejected
     /// credential from a watched source) or backs off, and the
     /// `DisconnectCause` of the `ProviderDisconnected` control it broadcasts.
-    /// For a refused subscribe or unsubscribe it decides only whether the
-    /// answer is `Error::Unauthenticated` or `Error::Provider`.
+    /// For a session's refused subscribe or unsubscribe it decides only
+    /// whether the answer is `Error::Unauthenticated` or `Error::Provider`.
     fn classify(failure: &FailureOf<Self>) -> StreamFailure;
 }
 
@@ -359,6 +360,8 @@ enum Next {
 enum FailurePoint {
     /// The connect itself.
     Connect,
+    /// The re-subscribe of the aggregate set on a fresh connection.
+    Resubscribe,
     /// The connected stream.
     Stream,
 }
@@ -368,6 +371,7 @@ impl FailurePoint {
     fn log_message(self) -> &'static str {
         match self {
             Self::Connect => "market-data stream connect failed",
+            Self::Resubscribe => "market-data stream re-subscribe refused",
             Self::Stream => "market-data stream failed",
         }
     }
@@ -377,6 +381,7 @@ impl FailurePoint {
     fn reason(self, chain: &str) -> String {
         match self {
             Self::Connect => format!("connect failed: {chain}"),
+            Self::Resubscribe => format!("re-subscribe refused: {chain}"),
             Self::Stream => format!("websocket: {chain}"),
         }
     }
@@ -481,15 +486,29 @@ impl<C: Connector> Hub<C> {
             }
         };
 
-        // Re-apply the aggregate subscription set on a fresh socket.
+        // Re-apply the aggregate subscription set on a fresh socket. A
+        // refusal that reads as a rejected credential is one, wherever the
+        // server says so, and ends this connection like a failed stream; any
+        // other refusal is broadcast and the stream stays up, since a
+        // reconnect would only be refused again.
         if !self.subs.is_empty()
             && let Err(err) = upstream.add(&self.subs).await
         {
-            broadcast_error::<C>(
-                &self.routes,
-                format!("re-subscribe failed: {}", error_chain(&err)),
-            )
-            .await;
+            match C::classify(&err) {
+                StreamFailure::Unauthenticated => {
+                    upstream.shut_down().await;
+                    return self
+                        .fail(FailurePoint::Resubscribe, &err, cred_rx.as_mut())
+                        .await;
+                }
+                StreamFailure::Transient => {
+                    broadcast_error::<C>(
+                        &self.routes,
+                        format!("re-subscribe failed: {}", error_chain(&err)),
+                    )
+                    .await;
+                }
+            }
         }
 
         self.serve(upstream, &mut cred_rx, &mut settings_rx).await
@@ -590,11 +609,13 @@ impl<C: Connector> Hub<C> {
         }
     }
 
-    /// A failed connect or stream: classify it, log it, tell every route how
-    /// the provider disconnected, then park until the credentials rotate
-    /// when it is a rejected credential from a watched source (retrying
-    /// cannot help, provisioning can), or back off (a static source cannot
-    /// rotate, and anything else may clear on its own).
+    /// A failed connect, refused re-subscribe or failed stream: classify it,
+    /// log it, tell every route how the provider disconnected, then park
+    /// until the credentials rotate when it is a rejected credential from a
+    /// watched source (retrying cannot help, provisioning can), or back off
+    /// (a static source cannot rotate, and anything else may clear on its
+    /// own).
+
     async fn fail(
         &mut self,
         point: FailurePoint,
@@ -1036,7 +1057,9 @@ pub(super) mod tests {
     /// `refuse_add` is `Some`, and yields `events` in order, then pends.
     #[derive(Default)]
     struct FakeUpstream {
-        adds: usize,
+        /// How many times `add` was called, readable after the upstream
+        /// moves into the hub.
+        adds: Arc<AtomicUsize>,
         removals: Vec<PairSet>,
         refuse_add: Option<Refused>,
         events: VecDeque<std::result::Result<Vec<MarketEvent>, Refused>>,
@@ -1055,6 +1078,19 @@ pub(super) mod tests {
                 ..Self::default()
             }
         }
+
+        /// An idle upstream that refuses every `add` with `refused`.
+        fn refusing_adds(refused: Refused) -> Self {
+            Self {
+                refuse_add: Some(refused),
+                ..Self::default()
+            }
+        }
+
+        /// The counter of `add` calls, to keep after the upstream moves.
+        fn add_count(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.adds)
+        }
     }
 
     impl Upstream for FakeUpstream {
@@ -1062,7 +1098,7 @@ pub(super) mod tests {
         type Failure = Refused;
 
         async fn add(&mut self, _subs: &PairSet) -> std::result::Result<(), Refused> {
-            self.adds += 1;
+            self.adds.fetch_add(1, Ordering::SeqCst);
             match self.refuse_add {
                 Some(refused) => Err(refused),
                 None => Ok(()),
@@ -1207,6 +1243,107 @@ pub(super) mod tests {
         instrument("AAPL")
     }
 
+    /// The kinds of every control queued on `rx`, in order; a data event
+    /// there is a test error.
+    fn control_kinds(rx: &mut mpsc::Receiver<MarketEvent>) -> Vec<ControlKind> {
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                MarketEvent::Control(Control { kind, .. }) => kinds.push(kind),
+                other => panic!("expected a control, got {other:?}"),
+            }
+        }
+        kinds
+    }
+
+    /// The causes of the `ProviderDisconnected` controls queued on `rx`, in
+    /// order, dropping every other control.
+    fn disconnect_causes(rx: &mut mpsc::Receiver<MarketEvent>) -> Vec<DisconnectCause> {
+        control_kinds(rx)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                ControlKind::ProviderDisconnected { cause, .. } => Some(cause),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A hub connected once with one route on AAPL trades, its sources with
+    /// watched settings and credentials so a test can force a reconnect or
+    /// a disable, and the connects the script answers after the first.
+    struct ConnectedHub {
+        settings_tx: watch::Sender<Option<()>>,
+        creds_tx: watch::Sender<Option<AlpacaCredentials>>,
+        connects: Arc<AtomicUsize>,
+        cmd_tx: mpsc::Sender<HubCommand>,
+        handle: Box<SharedLiveHandle>,
+        rx: mpsc::Receiver<MarketEvent>,
+    }
+
+    impl ConnectedHub {
+        /// Connect on an idle upstream and subscribe AAPL trades; `later`
+        /// answers the connects after that one. The route's queue is drained
+        /// of the connect's controls.
+        async fn with_later_connects(
+            later: Vec<std::result::Result<FakeUpstream, Refused>>,
+        ) -> (JoinHandle<()>, Self) {
+            let (settings_tx, settings_rx) = watch::channel(Some(()));
+            let (creds_tx, sources) = watched_credentials();
+            let sources = HubSources {
+                settings: SettingsSource::Watch(settings_rx),
+                ..sources
+            };
+            let mut connects = vec![Ok(FakeUpstream::idle())];
+            connects.extend(later);
+            let connector = FakeConnector::scripted(connects);
+            let connect_count = connector.connect_count();
+            let (hub, cmd_tx) = spawn_hub(connector, sources);
+            let (sink, mut rx) = mpsc::channel(8);
+            let handle = Box::new(SharedLiveHandle::new(cmd_tx.clone(), sink));
+            handle
+                .subscribe(aapl(), EventKind::Trade)
+                .await
+                .expect("subscribes on the first connection");
+            assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+            control_kinds(&mut rx);
+            let connected = Self {
+                settings_tx,
+                creds_tx,
+                connects: connect_count,
+                cmd_tx,
+                handle,
+                rx,
+            };
+            (hub, connected)
+        }
+
+        fn connects(&self) -> usize {
+            self.connects.load(Ordering::SeqCst)
+        }
+
+        /// Rotate the credentials, which reconnects the hub, and let it run
+        /// into the next scripted connect.
+        async fn rotate_credentials(&self) {
+            self.creds_tx.send(Some(test_credentials())).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        /// Change the settings, which reconnects the hub, and let it run into
+        /// the next scripted connect.
+        async fn change_settings(&self) {
+            self.settings_tx.send(Some(())).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        /// A second session's subscribe, to SPY trades, as the hub answers it
+        /// now.
+        async fn another_subscribe(&self) -> Result<()> {
+            let (sink, _rx) = mpsc::channel(8);
+            let other = SharedLiveHandle::new(self.cmd_tx.clone(), sink);
+            other.subscribe(instrument("SPY"), EventKind::Trade).await
+        }
+    }
+
     /// A subscribe that lands while the hub sleeps out a backoff is refused
     /// at once as reconnecting rather than queued behind the next connect.
     #[tokio::test(start_paused = true)]
@@ -1285,18 +1422,8 @@ pub(super) mod tests {
         settings_tx.send(Some(())).unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(connects.load(Ordering::SeqCst), 2, "the hub reconnected");
-        let mut causes = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            if let MarketEvent::Control(Control {
-                kind: ControlKind::ProviderDisconnected { cause, .. },
-                ..
-            }) = ev
-            {
-                causes.push(cause);
-            }
-        }
         assert_eq!(
-            causes,
+            disconnect_causes(&mut rx),
             [DisconnectCause::Error, DisconnectCause::Unauthenticated],
             "the settings change, then the refused connect"
         );
@@ -1315,7 +1442,72 @@ pub(super) mod tests {
         );
     }
 
+    /// A re-subscribe after a reconnect that the server refuses as a rejected
+    /// credential is one: the routes hear an unauthenticated disconnect and,
+    /// the credentials being watched, the hub parks until they rotate, as it
+    /// does when the connect or the stream fails that way.
+    #[tokio::test(start_paused = true)]
+    async fn a_re_subscribe_refused_as_unauthenticated_parks_until_credentials_rotate() {
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![
+            Ok(FakeUpstream::refusing_adds(Refused(
+                StreamFailure::Unauthenticated,
+            ))),
+            Ok(FakeUpstream::idle()),
+        ])
+        .await;
+        hub.rotate_credentials().await;
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert_eq!(hub.connects(), 2, "parked: no reconnect on its own");
+        assert_eq!(
+            disconnect_causes(&mut hub.rx),
+            [DisconnectCause::Error, DisconnectCause::Unauthenticated],
+            "the rotation, then the refused re-subscribe"
+        );
+        assert!(
+            matches!(
+                hub.another_subscribe().await,
+                Err(Error::Unauthenticated { .. })
+            ),
+            "a subscribe to the parked hub says why"
+        );
+        hub.rotate_credentials().await;
+        assert_eq!(hub.connects(), 3, "a rotation reconnects it");
+    }
+
+    /// A re-subscribe refused for any other reason is broadcast as a provider
+    /// error and leaves the stream up: a reconnect would only be refused again.
+    #[tokio::test(start_paused = true)]
+    async fn a_re_subscribe_refused_otherwise_leaves_the_stream_up() {
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![Ok(
+            FakeUpstream::refusing_adds(Refused(StreamFailure::Transient)),
+        )])
+        .await;
+        hub.change_settings().await;
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert_eq!(hub.connects(), 2, "no reconnect");
+        let Err(Error::Provider { message, .. }) = hub.another_subscribe().await else {
+            panic!("a connected hub answers a refused subscribe as a provider error");
+        };
+        assert!(
+            message.starts_with("add_subscriptions:"),
+            "the subscribe reached the upstream, which refused it: {message}"
+        );
+        let kinds = control_kinds(&mut hub.rx);
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [
+                    ControlKind::ProviderDisconnected { cause: DisconnectCause::Error, .. },
+                    ControlKind::ProviderConnected { .. },
+                    ControlKind::ProviderError { message, .. },
+                ] if message.starts_with("re-subscribe failed:")
+            ),
+            "{kinds:?}"
+        );
+    }
+
     /// A spawn that panics while the slot is locked (here: outside a tokio
+
     /// runtime) poisons the lock but leaves the state consistent, so the
     /// slot still serves: the next `ensure` inside a runtime spawns the hub.
     #[test]
