@@ -632,7 +632,6 @@ impl<C: Connector> Hub<C> {
     /// watched source (retrying cannot help, provisioning can), or back off
     /// (a static source cannot rotate, and anything else may clear on its
     /// own).
-
     async fn fail(
         &mut self,
         point: FailurePoint,
@@ -727,24 +726,83 @@ impl<C: Connector> Hub<C> {
                     let Some(cmd) = cmd else {
                         return Next::Exit;
                     };
-                    refuse::<C>(cmd, park);
+                    self.handle_disconnected_command(cmd, || park.error(C::PROVIDER_ID))
+                        .await;
                 }
             }
         }
     }
 
-    /// Sleep out the current backoff, doubling it for the next time.
+    /// Sleep out the current backoff, doubling it for the next time, and
+    /// answer commands meanwhile without cutting the sleep short: a command
+    /// is no reason to try the server again sooner.
     async fn back_off(&mut self) -> Next {
-        if sleep_with_jitter::<C>(
-            &mut self.backoff_ms,
-            &self.sources.reconnect,
-            &mut self.cmd_rx,
-        )
-        .await
-        {
-            Next::Reconnect
+        // Full jitter: pick a sleep uniformly in [0, backoff_ms]. With many
+        // providers reconnecting after a shared upstream blip this avoids
+        // synchronized retry storms; without it every one retries on the same
+        // exponential ladder.
+        let policy = &self.sources.reconnect;
+        let delay_ms = if policy.jitter {
+            fastrand::u64(0..=self.backoff_ms)
         } else {
-            Next::Exit
+            self.backoff_ms
+        };
+        self.backoff_ms = (self.backoff_ms * 2).min(policy.max_backoff_ms);
+        let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                () = &mut sleep => return Next::Reconnect,
+                cmd = self.cmd_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        return Next::Exit;
+                    };
+                    self.handle_disconnected_command(cmd, || Error::Provider {
+                        provider: C::PROVIDER_ID.to_string(),
+                        message: "provider is reconnecting".to_string(),
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Answer a command that arrives while there is no connection. A
+    /// subscribe is refused with `refusal`, so the session sees a clear
+    /// error rather than stalling. An unsubscribe has no socket to reach,
+    /// so it is applied here, to the routes and the aggregate set, and
+    /// answered `Ok`: a session that closes while the hub is parked or
+    /// backing off takes its pair with it, rather than leaving it for the
+    /// next connect to subscribe for nobody, against the account's symbol
+    /// limit, until another session takes the pair.
+    async fn handle_disconnected_command(
+        &mut self,
+        cmd: HubCommand,
+        refusal: impl FnOnce() -> Error,
+    ) {
+        match cmd {
+            HubCommand::Subscribe { ack, .. } => {
+                let _ = ack.send(Err(refusal()));
+            }
+            HubCommand::Unsubscribe {
+                instrument,
+                kind,
+                ack,
+            } => {
+                self.subs.remove(&instrument, kind);
+                let removed = self.routes.remove(&(instrument.clone(), kind));
+                broadcast_control_to(
+                    removed.as_ref(),
+                    ControlKind::SubscriptionChanged {
+                        provider: C::PROVIDER_ID.to_string(),
+                        instrument,
+                        kind,
+                        active: false,
+                    },
+                )
+                .await;
+                let _ = ack.send(Ok(()));
+            }
         }
     }
 }
@@ -757,51 +815,6 @@ async fn watch_change<T>(
     match rx {
         Some(rx) => rx.changed().await,
         None => std::future::pending().await,
-    }
-}
-
-/// Answer `cmd` with `park`'s error: there is no connection to apply it to.
-fn refuse<C: Connector>(cmd: HubCommand, park: Park) {
-    let (HubCommand::Subscribe { ack, .. } | HubCommand::Unsubscribe { ack, .. }) = cmd;
-    let _ = ack.send(Err(park.error(C::PROVIDER_ID)));
-}
-
-/// Sleeps with exponential backoff, servicing the command channel meanwhile.
-/// Returns `false` if the hub task should exit (provider and handles gone).
-async fn sleep_with_jitter<C: Connector>(
-    backoff_ms: &mut u64,
-    policy: &ReconnectPolicy,
-    cmd_rx: &mut mpsc::Receiver<HubCommand>,
-) -> bool {
-    // Full jitter: pick a sleep uniformly in [0, backoff_ms]. With many
-    // providers reconnecting after a shared upstream blip this avoids
-    // synchronized retry storms; without it every one retries on the same
-    // exponential ladder.
-    let delay_ms = if policy.jitter {
-        fastrand::u64(0..=*backoff_ms)
-    } else {
-        *backoff_ms
-    };
-    let delay = Duration::from_millis(delay_ms);
-    *backoff_ms = (*backoff_ms * 2).min(policy.max_backoff_ms);
-
-    tokio::select! {
-        () = tokio::time::sleep(delay) => true,
-        cmd = cmd_rx.recv() => {
-            match cmd {
-                // While disconnected, fail subscribe/unsubscribe immediately so
-                // sessions see a clear error rather than stalling.
-                Some(HubCommand::Subscribe { ack, .. } | HubCommand::Unsubscribe { ack, .. }) => {
-                    let _ = ack.send(Err(Error::Provider {
-                        provider: C::PROVIDER_ID.to_string(),
-                        message: "provider is reconnecting".to_string(),
-                    }));
-                    true
-                }
-                // The provider and every handle are gone: exit.
-                None => false,
-            }
-        }
     }
 }
 
@@ -1565,8 +1578,102 @@ pub(super) mod tests {
         assert_eq!(hub.connects(), 3, "re-enabled: connects again");
     }
 
-    /// A spawn that panics while the slot is locked (here: outside a tokio
+    /// A session that closes while the hub backs off takes its pair with it:
+    /// the route is dropped and told, the next connect does not subscribe the
+    /// pair for nobody, and the backoff runs out as it would have.
+    #[tokio::test(start_paused = true)]
+    async fn an_unsubscribe_during_backoff_drops_the_pair_and_keeps_the_backoff() {
+        let third = FakeUpstream::idle();
+        let adds = third.add_count();
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![
+            Err(Refused(StreamFailure::Transient)),
+            Ok(third),
+        ])
+        .await;
+        hub.change_settings().await;
+        assert_eq!(hub.connects(), 2, "the reconnect failed; backing off");
+        control_kinds(&mut hub.rx);
 
+        let ConnectedHub {
+            handle,
+            mut rx,
+            connects,
+            ..
+        } = hub;
+        handle
+            .close()
+            .await
+            .expect("an unsubscribe while backing off is applied");
+        assert!(
+            matches!(
+                control_kinds(&mut rx).as_slice(),
+                [ControlKind::SubscriptionChanged { active: false, .. }]
+            ),
+            "the route is told its subscription ended"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "the command did not cut the backoff short"
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(connects.load(Ordering::SeqCst), 3, "the backoff ran out");
+        assert_eq!(
+            adds.load(Ordering::SeqCst),
+            0,
+            "nothing left to re-subscribe"
+        );
+    }
+
+    /// A session that closes while the hub is parked takes its pair with it
+    /// too, so the connect after a rotation subscribes nothing for it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unsubscribe_during_a_park_drops_the_pair() {
+        let third = FakeUpstream::idle();
+        let adds = third.add_count();
+        let (_hub, hub) = ConnectedHub::with_later_connects(vec![
+            Err(Refused(StreamFailure::Unauthenticated)),
+            Ok(third),
+        ])
+        .await;
+        hub.rotate_credentials().await;
+        assert_eq!(hub.connects(), 2, "the reconnect was refused; parked");
+
+        let ConnectedHub {
+            handle,
+            mut rx,
+            creds_tx,
+            connects,
+            ..
+        } = hub;
+        control_kinds(&mut rx);
+        handle
+            .close()
+            .await
+            .expect("an unsubscribe while parked is applied");
+        assert!(
+            matches!(
+                control_kinds(&mut rx).as_slice(),
+                [ControlKind::SubscriptionChanged { active: false, .. }]
+            ),
+            "the route is told its subscription ended"
+        );
+        creds_tx.send(Some(test_credentials())).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            3,
+            "a rotation reconnects it"
+        );
+        assert_eq!(
+            adds.load(Ordering::SeqCst),
+            0,
+            "nothing left to re-subscribe"
+        );
+    }
+
+    /// A spawn that panics while the slot is locked (here: outside a tokio
     /// runtime) poisons the lock but leaves the state consistent, so the
     /// slot still serves: the next `ensure` inside a runtime spawns the hub.
     #[test]
