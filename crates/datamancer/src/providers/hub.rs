@@ -25,12 +25,15 @@ use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
 use super::runtime::{Park, SettingsSource};
 use crate::session::ReconnectPolicy;
 
-/// How a failure to connect, or of the connected stream, is handled. A
-/// rejected credential pair from a watched source parks the hub until a
-/// rotation (retrying cannot help, provisioning can); one from a static
-/// source, and everything else — a dropped socket, `406 connection limit
-/// exceeded`, `407 slow client` — backs off. A refused subscribe is only
-/// answered by its class and never parks the hub.
+/// How a provider's [`Connector::classify`] reads a failed connect, a
+/// refused re-subscribe or a failed stream, and so what the hub does about
+/// it. A rejected credential pair from a watched source parks the hub until
+/// a rotation (retrying cannot help, provisioning can); one from a static
+/// source, and everything transient, backs off. A session's subscribe the
+/// upstream refuses is only answered by its class and never parks the hub;
+/// the hub's own re-subscribe on a fresh connection, refused as a rejected
+/// credential, ends that connection like a failed stream. Which of a
+/// provider's errors are which is the provider's to say, in its `classify`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StreamFailure {
     Unauthenticated,
@@ -1392,9 +1395,10 @@ pub(super) mod tests {
             .subscribe(aapl(), EventKind::Trade)
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, Error::Provider { ref message, .. } if message == "provider is reconnecting")
-        );
+        assert!(matches!(
+            err,
+            Error::Provider { ref message, .. } if message == "provider is reconnecting"
+        ));
         drop(hub);
     }
 
@@ -1749,9 +1753,10 @@ pub(super) mod tests {
         routes.insert((instrument("SPY"), EventKind::Quote), spy_tx);
 
         dispatch_event(&routes, trade("AAPL")).await;
-        assert!(
-            matches!(aapl_rx.try_recv(), Ok(MarketEvent::Trade(t)) if t.instrument.symbol() == "AAPL")
-        );
+        assert!(matches!(
+            aapl_rx.try_recv(),
+            Ok(MarketEvent::Trade(t)) if t.instrument.symbol() == "AAPL"
+        ));
         assert!(
             spy_rx.try_recv().is_err(),
             "SPY quote sink must not see an AAPL trade"

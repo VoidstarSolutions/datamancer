@@ -28,9 +28,12 @@
 //! reconnects, re-applying the active subscription set. A
 //! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast
 //! to all active sinks so consumers see the gap window. A rejected
-//! credential pair (`402`) parks until the credentials rotate when they
+//! credential pair (`402`), at connect, on the re-subscribe after a
+//! reconnect, or mid-stream, parks until the credentials rotate when they
 //! come from a watched source, and backs off like any other failure
 //! otherwise; a `406` or any other server error is transient and backs off.
+//! A parked hub still hears a disable, and a session that closes while the
+//! hub is parked or backing off takes its pair with it.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

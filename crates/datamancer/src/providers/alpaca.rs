@@ -37,13 +37,15 @@
 //! reconnects — re-applying the aggregate subscription set. A
 //! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast to
 //! every active sink so consumers see the gap window in the event stream. A
-//! credential pair rejected (`402`) at connect or mid-stream parks until the
-//! credentials rotate when they come from a watched source, and backs off
-//! like any other failure otherwise; a `406` or any other server error is
-//! transient and backs off (see `classify_stream_failure` for the upstream
-//! caveat). A `402` that refuses a subscribe is answered to that subscribe as
-//! unauthenticated and does not park; one that refuses the re-subscribe after
-//! a reconnect is broadcast as a provider error, and the stream stays up.
+//! credential pair rejected (`402`) at connect, on the re-subscribe after a
+//! reconnect, or mid-stream parks until the credentials rotate when they
+//! come from a watched source, and backs off like any other failure
+//! otherwise; a `406` or any other server error is transient and backs off
+//! (see `classify_stream_failure` for the upstream caveat). A `402` that
+//! refuses a session's own subscribe is answered to that subscribe as
+//! unauthenticated and does not park. A parked hub still hears a disable,
+//! and a session that closes while the hub is parked or backing off takes
+//! its pair with it rather than leaving it for the next connect.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -565,11 +567,12 @@ impl Provider for AlpacaProvider {
 /// `oxidized_alpaca`.
 ///
 /// `406 connection limit exceeded` is transient: another connection on the
-/// same key pair holds the slot, which clears when it closes. Only
-/// `402 auth failed` means the credentials themselves are rejected, whether
-/// it arrives mid-stream (`Error::StreamingError`) or as the server's
-/// refusal of a subscribe (`Error::StreamingSubscribe`). Any other code on
-/// either variant, `401 not authenticated` included, is transient.
+/// same key pair holds the slot, which clears when it closes. So is
+/// `407 slow client`, and a dropped socket. Only `402 auth failed` means the
+/// credentials themselves are rejected, whether it arrives mid-stream
+/// (`Error::StreamingError`) or as the server's refusal of a subscribe
+/// (`Error::StreamingSubscribe`). Any other code on either variant,
+/// `401 not authenticated` included, is transient.
 ///
 /// Limitation to know about: at **connect** time `oxidized_alpaca` 0.0.10
 /// (and 0.0.11) collapses every non-`authenticated` auth response into the
