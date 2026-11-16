@@ -41,10 +41,11 @@ pub(super) enum StreamFailure {
     Transient,
 }
 
-/// Why the hub has no connection, and so what a subscribe arriving
-/// meanwhile is refused with: a credential park is `Error::Unauthenticated`,
-/// a disable is `Error::ProviderDisabled`, a backoff is `Error::Provider`.
-/// An unsubscribe arriving meanwhile is applied and succeeds.
+/// Why the hub has no connection, which says what ends the wait besides a
+/// settings change, and what a subscribe arriving meanwhile is refused
+/// with: a credential park is `Error::Unauthenticated`, a disable is
+/// `Error::ProviderDisabled`, a backoff is `Error::Provider`. An unsubscribe
+/// arriving meanwhile is applied and succeeds.
 #[derive(Debug, Clone, Copy)]
 enum Disconnected {
     /// Parked until the settings re-enable the provider.
@@ -53,8 +54,8 @@ enum Disconnected {
     MissingCredentials,
     /// Parked until a watched credential source rotates a rejected pair.
     RejectedCredentials,
-    /// Sleeping out a backoff before the next connect.
-    Reconnecting,
+    /// Sleeping out a backoff of this length before the next connect.
+    Reconnecting(Duration),
 }
 
 impl Disconnected {
@@ -71,11 +72,16 @@ impl Disconnected {
                 provider,
                 message: "waiting for new credentials after auth rejection".to_string(),
             },
-            Self::Reconnecting => Error::Provider {
+            Self::Reconnecting(_) => Error::Provider {
                 provider,
                 message: "provider is reconnecting".to_string(),
             },
         }
+    }
+
+    /// Whether a credentials rotation ends the wait in this state.
+    const fn wakes_on_rotation(self) -> bool {
+        matches!(self, Self::MissingCredentials | Self::RejectedCredentials)
     }
 }
 
@@ -448,17 +454,6 @@ struct Hub<C: Connector> {
     settings_rx: SettingsRx<C::Settings>,
 }
 
-/// What ends a wait with no connection, besides a settings change.
-#[derive(Debug, Clone, Copy)]
-enum Wake {
-    /// A rotation on the credentials watch.
-    Rotation,
-    /// The clock running out a backoff of this length.
-    After(Duration),
-    /// Nothing but the settings.
-    Never,
-}
-
 /// Run a provider's hub: connect, serve, and connect again, until the
 /// provider and every handle are gone.
 async fn run_hub<C: Connector>(
@@ -496,7 +491,7 @@ impl<C: Connector> Hub<C> {
             WatchRead::Empty(rx) => {
                 self.settings_rx = rx;
                 self.tell_routes_disabled().await;
-                return self.idle(Wake::Never, Disconnected::Disabled).await;
+                return self.idle(Disconnected::Disabled).await;
             }
         };
         self.told_disabled = false;
@@ -509,9 +504,7 @@ impl<C: Connector> Hub<C> {
             // bad auth, then resolve again.
             WatchRead::Empty(rx) => {
                 self.cred_rx = rx;
-                return self
-                    .idle(Wake::Rotation, Disconnected::MissingCredentials)
-                    .await;
+                return self.idle(Disconnected::MissingCredentials).await;
             }
         };
 
@@ -533,16 +526,14 @@ impl<C: Connector> Hub<C> {
         // refusal that reads as a rejected credential is one, wherever the
         // server says so, and ends this connection like a failed stream; any
         // other refusal is broadcast and the stream stays up, since a
-        // reconnect would only be refused again. Only a set applied starts
-        // the backoff ladder over: a connect that got no further has not
-        // succeeded, and its next failure climbs on.
+        // reconnect would only be refused again.
         let applied = if self.subs.is_empty() {
             Ok(())
         } else {
             upstream.add(&self.subs).await
         };
         match applied {
-            Ok(()) => self.backoff_ms = self.sources.reconnect.initial_backoff_ms,
+            Ok(()) => self.reset_backoff(),
             Err(err) => match C::classify(&err) {
                 StreamFailure::Unauthenticated => {
                     upstream.shut_down().await;
@@ -661,11 +652,15 @@ impl<C: Connector> Hub<C> {
         )
         .await;
         if unauthenticated && self.cred_rx.may_change() {
-            return self
-                .idle(Wake::Rotation, Disconnected::RejectedCredentials)
-                .await;
+            return self.idle(Disconnected::RejectedCredentials).await;
         }
         self.back_off().await
+    }
+
+    /// Start the backoff ladder over: a fresh connection has its
+    /// subscription set applied, so the next failure is a new one.
+    fn reset_backoff(&mut self) {
+        self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
     }
 
     /// Tell the routes the provider was disabled, once per disable: from the
@@ -695,22 +690,22 @@ impl<C: Connector> Hub<C> {
         .await;
     }
 
-    /// Wait, with no connection, until `wake` or a settings change, answering
-    /// every command meanwhile as `why` says. The next cycle resolves the
-    /// sources again; a value still missing lands back here rather than
-    /// spinning. With every sender gone the hub still answers commands, so
-    /// its shutdown (every handle dropped) still works.
-    async fn idle(&mut self, wake: Wake, why: Disconnected) -> Next {
+    /// Wait, with no connection, until what ends `why` or a settings change,
+    /// answering every command meanwhile as `why` says. The next cycle
+    /// resolves the sources again; a value still missing lands back here
+    /// rather than spinning. With every sender gone the hub still answers
+    /// commands, so its shutdown (every handle dropped) still works.
+    async fn idle(&mut self, why: Disconnected) -> Next {
         let mut clock = std::pin::pin!(async {
-            match wake {
-                Wake::After(delay) => tokio::time::sleep(delay).await,
-                Wake::Rotation | Wake::Never => std::future::pending().await,
+            match why {
+                Disconnected::Reconnecting(delay) => tokio::time::sleep(delay).await,
+                _ => std::future::pending().await,
             }
         });
         loop {
             tokio::select! {
                 () = &mut clock => return Next::Reconnect,
-                _ = self.cred_rx.changed(), if matches!(wake, Wake::Rotation) => {
+                _ = self.cred_rx.changed(), if why.wakes_on_rotation() => {
                     return Next::Reconnect;
                 }
                 _ = self.settings_rx.changed() => return Next::Reconnect,
@@ -741,11 +736,8 @@ impl<C: Connector> Hub<C> {
             self.backoff_ms
         };
         self.backoff_ms = (self.backoff_ms * 2).min(policy.max_backoff_ms);
-        self.idle(
-            Wake::After(Duration::from_millis(delay_ms)),
-            Disconnected::Reconnecting,
-        )
-        .await
+        self.idle(Disconnected::Reconnecting(Duration::from_millis(delay_ms)))
+            .await
     }
 
     /// Answer a command that arrives while there is no connection. A
