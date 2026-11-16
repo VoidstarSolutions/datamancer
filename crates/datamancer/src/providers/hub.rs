@@ -435,7 +435,7 @@ impl<C: Connector> Hub<C> {
             let Some(rx) = settings_rx.as_mut() else {
                 return Next::Exit;
             };
-            return self.park(rx, Park::Disabled).await;
+            return self.park(rx, None, Park::Disabled).await;
         };
 
         // Fresh receiver per connect attempt: `watch()` marks the current
@@ -463,7 +463,9 @@ impl<C: Connector> Hub<C> {
                 let Some(rx) = cred_rx.as_mut() else {
                     return Next::Exit;
                 };
-                return self.park(rx, Park::MissingCredentials).await;
+                return self
+                    .park(rx, settings_rx.as_mut(), Park::MissingCredentials)
+                    .await;
             }
         };
 
@@ -481,7 +483,12 @@ impl<C: Connector> Hub<C> {
             }
             Err(err) => {
                 return self
-                    .fail(FailurePoint::Connect, &err, cred_rx.as_mut())
+                    .fail(
+                        FailurePoint::Connect,
+                        &err,
+                        cred_rx.as_mut(),
+                        settings_rx.as_mut(),
+                    )
                     .await;
             }
         };
@@ -498,7 +505,12 @@ impl<C: Connector> Hub<C> {
                 StreamFailure::Unauthenticated => {
                     upstream.shut_down().await;
                     return self
-                        .fail(FailurePoint::Resubscribe, &err, cred_rx.as_mut())
+                        .fail(
+                            FailurePoint::Resubscribe,
+                            &err,
+                            cred_rx.as_mut(),
+                            settings_rx.as_mut(),
+                        )
                         .await;
                 }
                 StreamFailure::Transient => {
@@ -549,7 +561,12 @@ impl<C: Connector> Hub<C> {
                         Err(err) => {
                             drop(upstream);
                             return self
-                                .fail(FailurePoint::Stream, &err, cred_rx.as_mut())
+                                .fail(
+                                    FailurePoint::Stream,
+                                    &err,
+                                    cred_rx.as_mut(),
+                                    settings_rx.as_mut(),
+                                )
                                 .await;
                         }
                     }
@@ -621,6 +638,7 @@ impl<C: Connector> Hub<C> {
         point: FailurePoint,
         err: &FailureOf<C>,
         cred_rx: Option<&mut CredentialsRx>,
+        settings_rx: Option<&mut SettingsRx<C::Settings>>,
     ) -> Next {
         let failure = C::classify(err);
         let unauthenticated = failure == StreamFailure::Unauthenticated;
@@ -646,7 +664,7 @@ impl<C: Connector> Hub<C> {
         )
         .await;
         if unauthenticated && let Some(rx) = cred_rx {
-            return self.park(rx, Park::RejectedCredentials).await;
+            return self.park(rx, settings_rx, Park::RejectedCredentials).await;
         }
         self.back_off().await
     }
@@ -662,13 +680,56 @@ impl<C: Connector> Hub<C> {
         }
     }
 
-    /// Park until `rx` delivers a new value, answering every command
-    /// meanwhile with `park`'s error.
-    async fn park<T>(&mut self, rx: &mut watch::Receiver<T>, park: Park) -> Next {
-        if wait_for_provisioning::<C, T>(rx, &mut self.cmd_rx, park).await {
-            Next::Reconnect
-        } else {
-            Next::Exit
+    /// Park until `rx` delivers a new value or, under `settings_rx`, the
+    /// settings change, answering every command meanwhile with `park`'s
+    /// error. The next cycle resolves the sources again; a value still
+    /// disabled or missing lands back here rather than spinning. A disable
+    /// while parked is told to the routes here, since there is no connection
+    /// whose end would tell them.
+    async fn park<T>(
+        &mut self,
+        rx: &mut watch::Receiver<T>,
+        mut settings_rx: Option<&mut SettingsRx<C::Settings>>,
+        park: Park,
+    ) -> Next {
+        let mut rx = Some(rx);
+        loop {
+            tokio::select! {
+                changed = watch_change(rx.as_deref_mut()), if rx.is_some() => {
+                    if changed.is_ok() {
+                        return Next::Reconnect;
+                    }
+                    // Sender dropped with no value: it can never arrive. Stop
+                    // waiting on it; commands, and a settings change, are
+                    // still answered, so hub shutdown (all handles dropped)
+                    // still works.
+                    rx = None;
+                }
+                changed = watch_change(settings_rx.as_deref_mut()), if settings_rx.is_some() => {
+                    if changed.is_ok() {
+                        let (reason, cause) = self.settings_change();
+                        if cause == DisconnectCause::Disabled {
+                            broadcast_control(
+                                &self.routes,
+                                ControlKind::ProviderDisconnected {
+                                    provider: C::PROVIDER_ID.to_string(),
+                                    reason: reason.to_string(),
+                                    cause,
+                                },
+                            )
+                            .await;
+                        }
+                        return Next::Reconnect;
+                    }
+                    settings_rx = None;
+                }
+                cmd = self.cmd_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        return Next::Exit;
+                    };
+                    refuse::<C>(cmd, park);
+                }
+            }
         }
     }
 
@@ -699,51 +760,10 @@ async fn watch_change<T>(
     }
 }
 
-/// Waits for a `Watch` source (settings or credentials) to deliver a new
-/// value, servicing the command channel meanwhile (drop of the provider and
-/// every handle exits; subscribe/unsubscribe fail fast with `park`'s error).
-/// Returns `false` if the hub task should exit.
-async fn wait_for_provisioning<C: Connector, T>(
-    rx: &mut watch::Receiver<T>,
-    cmd_rx: &mut mpsc::Receiver<HubCommand>,
-    park: Park,
-) -> bool {
-    loop {
-        tokio::select! {
-            changed = rx.changed() => {
-                if changed.is_ok() {
-                    // The outer loop re-resolves; if the new value is still
-                    // disabled/missing it lands back here rather than spinning.
-                    return true;
-                }
-                // Sender dropped with no value: it can never arrive. Keep
-                // servicing commands so hub shutdown (all handles dropped)
-                // still works.
-                loop {
-                    match cmd_rx.recv().await {
-                        Some(
-                            HubCommand::Subscribe { ack, .. }
-                            | HubCommand::Unsubscribe { ack, .. },
-                        ) => {
-                            let _ = ack.send(Err(park.error(C::PROVIDER_ID)));
-                        }
-                        None => return false,
-                    }
-                }
-            }
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(
-                        HubCommand::Subscribe { ack, .. }
-                        | HubCommand::Unsubscribe { ack, .. },
-                    ) => {
-                        let _ = ack.send(Err(park.error(C::PROVIDER_ID)));
-                    }
-                    None => return false,
-                }
-            }
-        }
-    }
+/// Answer `cmd` with `park`'s error: there is no connection to apply it to.
+fn refuse<C: Connector>(cmd: HubCommand, park: Park) {
+    let (HubCommand::Subscribe { ack, .. } | HubCommand::Unsubscribe { ack, .. }) = cmd;
+    let _ = ack.send(Err(park.error(C::PROVIDER_ID)));
 }
 
 /// Sleeps with exponential backoff, servicing the command channel meanwhile.
@@ -1504,6 +1524,45 @@ pub(super) mod tests {
             ),
             "{kinds:?}"
         );
+    }
+
+    /// A hub parked on rejected credentials still hears a disable: the routes
+    /// get a disabled disconnect, a subscribe answers disabled, and a
+    /// re-enable connects again.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_hub_notices_a_disable() {
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![
+            Err(Refused(StreamFailure::Unauthenticated)),
+            Ok(FakeUpstream::idle()),
+        ])
+        .await;
+        hub.rotate_credentials().await;
+        assert_eq!(hub.connects(), 2);
+        assert_eq!(
+            disconnect_causes(&mut hub.rx),
+            [DisconnectCause::Error, DisconnectCause::Unauthenticated],
+            "the rotation, then the refused connect"
+        );
+
+        hub.settings_tx.send(None).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            disconnect_causes(&mut hub.rx),
+            [DisconnectCause::Disabled],
+            "the disable reaches the routes of a parked hub"
+        );
+        assert!(
+            matches!(
+                hub.another_subscribe().await,
+                Err(Error::ProviderDisabled { .. })
+            ),
+            "a subscribe answers disabled, not rejected credentials"
+        );
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert_eq!(hub.connects(), 2, "disabled: no connect");
+
+        hub.change_settings().await;
+        assert_eq!(hub.connects(), 3, "re-enabled: connects again");
     }
 
     /// A spawn that panics while the slot is locked (here: outside a tokio
