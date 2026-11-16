@@ -52,8 +52,10 @@ pub(super) trait SubscriptionSet: Clone + Send + Sync + 'static {
     fn empty() -> Self;
     /// Whether the set holds no pair.
     fn is_empty(&self) -> bool;
-    /// Add (`add`) or remove one `(instrument, kind)` pair.
-    fn apply(&mut self, instrument: &Instrument, kind: EventKind, add: bool);
+    /// Add one `(instrument, kind)` pair; one already held stays as it is.
+    fn insert(&mut self, instrument: &Instrument, kind: EventKind);
+    /// Remove one `(instrument, kind)` pair; one not held changes nothing.
+    fn remove(&mut self, instrument: &Instrument, kind: EventKind);
 }
 
 /// One connected upstream: the calls the hub makes on it.
@@ -754,10 +756,10 @@ async fn subscribe_route<C: Connector>(
 ) -> Result<()> {
     let key = (instrument, kind);
     routes.insert(key.clone(), sink);
-    subs.apply(&key.0, kind, true);
+    subs.insert(&key.0, kind);
     if let Err(failure) = upstream.add(subs).await {
         routes.remove(&key);
-        subs.apply(&key.0, kind, false);
+        subs.remove(&key.0, kind);
         return Err(ack_error::<C>("add_subscriptions", &failure));
     }
     // We are in the connected loop, so the provider is up.
@@ -798,9 +800,9 @@ async fn unsubscribe_route<C: Connector>(
     kind: EventKind,
 ) -> Result<()> {
     let key = (instrument, kind);
-    subs.apply(&key.0, kind, false);
+    subs.remove(&key.0, kind);
     let mut removal = <C::Upstream as Upstream>::Subs::empty();
-    removal.apply(&key.0, kind, true);
+    removal.insert(&key.0, kind);
     match upstream.remove(&removal).await {
         Ok(()) => {
             // Drop the route after the upstream ack so any tail events still
@@ -820,7 +822,7 @@ async fn unsubscribe_route<C: Connector>(
         }
         Err(failure) => {
             // The pair is still streaming upstream, so a reconnect must apply it.
-            subs.apply(&key.0, kind, true);
+            subs.insert(&key.0, kind);
             Err(ack_error::<C>("remove_subscriptions", &failure))
         }
     }
@@ -941,13 +943,12 @@ pub(super) mod tests {
             self.0.is_empty()
         }
 
-        fn apply(&mut self, instrument: &Instrument, kind: EventKind, add: bool) {
-            let pair = (instrument.clone(), kind);
-            if add {
-                self.0.insert(pair);
-            } else {
-                self.0.remove(&pair);
-            }
+        fn insert(&mut self, instrument: &Instrument, kind: EventKind) {
+            self.0.insert((instrument.clone(), kind));
+        }
+
+        fn remove(&mut self, instrument: &Instrument, kind: EventKind) {
+            self.0.remove(&(instrument.clone(), kind));
         }
     }
 

@@ -51,6 +51,7 @@ use oxidized_alpaca::{
 };
 use tokio::sync::{mpsc, watch};
 
+use super::alpaca::SymbolLists;
 use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
 use super::hub::{
     Connector, HubSlot, HubSources, PresentCredentials, StreamFailure, SubscriptionSet, Upstream,
@@ -518,38 +519,23 @@ impl SubscriptionSet for CryptoSubscriptionList {
             && self.orderbooks.as_ref().is_none_or(Vec::is_empty)
     }
 
-    fn apply(&mut self, instrument: &Instrument, kind: EventKind, add: bool) {
-        apply_pair_to_list(self, instrument, kind, add);
+    fn insert(&mut self, instrument: &Instrument, kind: EventKind) {
+        crypto_symbol_lists(self).insert(instrument, kind);
+    }
+
+    fn remove(&mut self, instrument: &Instrument, kind: EventKind) {
+        crypto_symbol_lists(self).remove(instrument, kind);
     }
 }
 
-fn apply_pair_to_list(
-    list: &mut CryptoSubscriptionList,
-    instrument: &Instrument,
-    kind: EventKind,
-    add: bool,
-) {
-    let symbol = instrument.symbol().to_string();
-    match kind {
-        EventKind::Trade => mutate_field(&mut list.trades, &symbol, add),
-        EventKind::Quote => mutate_field(&mut list.quotes, &symbol, add),
-        EventKind::Bar(BarInterval::OneMinute) => mutate_field(&mut list.bars, &symbol, add),
-        EventKind::Bar(BarInterval::OneDay) => mutate_field(&mut list.daily_bars, &symbol, add),
-        EventKind::Bar(_) => {}
-    }
-}
-
-fn mutate_field(field: &mut Option<Vec<String>>, symbol: &str, add: bool) {
-    let list = field.get_or_insert_with(Vec::new);
-    if add {
-        if !list.iter().any(|s| s == symbol) {
-            list.push(symbol.to_string());
-        }
-    } else {
-        list.retain(|s| s != symbol);
-    }
-    if list.is_empty() {
-        *field = None;
+/// The lists of `list` the hub fills; `updated_bars` and `orderbooks` have
+/// no [`EventKind`] and stay empty.
+fn crypto_symbol_lists(list: &mut CryptoSubscriptionList) -> SymbolLists<'_> {
+    SymbolLists {
+        trades: &mut list.trades,
+        quotes: &mut list.quotes,
+        bars: &mut list.bars,
+        daily_bars: &mut list.daily_bars,
     }
 }
 

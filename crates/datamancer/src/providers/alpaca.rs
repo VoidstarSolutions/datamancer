@@ -687,39 +687,69 @@ impl SubscriptionSet for StockSubscriptionList {
             && self.trades.as_ref().is_none_or(Vec::is_empty)
     }
 
-    fn apply(&mut self, instrument: &Instrument, kind: EventKind, add: bool) {
-        apply_pair_to_list(self, instrument, kind, add);
+    fn insert(&mut self, instrument: &Instrument, kind: EventKind) {
+        stock_symbol_lists(self).insert(instrument, kind);
+    }
+
+    fn remove(&mut self, instrument: &Instrument, kind: EventKind) {
+        stock_symbol_lists(self).remove(instrument, kind);
     }
 }
 
-fn apply_pair_to_list(
-    list: &mut StockSubscriptionList,
-    instrument: &Instrument,
-    kind: EventKind,
-    add: bool,
-) {
-    let symbol = instrument.symbol().to_string();
-    match kind {
-        EventKind::Trade => mutate_field(&mut list.trades, &symbol, add),
-        EventKind::Quote => mutate_field(&mut list.quotes, &symbol, add),
-        EventKind::Bar(BarInterval::OneMinute) => mutate_field(&mut list.bars, &symbol, add),
-        EventKind::Bar(BarInterval::OneDay) => mutate_field(&mut list.daily_bars, &symbol, add),
-        // Unsupported intervals were rejected by `supports`; ignore here.
-        EventKind::Bar(_) => {}
+/// The lists of `list` the hub fills.
+fn stock_symbol_lists(list: &mut StockSubscriptionList) -> SymbolLists<'_> {
+    SymbolLists {
+        trades: &mut list.trades,
+        quotes: &mut list.quotes,
+        bars: &mut list.bars,
+        daily_bars: &mut list.daily_bars,
     }
 }
 
-fn mutate_field(field: &mut Option<Vec<String>>, symbol: &str, add: bool) {
-    let list = field.get_or_insert_with(Vec::new);
-    if add {
-        if !list.iter().any(|s| s == symbol) {
-            list.push(symbol.to_string());
+/// The symbol lists of an Alpaca subscription list that the hub fills, one
+/// per streamed [`EventKind`]. The stock and crypto lists both have these
+/// four, as `Option<Vec<String>>` that is `None` when empty, and the hub
+/// subscribes to nothing else, so one insert and remove serve both.
+pub(super) struct SymbolLists<'a> {
+    pub(super) trades: &'a mut Option<Vec<String>>,
+    pub(super) quotes: &'a mut Option<Vec<String>>,
+    pub(super) bars: &'a mut Option<Vec<String>>,
+    pub(super) daily_bars: &'a mut Option<Vec<String>>,
+}
+
+impl<'a> SymbolLists<'a> {
+    /// Add `instrument` to the list for `kind`, once.
+    pub(super) fn insert(self, instrument: &Instrument, kind: EventKind) {
+        if let Some(field) = self.list(kind) {
+            let list = field.get_or_insert_with(Vec::new);
+            if !list.iter().any(|s| s == instrument.symbol()) {
+                list.push(instrument.symbol().to_string());
+            }
         }
-    } else {
-        list.retain(|s| s != symbol);
     }
-    if list.is_empty() {
-        *field = None;
+
+    /// Drop `instrument` from the list for `kind`; an emptied list is `None`.
+    pub(super) fn remove(self, instrument: &Instrument, kind: EventKind) {
+        if let Some(field) = self.list(kind)
+            && let Some(list) = field.as_mut()
+        {
+            list.retain(|s| s != instrument.symbol());
+            if list.is_empty() {
+                *field = None;
+            }
+        }
+    }
+
+    /// The list for `kind`; `None` for a bar interval the stream does not
+    /// carry, which `supports` already refused.
+    fn list(self, kind: EventKind) -> Option<&'a mut Option<Vec<String>>> {
+        match kind {
+            EventKind::Trade => Some(self.trades),
+            EventKind::Quote => Some(self.quotes),
+            EventKind::Bar(BarInterval::OneMinute) => Some(self.bars),
+            EventKind::Bar(BarInterval::OneDay) => Some(self.daily_bars),
+            EventKind::Bar(_) => None,
+        }
     }
 }
 
@@ -1325,37 +1355,34 @@ pub(super) mod tests {
         }
     }
 
+    /// A pair inserted lands in the list for its kind, once however often it
+    /// is inserted; removed, it leaves an emptied list as `None`, and a
+    /// removal of a pair not held changes nothing.
     #[test]
-    fn subscription_list_apply_add_remove() {
+    fn subscription_list_insert_and_remove() {
         let mut list = StockSubscriptionList::new();
         let aapl = provider_instrument("AAPL");
-        apply_pair_to_list(&mut list, &aapl, EventKind::Trade, true);
-        apply_pair_to_list(
-            &mut list,
-            &aapl,
-            EventKind::Bar(BarInterval::OneMinute),
-            true,
-        );
+        SubscriptionSet::insert(&mut list, &aapl, EventKind::Trade);
+        SubscriptionSet::insert(&mut list, &aapl, EventKind::Trade);
+        SubscriptionSet::insert(&mut list, &aapl, EventKind::Bar(BarInterval::OneMinute));
         assert_eq!(list.trades.as_deref(), Some(&["AAPL".to_string()][..]));
         assert_eq!(list.bars.as_deref(), Some(&["AAPL".to_string()][..]));
-        apply_pair_to_list(&mut list, &aapl, EventKind::Trade, false);
-        apply_pair_to_list(
-            &mut list,
-            &aapl,
-            EventKind::Bar(BarInterval::OneMinute),
-            false,
-        );
+        assert!(list.quotes.is_none());
+        SubscriptionSet::remove(&mut list, &aapl, EventKind::Quote);
+        SubscriptionSet::remove(&mut list, &aapl, EventKind::Trade);
+        SubscriptionSet::remove(&mut list, &aapl, EventKind::Bar(BarInterval::OneMinute));
         assert!(list.trades.is_none());
         assert!(list.bars.is_none());
+        assert!(list.quotes.is_none());
     }
 
     #[test]
-    fn stock_set_is_empty_until_a_pair_is_applied() {
+    fn stock_set_is_empty_until_a_pair_is_inserted() {
         let mut set = <StockSubscriptionList as SubscriptionSet>::empty();
         assert!(SubscriptionSet::is_empty(&set));
-        set.apply(&provider_instrument("AAPL"), EventKind::Trade, true);
+        set.insert(&provider_instrument("AAPL"), EventKind::Trade);
         assert!(!SubscriptionSet::is_empty(&set));
-        set.apply(&provider_instrument("AAPL"), EventKind::Trade, false);
+        set.remove(&provider_instrument("AAPL"), EventKind::Trade);
         assert!(SubscriptionSet::is_empty(&set));
     }
 
