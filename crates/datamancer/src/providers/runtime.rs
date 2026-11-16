@@ -61,7 +61,10 @@ impl<T: Clone> SettingsSource<T> {
     /// Read the source for one connect (see [`SettingsRead`]). For a `Watch`
     /// source the value and the seen-marker come from one
     /// `borrow_and_update` on the returned clone, so the receiver reports
-    /// exactly the changes that land after this read.
+    /// exactly the changes that land after this read. An enabled `Watch`
+    /// source whose sender is gone can change no more, so its settings come
+    /// with no receiver, as a static source's do; a disabled one keeps its
+    /// receiver, since nothing else could ever wake the park.
     pub(crate) fn read(&self) -> SettingsRead<T> {
         match self {
             Self::Static(s) => SettingsRead::Enabled {
@@ -71,10 +74,13 @@ impl<T: Clone> SettingsSource<T> {
             Self::Watch(rx) => {
                 let mut rx = rx.clone();
                 let value = rx.borrow_and_update().clone();
+                // With the value just marked seen, `has_changed` errs only
+                // when the sender is gone.
+                let can_change = rx.has_changed().is_ok();
                 match value {
                     Some(settings) => SettingsRead::Enabled {
                         settings,
-                        rx: Some(rx),
+                        rx: can_change.then_some(rx),
                     },
                     None => SettingsRead::Disabled(rx),
                 }
@@ -162,6 +168,18 @@ mod tests {
                 rx: None
             }
         ));
+
+        drop(tx);
+        assert!(
+            matches!(
+                source.read(),
+                SettingsRead::Enabled {
+                    settings: 2,
+                    rx: None
+                }
+            ),
+            "with the sender gone the settings come with no receiver"
+        );
     }
 
     #[test]

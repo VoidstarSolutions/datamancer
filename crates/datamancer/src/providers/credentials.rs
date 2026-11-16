@@ -162,7 +162,9 @@ impl CredentialsSource {
     /// Read the source for one connect (see [`CredentialsRead`]). For a
     /// `Watch` source the value and the seen-marker come from one
     /// `borrow_and_update` on the returned clone, so the receiver reports
-    /// exactly the rotations that land after this read.
+    /// exactly the rotations that land after this read. A `Watch` source
+    /// whose sender is gone can rotate no more, so its value comes with no
+    /// receiver, as a static source's does.
     pub(crate) fn read(&self) -> CredentialsRead {
         match self {
             Self::Env => CredentialsRead::Present {
@@ -176,10 +178,13 @@ impl CredentialsSource {
             Self::Watch(rx) => {
                 let mut rx = rx.clone();
                 let value = rx.borrow_and_update().clone();
+                // With the value just marked seen, `has_changed` errs only
+                // when the sender is gone.
+                let can_rotate = rx.has_changed().is_ok();
                 match value {
                     Some(c) => CredentialsRead::Present {
                         credentials: PresentCredentials::Creds(c),
-                        rx: Some(rx),
+                        rx: can_rotate.then_some(rx),
                     },
                     None => CredentialsRead::Missing(rx),
                 }
@@ -227,6 +232,12 @@ mod tests {
                 rx: None
             }
         ));
+
+        drop(tx);
+        assert!(
+            matches!(source.read(), CredentialsRead::Present { rx: None, .. }),
+            "with the sender gone the value comes with no receiver"
+        );
     }
 
     fn creds(key: &str) -> AlpacaCredentials {
