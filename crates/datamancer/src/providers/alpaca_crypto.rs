@@ -427,7 +427,7 @@ impl Provider for AlpacaCryptoProvider {
 // Hub connector
 // ---------------------------------------------------------------------------
 
-/// How the hub opens and classifies the crypto market-data stream.
+/// How the hub opens the crypto market-data stream.
 struct CryptoConnector;
 
 impl Connector for CryptoConnector {

@@ -41,7 +41,7 @@
 //! reconnect, or mid-stream parks until the credentials rotate when they
 //! come from a watched source, and backs off like any other failure
 //! otherwise; a `406` or any other server error is transient and backs off
-//! (see `classify_stream_failure` for the upstream caveat). A `402` that
+//! (see the `Classify` impl for the upstream caveat). A `402` that
 //! refuses a session's own subscribe is answered to that subscribe as
 //! unauthenticated and does not park. A parked or backing-off hub still
 //! hears a disable, and a session that closes while the hub is parked or
@@ -555,37 +555,6 @@ impl Provider for AlpacaProvider {
     }
 }
 
-/// Classify a connect-time, subscribe or mid-stream error from
-/// `oxidized_alpaca`.
-///
-/// `406 connection limit exceeded` is transient: another connection on the
-/// same key pair holds the slot, which clears when it closes. So is
-/// `407 slow client`, and a dropped socket. Only `402 auth failed` means the
-/// credentials themselves are rejected, whether it arrives mid-stream
-/// (`Error::StreamingError`) or as the server's refusal of a subscribe
-/// (`Error::StreamingSubscribe`). Any other code on either variant,
-/// `401 not authenticated` included, is transient.
-///
-/// Limitation to know about: at **connect** time `oxidized_alpaca` 0.0.10
-/// (and 0.0.11) collapses every non-`authenticated` auth response into the
-/// payload-less `Error::StreamingAuth` and only logs the envelope, so a 406
-/// there is indistinguishable from a 402 and lands in the park. The hub
-/// itself never opens a second connection, so a connect-time rejection is
-/// treated as the credential case it is in practice; once upstream carries
-/// the `StreamError` on that path, it classifies through the same arm as
-/// the mid-stream case below with no further change here.
-pub(super) fn classify_stream_failure(err: &oxidized_alpaca::Error) -> StreamFailure {
-    match err {
-        oxidized_alpaca::Error::StreamingAuth => StreamFailure::Unauthenticated,
-        oxidized_alpaca::Error::StreamingError(e)
-        | oxidized_alpaca::Error::StreamingSubscribe(e) => match e.code {
-            StreamErrorCode::AuthFailed => StreamFailure::Unauthenticated,
-            _ => StreamFailure::Transient,
-        },
-        _ => StreamFailure::Transient,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Hub connector
 // ---------------------------------------------------------------------------
@@ -599,7 +568,7 @@ fn hub_sources(cfg: &AlpacaProviderConfig) -> HubSources<AlpacaSettings> {
     }
 }
 
-/// How the hub opens and classifies the stock market-data stream.
+/// How the hub opens the stock market-data stream.
 struct StockConnector {
     stream_feed: AlpacaStreamFeed,
 }
@@ -645,9 +614,35 @@ impl Connector for StockConnector {
     }
 }
 
+/// Classify a connect-time, subscribe or mid-stream error from
+/// `oxidized_alpaca`.
+///
+/// `406 connection limit exceeded` is transient: another connection on the
+/// same key pair holds the slot, which clears when it closes. So is
+/// `407 slow client`, and a dropped socket. Only `402 auth failed` means the
+/// credentials themselves are rejected, whether it arrives mid-stream
+/// (`Error::StreamingError`) or as the server's refusal of a subscribe
+/// (`Error::StreamingSubscribe`). Any other code on either variant,
+/// `401 not authenticated` included, is transient.
+///
+/// Limitation to know about: at **connect** time `oxidized_alpaca` 0.0.10
+/// (and 0.0.11) collapses every non-`authenticated` auth response into the
+/// payload-less `Error::StreamingAuth` and only logs the envelope, so a 406
+/// there is indistinguishable from a 402 and lands in the park. The hub
+/// itself never opens a second connection, so a connect-time rejection is
+/// treated as the credential case it is in practice; once upstream carries
+/// the `StreamError` on that path, it classifies through the same arm as
+/// the mid-stream case below with no further change here.
 impl Classify for oxidized_alpaca::Error {
     fn classify(&self) -> StreamFailure {
-        classify_stream_failure(self)
+        match self {
+            Self::StreamingAuth => StreamFailure::Unauthenticated,
+            Self::StreamingError(e) | Self::StreamingSubscribe(e) => match e.code {
+                StreamErrorCode::AuthFailed => StreamFailure::Unauthenticated,
+                _ => StreamFailure::Transient,
+            },
+            _ => StreamFailure::Transient,
+        }
     }
 }
 
@@ -1878,7 +1873,7 @@ pub(super) mod tests {
     fn stream_failures_park_on_402_and_back_off_on_406() {
         let mid_stream = oxidized_alpaca::Error::StreamingError;
         assert_eq!(
-            classify_stream_failure(&server_error(mid_stream, StreamErrorCode::AuthFailed)),
+            server_error(mid_stream, StreamErrorCode::AuthFailed).classify(),
             StreamFailure::Unauthenticated
         );
         for code in [
@@ -1889,19 +1884,17 @@ pub(super) mod tests {
             StreamErrorCode::InvalidSyntax,
         ] {
             assert_eq!(
-                classify_stream_failure(&server_error(mid_stream, code)),
+                server_error(mid_stream, code).classify(),
                 StreamFailure::Transient,
                 "code {code:?}"
             );
         }
         assert_eq!(
-            classify_stream_failure(&oxidized_alpaca::Error::StreamingAuth),
+            oxidized_alpaca::Error::StreamingAuth.classify(),
             StreamFailure::Unauthenticated
         );
         assert_eq!(
-            classify_stream_failure(&oxidized_alpaca::Error::UnexpectedConnectionMessage(
-                "boom".to_string()
-            )),
+            oxidized_alpaca::Error::UnexpectedConnectionMessage("boom".to_string()).classify(),
             StreamFailure::Transient
         );
     }

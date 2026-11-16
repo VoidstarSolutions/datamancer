@@ -26,15 +26,16 @@ use super::credentials::{AlpacaCredentials, CredentialsSource, PresentCredential
 use super::runtime::{SettingsSource, WatchRead, Watched};
 use crate::session::ReconnectPolicy;
 
-/// How a provider's [`Connector::classify`] reads a failed connect, a
-/// refused re-subscribe or a failed stream, and so what the hub does about
-/// it. A rejected credential pair from a watched source parks the hub until
-/// a rotation (retrying cannot help, provisioning can); one from a static
+/// How a failure's [`Classify::classify`] reads a failed connect, a refused
+/// re-subscribe or a failed stream, and so what the hub does about it. A
+/// rejected credential pair from a watched source parks the hub until a
+/// rotation (retrying cannot help, provisioning can); one from a static
 /// source, and everything transient, backs off. A session's subscribe the
 /// upstream refuses is only answered by its class and never parks the hub;
 /// the hub's own re-subscribe on a fresh connection, refused as a rejected
-/// credential, ends that connection like a failed stream. Which of a
-/// provider's errors are which is the provider's to say, in its `classify`.
+/// credential, ends that connection like a failed stream. Which of an
+/// upstream's failures are which is the failure type's to say, in its
+/// [`Classify`] impl.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StreamFailure {
     Unauthenticated,
@@ -97,14 +98,9 @@ pub(super) trait SubscriptionSet: Clone + Send + Sync + 'static {
     fn remove(&mut self, instrument: &Instrument, kind: EventKind);
 }
 
-/// How a failure reads: a rejected credential or transient. For a failed
-/// connect or stream, and for the hub's own re-subscribe on a fresh
-/// connection, the answer decides whether the hub parks (a rejected
-/// credential from a watched source) or backs off, and the `DisconnectCause`
-/// of the `ProviderDisconnected` control it broadcasts. For a session's
-/// refused subscribe or unsubscribe it decides only whether the answer is
-/// `Error::Unauthenticated` or `Error::Provider`. A property of the failure
-/// type, so every upstream that fails the same way classifies the same way.
+/// How a failure reads, as a [`StreamFailure`], which says what the hub
+/// does about it. A property of the failure type, so every upstream that
+/// fails the same way classifies the same way.
 pub(super) trait Classify {
     /// Whether this failure is a rejected credential or transient.
     fn classify(&self) -> StreamFailure;
@@ -1055,8 +1051,9 @@ pub(super) mod tests {
         }
     }
 
-    /// Records the upstream calls the hub makes; refuses `add` while
-    /// `refuse_add` is `Some`, and yields `events` in order, then pends.
+    /// Records the upstream calls the hub makes; refuses the first `add`
+    /// with `refuse_first_add` and every `add` with `refuse_add`, and yields
+    /// `events` in order, then pends.
     #[derive(Default)]
     struct FakeUpstream {
         /// How many times `add` was called, readable after the upstream
