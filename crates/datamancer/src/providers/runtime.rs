@@ -42,10 +42,13 @@ pub enum SettingsSource<T> {
 pub(crate) struct Watched<T>(pub(crate) Option<watch::Receiver<T>>);
 
 impl<T> Watched<T> {
-    /// Whether a change can still arrive: there is a receiver, and its
-    /// sender is still there.
+    /// Whether a change can still arrive, or one has arrived unseen: there is
+    /// a receiver, and its sender is still there or left it a value this
+    /// watch has not yet handed back.
     pub(crate) fn may_change(&self) -> bool {
-        self.0.as_ref().is_some_and(|rx| rx.has_changed().is_ok())
+        self.0
+            .as_ref()
+            .is_some_and(|rx| rx.has_changed().is_ok() || rx.borrow().has_changed())
     }
 
     /// Resolves to the new value once one has landed, marked seen. With

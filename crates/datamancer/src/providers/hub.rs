@@ -1735,6 +1735,34 @@ pub(super) mod tests {
             .expect("the retry connected");
     }
 
+    /// A rotation that landed before its sender went away is a rotation the
+    /// hub has: a rejection then reconnects with it at once, rather than
+    /// sleeping a backoff for a pair it already holds.
+    #[tokio::test(start_paused = true)]
+    async fn a_rotation_landed_before_the_sender_went_is_used_at_once() {
+        let (creds_tx, sources) = watched_credentials();
+        let connector = FakeConnector {
+            yields_in_connect: true,
+            ..FakeConnector::scripted(vec![
+                Err(Refused(StreamFailure::Unauthenticated)),
+                Ok(FakeUpstream::idle()),
+            ])
+        };
+        let connects = connector.connect_count();
+        let (_hub, _cmd_tx) = spawn_hub(connector, sources);
+        // The hub has read its sources and is inside the connect.
+        tokio::task::yield_now().await;
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        creds_tx.send(Some(test_credentials())).unwrap();
+        drop(creds_tx);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "the rotation that already landed is used at once"
+        );
+    }
+
     /// A disable that lands in the same poll as a credentials rotation still
     /// reaches the routes: whichever wake the parked hub takes, the routes
     /// hear the disabled disconnect once before the hub parks disabled.
@@ -1827,6 +1855,9 @@ pub(super) mod tests {
             connects,
             ..
         } = hub;
+        // Well into the one-second backoff, so a sleep the command cut short
+        // or restarted would end outside the window checked below.
+        tokio::time::sleep(Duration::from_millis(600)).await;
         handle
             .close()
             .await
@@ -1838,14 +1869,18 @@ pub(super) mod tests {
             ),
             "the route is told its subscription ended"
         );
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             connects.load(Ordering::SeqCst),
             2,
             "the command did not cut the backoff short"
         );
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert_eq!(connects.load(Ordering::SeqCst), 3, "the backoff ran out");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            3,
+            "the backoff ran out when it would have"
+        );
         assert_eq!(
             adds.load(Ordering::SeqCst),
             0,
