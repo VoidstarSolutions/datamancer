@@ -515,11 +515,17 @@ impl<C: Connector> Hub<C> {
         // refusal that reads as a rejected credential is one, wherever the
         // server says so, and ends this connection like a failed stream; any
         // other refusal is broadcast and the stream stays up, since a
-        // reconnect would only be refused again.
-        if !self.subs.is_empty()
-            && let Err(err) = upstream.add(&self.subs).await
-        {
-            match C::classify(&err) {
+        // reconnect would only be refused again. Only a set applied starts
+        // the backoff ladder over: a connect that got no further has not
+        // succeeded, and its next failure climbs on.
+        let applied = if self.subs.is_empty() {
+            Ok(())
+        } else {
+            upstream.add(&self.subs).await
+        };
+        match applied {
+            Ok(()) => self.backoff_ms = self.sources.reconnect.initial_backoff_ms,
+            Err(err) => match C::classify(&err) {
                 StreamFailure::Unauthenticated => {
                     upstream.shut_down().await;
                     return self
@@ -538,23 +544,20 @@ impl<C: Connector> Hub<C> {
                     )
                     .await;
                 }
-            }
+            },
         }
 
         self.serve(upstream, &mut cred_rx, &mut settings_rx).await
     }
 
-    /// Serve the connected and subscribed `upstream`: its messages, the
-    /// handles' commands and the credential and settings watches, until the
-    /// connection ends. A hub that serves has climbed down its backoff
-    /// ladder; a connect whose re-subscribe is refused never gets here.
+    /// Serve the connected `upstream`: its messages, the handles' commands
+    /// and the credential and settings watches, until the connection ends.
     async fn serve(
         &mut self,
         mut upstream: C::Upstream,
         cred_rx: &mut CredentialsRx,
         settings_rx: &mut SettingsRx<C::Settings>,
     ) -> Next {
-        self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
         loop {
             tokio::select! {
                 cmd = self.cmd_rx.recv() => {
@@ -592,33 +595,36 @@ impl<C: Connector> Hub<C> {
                         provider = C::PROVIDER_ID,
                         "credentials changed; reconnecting"
                     );
-                        // Same in-band control the failure path broadcasts,
-                        // then reconnect at once with the new credentials.
+                    // Same in-band control the failure path broadcasts,
+                    // then reconnect at once with the new credentials.
+                    self.broadcast_disconnected(
+                        "credentials rotated".to_string(),
+                        DisconnectCause::Error,
+                    )
+                    .await;
+                    upstream.shut_down().await;
+                    return Next::Reconnect;
+                }
+                () = settings_rx.changed() => {
+                    // The connection ends either way, and the routes hear it
+                    // end before anything else: a change while enabled is a
+                    // reconfiguration, a disable is told once, here or by the
+                    // disabled park, whichever comes first.
+                    if self.sources.settings.current().is_some() {
+                        tracing::info!(
+                            provider = C::PROVIDER_ID,
+                            "settings changed; reconnecting"
+                        );
                         self.broadcast_disconnected(
-                            "credentials rotated".to_string(),
+                            "settings changed".to_string(),
                             DisconnectCause::Error,
                         )
                         .await;
-                        upstream.shut_down().await;
-                        return Next::Reconnect;
-                }
-                () = settings_rx.changed() => {
-                    // A change while enabled is a reconfiguration: say so and
-                    // reconnect. A disable is told to the routes by the
-                    // disabled park the next cycle enters.
-                        if self.sources.settings.current().is_some() {
-                            tracing::info!(
-                                provider = C::PROVIDER_ID,
-                                "settings changed; reconnecting"
-                            );
-                            self.broadcast_disconnected(
-                                "settings changed".to_string(),
-                                DisconnectCause::Error,
-                            )
-                            .await;
-                        }
-                        upstream.shut_down().await;
-                        return Next::Reconnect;
+                    } else {
+                        self.tell_routes_disabled().await;
+                    }
+                    upstream.shut_down().await;
+                    return Next::Reconnect;
                 }
             }
         }
@@ -656,7 +662,7 @@ impl<C: Connector> Hub<C> {
             },
         )
         .await;
-        if unauthenticated && cred_rx.is_some() {
+        if unauthenticated && cred_rx.may_change() {
             return self
                 .park(cred_rx, settings_rx, Disconnected::RejectedCredentials)
                 .await;
@@ -664,10 +670,10 @@ impl<C: Connector> Hub<C> {
         self.back_off(settings_rx).await
     }
 
-    /// Tell the routes the provider was disabled, once per disable. Every
-    /// disable, whether it ends a connection, wakes a park or cuts a backoff
-    /// short, passes through the disabled park, so it is told there and no
-    /// connection's end need say it.
+    /// Tell the routes the provider was disabled, once per disable: from the
+    /// connection it ends, so the gap is told before the settings can change
+    /// again, and from the disabled park, which every disable reaches
+    /// however it arrived.
     async fn tell_routes_disabled(&mut self) {
         if self.told_disabled {
             return;
@@ -1063,6 +1069,9 @@ pub(super) mod tests {
         removals: Vec<PairSet>,
         refuse_add: Option<Refused>,
         events: VecDeque<std::result::Result<Vec<MarketEvent>, Refused>>,
+        /// Whether `shut_down` yields once before returning, as a real
+        /// websocket close, network I/O, does.
+        yields_on_shut_down: bool,
     }
 
     impl FakeUpstream {
@@ -1117,7 +1126,11 @@ pub(super) mod tests {
             }
         }
 
-        async fn shut_down(self) {}
+        async fn shut_down(self) {
+            if self.yields_on_shut_down {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     /// A connector that answers each connect from a script.
@@ -1127,6 +1140,9 @@ pub(super) mod tests {
         /// Panic on the first `connect`, taking that hub task down with it;
         /// a hub spawned after it connects as scripted.
         panics_once: AtomicBool,
+        /// Whether every `connect` yields once before resolving, as a real
+        /// connect, network I/O, does.
+        yields_in_connect: bool,
     }
 
     impl FakeConnector {
@@ -1136,6 +1152,7 @@ pub(super) mod tests {
                 connects: std::sync::Mutex::new(connects.into()),
                 connect_count: Arc::default(),
                 panics_once: AtomicBool::new(false),
+                yields_in_connect: false,
             }
         }
 
@@ -1217,7 +1234,11 @@ pub(super) mod tests {
                 .lock()
                 .expect("connect script poisoned")
                 .pop_front();
+            let yields = self.yields_in_connect;
             async move {
+                if yields {
+                    tokio::task::yield_now().await;
+                }
                 match next {
                     Some(result) => result,
                     None => std::future::pending().await,
@@ -1522,6 +1543,40 @@ pub(super) mod tests {
         );
     }
 
+    /// A re-subscribe refused for a transient reason leaves the stream up but
+    /// has not subscribed it: a stream that then drops has not succeeded
+    /// either, so the connects climb the backoff ladder rather than retry at
+    /// the initial delay forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_re_subscribe_refusal_does_not_reset_the_backoff() {
+        let (settings_tx, sources) = with_watched_settings(static_sources());
+        let mut connects = vec![Ok(FakeUpstream::idle())];
+        connects.extend((0..120).map(|_| {
+            Ok(FakeUpstream {
+                refuse_add: Some(Refused(StreamFailure::Transient)),
+                events: VecDeque::from([Err(Refused(StreamFailure::Transient))]),
+                ..FakeUpstream::idle()
+            })
+        }));
+        let connector = FakeConnector::scripted(connects);
+        let count = connector.connect_count();
+        let (_hub, cmd_tx) = spawn_hub(connector, sources);
+        let (sink, _rx) = mpsc::channel(2048);
+        let handle = SharedLiveHandle::new(cmd_tx, sink);
+        handle
+            .subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("subscribes on the first connection");
+
+        settings_tx.send(Some(())).unwrap();
+        tokio::time::sleep(Duration::from_mins(2)).await;
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            9,
+            "the backoff climbs its ladder"
+        );
+    }
+
     /// A re-subscribe refused for any other reason is broadcast as a provider
     /// error and leaves the stream up: a reconnect would only be refused again.
     #[tokio::test(start_paused = true)]
@@ -1606,6 +1661,84 @@ pub(super) mod tests {
         ]);
         let connects = connector.connect_count();
         let (_hub, cmd_tx) = spawn_hub(connector, sources);
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "no rotation can come: the hub backed off and retried"
+        );
+        let (sink, _rx) = mpsc::channel(8);
+        let handle = SharedLiveHandle::new(cmd_tx, sink);
+        handle
+            .subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("the retry connected");
+    }
+
+    /// A disable undone while the connection is still closing is a gap the
+    /// routes hear about: the first connection's end is told before the
+    /// second's start, whatever the settings say by the time the next cycle
+    /// reads them.
+    #[tokio::test(start_paused = true)]
+    async fn a_disable_undone_during_shut_down_still_tells_the_routes_of_the_gap() {
+        let (settings_tx, sources) = with_watched_settings(static_sources());
+        let first = FakeUpstream {
+            yields_on_shut_down: true,
+            ..FakeUpstream::idle()
+        };
+        let connector = FakeConnector::scripted(vec![Ok(first), Ok(FakeUpstream::idle())]);
+        let connects = connector.connect_count();
+        let (_hub, cmd_tx) = spawn_hub(connector, sources);
+        let (sink, mut rx) = mpsc::channel(8);
+        let handle = SharedLiveHandle::new(cmd_tx, sink);
+        handle
+            .subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("subscribes on the first connection");
+        control_kinds(&mut rx);
+
+        settings_tx.send(None).unwrap();
+        // The hub takes its settings arm and is inside the shut-down when
+        // the re-enable lands.
+        tokio::task::yield_now().await;
+        settings_tx.send(Some(())).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(connects.load(Ordering::SeqCst), 2, "the hub reconnected");
+        let kinds = control_kinds(&mut rx);
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [
+                    ControlKind::ProviderDisconnected {
+                        cause: DisconnectCause::Disabled,
+                        ..
+                    },
+                    ControlKind::ProviderConnected { .. },
+                ]
+            ),
+            "the first connection's end is told before the second's start: {kinds:?}"
+        );
+    }
+
+    /// Watched credentials whose sender goes away while the connect is in
+    /// flight can rotate no more either: the rejection that follows backs
+    /// off and retries, rather than parking for a rotation that cannot come.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejection_with_the_sender_gone_mid_connect_backs_off() {
+        let (creds_tx, sources) = watched_credentials();
+        let connector = FakeConnector {
+            yields_in_connect: true,
+            ..FakeConnector::scripted(vec![
+                Err(Refused(StreamFailure::Unauthenticated)),
+                Ok(FakeUpstream::idle()),
+            ])
+        };
+        let connects = connector.connect_count();
+        let (_hub, cmd_tx) = spawn_hub(connector, sources);
+        // The hub has read its sources and is inside the connect.
+        tokio::task::yield_now().await;
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+        drop(creds_tx);
         tokio::time::sleep(Duration::from_hours(1)).await;
         assert_eq!(
             connects.load(Ordering::SeqCst),

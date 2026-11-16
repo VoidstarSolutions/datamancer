@@ -47,8 +47,15 @@ impl<T> Watched<T> {
         Self(None)
     }
 
-    /// Whether a value can still arrive.
-    pub(crate) fn is_some(&self) -> bool {
+    /// Whether a change can still arrive: there is a receiver, and its
+    /// sender is still there. A sender found gone is dropped here, so a
+    /// later wait pends rather than fires.
+    pub(crate) fn may_change(&mut self) -> bool {
+        if let Some(rx) = &self.0
+            && rx.has_changed().is_err()
+        {
+            self.0 = None;
+        }
         self.0.is_some()
     }
 
