@@ -6,6 +6,8 @@
 #[cfg(feature = "provider-alpaca")]
 pub mod alpaca;
 #[cfg(feature = "provider-alpaca")]
+mod alpaca_common;
+#[cfg(feature = "provider-alpaca")]
 pub mod alpaca_crypto;
 #[cfg(feature = "provider-alpaca")]
 pub mod credentials;

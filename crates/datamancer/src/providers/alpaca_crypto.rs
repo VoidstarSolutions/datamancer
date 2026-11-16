@@ -54,7 +54,7 @@ use oxidized_alpaca::{
 };
 use tokio::sync::{mpsc, watch};
 
-use super::alpaca::SymbolLists;
+use super::alpaca_common::SymbolLists;
 use super::credentials::{AlpacaCredentials, CredentialsSource, PresentCredentials, Resolved};
 use super::hub::{Connector, HubSlot, HubSources, SubscriptionSet, Upstream, wall_clock_ts};
 use super::runtime::SettingsSource;
