@@ -1322,8 +1322,11 @@ fn fanout_error(kind: &ControlKind, rx_ts: i64) -> MarketEvent {
 }
 
 /// An error about the one subscription it arrives on.
-fn subscription_error(message: &str, rx_ts: i64) -> MarketEvent {
-    provider_control(ControlKind::subscription_error("fake", message), rx_ts)
+fn subscription_error(symbol: &str, message: &str, rx_ts: i64) -> MarketEvent {
+    provider_control(
+        ControlKind::subscription_error("fake", inst(symbol), EventKind::Trade, message),
+        rx_ts,
+    )
 }
 
 /// The provider's `ProviderConnected`.
@@ -1452,7 +1455,8 @@ async fn a_later_error_with_the_same_text_is_delivered_and_a_copy_is_not() {
     ctrl.push("AAPL", trade("AAPL", 100)).await;
     assert_eq!(errors_until(&mut stream, 100).await, 1, "copies coalesce");
     // A second failure later, with the same text (a second fetch failing).
-    ctrl.push("MSFT", subscription_error("HTTP 403", 20)).await;
+    ctrl.push("MSFT", subscription_error("MSFT", "HTTP 403", 20))
+        .await;
     ctrl.push("MSFT", trade("MSFT", 200)).await;
     assert_eq!(
         errors_until(&mut stream, 200).await,
@@ -3977,6 +3981,44 @@ async fn a_retried_backfill_failing_the_same_way_is_delivered() {
     let _ = client.close().await;
 }
 
+/// A failed backfill's `ProviderError` names the subscription it is about,
+/// so a consumer of the multiplexed stream can tell which pair failed.
+#[tokio::test]
+async fn a_failed_backfills_error_names_its_subscription() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    ctrl.shared.lock().await.history_error = Some("HTTP 403".to_string());
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let mut stream = client.take_events().await.unwrap();
+    client
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            LiveScope::backfill(Timestamp(0)),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let subscription = loop {
+        if let MarketEvent::Control(c) = next_ev(&mut stream).await
+            && let ControlKind::ProviderError { subscription, .. } = c.kind
+        {
+            break subscription;
+        }
+    };
+    assert_eq!(
+        subscription,
+        Some(datamancer::SubscriptionRef {
+            instrument: inst("AAPL"),
+            kind: EventKind::Trade,
+        })
+    );
+    let _ = client.close().await;
+}
+
 /// One error, then one reconnect, each fanned out to both substreams; AAPL's
 /// copies are read before MSFT's. MSFT's copy of the pre-reconnect error is
 /// a copy of a fan-out the client delivered and must be suppressed.
@@ -4345,7 +4387,7 @@ async fn a_fanout_copy_dropped_while_the_first_was_buffered_is_not_lost() {
 }
 
 /// `ControlKind::subscription_error`: "an error about one subscription, which
-/// a client session always delivers". One that meets a full channel must not
+/// a client session never drops as a copy of another". One that meets a full channel must not
 /// be replaced by a later, unrelated fan-out error on the same provider: the
 /// fan-out has copies elsewhere, the subscription error has none.
 #[tokio::test]
@@ -4364,8 +4406,11 @@ async fn a_subscription_error_owed_on_a_full_channel_survives_a_later_fanout() {
         ctrl.push("AAPL", trade("AAPL", ts)).await;
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
-    ctrl.push("AAPL", subscription_error("backfill fetch failed", 3000))
-        .await;
+    ctrl.push(
+        "AAPL",
+        subscription_error("AAPL", "backfill fetch failed", 3000),
+    )
+    .await;
     ctrl.push("AAPL", fanout_error(&fanout("unrelated"), 3001))
         .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -4418,7 +4463,8 @@ async fn a_fanout_error_is_delivered_with_the_largest_resume_buffer() {
     let client = dm.client_session();
     subscribe_live(&client, "AAPL").await;
     let mut stream = client.take_events().await.unwrap();
-    ctrl.push("AAPL", subscription_error("HTTP 403", 5)).await;
+    ctrl.push("AAPL", subscription_error("AAPL", "HTTP 403", 5))
+        .await;
     ctrl.push("AAPL", trade("AAPL", 50)).await;
     assert_eq!(errors_until(&mut stream, 50).await, 1, "control case");
     ctrl.push("AAPL", fanout_error(&fanout("HTTP 403"), 10))

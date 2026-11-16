@@ -1862,7 +1862,12 @@ impl Controller {
             source_ts,
             rx_ts: source_ts,
             seq: Seq(0),
-            kind: ControlKind::subscription_error(self.provider.id(), message),
+            kind: ControlKind::subscription_error(
+                self.provider.id(),
+                self.inner.instrument.clone(),
+                self.inner.kind,
+                message,
+            ),
         }))
         .await;
     }

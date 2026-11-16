@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Instrument, Price, Quantity};
+use crate::{Instrument, Price, Quantity, SubscriptionRef};
 
 /// A per-`(instrument, kind)` ordering identifier stamped **once at the
 /// source** of that pair's authoritative session, in the session's canonical
@@ -331,6 +331,10 @@ pub enum ControlKind {
         /// that predate the field.
         #[serde(default = "subscription_origin")]
         origin: ErrorOrigin,
+        /// The subscription a [`ControlKind::subscription_error`] is about;
+        /// `None` for a fan-out error, and on frames that predate the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subscription: Option<SubscriptionRef>,
     },
     /// The session is closing in response to an explicit `close()`.
     SessionClosing,
@@ -365,30 +369,51 @@ impl ControlKind {
     /// ```
     #[must_use]
     pub fn fanout_error(provider: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::provider_error(provider, message, ErrorOrigin::Fanout(FanoutId::next()))
+        Self::provider_error(
+            provider,
+            message,
+            ErrorOrigin::Fanout(FanoutId::next()),
+            None,
+        )
     }
 
     /// Builds a [`ControlKind::ProviderError`] about one subscription, which a
-    /// client session never drops as a copy of another.
+    /// client session never drops as a copy of another. It names the
+    /// subscription, so a consumer of a multiplexed stream can tell which
+    /// pair failed.
     ///
     /// # Arguments
     ///
     /// * `provider` - the provider that reported the error.
+    /// * `instrument` - the subscription's instrument.
+    /// * `kind` - the subscription's event kind.
     /// * `message` - the provider's error text.
     #[must_use]
-    pub fn subscription_error(provider: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::provider_error(provider, message, ErrorOrigin::Subscription)
+    pub fn subscription_error(
+        provider: impl Into<String>,
+        instrument: Instrument,
+        kind: EventKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::provider_error(
+            provider,
+            message,
+            ErrorOrigin::Subscription,
+            Some(SubscriptionRef { instrument, kind }),
+        )
     }
 
     fn provider_error(
         provider: impl Into<String>,
         message: impl Into<String>,
         origin: ErrorOrigin,
+        subscription: Option<SubscriptionRef>,
     ) -> Self {
         Self::ProviderError {
             provider: provider.into(),
             message: message.into(),
             origin,
+            subscription,
         }
     }
 }
@@ -474,17 +499,53 @@ mod serde_tests {
         BarInterval, ControlKind, DisconnectCause, ErrorOrigin, EventKind, FanoutId, GapSpan, Seq,
         Timestamp,
     };
+    use crate::{AssetClass, Instrument, ProviderId, SubscriptionRef};
+
+    fn aapl() -> Instrument {
+        Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, "AAPL")
+    }
 
     #[test]
     fn provider_error_origin_defaults_on_old_frames() {
         let old = r#"{"ProviderError":{"provider":"p","message":"HTTP 403"}}"#;
         let kind: ControlKind = serde_json::from_str(old).unwrap();
-        assert_eq!(kind, ControlKind::subscription_error("p", "HTTP 403"));
+        assert!(matches!(
+            kind,
+            ControlKind::ProviderError {
+                origin: ErrorOrigin::Subscription,
+                subscription: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_subscription_error_names_its_pair_on_the_wire() {
+        let error = ControlKind::subscription_error(
+            "p",
+            aapl(),
+            EventKind::Bar(BarInterval::OneDay),
+            "HTTP 403",
+        );
+        let json = serde_json::to_string(&error).unwrap();
+        let back: ControlKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, error);
+        assert!(matches!(
+            back,
+            ControlKind::ProviderError {
+                subscription: Some(SubscriptionRef {
+                    kind: EventKind::Bar(BarInterval::OneDay),
+                    ..
+                }),
+                ..
+            }
+        ));
     }
 
     #[test]
     fn provider_error_round_trips_with_its_origin() {
-        let subscription = ControlKind::subscription_error("p", "HTTP 403");
+        let subscription =
+            ControlKind::subscription_error("p", aapl(), EventKind::Trade, "HTTP 403");
         let json = serde_json::to_string(&subscription).unwrap();
         assert_eq!(
             serde_json::from_str::<ControlKind>(&json).unwrap(),

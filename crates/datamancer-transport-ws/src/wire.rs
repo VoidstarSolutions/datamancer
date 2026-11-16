@@ -484,7 +484,7 @@ mod tests {
                 reason: "boom".to_string(),
                 cause: DisconnectCause::Error,
             },
-            ControlKind::subscription_error("alpaca", "oops"),
+            ControlKind::subscription_error("alpaca", inst("AAPL"), EventKind::Trade, "oops"),
         ] {
             let ev = MarketEvent::Control(Control {
                 source_ts: Timestamp(1),
