@@ -338,69 +338,135 @@ impl LiveHandle for SharedLiveHandle {
 // Hub task
 // ---------------------------------------------------------------------------
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "single-pass connect / authenticate / subscribe / dispatch / reconnect state machine; extraction would obscure the linear lifecycle"
-)]
+/// The sinks of the live sessions, keyed by the pair each owns.
+pub(super) type Routes = HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>;
+/// A credentials watch taken for one connect cycle.
+type CredentialsRx = watch::Receiver<Option<AlpacaCredentials>>;
+/// A settings watch taken for one connect cycle.
+type SettingsRx<S> = watch::Receiver<Option<S>>;
+
+/// What the hub does once a connection, or the attempt at one, is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// Resolve the sources again and connect.
+    Reconnect,
+    /// The provider and every handle are gone: exit.
+    Exit,
+}
+
+/// Where a connection failed, for the log line and the disconnect reason.
+#[derive(Debug, Clone, Copy)]
+enum FailurePoint {
+    /// The connect itself.
+    Connect,
+    /// The connected stream.
+    Stream,
+}
+
+impl FailurePoint {
+    /// The warning logged for a failure here.
+    fn log_message(self) -> &'static str {
+        match self {
+            Self::Connect => "market-data stream connect failed",
+            Self::Stream => "market-data stream failed",
+        }
+    }
+
+    /// The reason the `ProviderDisconnected` control carries for a failure
+    /// here, with the error's `chain`.
+    fn reason(self, chain: &str) -> String {
+        match self {
+            Self::Connect => format!("connect failed: {chain}"),
+            Self::Stream => format!("websocket: {chain}"),
+        }
+    }
+}
+
+/// One hub task: the connector and sources it connects with, the command
+/// channel its handles reach it over, and the state that outlives any one
+/// connection.
+struct Hub<C: Connector> {
+    connector: C,
+    sources: HubSources<C::Settings>,
+    cmd_rx: mpsc::Receiver<HubCommand>,
+    /// Per-session sinks keyed by the pair they own; the session registry's
+    /// at-most-one-live-session-per-pair rule keeps this a function.
+    routes: Routes,
+    /// Authoritative aggregate subscription set, applied to every fresh socket.
+    subs: <C::Upstream as Upstream>::Subs,
+    /// The next backoff, doubled after each failed connect up to the
+    /// policy's maximum and reset by a connect that succeeds.
+    backoff_ms: u64,
+}
+
+/// Run a provider's hub: connect, serve, and connect again, until the
+/// provider and every handle are gone.
 async fn run_hub<C: Connector>(
     connector: C,
     sources: HubSources<C::Settings>,
-    mut cmd_rx: mpsc::Receiver<HubCommand>,
+    cmd_rx: mpsc::Receiver<HubCommand>,
 ) {
-    // Per-session sinks keyed by the pair they own; the session registry's
-    // at-most-one-live-session-per-pair rule keeps this a function.
-    let mut routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>> = HashMap::new();
-    // Authoritative aggregate subscription set, applied to every fresh socket.
-    let mut subs = <C::Upstream as Upstream>::Subs::empty();
-    let mut backoff = sources.reconnect.initial_backoff_ms;
+    let mut hub = Hub {
+        backoff_ms: sources.reconnect.initial_backoff_ms,
+        connector,
+        sources,
+        cmd_rx,
+        routes: HashMap::new(),
+        subs: <C::Upstream as Upstream>::Subs::empty(),
+    };
+    while hub.cycle().await == Next::Reconnect {}
+}
 
-    'outer: loop {
-        let mut settings_rx = sources.settings.watch();
-        let Some(settings) = sources.settings.current() else {
+impl<C: Connector> Hub<C> {
+    /// One connect cycle: resolve the sources, connect, apply the aggregate
+    /// subscription set and serve the stream until it ends, parking or
+    /// backing off as its end demands.
+    async fn cycle(&mut self) -> Next {
+        let mut settings_rx = self.sources.settings.watch();
+        let Some(settings) = self.sources.settings.current() else {
             // Disabled: park until the settings watch delivers a value. Only a
             // Watch source can resolve to None, so the receiver is always
             // present here; exit defensively if it isn't (never busy-loop).
             let Some(rx) = settings_rx.as_mut() else {
-                return;
+                return Next::Exit;
             };
-            if !wait_for_provisioning::<C, _>(rx, &mut cmd_rx, Park::Disabled).await {
-                return;
-            }
-            continue 'outer;
+            return self.park(rx, Park::Disabled).await;
         };
 
         // Fresh receiver per connect attempt: `watch()` marks the current
         // value as seen on the clone (tokio's `Receiver::clone` would
         // otherwise inherit the stored receiver's stale seen-version), so
-        // the hot-reconnect arm below only fires on rotations that land
+        // the hot-reconnect arm in `serve` only fires on rotations that land
         // *after* this resolution.
-        let mut cred_rx = sources.credentials.watch();
-        let connect_result = match sources.credentials.current() {
-            Resolved::Env => connector.connect(&settings, PresentCredentials::Env).await,
+        let mut cred_rx = self.sources.credentials.watch();
+        let connect_result = match self.sources.credentials.current() {
+            Resolved::Env => {
+                self.connector
+                    .connect(&settings, PresentCredentials::Env)
+                    .await
+            }
             Resolved::Creds(c) => {
-                connector
+                self.connector
                     .connect(&settings, PresentCredentials::Creds(c))
                     .await
             }
             Resolved::Missing => {
                 // No credentials yet: wait for provisioning instead of
-                // hammering bad auth, then retry the outer loop. Only a
-                // Watch source can resolve to Missing, so the receiver is
-                // always present here; exit defensively if it isn't (never
-                // busy-loop).
-                let Some(rx) = cred_rx.as_mut() else { return };
-                if !wait_for_provisioning::<C, _>(rx, &mut cmd_rx, Park::MissingCredentials).await {
-                    return;
-                }
-                continue 'outer;
+                // hammering bad auth, then resolve again. Only a Watch source
+                // can resolve to Missing, so the receiver is always present
+                // here; exit defensively if it isn't (never busy-loop).
+                let Some(rx) = cred_rx.as_mut() else {
+                    return Next::Exit;
+                };
+                return self.park(rx, Park::MissingCredentials).await;
             }
         };
 
         let mut upstream = match connect_result {
             Ok(upstream) => {
-                backoff = sources.reconnect.initial_backoff_ms;
+                self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
                 broadcast_control(
-                    &routes,
+                    &self.routes,
                     ControlKind::ProviderConnected {
                         provider: C::PROVIDER_ID.to_string(),
                     },
@@ -409,143 +475,78 @@ async fn run_hub<C: Connector>(
                 upstream
             }
             Err(err) => {
-                let failure = C::classify(&err);
-                let unauthenticated = failure == StreamFailure::Unauthenticated;
-                tracing::warn!(
-                    provider = C::PROVIDER_ID,
-                    ?failure,
-                    error = %error_chain(&err),
-                    "market-data stream connect failed"
-                );
-                broadcast_control(
-                    &routes,
-                    ControlKind::ProviderDisconnected {
-                        provider: C::PROVIDER_ID.to_string(),
-                        reason: format!("connect failed: {}", error_chain(&err)),
-                        cause: if unauthenticated {
-                            DisconnectCause::Unauthenticated
-                        } else {
-                            DisconnectCause::Error
-                        },
-                    },
-                )
-                .await;
-                if unauthenticated && let Some(rx) = cred_rx.as_mut() {
-                    // Rejected credentials: retrying cannot help. Park until
-                    // a rotation (set-credentials hot-apply) or disable —
-                    // mirrors the Missing-credentials park above. Static
-                    // sources can't rotate, so they fall through to backoff.
-                    if !wait_for_provisioning::<C, _>(rx, &mut cmd_rx, Park::RejectedCredentials)
-                        .await
-                    {
-                        return;
-                    }
-                    continue 'outer;
-                }
-                if !sleep_with_jitter::<C>(&mut backoff, &sources.reconnect, &mut cmd_rx).await {
-                    return;
-                }
-                continue 'outer;
+                return self
+                    .fail(FailurePoint::Connect, &err, cred_rx.as_mut())
+                    .await;
             }
         };
 
         // Re-apply the aggregate subscription set on a fresh socket.
-        if !subs.is_empty()
-            && let Err(err) = upstream.add(&subs).await
+        if !self.subs.is_empty()
+            && let Err(err) = upstream.add(&self.subs).await
         {
             broadcast_error::<C>(
-                &routes,
+                &self.routes,
                 format!("re-subscribe failed: {}", error_chain(&err)),
             )
             .await;
         }
 
-        // Event loop: select between commands, incoming messages, and the
-        // credential/settings watches.
+        self.serve(upstream, &mut cred_rx, &mut settings_rx).await
+    }
+
+    /// Serve the connected `upstream`: its messages, the handles' commands
+    /// and the credential and settings watches, until the connection ends.
+    async fn serve(
+        &mut self,
+        mut upstream: C::Upstream,
+        cred_rx: &mut Option<CredentialsRx>,
+        settings_rx: &mut Option<SettingsRx<C::Settings>>,
+    ) -> Next {
         loop {
             tokio::select! {
-                cmd = cmd_rx.recv() => {
+                cmd = self.cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
                         // The provider and every handle are gone; no command
                         // can ever arrive again. Close the websocket and exit.
                         upstream.shut_down().await;
-                        return;
+                        return Next::Exit;
                     };
-                    handle_route_command::<C>(&mut routes, &mut subs, &mut upstream, cmd).await;
+                    handle_route_command::<C>(
+                        &mut self.routes,
+                        &mut self.subs,
+                        &mut upstream,
+                        cmd,
+                    )
+                    .await;
                 }
                 next = upstream.next_events() => {
                     match next {
                         Ok(events) => {
                             for ev in events {
-                                dispatch_event(&routes, ev).await;
+                                dispatch_event(&self.routes, ev).await;
                             }
                         }
                         Err(err) => {
-                            // The connector's `classify` decides: a failure it
-                            // reads as rejected credentials (for Alpaca, a
-                            // mid-stream `402`) parks below; anything else
-                            // (a `406`/`407`, a dropped socket) backs off.
-                            let failure = C::classify(&err);
-                            let unauthenticated = failure == StreamFailure::Unauthenticated;
-                            tracing::warn!(
-                                provider = C::PROVIDER_ID,
-                                ?failure,
-                                error = %error_chain(&err),
-                                "market-data stream failed"
-                            );
-                            broadcast_control(
-                                &routes,
-                                ControlKind::ProviderDisconnected {
-                                    provider: C::PROVIDER_ID.to_string(),
-                                    reason: format!("websocket: {}", error_chain(&err)),
-                                    cause: if unauthenticated {
-                                        DisconnectCause::Unauthenticated
-                                    } else {
-                                        DisconnectCause::Error
-                                    },
-                                },
-                            )
-                            .await;
-                            // Drop the upstream and reconnect.
                             drop(upstream);
-                            if unauthenticated && let Some(rx) = cred_rx.as_mut() {
-                                // Rejected credentials: retrying cannot help.
-                                // Park until a rotation or disable, exactly
-                                // as the connect-time arm does. Static
-                                // sources can't rotate, so they fall through
-                                // to backoff.
-                                if !wait_for_provisioning::<C, _>(rx, &mut cmd_rx, Park::RejectedCredentials)
-                                    .await
-                                {
-                                    return;
-                                }
-                                continue 'outer;
-                            }
-                            if !sleep_with_jitter::<C>(&mut backoff, &sources.reconnect, &mut cmd_rx).await {
-                                return;
-                            }
-                            continue 'outer;
+                            return self
+                                .fail(FailurePoint::Stream, &err, cred_rx.as_mut())
+                                .await;
                         }
                     }
                 }
-                changed = async {
-                    match cred_rx.as_mut() {
-                        Some(rx) => rx.changed().await,
-                        // Unreachable: the arm is guarded on `is_some()`.
-                        None => std::future::pending().await,
-                    }
-                }, if cred_rx.is_some() => {
+                changed = watch_change(cred_rx.as_mut()), if cred_rx.is_some() => {
                     if changed.is_ok() {
                         tracing::info!(
                             provider = C::PROVIDER_ID,
                             "credentials changed; reconnecting"
                         );
-                        // Same in-band control the websocket error path
-                        // broadcasts, then reconnect immediately with the
-                        // new credentials — reset the backoff, this is a
-                        // deliberate rotation, not a failure.
+                        // Same in-band control the failure path broadcasts,
+                        // then reconnect at once with the new credentials.
+                        // Reset the backoff: this is a deliberate rotation,
+                        // not a failure.
                         broadcast_control(
-                            &routes,
+                            &self.routes,
                             ControlKind::ProviderDisconnected {
                                 provider: C::PROVIDER_ID.to_string(),
                                 reason: "credentials rotated".to_string(),
@@ -554,32 +555,24 @@ async fn run_hub<C: Connector>(
                         )
                         .await;
                         upstream.shut_down().await;
-                        backoff = sources.reconnect.initial_backoff_ms;
-                        continue 'outer;
+                        self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
+                        return Next::Reconnect;
                     }
                     // Watch sender dropped: no further rotations can
                     // arrive. Disable this arm (a closed receiver would
                     // otherwise resolve immediately and spin the select).
-                    cred_rx = None;
+                    *cred_rx = None;
                 }
-                changed = async {
-                    match settings_rx.as_mut() {
-                        Some(rx) => rx.changed().await,
-                        // Unreachable: the arm is guarded on `is_some()`.
-                        None => std::future::pending().await,
-                    }
-                }, if settings_rx.is_some() => {
+                changed = watch_change(settings_rx.as_mut()), if settings_rx.is_some() => {
                     if changed.is_ok() {
-                        // A disable is deliberate, not a fault: classify it so
-                        // health does not read the dropped streams as Stale.
-                        let (reason, cause) = if sources.settings.current().is_none() {
-                            ("provider disabled", DisconnectCause::Disabled)
-                        } else {
-                            ("settings changed", DisconnectCause::Error)
-                        };
-                        tracing::info!(provider = C::PROVIDER_ID, reason, "settings changed; reconnecting");
+                        let (reason, cause) = self.settings_change();
+                        tracing::info!(
+                            provider = C::PROVIDER_ID,
+                            reason,
+                            "settings changed; reconnecting"
+                        );
                         broadcast_control(
-                            &routes,
+                            &self.routes,
                             ControlKind::ProviderDisconnected {
                                 provider: C::PROVIDER_ID.to_string(),
                                 reason: reason.to_string(),
@@ -588,13 +581,100 @@ async fn run_hub<C: Connector>(
                         )
                         .await;
                         upstream.shut_down().await;
-                        backoff = sources.reconnect.initial_backoff_ms;
-                        continue 'outer;
+                        self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
+                        return Next::Reconnect;
                     }
-                    settings_rx = None;
+                    *settings_rx = None;
                 }
             }
         }
+    }
+
+    /// A failed connect or stream: classify it, log it, tell every route how
+    /// the provider disconnected, then park until the credentials rotate
+    /// when it is a rejected credential from a watched source (retrying
+    /// cannot help, provisioning can), or back off (a static source cannot
+    /// rotate, and anything else may clear on its own).
+    async fn fail(
+        &mut self,
+        point: FailurePoint,
+        err: &FailureOf<C>,
+        cred_rx: Option<&mut CredentialsRx>,
+    ) -> Next {
+        let failure = C::classify(err);
+        let unauthenticated = failure == StreamFailure::Unauthenticated;
+        let chain = error_chain(err);
+        tracing::warn!(
+            provider = C::PROVIDER_ID,
+            ?failure,
+            error = %chain,
+            "{}",
+            point.log_message()
+        );
+        broadcast_control(
+            &self.routes,
+            ControlKind::ProviderDisconnected {
+                provider: C::PROVIDER_ID.to_string(),
+                reason: point.reason(&chain),
+                cause: if unauthenticated {
+                    DisconnectCause::Unauthenticated
+                } else {
+                    DisconnectCause::Error
+                },
+            },
+        )
+        .await;
+        if unauthenticated && let Some(rx) = cred_rx {
+            return self.park(rx, Park::RejectedCredentials).await;
+        }
+        self.back_off().await
+    }
+
+    /// What a settings change means for the routes: a disable is deliberate,
+    /// not a fault, so it is classified apart and health does not read the
+    /// dropped streams as stale.
+    fn settings_change(&self) -> (&'static str, DisconnectCause) {
+        if self.sources.settings.current().is_none() {
+            ("provider disabled", DisconnectCause::Disabled)
+        } else {
+            ("settings changed", DisconnectCause::Error)
+        }
+    }
+
+    /// Park until `rx` delivers a new value, answering every command
+    /// meanwhile with `park`'s error.
+    async fn park<T>(&mut self, rx: &mut watch::Receiver<T>, park: Park) -> Next {
+        if wait_for_provisioning::<C, T>(rx, &mut self.cmd_rx, park).await {
+            Next::Reconnect
+        } else {
+            Next::Exit
+        }
+    }
+
+    /// Sleep out the current backoff, doubling it for the next time.
+    async fn back_off(&mut self) -> Next {
+        if sleep_with_jitter::<C>(
+            &mut self.backoff_ms,
+            &self.sources.reconnect,
+            &mut self.cmd_rx,
+        )
+        .await
+        {
+            Next::Reconnect
+        } else {
+            Next::Exit
+        }
+    }
+}
+
+/// `rx.changed()`; pending with no receiver, which the guarded `select!`
+/// arms that call this never poll.
+async fn watch_change<T>(
+    rx: Option<&mut watch::Receiver<T>>,
+) -> std::result::Result<(), watch::error::RecvError> {
+    match rx {
+        Some(rx) => rx.changed().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -687,10 +767,7 @@ async fn sleep_with_jitter<C: Connector>(
 /// Route one translated event to the sink owning its `(instrument, kind)`;
 /// a control (no pair) fans out to every active sink so each session sees
 /// provider-level state changes.
-pub(super) async fn dispatch_event(
-    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    ev: MarketEvent,
-) {
+pub(super) async fn dispatch_event(routes: &Routes, ev: MarketEvent) {
     if let Some(key) = event_route_key(&ev) {
         if let Some(sink) = routes.get(&key) {
             let _ = sink.send(ev).await;
@@ -725,7 +802,7 @@ fn ack_error<C: Connector>(what: &str, failure: &FailureOf<C>) -> Error {
 /// Apply one session's subscribe or unsubscribe on the connected socket and
 /// answer it.
 async fn handle_route_command<C: Connector>(
-    routes: &mut HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    routes: &mut Routes,
     subs: &mut <C::Upstream as Upstream>::Subs,
     upstream: &mut C::Upstream,
     cmd: HubCommand,
@@ -756,7 +833,7 @@ async fn handle_route_command<C: Connector>(
 /// reconnect does not apply a subscription the server rejected. That also
 /// clears a route left behind by a session whose unsubscribe never arrived.
 async fn subscribe_route<C: Connector>(
-    routes: &mut HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    routes: &mut Routes,
     subs: &mut <C::Upstream as Upstream>::Subs,
     upstream: &mut C::Upstream,
     instrument: Instrument,
@@ -802,7 +879,7 @@ async fn subscribe_route<C: Connector>(
 /// subscription ended. A failed upstream removal keeps the pair in `subs`,
 /// so a reconnect applies it again.
 async fn unsubscribe_route<C: Connector>(
-    routes: &mut HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    routes: &mut Routes,
     subs: &mut <C::Upstream as Upstream>::Subs,
     upstream: &mut C::Upstream,
     instrument: Instrument,
@@ -849,10 +926,7 @@ pub(super) fn control_event(kind: ControlKind) -> MarketEvent {
 }
 
 /// Fan a control out to every active sink.
-async fn broadcast_control(
-    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    kind: ControlKind,
-) {
+async fn broadcast_control(routes: &Routes, kind: ControlKind) {
     let ev = control_event(kind);
     for sink in routes.values() {
         let _ = sink.send(ev.clone()).await;
@@ -861,10 +935,7 @@ async fn broadcast_control(
 
 /// Fan one provider error out to every active sink, every copy carrying the
 /// same fresh fan-out id.
-async fn broadcast_error<C: Connector>(
-    routes: &HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-    message: String,
-) {
+async fn broadcast_error<C: Connector>(routes: &Routes, message: String) {
     broadcast_control(routes, ControlKind::fanout_error(C::PROVIDER_ID, message)).await;
 }
 
@@ -1369,9 +1440,6 @@ pub(super) mod tests {
         }
         ids
     }
-
-    pub(in crate::providers) type Routes =
-        HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>;
 
     /// Two routes on distinct pairs, and the receivers of their sinks.
     pub(in crate::providers) fn two_routes() -> (
