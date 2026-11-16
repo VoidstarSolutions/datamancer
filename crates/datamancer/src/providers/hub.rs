@@ -131,9 +131,10 @@ pub(super) struct HubSources<S> {
 // Hub slot
 // ---------------------------------------------------------------------------
 
-/// A provider's hub task: none until the first live session, then one.
-/// The slot guards its own state, so a provider holds it plainly and every
-/// session's `start_live` shares it.
+/// A provider's hub task: none until the first live session, then one that
+/// takes commands. The slot guards its own state, so a provider holds it
+/// plainly and every session's `start_live` shares it; a hub whose task has
+/// ended is replaced by the next session that attaches.
 pub(super) struct HubSlot<C: Connector> {
     sources: HubSources<C::Settings>,
     state: std::sync::Mutex<SlotState>,
@@ -146,6 +147,8 @@ struct SlotState {
 }
 
 struct ActiveHub {
+    /// Closed once the hub task has ended, however it ended: that is how
+    /// the slot tells a live hub from a dead one.
     cmd_tx: mpsc::Sender<HubCommand>,
     /// The hub exits on its own once the provider and every handle are
     /// gone (its command channel closes); the join handle is kept so a
@@ -168,7 +171,7 @@ impl<C: Connector> HubSlot<C> {
     }
 
     /// A session's handle onto the hub, with its events routed to `sink`;
-    /// spawns the hub with `make()` if none runs.
+    /// spawns the hub with `make()` if none runs or the last one has ended.
     pub(super) fn attach(
         &self,
         make: impl FnOnce() -> C,
@@ -188,9 +191,15 @@ impl<C: Connector> HubSlot<C> {
     }
 
     /// The hub's command sender, spawning the hub with `make()` if none runs.
+    /// A hub whose task has ended (a defensive exit, a panic in its
+    /// connector) has dropped its receiver, so its sender is closed and it is
+    /// replaced like an idle slot, rather than handed out to answer every
+    /// later command with `SessionClosed`.
     fn ensure(&self, make: impl FnOnce() -> C) -> mpsc::Sender<HubCommand> {
         let mut state = self.state();
-        if let Some(active) = &state.active {
+        if let Some(active) = &state.active
+            && !active.cmd_tx.is_closed()
+        {
             return active.cmd_tx.clone();
         }
         let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(64);
@@ -1008,6 +1017,8 @@ pub(super) mod tests {
     struct FakeConnector {
         connects: std::sync::Mutex<VecDeque<std::result::Result<FakeUpstream, Refused>>>,
         connect_count: Arc<AtomicUsize>,
+        /// Panic on the first `connect`, taking the hub task down with it.
+        panics: bool,
     }
 
     impl FakeConnector {
@@ -1016,11 +1027,20 @@ pub(super) mod tests {
             Self {
                 connects: std::sync::Mutex::new(connects.into()),
                 connect_count: Arc::default(),
+                panics: false,
             }
         }
 
         fn never_connects() -> Self {
             Self::scripted(vec![])
+        }
+
+        /// A connector whose `connect` panics, so the hub task ends at once.
+        fn panicking() -> Self {
+            Self {
+                panics: true,
+                ..Self::never_connects()
+            }
         }
 
         /// How many times the hub has called `connect`, readable after the
@@ -1065,6 +1085,7 @@ pub(super) mod tests {
             _settings: &(),
             _credentials: PresentCredentials,
         ) -> impl Future<Output = std::result::Result<FakeUpstream, Refused>> + Send {
+            assert!(!self.panics, "the scripted connect panics");
             self.connect_count.fetch_add(1, Ordering::SeqCst);
             let next = self
                 .connects
@@ -1221,6 +1242,44 @@ pub(super) mod tests {
             3,
             "the hub retries after its backoff instead of parking"
         );
+    }
+
+    /// A spawn that panics while the slot is locked (here: outside a tokio
+    /// runtime) poisons the lock but leaves the state consistent, so the
+    /// slot still serves: the next `ensure` inside a runtime spawns the hub.
+    #[test]
+    fn a_panicking_spawn_does_not_poison_the_slot() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let slot = HubSlot::<FakeConnector>::new(static_sources());
+        let outside = catch_unwind(AssertUnwindSafe(|| {
+            slot.ensure(FakeConnector::never_connects)
+        }));
+        assert!(outside.is_err(), "a spawn outside a runtime panics");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cmd_tx = slot.ensure(FakeConnector::never_connects);
+            assert!(!cmd_tx.is_closed());
+            assert_eq!(slot.spawns(), 1);
+        });
+    }
+
+    /// A hub whose task has ended, here by a panic inside its connector, is
+    /// not handed out again: the next `ensure` spawns a fresh hub, so a slot
+    /// is either idle or holds a hub that takes commands.
+    #[tokio::test]
+    async fn a_dead_hub_is_respawned_by_the_next_ensure() {
+        let slot = HubSlot::<FakeConnector>::new(static_sources());
+        let dead = slot.ensure(FakeConnector::panicking);
+        while !dead.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        let live = slot.ensure(FakeConnector::never_connects);
+        assert!(!live.same_channel(&dead), "a fresh hub, not the dead one");
+        assert!(!live.is_closed());
+        assert_eq!(slot.spawns(), 2);
     }
 
     #[test]

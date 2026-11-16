@@ -1037,43 +1037,4 @@ mod tests {
                 .is_none()
         );
     }
-
-    /// A `start_live` that panics while it holds the hub slot (here: polled
-    /// once outside a tokio runtime, so the spawn panics) must not take the
-    /// provider down for every later caller: a later `start_live` inside a
-    /// runtime still succeeds.
-    #[test]
-    fn a_panicking_start_live_does_not_poison_later_start_lives() {
-        use std::future::Future;
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-        use std::task::{Context, Poll, Waker};
-        let (_tx, rx) = tokio::sync::watch::channel(None);
-        let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
-            settings: SettingsSource::Watch(rx),
-            ..Default::default()
-        });
-        // Polls `start_live` once by hand; true when it completes with a handle.
-        let poll_once = || {
-            catch_unwind(AssertUnwindSafe(|| {
-                let (sink, _events) = tokio::sync::mpsc::channel(8);
-                let mut fut = std::pin::pin!(p.start_live(sink));
-                let mut cx = Context::from_waker(Waker::noop());
-                matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(_)))
-            }))
-        };
-        assert!(poll_once().is_err(), "a spawn outside a runtime panics");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let later = rt.block_on(async { poll_once() });
-        assert!(
-            matches!(later, Ok(true)),
-            "a later start_live in a runtime must succeed, got {:?}",
-            later.map_err(|e| e
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| e.downcast_ref::<String>().cloned()))
-        );
-    }
 }
