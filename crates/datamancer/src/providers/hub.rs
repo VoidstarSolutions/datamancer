@@ -1553,9 +1553,8 @@ pub(super) mod tests {
         let mut connects = vec![Ok(FakeUpstream::idle())];
         connects.extend((0..120).map(|_| {
             Ok(FakeUpstream {
-                refuse_add: Some(Refused(StreamFailure::Transient)),
                 events: VecDeque::from([Err(Refused(StreamFailure::Transient))]),
-                ..FakeUpstream::idle()
+                ..FakeUpstream::refusing_adds(Refused(StreamFailure::Transient))
             })
         }));
         let connector = FakeConnector::scripted(connects);

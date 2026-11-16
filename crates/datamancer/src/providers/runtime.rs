@@ -42,21 +42,10 @@ pub enum SettingsSource<T> {
 pub(crate) struct Watched<T>(pub(crate) Option<watch::Receiver<T>>);
 
 impl<T> Watched<T> {
-    /// Nothing to wait on.
-    pub(crate) const fn none() -> Self {
-        Self(None)
-    }
-
     /// Whether a change can still arrive: there is a receiver, and its
-    /// sender is still there. A sender found gone is dropped here, so a
-    /// later wait pends rather than fires.
-    pub(crate) fn may_change(&mut self) -> bool {
-        if let Some(rx) = &self.0
-            && rx.has_changed().is_err()
-        {
-            self.0 = None;
-        }
-        self.0.is_some()
+    /// sender is still there.
+    pub(crate) fn may_change(&self) -> bool {
+        self.0.as_ref().is_some_and(|rx| rx.has_changed().is_ok())
     }
 
     /// Resolves once a new value has landed. With nothing to wait on it
@@ -64,14 +53,13 @@ impl<T> Watched<T> {
     /// receiver is dropped and the wait goes on pending, where a closed
     /// receiver on its own would resolve at once and spin a `select!`.
     pub(crate) async fn changed(&mut self) {
-        if let Some(rx) = &mut self.0
-            && rx.changed().await.is_err()
-        {
+        if let Some(rx) = &mut self.0 {
+            if rx.changed().await.is_ok() {
+                return;
+            }
             self.0 = None;
         }
-        if self.0.is_none() {
-            std::future::pending::<()>().await;
-        }
+        std::future::pending::<()>().await;
     }
 }
 
@@ -120,7 +108,7 @@ impl<T: Clone> SettingsSource<T> {
         match self {
             Self::Static(s) => WatchRead::Value {
                 value: s.clone(),
-                rx: Watched::none(),
+                rx: Watched(None),
             },
             Self::Watch(rx) => read_watch(rx),
         }

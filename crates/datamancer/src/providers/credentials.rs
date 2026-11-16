@@ -168,11 +168,11 @@ impl CredentialsSource {
         match self {
             Self::Env => CredentialsRead::Present {
                 credentials: PresentCredentials::Env,
-                rx: Watched::none(),
+                rx: Watched(None),
             },
             Self::Static(c) => CredentialsRead::Present {
                 credentials: PresentCredentials::Creds(c.clone()),
-                rx: Watched::none(),
+                rx: Watched(None),
             },
             Self::Watch(rx) => match read_watch(rx) {
                 WatchRead::Value { value, rx } => CredentialsRead::Present {
@@ -187,9 +187,9 @@ impl CredentialsSource {
 
 #[cfg(test)]
 mod tests {
-    use super::super::runtime::Watched;
     use super::{
         AlpacaCredentials, CredentialsRead, CredentialsSource, PresentCredentials, Resolved,
+        Watched,
     };
 
     /// A read of a watched source carries the receiver with its value, and
