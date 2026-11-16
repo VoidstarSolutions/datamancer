@@ -97,12 +97,25 @@ pub(super) trait SubscriptionSet: Clone + Send + Sync + 'static {
     fn remove(&mut self, instrument: &Instrument, kind: EventKind);
 }
 
+/// How a failure reads: a rejected credential or transient. For a failed
+/// connect or stream, and for the hub's own re-subscribe on a fresh
+/// connection, the answer decides whether the hub parks (a rejected
+/// credential from a watched source) or backs off, and the `DisconnectCause`
+/// of the `ProviderDisconnected` control it broadcasts. For a session's
+/// refused subscribe or unsubscribe it decides only whether the answer is
+/// `Error::Unauthenticated` or `Error::Provider`. A property of the failure
+/// type, so every upstream that fails the same way classifies the same way.
+pub(super) trait Classify {
+    /// Whether this failure is a rejected credential or transient.
+    fn classify(&self) -> StreamFailure;
+}
+
 /// One connected upstream: the calls the hub makes on it.
 pub(super) trait Upstream: Send {
     /// The subscription set this upstream takes.
     type Subs: SubscriptionSet;
-    /// What a failed call returns, classified by [`Connector::classify`].
-    type Failure: std::error::Error + Send + Sync + 'static;
+    /// What a failed call returns.
+    type Failure: std::error::Error + Classify + Send + Sync + 'static;
     /// Apply the aggregate subscription set `subs`.
     fn add(
         &mut self,
@@ -125,9 +138,9 @@ pub(super) trait Upstream: Send {
     fn shut_down(self) -> impl Future<Output = ()> + Send;
 }
 
-/// What differs between providers: how to open the upstream and how to read
-/// its failures. The sources the hub reads are data, not behaviour, and come
-/// with the slot as [`HubSources`].
+/// What differs between providers: how to open the upstream. The sources
+/// the hub reads are data, not behaviour, and come with the slot as
+/// [`HubSources`]; how a failure reads is the failure type's own.
 pub(super) trait Connector: Send + Sync + 'static {
     /// The provider id stamped on every control and error the hub emits.
     const PROVIDER_ID: &'static str;
@@ -142,14 +155,6 @@ pub(super) trait Connector: Send + Sync + 'static {
         settings: &Self::Settings,
         credentials: PresentCredentials,
     ) -> impl Future<Output = std::result::Result<Self::Upstream, FailureOf<Self>>> + Send;
-    /// Whether `failure` is a rejected credential or transient. For a failed
-    /// connect or stream, and for the hub's own re-subscribe on a fresh
-    /// connection, the answer decides whether the hub parks (a rejected
-    /// credential from a watched source) or backs off, and the
-    /// `DisconnectCause` of the `ProviderDisconnected` control it broadcasts.
-    /// For a session's refused subscribe or unsubscribe it decides only
-    /// whether the answer is `Error::Unauthenticated` or `Error::Provider`.
-    fn classify(failure: &FailureOf<Self>) -> StreamFailure;
 }
 
 /// The failure type of a connector's upstream.
@@ -445,9 +450,9 @@ struct Hub<C: Connector> {
     /// policy's maximum and reset once a fresh connection has the
     /// subscription set applied.
     backoff_ms: u64,
-    /// Whether the routes have heard of the current disable, so the disabled
-    /// park tells them once however it is entered.
-    told_disabled: bool,
+    /// The cause the routes last heard a disconnect for, until the next
+    /// connect, so a disable is told once however the hub comes to it.
+    routes_heard: Option<DisconnectCause>,
     /// The credentials watch of the current cycle, taken at its read.
     cred_rx: CredentialsRx,
     /// The settings watch of the current cycle, taken at its read.
@@ -468,7 +473,7 @@ async fn run_hub<C: Connector>(
         cmd_rx,
         routes: HashMap::new(),
         subs: <C::Upstream as Upstream>::Subs::empty(),
-        told_disabled: false,
+        routes_heard: None,
         cred_rx: Watched(None),
         settings_rx: Watched(None),
     };
@@ -480,21 +485,19 @@ impl<C: Connector> Hub<C> {
     /// subscription set and serve the stream until it ends, parking or
     /// backing off as its end demands.
     async fn cycle(&mut self) -> Next {
-        self.cred_rx = Watched(None);
         let settings = match self.sources.settings.read() {
             WatchRead::Value { value, rx } => {
                 self.settings_rx = rx;
                 value
             }
-            // Disabled: tell the routes, since no connection ends to tell
-            // them, then park until the settings watch delivers a value.
+            // Disabled: tell the routes, then park until the settings watch
+            // delivers a value.
             WatchRead::Empty(rx) => {
                 self.settings_rx = rx;
                 self.tell_routes_disabled().await;
                 return self.idle(Disconnected::Disabled).await;
             }
         };
-        self.told_disabled = false;
         let credentials = match self.sources.credentials.read() {
             WatchRead::Value { value, rx } => {
                 self.cred_rx = rx;
@@ -510,6 +513,7 @@ impl<C: Connector> Hub<C> {
 
         let mut upstream = match self.connector.connect(&settings, credentials).await {
             Ok(upstream) => {
+                self.routes_heard = None;
                 broadcast_control(
                     &self.routes,
                     ControlKind::ProviderConnected {
@@ -534,7 +538,7 @@ impl<C: Connector> Hub<C> {
         };
         match applied {
             Ok(()) => self.reset_backoff(),
-            Err(err) => match C::classify(&err) {
+            Err(err) => match err.classify() {
                 StreamFailure::Unauthenticated => {
                     upstream.shut_down().await;
                     return self.fail(FailurePoint::Resubscribe, &err).await;
@@ -602,9 +606,7 @@ impl<C: Connector> Hub<C> {
                 }
                 settings = self.settings_rx.changed() => {
                     // The connection ends either way, and the routes hear it
-                    // end before anything else: a change while enabled is a
-                    // reconfiguration, a disable is told once, here or by the
-                    // disabled park, whichever comes first.
+                    // end before anything else.
                     if settings.is_some() {
                         tracing::info!(
                             provider = C::PROVIDER_ID,
@@ -632,7 +634,7 @@ impl<C: Connector> Hub<C> {
     /// (a static source cannot rotate, and anything else may clear on its
     /// own).
     async fn fail(&mut self, point: FailurePoint, err: &FailureOf<C>) -> Next {
-        let failure = C::classify(err);
+        let failure = err.classify();
         let unauthenticated = failure == StreamFailure::Unauthenticated;
         let chain = error_chain(err);
         tracing::warn!(
@@ -663,22 +665,20 @@ impl<C: Connector> Hub<C> {
         self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
     }
 
-    /// Tell the routes the provider was disabled, once per disable: from the
-    /// connection it ends, so the gap is told before the settings can change
-    /// again, and from the disabled park, which every disable reaches
-    /// however it arrived.
+    /// Tell the routes the provider was disabled, unless that is the last
+    /// thing they heard.
     async fn tell_routes_disabled(&mut self) {
-        if self.told_disabled {
+        if self.routes_heard == Some(DisconnectCause::Disabled) {
             return;
         }
-        self.told_disabled = true;
         tracing::info!(provider = C::PROVIDER_ID, "provider disabled");
         self.broadcast_disconnected("provider disabled".to_string(), DisconnectCause::Disabled)
             .await;
     }
 
     /// Tell every route the provider disconnected, for `reason`.
-    async fn broadcast_disconnected(&self, reason: String, cause: DisconnectCause) {
+    async fn broadcast_disconnected(&mut self, reason: String, cause: DisconnectCause) {
+        self.routes_heard = Some(cause);
         broadcast_control(
             &self.routes,
             ControlKind::ProviderDisconnected {
@@ -795,7 +795,7 @@ fn event_route_key(ev: &MarketEvent) -> Option<(Instrument, EventKind)> {
 fn ack_error<C: Connector>(what: &str, failure: &FailureOf<C>) -> Error {
     let provider = C::PROVIDER_ID.to_string();
     let message = format!("{what}: {}", error_chain(failure));
-    match C::classify(failure) {
+    match failure.classify() {
         StreamFailure::Unauthenticated => Error::Unauthenticated { provider, message },
         StreamFailure::Transient => Error::Provider { provider, message },
     }
@@ -1005,6 +1005,12 @@ pub(super) mod tests {
     }
 
     impl std::error::Error for Refused {}
+
+    impl Classify for Refused {
+        fn classify(&self) -> StreamFailure {
+            self.0
+        }
+    }
 
     /// A subscription set that is just the pairs it holds.
     #[derive(Debug, Clone, Default)]
@@ -1227,10 +1233,6 @@ pub(super) mod tests {
                     None => std::future::pending().await,
                 }
             }
-        }
-
-        fn classify(failure: &Refused) -> StreamFailure {
-            failure.0
         }
     }
 

@@ -75,7 +75,8 @@ use tokio::sync::{mpsc, watch};
 
 use super::credentials::{AlpacaCredentials, CredentialsSource, PresentCredentials, Resolved};
 use super::hub::{
-    Connector, HubSlot, HubSources, StreamFailure, SubscriptionSet, Upstream, wall_clock_ts,
+    Classify, Connector, HubSlot, HubSources, StreamFailure, SubscriptionSet, Upstream,
+    wall_clock_ts,
 };
 use super::runtime::SettingsSource;
 use crate::session::ReconnectPolicy;
@@ -642,9 +643,11 @@ impl Connector for StockConnector {
         )
         .await
     }
+}
 
-    fn classify(failure: &oxidized_alpaca::Error) -> StreamFailure {
-        classify_stream_failure(failure)
+impl Classify for oxidized_alpaca::Error {
+    fn classify(&self) -> StreamFailure {
+        classify_stream_failure(self)
     }
 }
 
@@ -1910,7 +1913,7 @@ pub(super) mod tests {
     fn stock_subscribe_refused_with_402_is_unauthenticated() {
         let refused = oxidized_alpaca::Error::StreamingSubscribe;
         assert_eq!(
-            StockConnector::classify(&server_error(refused, StreamErrorCode::AuthFailed)),
+            server_error(refused, StreamErrorCode::AuthFailed).classify(),
             StreamFailure::Unauthenticated
         );
         for code in [
@@ -1918,7 +1921,7 @@ pub(super) mod tests {
             StreamErrorCode::NotAuthenticated,
         ] {
             assert_eq!(
-                StockConnector::classify(&server_error(refused, code)),
+                server_error(refused, code).classify(),
                 StreamFailure::Transient,
                 "code {code:?}"
             );
