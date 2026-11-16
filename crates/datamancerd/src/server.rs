@@ -148,6 +148,7 @@ impl ClientEntry {
     /// the session skips those it has not started. A new session's queue is
     /// empty, so a list it cannot take will never fit: that is `bad_request`,
     /// not a refusal to retry.
+    #[cfg(not(windows))]
     fn queue_initial(
         &self,
         session: &ClientSession,
@@ -1598,6 +1599,7 @@ impl Server {
 
 /// The refusal for an `open-client` at the `max` client cap, with `open`
 /// clients listed and `closing` more still holding their slots.
+#[cfg(not(windows))]
 fn client_cap_refusal(max: usize, open: usize, closing: usize) -> Option<Reply> {
     if open + closing < max {
         return None;
@@ -2596,8 +2598,8 @@ mod tests {
 
     #[async_trait]
     impl EventSink for StuckSink {
-        async fn publish(&self, _: datamancer::MarketEvent) -> PublishOutcome {
-            PublishOutcome::Delivered
+        async fn publish(&self, _: datamancer::MarketEvent) -> datamancer::traits::PublishOutcome {
+            datamancer::traits::PublishOutcome::Delivered
         }
 
         async fn flush(&self) -> datamancer::Result<()> {
@@ -2610,8 +2612,8 @@ mod tests {
 
     #[async_trait]
     impl EventSink for ReadySink {
-        async fn publish(&self, _: datamancer::MarketEvent) -> PublishOutcome {
-            PublishOutcome::Delivered
+        async fn publish(&self, _: datamancer::MarketEvent) -> datamancer::traits::PublishOutcome {
+            datamancer::traits::PublishOutcome::Delivered
         }
 
         async fn flush(&self) -> datamancer::Result<()> {
@@ -3301,6 +3303,7 @@ always_on = true
 
     /// A refusal at the client cap says how many slots closed clients still
     /// hold, since `list-clients` no longer names them.
+    #[cfg(not(windows))]
     #[test]
     fn the_client_cap_refusal_counts_the_clients_still_closing() {
         assert!(client_cap_refusal(2, 1, 0).is_none());
