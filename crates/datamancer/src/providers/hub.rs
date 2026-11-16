@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -18,13 +19,13 @@ use datamancer_core::{
     Control, ControlKind, DisconnectCause, Error, EventKind, Instrument, LiveHandle, MarketEvent,
     Result, Seq, Timestamp,
 };
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::credentials::{
     AlpacaCredentials, CredentialsRead, CredentialsSource, PresentCredentials,
 };
-use super::runtime::{SettingsRead, SettingsSource};
+use super::runtime::{SettingsSource, WatchRead, Watched};
 use crate::session::ReconnectPolicy;
 
 /// How a provider's [`Connector::classify`] reads a failed connect, a
@@ -171,6 +172,7 @@ pub(super) struct HubSources<S> {
 /// plainly and every session's `start_live` shares it; a hub whose task has
 /// ended is replaced by the next session that attaches.
 pub(super) struct HubSlot<C: Connector> {
+    connector: Arc<C>,
     sources: HubSources<C::Settings>,
     state: std::sync::Mutex<SlotState>,
 }
@@ -193,9 +195,11 @@ struct ActiveHub {
 }
 
 impl<C: Connector> HubSlot<C> {
-    /// A slot with no hub running; a hub it spawns reads `sources`.
-    pub(super) const fn new(sources: HubSources<C::Settings>) -> Self {
+    /// A slot with no hub running; a hub it spawns connects through
+    /// `connector` and reads `sources`.
+    pub(super) fn new(connector: C, sources: HubSources<C::Settings>) -> Self {
         Self {
+            connector: Arc::new(connector),
             sources,
             state: std::sync::Mutex::new(SlotState {
                 active: None,
@@ -206,13 +210,9 @@ impl<C: Connector> HubSlot<C> {
     }
 
     /// A session's handle onto the hub, with its events routed to `sink`;
-    /// spawns the hub with `make()` if none runs or the last one has ended.
-    pub(super) fn attach(
-        &self,
-        make: impl FnOnce() -> C,
-        sink: mpsc::Sender<MarketEvent>,
-    ) -> SharedLiveHandle {
-        SharedLiveHandle::new(self.ensure(make), sink)
+    /// spawns the hub if none runs or the last one has ended.
+    pub(super) fn attach(&self, sink: mpsc::Sender<MarketEvent>) -> SharedLiveHandle {
+        SharedLiveHandle::new(self.ensure(), sink)
     }
 
     /// The slot's state. The lock is never held across an await, and
@@ -225,12 +225,12 @@ impl<C: Connector> HubSlot<C> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The hub's command sender, spawning the hub with `make()` if none runs.
-    /// A hub whose task has ended (a defensive exit, a panic in its
-    /// connector) has dropped its receiver, so its sender is closed and it is
-    /// replaced like an idle slot, rather than handed out to answer every
-    /// later command with `SessionClosed`.
-    fn ensure(&self, make: impl FnOnce() -> C) -> mpsc::Sender<HubCommand> {
+    /// The hub's command sender, spawning the hub if none runs. A hub whose
+    /// task has ended (a defensive exit, a panic in its connector) has
+    /// dropped its receiver, so its sender is closed and it is replaced like
+    /// an idle slot, rather than handed out to answer every later command
+    /// with `SessionClosed`.
+    fn ensure(&self) -> mpsc::Sender<HubCommand> {
         let mut state = self.state();
         if let Some(active) = &state.active
             && !active.cmd_tx.is_closed()
@@ -238,7 +238,11 @@ impl<C: Connector> HubSlot<C> {
             return active.cmd_tx.clone();
         }
         let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(64);
-        let task = tokio::spawn(run_hub(make(), self.sources.clone(), cmd_rx));
+        let task = tokio::spawn(run_hub(
+            Arc::clone(&self.connector),
+            self.sources.clone(),
+            cmd_rx,
+        ));
         #[cfg(test)]
         {
             state.spawns += 1;
@@ -380,36 +384,6 @@ type CredentialsRx = Watched<Option<AlpacaCredentials>>;
 /// The settings watch of one connect cycle.
 type SettingsRx<S> = Watched<Option<S>>;
 
-/// A watch receiver the hub may not have: a static source has none, and a
-/// source whose sender is gone can deliver nothing more. [`changed`] pends
-/// in either case, so a `select!` arm on it needs no guard.
-///
-/// [`changed`]: Self::changed
-struct Watched<T>(Option<watch::Receiver<T>>);
-
-impl<T> Watched<T> {
-    /// Whether a value can still arrive.
-    fn is_some(&self) -> bool {
-        self.0.is_some()
-    }
-
-    /// `true` once a new value has landed; `false`, once, when the sender is
-    /// gone and no value can follow; pending with nothing to wait on. A
-    /// closed receiver would otherwise resolve at once and spin a `select!`.
-    async fn changed(&mut self) -> bool {
-        match &mut self.0 {
-            Some(rx) => {
-                if rx.changed().await.is_ok() {
-                    return true;
-                }
-                self.0 = None;
-                false
-            }
-            None => std::future::pending().await,
-        }
-    }
-}
-
 /// What the hub does once a connection, or the attempt at one, is over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Next {
@@ -455,7 +429,7 @@ impl FailurePoint {
 /// channel its handles reach it over, and the state that outlives any one
 /// connection.
 struct Hub<C: Connector> {
-    connector: C,
+    connector: Arc<C>,
     sources: HubSources<C::Settings>,
     cmd_rx: mpsc::Receiver<HubCommand>,
     /// Per-session sinks keyed by the pair they own; the session registry's
@@ -474,7 +448,7 @@ struct Hub<C: Connector> {
 /// Run a provider's hub: connect, serve, and connect again, until the
 /// provider and every handle are gone.
 async fn run_hub<C: Connector>(
-    connector: C,
+    connector: Arc<C>,
     sources: HubSources<C::Settings>,
     cmd_rx: mpsc::Receiver<HubCommand>,
 ) {
@@ -495,36 +469,25 @@ impl<C: Connector> Hub<C> {
     /// subscription set and serve the stream until it ends, parking or
     /// backing off as its end demands.
     async fn cycle(&mut self) -> Next {
-        // Each read hands over the receiver its value came from, marked seen
-        // at the read, so the watch arms below fire only for changes that
-        // land after this cycle resolved its sources.
         let (settings, mut settings_rx) = match self.sources.settings.read() {
-            SettingsRead::Enabled { settings, rx } => (settings, Watched(rx)),
+            WatchRead::Value { value, rx } => (value, rx),
             // Disabled: tell the routes, since no connection ends to tell
             // them, then park until the settings watch delivers a value.
-            SettingsRead::Disabled(rx) => {
+            WatchRead::Empty(mut rx) => {
                 self.tell_routes_disabled().await;
                 return self
-                    .idle(
-                        std::future::pending(),
-                        &mut Watched(Some(rx)),
-                        Disconnected::Disabled,
-                    )
+                    .idle(std::future::pending(), &mut rx, Disconnected::Disabled)
                     .await;
             }
         };
         self.told_disabled = false;
         let (credentials, mut cred_rx) = match self.sources.credentials.read() {
-            CredentialsRead::Present { credentials, rx } => (credentials, Watched(rx)),
+            CredentialsRead::Present { credentials, rx } => (credentials, rx),
             // No credentials yet: wait for provisioning instead of hammering
             // bad auth, then resolve again.
-            CredentialsRead::Missing(rx) => {
+            CredentialsRead::Missing(mut rx) => {
                 return self
-                    .park(
-                        &mut Watched(Some(rx)),
-                        &mut settings_rx,
-                        Disconnected::MissingCredentials,
-                    )
+                    .park(&mut rx, &mut settings_rx, Disconnected::MissingCredentials)
                     .await;
             }
         };
@@ -578,22 +541,20 @@ impl<C: Connector> Hub<C> {
             }
         }
 
-        // Connected and subscribed: the next failure starts the ladder over,
-        // and so does the reconnect a rotation or a settings change forces
-        // while serving. A connect whose re-subscribe is refused has not got
-        // this far, so its backoff keeps climbing.
-        self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
         self.serve(upstream, &mut cred_rx, &mut settings_rx).await
     }
 
-    /// Serve the connected `upstream`: its messages, the handles' commands
-    /// and the credential and settings watches, until the connection ends.
+    /// Serve the connected and subscribed `upstream`: its messages, the
+    /// handles' commands and the credential and settings watches, until the
+    /// connection ends. A hub that serves has climbed down its backoff
+    /// ladder; a connect whose re-subscribe is refused never gets here.
     async fn serve(
         &mut self,
         mut upstream: C::Upstream,
         cred_rx: &mut CredentialsRx,
         settings_rx: &mut SettingsRx<C::Settings>,
     ) -> Next {
+        self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
         loop {
             tokio::select! {
                 cmd = self.cmd_rx.recv() => {
@@ -626,12 +587,11 @@ impl<C: Connector> Hub<C> {
                         }
                     }
                 }
-                changed = cred_rx.changed() => {
-                    if changed {
-                        tracing::info!(
-                            provider = C::PROVIDER_ID,
-                            "credentials changed; reconnecting"
-                        );
+                () = cred_rx.changed() => {
+                    tracing::info!(
+                        provider = C::PROVIDER_ID,
+                        "credentials changed; reconnecting"
+                    );
                         // Same in-band control the failure path broadcasts,
                         // then reconnect at once with the new credentials.
                         self.broadcast_disconnected(
@@ -641,13 +601,11 @@ impl<C: Connector> Hub<C> {
                         .await;
                         upstream.shut_down().await;
                         return Next::Reconnect;
-                    }
                 }
-                changed = settings_rx.changed() => {
-                    if changed {
-                        // A change while enabled is a reconfiguration: say
-                        // so and reconnect. A disable is told to the routes
-                        // by the disabled park the next cycle enters.
+                () = settings_rx.changed() => {
+                    // A change while enabled is a reconfiguration: say so and
+                    // reconnect. A disable is told to the routes by the
+                    // disabled park the next cycle enters.
                         if self.sources.settings.current().is_some() {
                             tracing::info!(
                                 provider = C::PROVIDER_ID,
@@ -661,7 +619,6 @@ impl<C: Connector> Hub<C> {
                         }
                         upstream.shut_down().await;
                         return Next::Reconnect;
-                    }
                 }
             }
         }
@@ -745,9 +702,7 @@ impl<C: Connector> Hub<C> {
         settings_rx: &mut SettingsRx<C::Settings>,
         why: Disconnected,
     ) -> Next {
-        // A `false` leaves nothing to wait on; the next `changed` pends.
-        self.idle(async { while !rx.changed().await {} }, settings_rx, why)
-            .await
+        self.idle(rx.changed(), settings_rx, why).await
     }
 
     /// Wait, with no connection, until `wake` resolves or the settings
@@ -763,11 +718,7 @@ impl<C: Connector> Hub<C> {
         loop {
             tokio::select! {
                 () = &mut wake => return Next::Reconnect,
-                changed = settings_rx.changed() => {
-                    if changed {
-                        return Next::Reconnect;
-                    }
-                }
+                () = settings_rx.changed() => return Next::Reconnect,
                 cmd = self.cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
                         return Next::Exit;
@@ -1045,11 +996,12 @@ pub(super) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 pub(super) mod tests {
     use std::collections::{BTreeSet, VecDeque};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use datamancer_core::{
         AssetClass, Bar, BarInterval, ErrorOrigin, FanoutId, Price, ProviderId, Quantity, Trade,
     };
+    use tokio::sync::watch;
 
     use super::*;
 
@@ -1172,8 +1124,9 @@ pub(super) mod tests {
     struct FakeConnector {
         connects: std::sync::Mutex<VecDeque<std::result::Result<FakeUpstream, Refused>>>,
         connect_count: Arc<AtomicUsize>,
-        /// Panic on the first `connect`, taking the hub task down with it.
-        panics: bool,
+        /// Panic on the first `connect`, taking that hub task down with it;
+        /// a hub spawned after it connects as scripted.
+        panics_once: AtomicBool,
     }
 
     impl FakeConnector {
@@ -1182,7 +1135,7 @@ pub(super) mod tests {
             Self {
                 connects: std::sync::Mutex::new(connects.into()),
                 connect_count: Arc::default(),
-                panics: false,
+                panics_once: AtomicBool::new(false),
             }
         }
 
@@ -1190,10 +1143,11 @@ pub(super) mod tests {
             Self::scripted(vec![])
         }
 
-        /// A connector whose `connect` panics, so the hub task ends at once.
-        fn panicking() -> Self {
+        /// A connector whose first `connect` panics, so that hub task ends at
+        /// once; the next hub's connect pends forever.
+        fn panicking_once() -> Self {
             Self {
-                panics: true,
+                panics_once: AtomicBool::new(true),
                 ..Self::never_connects()
             }
         }
@@ -1253,7 +1207,10 @@ pub(super) mod tests {
             _settings: &(),
             _credentials: PresentCredentials,
         ) -> impl Future<Output = std::result::Result<FakeUpstream, Refused>> + Send {
-            assert!(!self.panics, "the scripted connect panics");
+            assert!(
+                !self.panics_once.swap(false, Ordering::SeqCst),
+                "the scripted connect panics"
+            );
             self.connect_count.fetch_add(1, Ordering::SeqCst);
             let next = self
                 .connects
@@ -1279,8 +1236,8 @@ pub(super) mod tests {
         connector: FakeConnector,
         sources: HubSources<()>,
     ) -> (JoinHandle<()>, mpsc::Sender<HubCommand>) {
-        let slot = HubSlot::new(sources);
-        let cmd_tx = slot.ensure(|| connector);
+        let slot = HubSlot::new(connector, sources);
+        let cmd_tx = slot.ensure();
         let task = slot.take_task().expect("the hub was spawned");
         (task, cmd_tx)
     }
@@ -1834,17 +1791,15 @@ pub(super) mod tests {
     #[test]
     fn a_panicking_spawn_does_not_poison_the_slot() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
-        let slot = HubSlot::<FakeConnector>::new(static_sources());
-        let outside = catch_unwind(AssertUnwindSafe(|| {
-            slot.ensure(FakeConnector::never_connects)
-        }));
+        let slot = HubSlot::new(FakeConnector::never_connects(), static_sources());
+        let outside = catch_unwind(AssertUnwindSafe(|| slot.ensure()));
         assert!(outside.is_err(), "a spawn outside a runtime panics");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            let cmd_tx = slot.ensure(FakeConnector::never_connects);
+            let cmd_tx = slot.ensure();
             assert!(!cmd_tx.is_closed());
             assert_eq!(slot.spawns(), 1);
         });
@@ -1855,12 +1810,12 @@ pub(super) mod tests {
     /// is either idle or holds a hub that takes commands.
     #[tokio::test]
     async fn a_dead_hub_is_respawned_by_the_next_ensure() {
-        let slot = HubSlot::<FakeConnector>::new(static_sources());
-        let dead = slot.ensure(FakeConnector::panicking);
+        let slot = HubSlot::new(FakeConnector::panicking_once(), static_sources());
+        let dead = slot.ensure();
         while !dead.is_closed() {
             tokio::task::yield_now().await;
         }
-        let live = slot.ensure(FakeConnector::never_connects);
+        let live = slot.ensure();
         assert!(!live.same_channel(&dead), "a fresh hub, not the dead one");
         assert!(!live.is_closed());
         assert_eq!(slot.spawns(), 2);
@@ -1873,10 +1828,10 @@ pub(super) mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let slot = HubSlot::<FakeConnector>::new(static_sources());
-            let a = slot.ensure(FakeConnector::never_connects);
-            let b = slot.ensure(|| unreachable!("a running hub is reused"));
-            assert!(a.same_channel(&b));
+            let slot = HubSlot::new(FakeConnector::never_connects(), static_sources());
+            let a = slot.ensure();
+            let b = slot.ensure();
+            assert!(a.same_channel(&b), "a running hub is reused");
             assert_eq!(slot.spawns(), 1);
         });
     }

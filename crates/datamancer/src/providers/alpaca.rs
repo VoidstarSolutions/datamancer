@@ -379,7 +379,7 @@ impl AlpacaProvider {
             settings_rx,
         });
         Self {
-            hub: HubSlot::new(hub_sources(&cfg)),
+            hub: HubSlot::new(StockConnector::new(&cfg), hub_sources(&cfg)),
             cfg,
             rest,
         }
@@ -402,7 +402,7 @@ impl AlpacaProvider {
             settings_rx,
         });
         Self {
-            hub: HubSlot::new(hub_sources(&cfg)),
+            hub: HubSlot::new(StockConnector::new(&cfg), hub_sources(&cfg)),
             cfg,
             rest,
         }
@@ -475,10 +475,7 @@ impl Provider for AlpacaProvider {
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
         // Every `start_live` goes through the one slot, so the provider never
         // holds more than one upstream socket.
-        let stream_feed = self.cfg.stream_feed;
-        Ok(Box::new(
-            self.hub.attach(|| StockConnector { stream_feed }, sink),
-        ))
+        Ok(Box::new(self.hub.attach(sink)))
     }
 
     async fn fetch_history(
@@ -604,6 +601,14 @@ fn hub_sources(cfg: &AlpacaProviderConfig) -> HubSources<AlpacaSettings> {
 /// How the hub opens and classifies the stock market-data stream.
 struct StockConnector {
     stream_feed: AlpacaStreamFeed,
+}
+
+impl StockConnector {
+    fn new(cfg: &AlpacaProviderConfig) -> Self {
+        Self {
+            stream_feed: cfg.stream_feed,
+        }
+    }
 }
 
 impl Connector for StockConnector {

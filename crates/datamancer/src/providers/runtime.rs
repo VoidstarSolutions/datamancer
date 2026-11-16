@@ -34,50 +34,65 @@ pub enum SettingsSource<T> {
     Watch(watch::Receiver<Option<T>>),
 }
 
-/// A [`SettingsSource`] read for one connect: the settings to connect with
-/// and, for a `Watch` source, the receiver on which a change arrives after
-/// this read; or, disabled, the receiver that delivers the re-enable. A read
-/// never leaves a caller holding a value without the receiver that goes
-/// with it.
-pub(crate) enum SettingsRead<T> {
-    /// Enabled with these settings; `rx` is `Some` for a `Watch` source.
-    Enabled {
-        settings: T,
-        rx: Option<watch::Receiver<Option<T>>>,
-    },
-    /// A `Watch` source that is disabled.
-    Disabled(watch::Receiver<Option<T>>),
+/// A watch receiver a reader may not have: a static source has none, and a
+/// source whose sender is gone can deliver nothing more. [`changed`] pends
+/// in either case, so a `select!` arm on it needs no guard.
+///
+/// [`changed`]: Self::changed
+pub(crate) struct Watched<T>(pub(crate) Option<watch::Receiver<T>>);
+
+impl<T> Watched<T> {
+    /// Nothing to wait on.
+    pub(crate) const fn none() -> Self {
+        Self(None)
+    }
+
+    /// Whether a value can still arrive.
+    pub(crate) fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Resolves once a new value has landed. With nothing to wait on it
+    /// pends, and a sender that goes away leaves nothing to wait on: the
+    /// receiver is dropped and the wait goes on pending, where a closed
+    /// receiver on its own would resolve at once and spin a `select!`.
+    pub(crate) async fn changed(&mut self) {
+        if let Some(rx) = &mut self.0
+            && rx.changed().await.is_err()
+        {
+            self.0 = None;
+        }
+        if self.0.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
-/// One read of a watch for a connect: the value with the receiver it came
-/// from, or the receiver alone when there is no value yet.
+/// One read of a source for a connect: its value with the watch on which the
+/// next change arrives, or, with no value yet (a disabled provider, no
+/// credentials provisioned), that watch alone. A read never leaves a caller
+/// holding a value without the watch that goes with it.
 pub(crate) enum WatchRead<T> {
-    /// A value; `rx` is `Some` while the sender can still change it.
-    Value {
-        value: T,
-        rx: Option<watch::Receiver<Option<T>>>,
-    },
-    /// No value yet, and the receiver that delivers one.
-    Empty(watch::Receiver<Option<T>>),
+    /// A value; the watch has a receiver while the sender can still change
+    /// it, and none for a static source.
+    Value { value: T, rx: Watched<Option<T>> },
+    /// No value yet, and the watch that delivers one.
+    Empty(Watched<Option<T>>),
 }
 
 /// Read `rx` for one connect. The value and the seen-marker come from one
-/// `borrow_and_update` on a clone of `rx`, so the receiver handed back
-/// reports exactly the changes that land after this read. A sender that is
-/// gone can change nothing more, so a value then comes with no receiver, as
-/// a static source's does; a missing value keeps its receiver, since nothing
-/// else could ever wake the park on it.
+/// `borrow_and_update` on a clone of `rx`, so the watch handed back reports
+/// exactly the changes that land after this read. A sender that is gone can
+/// change nothing more, so the watch then has no receiver, as a static
+/// source's does, and a wait on it never ends.
 pub(crate) fn read_watch<T: Clone>(rx: &watch::Receiver<Option<T>>) -> WatchRead<T> {
     let mut rx = rx.clone();
     let value = rx.borrow_and_update().clone();
     // With the value just marked seen, `has_changed` errs only when the
     // sender is gone.
-    let can_change = rx.has_changed().is_ok();
+    let rx = Watched(rx.has_changed().is_ok().then_some(rx));
     match value {
-        Some(value) => WatchRead::Value {
-            value,
-            rx: can_change.then_some(rx),
-        },
+        Some(value) => WatchRead::Value { value, rx },
         None => WatchRead::Empty(rx),
     }
 }
@@ -91,21 +106,16 @@ impl<T: Clone> SettingsSource<T> {
         }
     }
 
-    /// Read the source for one connect (see [`SettingsRead`]); a `Watch`
-    /// source is read as [`read_watch`] says.
-    pub(crate) fn read(&self) -> SettingsRead<T> {
+    /// Read the source for one connect (see [`WatchRead`]): the settings, or
+    /// `Empty` while disabled. A `Watch` source is read as [`read_watch`]
+    /// says.
+    pub(crate) fn read(&self) -> WatchRead<T> {
         match self {
-            Self::Static(s) => SettingsRead::Enabled {
-                settings: s.clone(),
-                rx: None,
+            Self::Static(s) => WatchRead::Value {
+                value: s.clone(),
+                rx: Watched::none(),
             },
-            Self::Watch(rx) => match read_watch(rx) {
-                WatchRead::Value { value, rx } => SettingsRead::Enabled {
-                    settings: value,
-                    rx,
-                },
-                WatchRead::Empty(rx) => SettingsRead::Disabled(rx),
-            },
+            Self::Watch(rx) => read_watch(rx),
         }
     }
 
@@ -154,7 +164,7 @@ pub(crate) fn watch_changed<T>(rx_slot: &mut Option<watch::Receiver<T>>) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingsRead, SettingsSource, watch_changed};
+    use super::{SettingsSource, WatchRead, Watched, watch_changed};
 
     /// A read of a watched source carries the receiver with its value, and
     /// that receiver reports only a change after the read; a disabled source
@@ -163,30 +173,30 @@ mod tests {
     fn a_read_carries_the_receiver_its_value_came_from() {
         let (tx, rx) = tokio::sync::watch::channel(None);
         let source = SettingsSource::Watch(rx);
-        let SettingsRead::Disabled(disabled_rx) = source.read() else {
-            panic!("disabled");
+        let WatchRead::Empty(Watched(Some(disabled_rx))) = source.read() else {
+            panic!("disabled, with a receiver");
         };
         assert!(!disabled_rx.has_changed().unwrap());
         tx.send(Some(1_u32)).unwrap();
         assert!(disabled_rx.has_changed().unwrap());
 
-        let SettingsRead::Enabled {
-            settings,
-            rx: Some(enabled_rx),
+        let WatchRead::Value {
+            value,
+            rx: Watched(Some(enabled_rx)),
         } = source.read()
         else {
             panic!("enabled, with a receiver");
         };
-        assert_eq!(settings, 1);
+        assert_eq!(value, 1);
         assert!(!enabled_rx.has_changed().unwrap(), "the read value is seen");
         tx.send(Some(2)).unwrap();
         assert!(enabled_rx.has_changed().unwrap());
 
         assert!(matches!(
             SettingsSource::Static(7_u32).read(),
-            SettingsRead::Enabled {
-                settings: 7,
-                rx: None
+            WatchRead::Value {
+                value: 7,
+                rx: Watched(None)
             }
         ));
 
@@ -194,9 +204,9 @@ mod tests {
         assert!(
             matches!(
                 source.read(),
-                SettingsRead::Enabled {
-                    settings: 2,
-                    rx: None
+                WatchRead::Value {
+                    value: 2,
+                    rx: Watched(None)
                 }
             ),
             "with the sender gone the settings come with no receiver"

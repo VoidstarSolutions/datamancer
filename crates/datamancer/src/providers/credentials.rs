@@ -7,7 +7,7 @@
 
 use oxidized_alpaca::{AccountType, ApiKey};
 
-use super::runtime::{WatchRead, read_watch};
+use super::runtime::{WatchRead, Watched, read_watch};
 
 /// The `ALPACA_*` environment pair the legacy [`CredentialsSource::Env`]
 /// path reads for an account type — the same names `oxidized_alpaca`'s own
@@ -101,18 +101,19 @@ pub(crate) enum PresentCredentials {
 }
 
 /// A [`CredentialsSource`] read for one connect: the credentials to connect
-/// with and, for a `Watch` source, the receiver on which a rotation arrives
-/// after this read; or no credentials yet, with the receiver that delivers
-/// them. A read never leaves a caller holding a value without the receiver
-/// that goes with it.
+/// with and the watch on which a rotation arrives after this read, or no
+/// credentials yet and the watch that delivers them. The shape of
+/// [`WatchRead`], with the value an [`Env`](CredentialsSource::Env) source
+/// can only name, not hold.
 pub(crate) enum CredentialsRead {
-    /// Credentials to connect with; `rx` is `Some` for a `Watch` source.
+    /// Credentials to connect with; the watch has a receiver while a
+    /// rotation can still arrive.
     Present {
         credentials: PresentCredentials,
-        rx: Option<tokio::sync::watch::Receiver<Option<AlpacaCredentials>>>,
+        rx: Watched<Option<AlpacaCredentials>>,
     },
     /// A `Watch` source with no value yet.
-    Missing(tokio::sync::watch::Receiver<Option<AlpacaCredentials>>),
+    Missing(Watched<Option<AlpacaCredentials>>),
 }
 
 /// One resolution of a [`CredentialsSource`].
@@ -167,11 +168,11 @@ impl CredentialsSource {
         match self {
             Self::Env => CredentialsRead::Present {
                 credentials: PresentCredentials::Env,
-                rx: None,
+                rx: Watched::none(),
             },
             Self::Static(c) => CredentialsRead::Present {
                 credentials: PresentCredentials::Creds(c.clone()),
-                rx: None,
+                rx: Watched::none(),
             },
             Self::Watch(rx) => match read_watch(rx) {
                 WatchRead::Value { value, rx } => CredentialsRead::Present {
@@ -186,6 +187,7 @@ impl CredentialsSource {
 
 #[cfg(test)]
 mod tests {
+    use super::super::runtime::Watched;
     use super::{
         AlpacaCredentials, CredentialsRead, CredentialsSource, PresentCredentials, Resolved,
     };
@@ -197,8 +199,8 @@ mod tests {
     fn a_read_carries_the_receiver_its_value_came_from() {
         let (tx, rx) = tokio::sync::watch::channel(None);
         let source = CredentialsSource::Watch(rx);
-        let CredentialsRead::Missing(missing_rx) = source.read() else {
-            panic!("no credentials yet");
+        let CredentialsRead::Missing(Watched(Some(missing_rx))) = source.read() else {
+            panic!("no credentials yet, with a receiver");
         };
         assert!(!missing_rx.has_changed().unwrap());
         tx.send(Some(creds("k1"))).unwrap();
@@ -206,7 +208,7 @@ mod tests {
 
         let CredentialsRead::Present {
             credentials: PresentCredentials::Creds(c),
-            rx: Some(present_rx),
+            rx: Watched(Some(present_rx)),
         } = source.read()
         else {
             panic!("credentials present, with a receiver");
@@ -220,13 +222,19 @@ mod tests {
             CredentialsSource::Env.read(),
             CredentialsRead::Present {
                 credentials: PresentCredentials::Env,
-                rx: None
+                rx: Watched(None)
             }
         ));
 
         drop(tx);
         assert!(
-            matches!(source.read(), CredentialsRead::Present { rx: None, .. }),
+            matches!(
+                source.read(),
+                CredentialsRead::Present {
+                    rx: Watched(None),
+                    ..
+                }
+            ),
             "with the sender gone the value comes with no receiver"
         );
     }

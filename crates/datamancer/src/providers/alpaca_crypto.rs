@@ -293,11 +293,14 @@ impl AlpacaCryptoProvider {
         state.rebuild(&cfg);
         let rest = std::sync::Mutex::new(state);
         Self {
-            hub: HubSlot::new(HubSources {
-                settings: cfg.settings.clone(),
-                credentials: cfg.credentials.clone(),
-                reconnect: cfg.reconnect,
-            }),
+            hub: HubSlot::new(
+                CryptoConnector,
+                HubSources {
+                    settings: cfg.settings.clone(),
+                    credentials: cfg.credentials.clone(),
+                    reconnect: cfg.reconnect,
+                },
+            ),
             cfg,
             rest,
         }
@@ -347,7 +350,7 @@ impl Provider for AlpacaCryptoProvider {
     }
 
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
-        Ok(Box::new(self.hub.attach(|| CryptoConnector, sink)))
+        Ok(Box::new(self.hub.attach(sink)))
     }
 
     async fn fetch_history(
