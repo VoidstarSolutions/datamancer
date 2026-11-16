@@ -48,31 +48,37 @@ impl<T> Watched<T> {
         self.0.as_ref().is_some_and(|rx| rx.has_changed().is_ok())
     }
 
-    /// Resolves once a new value has landed. With nothing to wait on it
-    /// pends, and a sender that goes away leaves nothing to wait on: the
-    /// receiver is dropped and the wait goes on pending, where a closed
-    /// receiver on its own would resolve at once and spin a `select!`.
-    pub(crate) async fn changed(&mut self) {
+    /// Resolves to the new value once one has landed, marked seen. With
+    /// nothing to wait on it pends, and a sender that goes away leaves
+    /// nothing to wait on: the receiver is dropped and the wait goes on
+    /// pending, where a closed receiver on its own would resolve at once and
+    /// spin a `select!`.
+    pub(crate) async fn changed(&mut self) -> T
+    where
+        T: Clone,
+    {
         if let Some(rx) = &mut self.0 {
             if rx.changed().await.is_ok() {
-                return;
+                return rx.borrow_and_update().clone();
             }
             self.0 = None;
         }
-        std::future::pending::<()>().await;
+        std::future::pending().await
     }
 }
 
 /// One read of a source for a connect: its value with the watch on which the
 /// next change arrives, or, with no value yet (a disabled provider, no
 /// credentials provisioned), that watch alone. A read never leaves a caller
-/// holding a value without the watch that goes with it.
-pub(crate) enum WatchRead<T> {
+/// holding a value without the watch that goes with it. The watch carries
+/// `W`, which is the value's own type unless a source names a value it does
+/// not hold, as an environment credential source does.
+pub(crate) enum WatchRead<V, W = V> {
     /// A value; the watch has a receiver while the sender can still change
     /// it, and none for a static source.
-    Value { value: T, rx: Watched<Option<T>> },
+    Value { value: V, rx: Watched<Option<W>> },
     /// No value yet, and the watch that delivers one.
-    Empty(Watched<Option<T>>),
+    Empty(Watched<Option<W>>),
 }
 
 /// Read `rx` for one connect. The value and the seen-marker come from one

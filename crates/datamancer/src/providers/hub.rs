@@ -22,9 +22,7 @@ use datamancer_core::{
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::credentials::{
-    AlpacaCredentials, CredentialsRead, CredentialsSource, PresentCredentials,
-};
+use super::credentials::{AlpacaCredentials, CredentialsSource, PresentCredentials};
 use super::runtime::{SettingsSource, WatchRead, Watched};
 use crate::session::ReconnectPolicy;
 
@@ -443,6 +441,21 @@ struct Hub<C: Connector> {
     /// Whether the routes have heard of the current disable, so the disabled
     /// park tells them once however it is entered.
     told_disabled: bool,
+    /// The credentials watch of the current cycle, taken at its read.
+    cred_rx: CredentialsRx,
+    /// The settings watch of the current cycle, taken at its read.
+    settings_rx: SettingsRx<C::Settings>,
+}
+
+/// What ends a wait with no connection, besides a settings change.
+#[derive(Debug, Clone, Copy)]
+enum Wake {
+    /// A rotation on the credentials watch.
+    Rotation,
+    /// The clock reaching an instant: a backoff running out.
+    At(tokio::time::Instant),
+    /// Nothing but the settings.
+    Never,
 }
 
 /// Run a provider's hub: connect, serve, and connect again, until the
@@ -460,6 +473,8 @@ async fn run_hub<C: Connector>(
         routes: HashMap::new(),
         subs: <C::Upstream as Upstream>::Subs::empty(),
         told_disabled: false,
+        cred_rx: Watched(None),
+        settings_rx: Watched(None),
     };
     while hub.cycle().await == Next::Reconnect {}
 }
@@ -469,31 +484,37 @@ impl<C: Connector> Hub<C> {
     /// subscription set and serve the stream until it ends, parking or
     /// backing off as its end demands.
     async fn cycle(&mut self) -> Next {
-        let (settings, mut settings_rx) = match self.sources.settings.read() {
-            WatchRead::Value { value, rx } => (value, rx),
+        self.cred_rx = Watched(None);
+        let settings = match self.sources.settings.read() {
+            WatchRead::Value { value, rx } => {
+                self.settings_rx = rx;
+                value
+            }
             // Disabled: tell the routes, since no connection ends to tell
             // them, then park until the settings watch delivers a value.
-            WatchRead::Empty(mut rx) => {
+            WatchRead::Empty(rx) => {
+                self.settings_rx = rx;
                 self.tell_routes_disabled().await;
-                return self
-                    .idle(std::future::pending(), &mut rx, Disconnected::Disabled)
-                    .await;
+                return self.idle(Wake::Never, Disconnected::Disabled).await;
             }
         };
         self.told_disabled = false;
-        let (credentials, mut cred_rx) = match self.sources.credentials.read() {
-            CredentialsRead::Present { credentials, rx } => (credentials, rx),
+        let credentials = match self.sources.credentials.read() {
+            WatchRead::Value { value, rx } => {
+                self.cred_rx = rx;
+                value
+            }
             // No credentials yet: wait for provisioning instead of hammering
             // bad auth, then resolve again.
-            CredentialsRead::Missing(mut rx) => {
+            WatchRead::Empty(rx) => {
+                self.cred_rx = rx;
                 return self
-                    .park(&mut rx, &mut settings_rx, Disconnected::MissingCredentials)
+                    .idle(Wake::Rotation, Disconnected::MissingCredentials)
                     .await;
             }
         };
-        let connect_result = self.connector.connect(&settings, credentials).await;
 
-        let mut upstream = match connect_result {
+        let mut upstream = match self.connector.connect(&settings, credentials).await {
             Ok(upstream) => {
                 broadcast_control(
                     &self.routes,
@@ -504,11 +525,7 @@ impl<C: Connector> Hub<C> {
                 .await;
                 upstream
             }
-            Err(err) => {
-                return self
-                    .fail(FailurePoint::Connect, &err, &mut cred_rx, &mut settings_rx)
-                    .await;
-            }
+            Err(err) => return self.fail(FailurePoint::Connect, &err).await,
         };
 
         // Re-apply the aggregate subscription set on a fresh socket. A
@@ -528,14 +545,7 @@ impl<C: Connector> Hub<C> {
             Err(err) => match C::classify(&err) {
                 StreamFailure::Unauthenticated => {
                     upstream.shut_down().await;
-                    return self
-                        .fail(
-                            FailurePoint::Resubscribe,
-                            &err,
-                            &mut cred_rx,
-                            &mut settings_rx,
-                        )
-                        .await;
+                    return self.fail(FailurePoint::Resubscribe, &err).await;
                 }
                 StreamFailure::Transient => {
                     broadcast_error::<C>(
@@ -547,17 +557,12 @@ impl<C: Connector> Hub<C> {
             },
         }
 
-        self.serve(upstream, &mut cred_rx, &mut settings_rx).await
+        self.serve(upstream).await
     }
 
     /// Serve the connected `upstream`: its messages, the handles' commands
     /// and the credential and settings watches, until the connection ends.
-    async fn serve(
-        &mut self,
-        mut upstream: C::Upstream,
-        cred_rx: &mut CredentialsRx,
-        settings_rx: &mut SettingsRx<C::Settings>,
-    ) -> Next {
+    async fn serve(&mut self, mut upstream: C::Upstream) -> Next {
         loop {
             tokio::select! {
                 cmd = self.cmd_rx.recv() => {
@@ -584,13 +589,11 @@ impl<C: Connector> Hub<C> {
                         }
                         Err(err) => {
                             drop(upstream);
-                            return self
-                                .fail(FailurePoint::Stream, &err, cred_rx, settings_rx)
-                                .await;
+                            return self.fail(FailurePoint::Stream, &err).await;
                         }
                     }
                 }
-                () = cred_rx.changed() => {
+                _ = self.cred_rx.changed() => {
                     tracing::info!(
                         provider = C::PROVIDER_ID,
                         "credentials changed; reconnecting"
@@ -605,12 +608,12 @@ impl<C: Connector> Hub<C> {
                     upstream.shut_down().await;
                     return Next::Reconnect;
                 }
-                () = settings_rx.changed() => {
+                settings = self.settings_rx.changed() => {
                     // The connection ends either way, and the routes hear it
                     // end before anything else: a change while enabled is a
                     // reconfiguration, a disable is told once, here or by the
                     // disabled park, whichever comes first.
-                    if self.sources.settings.current().is_some() {
+                    if settings.is_some() {
                         tracing::info!(
                             provider = C::PROVIDER_ID,
                             "settings changed; reconnecting"
@@ -636,13 +639,7 @@ impl<C: Connector> Hub<C> {
     /// watched source (retrying cannot help, provisioning can), or back off
     /// (a static source cannot rotate, and anything else may clear on its
     /// own).
-    async fn fail(
-        &mut self,
-        point: FailurePoint,
-        err: &FailureOf<C>,
-        cred_rx: &mut CredentialsRx,
-        settings_rx: &mut SettingsRx<C::Settings>,
-    ) -> Next {
+    async fn fail(&mut self, point: FailurePoint, err: &FailureOf<C>) -> Next {
         let failure = C::classify(err);
         let unauthenticated = failure == StreamFailure::Unauthenticated;
         let chain = error_chain(err);
@@ -662,12 +659,12 @@ impl<C: Connector> Hub<C> {
             },
         )
         .await;
-        if unauthenticated && cred_rx.may_change() {
+        if unauthenticated && self.cred_rx.may_change() {
             return self
-                .park(cred_rx, settings_rx, Disconnected::RejectedCredentials)
+                .idle(Wake::Rotation, Disconnected::RejectedCredentials)
                 .await;
         }
-        self.back_off(settings_rx).await
+        self.back_off().await
     }
 
     /// Tell the routes the provider was disabled, once per disable: from the
@@ -697,34 +694,30 @@ impl<C: Connector> Hub<C> {
         .await;
     }
 
-    /// Park until `rx` delivers a new value or the settings change on
-    /// `settings_rx`, answering every command meanwhile as `why` says. The
-    /// next cycle resolves the sources again; a value still missing lands
-    /// back here rather than spinning. With both senders gone the hub still
-    /// answers commands, so its shutdown (every handle dropped) still works.
-    async fn park<T>(
-        &mut self,
-        rx: &mut Watched<T>,
-        settings_rx: &mut SettingsRx<C::Settings>,
-        why: Disconnected,
-    ) -> Next {
-        self.idle(rx.changed(), settings_rx, why).await
-    }
-
-    /// Wait, with no connection, until `wake` resolves or the settings
-    /// change on `settings_rx`, answering every command meanwhile as `why`
-    /// says.
-    async fn idle(
-        &mut self,
-        wake: impl Future<Output = ()>,
-        settings_rx: &mut SettingsRx<C::Settings>,
-        why: Disconnected,
-    ) -> Next {
-        let mut wake = std::pin::pin!(wake);
+    /// Wait, with no connection, until `wake` or a settings change, answering
+    /// every command meanwhile as `why` says. The next cycle resolves the
+    /// sources again; a value still missing lands back here rather than
+    /// spinning. With every sender gone the hub still answers commands, so
+    /// its shutdown (every handle dropped) still works.
+    async fn idle(&mut self, wake: Wake, why: Disconnected) -> Next {
+        let deadline = match wake {
+            Wake::At(instant) => Some(instant),
+            Wake::Rotation | Wake::Never => None,
+        };
+        let clock = async {
+            match deadline {
+                Some(instant) => tokio::time::sleep_until(instant).await,
+                None => std::future::pending().await,
+            }
+        };
+        let mut clock = std::pin::pin!(clock);
         loop {
             tokio::select! {
-                () = &mut wake => return Next::Reconnect,
-                () = settings_rx.changed() => return Next::Reconnect,
+                () = &mut clock => return Next::Reconnect,
+                _ = self.cred_rx.changed(), if matches!(wake, Wake::Rotation) => {
+                    return Next::Reconnect;
+                }
+                _ = self.settings_rx.changed() => return Next::Reconnect,
                 cmd = self.cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
                         return Next::Exit;
@@ -740,7 +733,7 @@ impl<C: Connector> Hub<C> {
     /// is no reason to try the server again sooner. A settings change is,
     /// being a reconfiguration rather than a retry: it ends the sleep and
     /// the next cycle connects with the new settings, or parks disabled.
-    async fn back_off(&mut self, settings_rx: &mut SettingsRx<C::Settings>) -> Next {
+    async fn back_off(&mut self) -> Next {
         // Full jitter: pick a sleep uniformly in [0, backoff_ms]. With many
         // providers reconnecting after a shared upstream blip this avoids
         // synchronized retry storms; without it every one retries on the same
@@ -752,8 +745,8 @@ impl<C: Connector> Hub<C> {
             self.backoff_ms
         };
         self.backoff_ms = (self.backoff_ms * 2).min(policy.max_backoff_ms);
-        let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
-        self.idle(sleep, settings_rx, Disconnected::Reconnecting)
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(delay_ms);
+        self.idle(Wake::At(deadline), Disconnected::Reconnecting)
             .await
     }
 

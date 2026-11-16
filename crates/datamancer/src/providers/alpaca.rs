@@ -719,17 +719,37 @@ pub(super) struct SymbolLists<'a> {
     pub(super) daily_bars: &'a mut Option<Vec<String>>,
 }
 
+/// The list of a [`SymbolLists`] a streamed [`EventKind`] lands in: the one
+/// classification of the kinds the stream carries, behind both `supports`
+/// and the inserts, so a kind the providers promise is one the lists hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Trades,
+    Quotes,
+    Bars,
+    DailyBars,
+}
+
+impl Slot {
+    /// The slot for `kind`; `None` for a bar interval the stream does not
+    /// carry.
+    const fn of(kind: EventKind) -> Option<Self> {
+        match kind {
+            EventKind::Trade => Some(Self::Trades),
+            EventKind::Quote => Some(Self::Quotes),
+            EventKind::Bar(BarInterval::OneMinute) => Some(Self::Bars),
+            EventKind::Bar(BarInterval::OneDay) => Some(Self::DailyBars),
+            EventKind::Bar(_) => None,
+        }
+    }
+}
+
 impl<'a> SymbolLists<'a> {
     /// Whether the stream carries `kind`: trades, quotes, and minute and
     /// daily bars. Both providers answer `supports` for the live surface
-    /// from this, so a pair they promise is one `insert` has a list for.
+    /// from this.
     pub(super) const fn carries(kind: EventKind) -> bool {
-        matches!(
-            kind,
-            EventKind::Trade
-                | EventKind::Quote
-                | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay)
-        )
+        Slot::of(kind).is_some()
     }
 
     /// Add `instrument` to the list for `kind`, once.
@@ -754,17 +774,14 @@ impl<'a> SymbolLists<'a> {
         }
     }
 
-    /// The list for `kind`; `None` for a bar interval [`carries`] refuses.
-    ///
-    /// [`carries`]: Self::carries
+    /// The list `kind` lands in.
     fn list(self, kind: EventKind) -> Option<&'a mut Option<Vec<String>>> {
-        match kind {
-            EventKind::Trade => Some(self.trades),
-            EventKind::Quote => Some(self.quotes),
-            EventKind::Bar(BarInterval::OneMinute) => Some(self.bars),
-            EventKind::Bar(BarInterval::OneDay) => Some(self.daily_bars),
-            EventKind::Bar(_) => None,
-        }
+        Some(match Slot::of(kind)? {
+            Slot::Trades => self.trades,
+            Slot::Quotes => self.quotes,
+            Slot::Bars => self.bars,
+            Slot::DailyBars => self.daily_bars,
+        })
     }
 }
 

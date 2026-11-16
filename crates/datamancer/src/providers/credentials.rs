@@ -92,28 +92,12 @@ pub enum CredentialsSource {
 }
 
 /// The credentials a streaming connect is made with. A source with none yet
-/// never reaches a connect: the hub parks on [`CredentialsRead::Missing`].
+/// never reaches a connect: the hub parks on the empty read.
 pub(crate) enum PresentCredentials {
     /// Read the environment pair for the configured account type.
     Env,
     /// Use these.
     Creds(AlpacaCredentials),
-}
-
-/// A [`CredentialsSource`] read for one connect: the credentials to connect
-/// with and the watch on which a rotation arrives after this read, or no
-/// credentials yet and the watch that delivers them. The shape of
-/// [`WatchRead`], with the value an [`Env`](CredentialsSource::Env) source
-/// can only name, not hold.
-pub(crate) enum CredentialsRead {
-    /// Credentials to connect with; the watch has a receiver while a
-    /// rotation can still arrive.
-    Present {
-        credentials: PresentCredentials,
-        rx: Watched<Option<AlpacaCredentials>>,
-    },
-    /// A `Watch` source with no value yet.
-    Missing(Watched<Option<AlpacaCredentials>>),
 }
 
 /// One resolution of a [`CredentialsSource`].
@@ -162,24 +146,26 @@ impl CredentialsSource {
         }
     }
 
-    /// Read the source for one connect (see [`CredentialsRead`]); a `Watch`
-    /// source is read as [`read_watch`] says.
-    pub(crate) fn read(&self) -> CredentialsRead {
+    /// Read the source for one connect (see [`WatchRead`]): the credentials
+    /// to connect with, or `Empty` while a `Watch` source has none. A `Watch`
+    /// source is read as [`read_watch`] says; an `Env` source names the pair
+    /// the connect reads from the environment.
+    pub(crate) fn read(&self) -> WatchRead<PresentCredentials, AlpacaCredentials> {
         match self {
-            Self::Env => CredentialsRead::Present {
-                credentials: PresentCredentials::Env,
+            Self::Env => WatchRead::Value {
+                value: PresentCredentials::Env,
                 rx: Watched(None),
             },
-            Self::Static(c) => CredentialsRead::Present {
-                credentials: PresentCredentials::Creds(c.clone()),
+            Self::Static(c) => WatchRead::Value {
+                value: PresentCredentials::Creds(c.clone()),
                 rx: Watched(None),
             },
             Self::Watch(rx) => match read_watch(rx) {
-                WatchRead::Value { value, rx } => CredentialsRead::Present {
-                    credentials: PresentCredentials::Creds(value),
+                WatchRead::Value { value, rx } => WatchRead::Value {
+                    value: PresentCredentials::Creds(value),
                     rx,
                 },
-                WatchRead::Empty(rx) => CredentialsRead::Missing(rx),
+                WatchRead::Empty(rx) => WatchRead::Empty(rx),
             },
         }
     }
@@ -188,8 +174,7 @@ impl CredentialsSource {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlpacaCredentials, CredentialsRead, CredentialsSource, PresentCredentials, Resolved,
-        Watched,
+        AlpacaCredentials, CredentialsSource, PresentCredentials, Resolved, WatchRead, Watched,
     };
 
     /// A read of a watched source carries the receiver with its value, and
@@ -199,15 +184,15 @@ mod tests {
     fn a_read_carries_the_receiver_its_value_came_from() {
         let (tx, rx) = tokio::sync::watch::channel(None);
         let source = CredentialsSource::Watch(rx);
-        let CredentialsRead::Missing(Watched(Some(missing_rx))) = source.read() else {
+        let WatchRead::Empty(Watched(Some(missing_rx))) = source.read() else {
             panic!("no credentials yet, with a receiver");
         };
         assert!(!missing_rx.has_changed().unwrap());
         tx.send(Some(creds("k1"))).unwrap();
         assert!(missing_rx.has_changed().unwrap());
 
-        let CredentialsRead::Present {
-            credentials: PresentCredentials::Creds(c),
+        let WatchRead::Value {
+            value: PresentCredentials::Creds(c),
             rx: Watched(Some(present_rx)),
         } = source.read()
         else {
@@ -220,8 +205,8 @@ mod tests {
 
         assert!(matches!(
             CredentialsSource::Env.read(),
-            CredentialsRead::Present {
-                credentials: PresentCredentials::Env,
+            WatchRead::Value {
+                value: PresentCredentials::Env,
                 rx: Watched(None)
             }
         ));
@@ -230,7 +215,7 @@ mod tests {
         assert!(
             matches!(
                 source.read(),
-                CredentialsRead::Present {
+                WatchRead::Value {
                     rx: Watched(None),
                     ..
                 }
