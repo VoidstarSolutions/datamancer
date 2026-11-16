@@ -568,13 +568,16 @@ impl<C: Connector> Hub<C> {
                         upstream.shut_down().await;
                         return Next::Exit;
                     };
-                    handle_route_command::<C>(
+                    let applied = handle_route_command::<C>(
                         &mut self.routes,
                         &mut self.subs,
                         &mut upstream,
                         cmd,
                     )
                     .await;
+                    if applied {
+                        self.reset_backoff();
+                    }
                 }
                 next = upstream.next_events() => {
                     match next {
@@ -802,13 +805,14 @@ fn ack_error<C: Connector>(what: &str, failure: &FailureOf<C>) -> Error {
 }
 
 /// Apply one session's subscribe or unsubscribe on the connected socket and
-/// answer it.
+/// answer it. Returns whether a subscribe applied the aggregate set, since a
+/// subscribe sends the whole set and its success is the set applied.
 async fn handle_route_command<C: Connector>(
     routes: &mut Routes,
     subs: &mut <C::Upstream as Upstream>::Subs,
     upstream: &mut C::Upstream,
     cmd: HubCommand,
-) {
+) -> bool {
     match cmd {
         HubCommand::Subscribe {
             instrument,
@@ -817,7 +821,9 @@ async fn handle_route_command<C: Connector>(
             ack,
         } => {
             let res = subscribe_route::<C>(routes, subs, upstream, instrument, kind, sink).await;
+            let applied = res.is_ok();
             let _ = ack.send(res);
+            applied
         }
         HubCommand::Unsubscribe {
             instrument,
@@ -826,6 +832,7 @@ async fn handle_route_command<C: Connector>(
         } => {
             let res = unsubscribe_route::<C>(routes, subs, upstream, instrument, kind).await;
             let _ = ack.send(res);
+            false
         }
     }
 }
@@ -1057,6 +1064,8 @@ pub(super) mod tests {
         adds: Arc<AtomicUsize>,
         removals: Vec<PairSet>,
         refuse_add: Option<Refused>,
+        /// Refuse the first `add` only, with this.
+        refuse_first_add: Option<Refused>,
         events: VecDeque<std::result::Result<Vec<MarketEvent>, Refused>>,
         /// Whether `shut_down` yields once before returning, as a real
         /// websocket close, network I/O, does.
@@ -1097,7 +1106,7 @@ pub(super) mod tests {
 
         async fn add(&mut self, _subs: &PairSet) -> std::result::Result<(), Refused> {
             self.adds.fetch_add(1, Ordering::SeqCst);
-            match self.refuse_add {
+            match self.refuse_first_add.take().or(self.refuse_add) {
                 Some(refused) => Err(refused),
                 None => Ok(()),
             }
@@ -1558,6 +1567,42 @@ pub(super) mod tests {
             count.load(Ordering::SeqCst),
             9,
             "the backoff climbs its ladder"
+        );
+    }
+
+    /// A session's subscribe applies the whole aggregate set, so one that
+    /// succeeds on a fresh connection whose own re-subscribe was refused has
+    /// the set applied after all, and starts the backoff ladder over.
+    #[tokio::test(start_paused = true)]
+    async fn a_subscribe_that_applies_the_set_resets_the_backoff() {
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![
+            Err(Refused(StreamFailure::Transient)),
+            Err(Refused(StreamFailure::Transient)),
+            Ok(FakeUpstream {
+                refuse_first_add: Some(Refused(StreamFailure::Transient)),
+                ..FakeUpstream::idle()
+            }),
+            Err(Refused(StreamFailure::Transient)),
+            Ok(FakeUpstream::idle()),
+        ])
+        .await;
+        // Two failed connects climb the ladder to four seconds; the third
+        // connects but has its re-subscribe refused, so the ladder stays.
+        hub.change_settings().await;
+        tokio::time::sleep(Duration::from_millis(3_100)).await;
+        assert_eq!(hub.connects(), 4, "connected with the re-subscribe refused");
+        control_kinds(&mut hub.rx);
+        hub.another_subscribe()
+            .await
+            .expect("the subscribe applies the set");
+
+        // The next failed connect sleeps the initial second, not four.
+        hub.change_settings().await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            hub.connects(),
+            6,
+            "the ladder started over at the applied set"
         );
     }
 
