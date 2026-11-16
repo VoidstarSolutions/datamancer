@@ -49,6 +49,39 @@ pub(crate) enum SettingsRead<T> {
     Disabled(watch::Receiver<Option<T>>),
 }
 
+/// One read of a watch for a connect: the value with the receiver it came
+/// from, or the receiver alone when there is no value yet.
+pub(crate) enum WatchRead<T> {
+    /// A value; `rx` is `Some` while the sender can still change it.
+    Value {
+        value: T,
+        rx: Option<watch::Receiver<Option<T>>>,
+    },
+    /// No value yet, and the receiver that delivers one.
+    Empty(watch::Receiver<Option<T>>),
+}
+
+/// Read `rx` for one connect. The value and the seen-marker come from one
+/// `borrow_and_update` on a clone of `rx`, so the receiver handed back
+/// reports exactly the changes that land after this read. A sender that is
+/// gone can change nothing more, so a value then comes with no receiver, as
+/// a static source's does; a missing value keeps its receiver, since nothing
+/// else could ever wake the park on it.
+pub(crate) fn read_watch<T: Clone>(rx: &watch::Receiver<Option<T>>) -> WatchRead<T> {
+    let mut rx = rx.clone();
+    let value = rx.borrow_and_update().clone();
+    // With the value just marked seen, `has_changed` errs only when the
+    // sender is gone.
+    let can_change = rx.has_changed().is_ok();
+    match value {
+        Some(value) => WatchRead::Value {
+            value,
+            rx: can_change.then_some(rx),
+        },
+        None => WatchRead::Empty(rx),
+    }
+}
+
 impl<T: Clone> SettingsSource<T> {
     /// The current settings, or `None` when a `Watch` source is disabled.
     pub fn current(&self) -> Option<T> {
@@ -58,33 +91,21 @@ impl<T: Clone> SettingsSource<T> {
         }
     }
 
-    /// Read the source for one connect (see [`SettingsRead`]). For a `Watch`
-    /// source the value and the seen-marker come from one
-    /// `borrow_and_update` on the returned clone, so the receiver reports
-    /// exactly the changes that land after this read. An enabled `Watch`
-    /// source whose sender is gone can change no more, so its settings come
-    /// with no receiver, as a static source's do; a disabled one keeps its
-    /// receiver, since nothing else could ever wake the park.
+    /// Read the source for one connect (see [`SettingsRead`]); a `Watch`
+    /// source is read as [`read_watch`] says.
     pub(crate) fn read(&self) -> SettingsRead<T> {
         match self {
             Self::Static(s) => SettingsRead::Enabled {
                 settings: s.clone(),
                 rx: None,
             },
-            Self::Watch(rx) => {
-                let mut rx = rx.clone();
-                let value = rx.borrow_and_update().clone();
-                // With the value just marked seen, `has_changed` errs only
-                // when the sender is gone.
-                let can_change = rx.has_changed().is_ok();
-                match value {
-                    Some(settings) => SettingsRead::Enabled {
-                        settings,
-                        rx: can_change.then_some(rx),
-                    },
-                    None => SettingsRead::Disabled(rx),
-                }
-            }
+            Self::Watch(rx) => match read_watch(rx) {
+                WatchRead::Value { value, rx } => SettingsRead::Enabled {
+                    settings: value,
+                    rx,
+                },
+                WatchRead::Empty(rx) => SettingsRead::Disabled(rx),
+            },
         }
     }
 

@@ -388,11 +388,6 @@ type SettingsRx<S> = Watched<Option<S>>;
 struct Watched<T>(Option<watch::Receiver<T>>);
 
 impl<T> Watched<T> {
-    /// A receiver that will deliver.
-    fn some(rx: watch::Receiver<T>) -> Self {
-        Self(Some(rx))
-    }
-
     /// Whether a value can still arrive.
     fn is_some(&self) -> bool {
         self.0.is_some()
@@ -510,9 +505,9 @@ impl<C: Connector> Hub<C> {
             SettingsRead::Disabled(rx) => {
                 self.tell_routes_disabled().await;
                 return self
-                    .park(
-                        &mut Watched::some(rx),
-                        &mut Watched(None),
+                    .idle(
+                        std::future::pending(),
+                        &mut Watched(Some(rx)),
                         Disconnected::Disabled,
                     )
                     .await;
@@ -526,7 +521,7 @@ impl<C: Connector> Hub<C> {
             CredentialsRead::Missing(rx) => {
                 return self
                     .park(
-                        &mut Watched::some(rx),
+                        &mut Watched(Some(rx)),
                         &mut settings_rx,
                         Disconnected::MissingCredentials,
                     )
@@ -583,9 +578,10 @@ impl<C: Connector> Hub<C> {
             }
         }
 
-        // Connected and subscribed: the next failure starts the ladder over.
-        // A connect whose re-subscribe is refused has not got this far, so
-        // its backoff keeps climbing.
+        // Connected and subscribed: the next failure starts the ladder over,
+        // and so does the reconnect a rotation or a settings change forces
+        // while serving. A connect whose re-subscribe is refused has not got
+        // this far, so its backoff keeps climbing.
         self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
         self.serve(upstream, &mut cred_rx, &mut settings_rx).await
     }
@@ -638,19 +634,12 @@ impl<C: Connector> Hub<C> {
                         );
                         // Same in-band control the failure path broadcasts,
                         // then reconnect at once with the new credentials.
-                        // Reset the backoff: this is a deliberate rotation,
-                        // not a failure.
-                        broadcast_control(
-                            &self.routes,
-                            ControlKind::ProviderDisconnected {
-                                provider: C::PROVIDER_ID.to_string(),
-                                reason: "credentials rotated".to_string(),
-                                cause: DisconnectCause::Error,
-                            },
+                        self.broadcast_disconnected(
+                            "credentials rotated".to_string(),
+                            DisconnectCause::Error,
                         )
                         .await;
                         upstream.shut_down().await;
-                        self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
                         return Next::Reconnect;
                     }
                 }
@@ -664,18 +653,13 @@ impl<C: Connector> Hub<C> {
                                 provider = C::PROVIDER_ID,
                                 "settings changed; reconnecting"
                             );
-                            broadcast_control(
-                                &self.routes,
-                                ControlKind::ProviderDisconnected {
-                                    provider: C::PROVIDER_ID.to_string(),
-                                    reason: "settings changed".to_string(),
-                                    cause: DisconnectCause::Error,
-                                },
+                            self.broadcast_disconnected(
+                                "settings changed".to_string(),
+                                DisconnectCause::Error,
                             )
                             .await;
                         }
                         upstream.shut_down().await;
-                        self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
                         return Next::Reconnect;
                     }
                 }
@@ -706,16 +690,12 @@ impl<C: Connector> Hub<C> {
             "{}",
             point.log_message()
         );
-        broadcast_control(
-            &self.routes,
-            ControlKind::ProviderDisconnected {
-                provider: C::PROVIDER_ID.to_string(),
-                reason: point.reason(&chain),
-                cause: if unauthenticated {
-                    DisconnectCause::Unauthenticated
-                } else {
-                    DisconnectCause::Error
-                },
+        self.broadcast_disconnected(
+            point.reason(&chain),
+            if unauthenticated {
+                DisconnectCause::Unauthenticated
+            } else {
+                DisconnectCause::Error
             },
         )
         .await;
@@ -737,12 +717,18 @@ impl<C: Connector> Hub<C> {
         }
         self.told_disabled = true;
         tracing::info!(provider = C::PROVIDER_ID, "provider disabled");
+        self.broadcast_disconnected("provider disabled".to_string(), DisconnectCause::Disabled)
+            .await;
+    }
+
+    /// Tell every route the provider disconnected, for `reason`.
+    async fn broadcast_disconnected(&self, reason: String, cause: DisconnectCause) {
         broadcast_control(
             &self.routes,
             ControlKind::ProviderDisconnected {
                 provider: C::PROVIDER_ID.to_string(),
-                reason: "provider disabled".to_string(),
-                cause: DisconnectCause::Disabled,
+                reason,
+                cause,
             },
         )
         .await;
@@ -750,23 +736,33 @@ impl<C: Connector> Hub<C> {
 
     /// Park until `rx` delivers a new value or the settings change on
     /// `settings_rx`, answering every command meanwhile as `why` says. The
-    /// next cycle resolves the sources again; a value still disabled or
-    /// missing lands back here rather than spinning. With both senders gone
-    /// the hub still answers commands, so its shutdown (every handle
-    /// dropped) still works.
+    /// next cycle resolves the sources again; a value still missing lands
+    /// back here rather than spinning. With both senders gone the hub still
+    /// answers commands, so its shutdown (every handle dropped) still works.
     async fn park<T>(
         &mut self,
         rx: &mut Watched<T>,
         settings_rx: &mut SettingsRx<C::Settings>,
         why: Disconnected,
     ) -> Next {
+        // A `false` leaves nothing to wait on; the next `changed` pends.
+        self.idle(async { while !rx.changed().await {} }, settings_rx, why)
+            .await
+    }
+
+    /// Wait, with no connection, until `wake` resolves or the settings
+    /// change on `settings_rx`, answering every command meanwhile as `why`
+    /// says.
+    async fn idle(
+        &mut self,
+        wake: impl Future<Output = ()>,
+        settings_rx: &mut SettingsRx<C::Settings>,
+        why: Disconnected,
+    ) -> Next {
+        let mut wake = std::pin::pin!(wake);
         loop {
             tokio::select! {
-                changed = rx.changed() => {
-                    if changed {
-                        return Next::Reconnect;
-                    }
-                }
+                () = &mut wake => return Next::Reconnect,
                 changed = settings_rx.changed() => {
                     if changed {
                         return Next::Reconnect;
@@ -800,24 +796,8 @@ impl<C: Connector> Hub<C> {
         };
         self.backoff_ms = (self.backoff_ms * 2).min(policy.max_backoff_ms);
         let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
-        tokio::pin!(sleep);
-        loop {
-            tokio::select! {
-                () = &mut sleep => return Next::Reconnect,
-                changed = settings_rx.changed() => {
-                    if changed {
-                        return Next::Reconnect;
-                    }
-                }
-                cmd = self.cmd_rx.recv() => {
-                    let Some(cmd) = cmd else {
-                        return Next::Exit;
-                    };
-                    self.handle_disconnected_command(cmd, Disconnected::Reconnecting)
-                        .await;
-                }
-            }
-        }
+        self.idle(sleep, settings_rx, Disconnected::Reconnecting)
+            .await
     }
 
     /// Answer a command that arrives while there is no connection. A
@@ -839,17 +819,7 @@ impl<C: Connector> Hub<C> {
                 ack,
             } => {
                 self.subs.remove(&instrument, kind);
-                let removed = self.routes.remove(&(instrument.clone(), kind));
-                broadcast_control_to(
-                    removed.as_ref(),
-                    ControlKind::SubscriptionChanged {
-                        provider: C::PROVIDER_ID.to_string(),
-                        instrument,
-                        kind,
-                        active: false,
-                    },
-                )
-                .await;
+                end_route::<C>(&mut self.routes, instrument, kind).await;
                 let _ = ack.send(Ok(()));
             }
         }
@@ -985,17 +955,7 @@ async fn unsubscribe_route<C: Connector>(
         Ok(()) => {
             // Drop the route after the upstream ack so any tail events still
             // in flight are routable.
-            let removed = routes.remove(&key);
-            broadcast_control_to(
-                removed.as_ref(),
-                ControlKind::SubscriptionChanged {
-                    provider: C::PROVIDER_ID.to_string(),
-                    instrument: key.0,
-                    kind,
-                    active: false,
-                },
-            )
-            .await;
+            end_route::<C>(routes, key.0, kind).await;
             Ok(())
         }
         Err(failure) => {
@@ -1004,6 +964,23 @@ async fn unsubscribe_route<C: Connector>(
             Err(ack_error::<C>("remove_subscriptions", &failure))
         }
     }
+}
+
+/// Drop the route for `(instrument, kind)` and tell its sink, if it has one,
+/// that the subscription ended.
+async fn end_route<C: Connector>(routes: &mut Routes, instrument: Instrument, kind: EventKind) {
+    let key = (instrument, kind);
+    let removed = routes.remove(&key);
+    broadcast_control_to(
+        removed.as_ref(),
+        ControlKind::SubscriptionChanged {
+            provider: C::PROVIDER_ID.to_string(),
+            instrument: key.0,
+            kind,
+            active: false,
+        },
+    )
+    .await;
 }
 
 /// A control event stamped with the current wall clock.
@@ -1253,6 +1230,19 @@ pub(super) mod tests {
         (creds_tx, sources)
     }
 
+    /// `sources`, with settings from a `Watch` source that starts enabled;
+    /// the sender changes or disables them.
+    fn with_watched_settings(
+        sources: HubSources<()>,
+    ) -> (watch::Sender<Option<()>>, HubSources<()>) {
+        let (settings_tx, settings_rx) = watch::channel(Some(()));
+        let sources = HubSources {
+            settings: SettingsSource::Watch(settings_rx),
+            ..sources
+        };
+        (settings_tx, sources)
+    }
+
     impl Connector for FakeConnector {
         const PROVIDER_ID: &'static str = "fake";
         type Settings = ();
@@ -1358,12 +1348,8 @@ pub(super) mod tests {
         async fn with_later_connects(
             later: Vec<std::result::Result<FakeUpstream, Refused>>,
         ) -> (JoinHandle<()>, Self) {
-            let (settings_tx, settings_rx) = watch::channel(Some(()));
             let (creds_tx, sources) = watched_credentials();
-            let sources = HubSources {
-                settings: SettingsSource::Watch(settings_rx),
-                ..sources
-            };
+            let (settings_tx, sources) = with_watched_settings(sources);
             let mut connects = vec![Ok(FakeUpstream::idle())];
             connects.extend(later);
             let connector = FakeConnector::scripted(connects);
@@ -1470,13 +1456,9 @@ pub(super) mod tests {
     /// and the hub connects again once its backoff elapses.
     #[tokio::test(start_paused = true)]
     async fn an_unauthenticated_connect_with_unwatched_credentials_backs_off() {
-        let (settings_tx, settings_rx) = watch::channel(Some(()));
-        let sources = HubSources {
-            // A watched settings source, so a settings change can force the
-            // reconnect after the route is in place.
-            settings: SettingsSource::Watch(settings_rx),
-            ..static_sources()
-        };
+        // A watched settings source, so a settings change can force the
+        // reconnect after the route is in place.
+        let (settings_tx, sources) = with_watched_settings(static_sources());
         assert!(matches!(sources.credentials, CredentialsSource::Env));
         let connector = FakeConnector::scripted(vec![
             Ok(FakeUpstream::idle()),
@@ -1553,11 +1535,7 @@ pub(super) mod tests {
     /// refused has not succeeded.
     #[tokio::test(start_paused = true)]
     async fn a_re_subscribe_refused_as_unauthenticated_climbs_the_backoff_ladder() {
-        let (settings_tx, settings_rx) = watch::channel(Some(()));
-        let sources = HubSources {
-            settings: SettingsSource::Watch(settings_rx),
-            ..static_sources()
-        };
+        let (settings_tx, sources) = with_watched_settings(static_sources());
         assert!(matches!(sources.credentials, CredentialsSource::Env));
         let mut connects = vec![Ok(FakeUpstream::idle())];
         connects.extend((0..60).map(|_| {

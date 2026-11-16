@@ -7,6 +7,8 @@
 
 use oxidized_alpaca::{AccountType, ApiKey};
 
+use super::runtime::{WatchRead, read_watch};
+
 /// The `ALPACA_*` environment pair the legacy [`CredentialsSource::Env`]
 /// path reads for an account type — the same names `oxidized_alpaca`'s own
 /// env-var constructors use, so `Env` keeps its documented contract.
@@ -159,12 +161,8 @@ impl CredentialsSource {
         }
     }
 
-    /// Read the source for one connect (see [`CredentialsRead`]). For a
-    /// `Watch` source the value and the seen-marker come from one
-    /// `borrow_and_update` on the returned clone, so the receiver reports
-    /// exactly the rotations that land after this read. A `Watch` source
-    /// whose sender is gone can rotate no more, so its value comes with no
-    /// receiver, as a static source's does.
+    /// Read the source for one connect (see [`CredentialsRead`]); a `Watch`
+    /// source is read as [`read_watch`] says.
     pub(crate) fn read(&self) -> CredentialsRead {
         match self {
             Self::Env => CredentialsRead::Present {
@@ -175,20 +173,13 @@ impl CredentialsSource {
                 credentials: PresentCredentials::Creds(c.clone()),
                 rx: None,
             },
-            Self::Watch(rx) => {
-                let mut rx = rx.clone();
-                let value = rx.borrow_and_update().clone();
-                // With the value just marked seen, `has_changed` errs only
-                // when the sender is gone.
-                let can_rotate = rx.has_changed().is_ok();
-                match value {
-                    Some(c) => CredentialsRead::Present {
-                        credentials: PresentCredentials::Creds(c),
-                        rx: can_rotate.then_some(rx),
-                    },
-                    None => CredentialsRead::Missing(rx),
-                }
-            }
+            Self::Watch(rx) => match read_watch(rx) {
+                WatchRead::Value { value, rx } => CredentialsRead::Present {
+                    credentials: PresentCredentials::Creds(value),
+                    rx,
+                },
+                WatchRead::Empty(rx) => CredentialsRead::Missing(rx),
+            },
         }
     }
 }
