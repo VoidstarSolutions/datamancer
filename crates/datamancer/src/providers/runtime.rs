@@ -23,8 +23,9 @@ pub(super) fn no_rest_client(provider: &str, enabled: bool) -> Error {
 }
 
 /// Why a provider's streaming task is parked, and so which error a
-/// subscribe or unsubscribe gets meanwhile: a credential park is
-/// [`Error::Unauthenticated`], a disable is [`Error::ProviderDisabled`].
+/// subscribe gets meanwhile: a credential park is
+/// [`Error::Unauthenticated`], a disable is [`Error::ProviderDisabled`]. An
+/// unsubscribe is applied without a connection and succeeds.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Park {
     Disabled,

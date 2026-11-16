@@ -72,8 +72,8 @@ use tokio::sync::{mpsc, watch};
 
 use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
 use super::hub::{
-    Connector, HubSlot, PresentCredentials, SharedLiveHandle, StreamFailure, SubscriptionSet,
-    Upstream, wall_clock_ts,
+    Connector, HubSlot, HubSources, PresentCredentials, StreamFailure, SubscriptionSet, Upstream,
+    wall_clock_ts,
 };
 use super::runtime::SettingsSource;
 use crate::session::ReconnectPolicy;
@@ -377,9 +377,9 @@ impl AlpacaProvider {
             settings_rx,
         });
         Self {
+            hub: HubSlot::new(hub_sources(&cfg)),
             cfg,
             rest,
-            hub: HubSlot::idle(),
         }
     }
 
@@ -400,9 +400,9 @@ impl AlpacaProvider {
             settings_rx,
         });
         Self {
+            hub: HubSlot::new(hub_sources(&cfg)),
             cfg,
             rest,
-            hub: HubSlot::idle(),
         }
     }
 
@@ -479,10 +479,10 @@ impl Provider for AlpacaProvider {
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
         // Every `start_live` goes through the one slot, so the provider never
         // holds more than one upstream socket.
-        let cmd_tx = self.hub.ensure(|| StockConnector {
-            cfg: self.cfg.clone(),
-        });
-        Ok(Box::new(SharedLiveHandle::new(cmd_tx, sink)))
+        let stream_feed = self.cfg.stream_feed;
+        Ok(Box::new(
+            self.hub.attach(|| StockConnector { stream_feed }, sink),
+        ))
     }
 
     async fn fetch_history(
@@ -595,41 +595,37 @@ pub(super) fn classify_stream_failure(err: &oxidized_alpaca::Error) -> StreamFai
 // Hub connector
 // ---------------------------------------------------------------------------
 
+/// What the hub reads from `cfg`.
+fn hub_sources(cfg: &AlpacaProviderConfig) -> HubSources<AlpacaSettings> {
+    HubSources {
+        settings: cfg.settings.clone(),
+        credentials: cfg.credentials.clone(),
+        reconnect: cfg.reconnect,
+    }
+}
+
 /// How the hub opens and classifies the stock market-data stream.
 struct StockConnector {
-    cfg: AlpacaProviderConfig,
+    stream_feed: AlpacaStreamFeed,
 }
 
 impl Connector for StockConnector {
     const PROVIDER_ID: &'static str = PROVIDER_ID;
     type Settings = AlpacaSettings;
-    type Failure = oxidized_alpaca::Error;
     type Upstream = StreamingStockClient;
-
-    fn settings(&self) -> &SettingsSource<AlpacaSettings> {
-        &self.cfg.settings
-    }
-
-    fn credentials(&self) -> &CredentialsSource {
-        &self.cfg.credentials
-    }
-
-    fn reconnect(&self) -> &ReconnectPolicy {
-        &self.cfg.reconnect
-    }
 
     async fn connect(
         &self,
         settings: &AlpacaSettings,
         credentials: PresentCredentials,
     ) -> std::result::Result<StreamingStockClient, oxidized_alpaca::Error> {
-        let feed = streaming_feed(self.cfg.stream_feed);
+        let feed = streaming_feed(self.stream_feed);
         // Every path connects through `new_with_credentials` so the account
         // type it sees is `STREAM_ACCOUNT_TYPE` (the production data host);
         // the configured account type only picks which env pair `Env` reads.
         tracing::info!(
             provider = PROVIDER_ID,
-            url = stream_url(self.cfg.stream_feed),
+            url = stream_url(self.stream_feed),
             account_type = ?settings.account_type,
             "connecting to the market-data stream"
         );

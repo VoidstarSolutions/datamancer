@@ -53,8 +53,8 @@ use tokio::sync::{mpsc, watch};
 
 use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
 use super::hub::{
-    Connector, HubSlot, PresentCredentials, SharedLiveHandle, StreamFailure, SubscriptionSet,
-    Upstream, wall_clock_ts,
+    Connector, HubSlot, HubSources, PresentCredentials, StreamFailure, SubscriptionSet, Upstream,
+    wall_clock_ts,
 };
 use super::runtime::SettingsSource;
 use crate::session::ReconnectPolicy;
@@ -290,8 +290,12 @@ impl AlpacaCryptoProvider {
         state.rebuild(&cfg);
         let rest = std::sync::Mutex::new(state);
         Self {
+            hub: HubSlot::new(HubSources {
+                settings: cfg.settings.clone(),
+                credentials: cfg.credentials.clone(),
+                reconnect: cfg.reconnect,
+            }),
             cfg,
-            hub: HubSlot::idle(),
             rest,
         }
     }
@@ -345,10 +349,7 @@ impl Provider for AlpacaCryptoProvider {
     }
 
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
-        let cmd_tx = self.hub.ensure(|| CryptoConnector {
-            cfg: self.cfg.clone(),
-        });
-        Ok(Box::new(SharedLiveHandle::new(cmd_tx, sink)))
+        Ok(Box::new(self.hub.attach(|| CryptoConnector, sink)))
     }
 
     async fn fetch_history(
@@ -428,27 +429,12 @@ impl Provider for AlpacaCryptoProvider {
 // ---------------------------------------------------------------------------
 
 /// How the hub opens and classifies the crypto market-data stream.
-struct CryptoConnector {
-    cfg: AlpacaCryptoProviderConfig,
-}
+struct CryptoConnector;
 
 impl Connector for CryptoConnector {
     const PROVIDER_ID: &'static str = PROVIDER_ID;
     type Settings = AlpacaCryptoSettings;
-    type Failure = oxidized_alpaca::Error;
     type Upstream = StreamingCryptoClient;
-
-    fn settings(&self) -> &SettingsSource<AlpacaCryptoSettings> {
-        &self.cfg.settings
-    }
-
-    fn credentials(&self) -> &CredentialsSource {
-        &self.cfg.credentials
-    }
-
-    fn reconnect(&self) -> &ReconnectPolicy {
-        &self.cfg.reconnect
-    }
 
     async fn connect(
         &self,

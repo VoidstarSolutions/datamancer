@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -85,36 +84,45 @@ pub(super) trait Upstream: Send {
     fn shut_down(self) -> impl Future<Output = ()> + Send;
 }
 
-/// What a provider gives the hub: its sources, its reconnect policy, and how
-/// to open and classify its upstream.
+/// What differs between providers: how to open the upstream and how to read
+/// its failures. The sources the hub reads are data, not behaviour, and come
+/// with the slot as [`HubSources`].
 pub(super) trait Connector: Send + Sync + 'static {
     /// The provider id stamped on every control and error the hub emits.
     const PROVIDER_ID: &'static str;
     /// The runtime settings a connect reads.
     type Settings: Clone + Send + Sync + 'static;
-    /// What a failed connect or upstream call returns.
-    type Failure: std::error::Error + Send + Sync + 'static;
-    /// The connected upstream.
-    type Upstream: Upstream<Failure = Self::Failure>;
-    /// Where the settings come from; `None` parks the hub disabled.
-    fn settings(&self) -> &SettingsSource<Self::Settings>;
-    /// Where the credentials come from; none yet parks the hub.
-    fn credentials(&self) -> &CredentialsSource;
-    /// The backoff policy between failed connects.
-    fn reconnect(&self) -> &ReconnectPolicy;
+    /// The connected upstream; its `Failure` is what a failed connect
+    /// returns too.
+    type Upstream: Upstream;
     /// Open the upstream with `settings` and `credentials`.
     fn connect(
         &self,
         settings: &Self::Settings,
         credentials: PresentCredentials,
-    ) -> impl Future<Output = std::result::Result<Self::Upstream, Self::Failure>> + Send;
+    ) -> impl Future<Output = std::result::Result<Self::Upstream, FailureOf<Self>>> + Send;
     /// Whether `failure` is a rejected credential or transient. For a failed
     /// connect or stream the answer decides whether the hub parks (a rejected
     /// credential from a watched source) or backs off, and the
     /// `DisconnectCause` of the `ProviderDisconnected` control it broadcasts.
     /// For a refused subscribe or unsubscribe it decides only whether the
     /// answer is `Error::Unauthenticated` or `Error::Provider`.
-    fn classify(failure: &Self::Failure) -> StreamFailure;
+    fn classify(failure: &FailureOf<Self>) -> StreamFailure;
+}
+
+/// The failure type of a connector's upstream.
+pub(super) type FailureOf<C> = <<C as Connector>::Upstream as Upstream>::Failure;
+
+/// What the hub reads from its provider's configuration: where the settings
+/// and credentials come from, and how to back off between failed connects.
+#[derive(Clone)]
+pub(super) struct HubSources<S> {
+    /// Where the settings come from; `None` parks the hub disabled.
+    pub(super) settings: SettingsSource<S>,
+    /// Where the credentials come from; none yet parks the hub.
+    pub(super) credentials: CredentialsSource,
+    /// The backoff policy between failed connects.
+    pub(super) reconnect: ReconnectPolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,8 +133,8 @@ pub(super) trait Connector: Send + Sync + 'static {
 /// The slot guards its own state, so a provider holds it plainly and every
 /// session's `start_live` shares it.
 pub(super) struct HubSlot<C: Connector> {
+    sources: HubSources<C::Settings>,
     state: std::sync::Mutex<SlotState>,
-    connector: PhantomData<fn() -> C>,
 }
 
 struct SlotState {
@@ -145,16 +153,26 @@ struct ActiveHub {
 }
 
 impl<C: Connector> HubSlot<C> {
-    /// A slot with no hub running.
-    pub(super) const fn idle() -> Self {
+    /// A slot with no hub running; a hub it spawns reads `sources`.
+    pub(super) const fn new(sources: HubSources<C::Settings>) -> Self {
         Self {
+            sources,
             state: std::sync::Mutex::new(SlotState {
                 active: None,
                 #[cfg(test)]
                 spawns: 0,
             }),
-            connector: PhantomData,
         }
+    }
+
+    /// A session's handle onto the hub, with its events routed to `sink`;
+    /// spawns the hub with `make()` if none runs.
+    pub(super) fn attach(
+        &self,
+        make: impl FnOnce() -> C,
+        sink: mpsc::Sender<MarketEvent>,
+    ) -> SharedLiveHandle {
+        SharedLiveHandle::new(self.ensure(make), sink)
     }
 
     /// The slot's state. The lock is never held across an await, and
@@ -168,13 +186,13 @@ impl<C: Connector> HubSlot<C> {
     }
 
     /// The hub's command sender, spawning the hub with `make()` if none runs.
-    pub(super) fn ensure(&self, make: impl FnOnce() -> C) -> mpsc::Sender<HubCommand> {
+    fn ensure(&self, make: impl FnOnce() -> C) -> mpsc::Sender<HubCommand> {
         let mut state = self.state();
         if let Some(active) = &state.active {
             return active.cmd_tx.clone();
         }
         let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(64);
-        let task = tokio::spawn(run_hub(make(), cmd_rx));
+        let task = tokio::spawn(run_hub(make(), self.sources.clone(), cmd_rx));
         #[cfg(test)]
         {
             state.spawns += 1;
@@ -206,7 +224,7 @@ impl<C: Connector> HubSlot<C> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub(super) enum HubCommand {
+enum HubCommand {
     Subscribe {
         instrument: Instrument,
         kind: EventKind,
@@ -235,7 +253,7 @@ pub(super) struct SharedLiveHandle {
 impl SharedLiveHandle {
     /// A handle that commands the hub over `cmd_tx` and has its events
     /// routed to `sink`.
-    pub(super) fn new(cmd_tx: mpsc::Sender<HubCommand>, sink: mpsc::Sender<MarketEvent>) -> Self {
+    fn new(cmd_tx: mpsc::Sender<HubCommand>, sink: mpsc::Sender<MarketEvent>) -> Self {
         Self {
             cmd_tx,
             sink,
@@ -313,17 +331,21 @@ impl LiveHandle for SharedLiveHandle {
     clippy::too_many_lines,
     reason = "single-pass connect / authenticate / subscribe / dispatch / reconnect state machine; extraction would obscure the linear lifecycle"
 )]
-async fn run_hub<C: Connector>(connector: C, mut cmd_rx: mpsc::Receiver<HubCommand>) {
+async fn run_hub<C: Connector>(
+    connector: C,
+    sources: HubSources<C::Settings>,
+    mut cmd_rx: mpsc::Receiver<HubCommand>,
+) {
     // Per-session sinks keyed by the pair they own; the session registry's
     // at-most-one-live-session-per-pair rule keeps this a function.
     let mut routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>> = HashMap::new();
     // Authoritative aggregate subscription set, applied to every fresh socket.
     let mut subs = <C::Upstream as Upstream>::Subs::empty();
-    let mut backoff = connector.reconnect().initial_backoff_ms;
+    let mut backoff = sources.reconnect.initial_backoff_ms;
 
     'outer: loop {
-        let mut settings_rx = connector.settings().watch();
-        let Some(settings) = connector.settings().current() else {
+        let mut settings_rx = sources.settings.watch();
+        let Some(settings) = sources.settings.current() else {
             // Disabled: park until the settings watch delivers a value. Only a
             // Watch source can resolve to None, so the receiver is always
             // present here; exit defensively if it isn't (never busy-loop).
@@ -341,8 +363,8 @@ async fn run_hub<C: Connector>(connector: C, mut cmd_rx: mpsc::Receiver<HubComma
         // otherwise inherit the stored receiver's stale seen-version), so
         // the hot-reconnect arm below only fires on rotations that land
         // *after* this resolution.
-        let mut cred_rx = connector.credentials().watch();
-        let connect_result = match connector.credentials().current() {
+        let mut cred_rx = sources.credentials.watch();
+        let connect_result = match sources.credentials.current() {
             Resolved::Env => connector.connect(&settings, PresentCredentials::Env).await,
             Resolved::Creds(c) => {
                 connector
@@ -365,7 +387,7 @@ async fn run_hub<C: Connector>(connector: C, mut cmd_rx: mpsc::Receiver<HubComma
 
         let mut upstream = match connect_result {
             Ok(upstream) => {
-                backoff = connector.reconnect().initial_backoff_ms;
+                backoff = sources.reconnect.initial_backoff_ms;
                 broadcast_control(
                     &routes,
                     ControlKind::ProviderConnected {
@@ -409,7 +431,7 @@ async fn run_hub<C: Connector>(connector: C, mut cmd_rx: mpsc::Receiver<HubComma
                     }
                     continue 'outer;
                 }
-                if !sleep_with_jitter::<C>(&mut backoff, connector.reconnect(), &mut cmd_rx).await {
+                if !sleep_with_jitter::<C>(&mut backoff, &sources.reconnect, &mut cmd_rx).await {
                     return;
                 }
                 continue 'outer;
@@ -488,7 +510,7 @@ async fn run_hub<C: Connector>(connector: C, mut cmd_rx: mpsc::Receiver<HubComma
                                 }
                                 continue 'outer;
                             }
-                            if !sleep_with_jitter::<C>(&mut backoff, connector.reconnect(), &mut cmd_rx).await {
+                            if !sleep_with_jitter::<C>(&mut backoff, &sources.reconnect, &mut cmd_rx).await {
                                 return;
                             }
                             continue 'outer;
@@ -521,7 +543,7 @@ async fn run_hub<C: Connector>(connector: C, mut cmd_rx: mpsc::Receiver<HubComma
                         )
                         .await;
                         upstream.shut_down().await;
-                        backoff = connector.reconnect().initial_backoff_ms;
+                        backoff = sources.reconnect.initial_backoff_ms;
                         continue 'outer;
                     }
                     // Watch sender dropped: no further rotations can
@@ -539,7 +561,7 @@ async fn run_hub<C: Connector>(connector: C, mut cmd_rx: mpsc::Receiver<HubComma
                     if changed.is_ok() {
                         // A disable is deliberate, not a fault: classify it so
                         // health does not read the dropped streams as Stale.
-                        let (reason, cause) = if connector.settings().current().is_none() {
+                        let (reason, cause) = if sources.settings.current().is_none() {
                             ("provider disabled", DisconnectCause::Disabled)
                         } else {
                             ("settings changed", DisconnectCause::Error)
@@ -555,7 +577,7 @@ async fn run_hub<C: Connector>(connector: C, mut cmd_rx: mpsc::Receiver<HubComma
                         )
                         .await;
                         upstream.shut_down().await;
-                        backoff = connector.reconnect().initial_backoff_ms;
+                        backoff = sources.reconnect.initial_backoff_ms;
                         continue 'outer;
                     }
                     settings_rx = None;
@@ -680,7 +702,7 @@ fn event_route_key(ev: &MarketEvent) -> Option<(Instrument, EventKind)> {
 
 /// The error a subscribe or unsubscribe is answered with when the upstream
 /// refuses `what`.
-fn ack_error<C: Connector>(what: &str, failure: &C::Failure) -> Error {
+fn ack_error<C: Connector>(what: &str, failure: &FailureOf<C>) -> Error {
     let provider = C::PROVIDER_ID.to_string();
     let message = format!("{what}: {}", error_chain(failure));
     match C::classify(failure) {
@@ -984,45 +1006,20 @@ pub(super) mod tests {
     /// A connector that answers each connect from a script.
     struct FakeConnector {
         connects: std::sync::Mutex<VecDeque<std::result::Result<FakeUpstream, Refused>>>,
-        settings: SettingsSource<()>,
-        credentials: CredentialsSource,
-        reconnect: ReconnectPolicy,
         connect_count: Arc<AtomicUsize>,
     }
 
     impl FakeConnector {
-        /// Static settings, `Env` credentials; once the script runs out,
-        /// `connect` pends forever.
+        /// Once the script runs out, `connect` pends forever.
         fn scripted(connects: Vec<std::result::Result<FakeUpstream, Refused>>) -> Self {
             Self {
                 connects: std::sync::Mutex::new(connects.into()),
-                settings: SettingsSource::Static(()),
-                credentials: CredentialsSource::Env,
-                // No jitter, so a backoff sleep is never zero.
-                reconnect: ReconnectPolicy {
-                    initial_backoff_ms: 1_000,
-                    max_backoff_ms: 30_000,
-                    jitter: false,
-                },
                 connect_count: Arc::default(),
             }
         }
 
         fn never_connects() -> Self {
             Self::scripted(vec![])
-        }
-
-        /// As `scripted`, but credentials come from a `Watch` source that
-        /// starts provisioned; the sender rotates them.
-        fn with_watched_credentials(
-            connects: Vec<std::result::Result<FakeUpstream, Refused>>,
-        ) -> (watch::Sender<Option<AlpacaCredentials>>, Self) {
-            let (creds_tx, creds_rx) = watch::channel(Some(test_credentials()));
-            let connector = Self {
-                credentials: CredentialsSource::Watch(creds_rx),
-                ..Self::scripted(connects)
-            };
-            (creds_tx, connector)
         }
 
         /// How many times the hub has called `connect`, readable after the
@@ -1032,23 +1029,35 @@ pub(super) mod tests {
         }
     }
 
+    /// Static settings, `Env` credentials, and a backoff that starts at one
+    /// second with no jitter, so a backoff sleep is never zero.
+    fn static_sources() -> HubSources<()> {
+        HubSources {
+            settings: SettingsSource::Static(()),
+            credentials: CredentialsSource::Env,
+            reconnect: ReconnectPolicy {
+                initial_backoff_ms: 1_000,
+                max_backoff_ms: 30_000,
+                jitter: false,
+            },
+        }
+    }
+
+    /// As `static_sources`, but credentials come from a `Watch` source that
+    /// starts provisioned; the sender rotates them.
+    fn watched_credentials() -> (watch::Sender<Option<AlpacaCredentials>>, HubSources<()>) {
+        let (creds_tx, creds_rx) = watch::channel(Some(test_credentials()));
+        let sources = HubSources {
+            credentials: CredentialsSource::Watch(creds_rx),
+            ..static_sources()
+        };
+        (creds_tx, sources)
+    }
+
     impl Connector for FakeConnector {
         const PROVIDER_ID: &'static str = "fake";
         type Settings = ();
-        type Failure = Refused;
         type Upstream = FakeUpstream;
-
-        fn settings(&self) -> &SettingsSource<()> {
-            &self.settings
-        }
-
-        fn credentials(&self) -> &CredentialsSource {
-            &self.credentials
-        }
-
-        fn reconnect(&self) -> &ReconnectPolicy {
-            &self.reconnect
-        }
 
         fn connect(
             &self,
@@ -1074,9 +1083,13 @@ pub(super) mod tests {
         }
     }
 
-    /// Spawn a hub on `connector`: its task and its command sender.
-    fn spawn_hub(connector: FakeConnector) -> (JoinHandle<()>, mpsc::Sender<HubCommand>) {
-        let slot = HubSlot::idle();
+    /// Spawn a hub on `connector` reading `sources`: its task and its command
+    /// sender.
+    fn spawn_hub(
+        connector: FakeConnector,
+        sources: HubSources<()>,
+    ) -> (JoinHandle<()>, mpsc::Sender<HubCommand>) {
+        let slot = HubSlot::new(sources);
         let cmd_tx = slot.ensure(|| connector);
         let task = slot.take_task().expect("the hub was spawned");
         (task, cmd_tx)
@@ -1105,9 +1118,10 @@ pub(super) mod tests {
     /// at once as reconnecting rather than queued behind the next connect.
     #[tokio::test(start_paused = true)]
     async fn a_subscribe_during_backoff_is_refused_as_reconnecting() {
-        let (hub, cmd_tx) = spawn_hub(FakeConnector::scripted(vec![Err(Refused(
-            StreamFailure::Transient,
-        ))]));
+        let (hub, cmd_tx) = spawn_hub(
+            FakeConnector::scripted(vec![Err(Refused(StreamFailure::Transient))]),
+            static_sources(),
+        );
         let (sink, _rx) = mpsc::channel(8);
         let handle = SharedLiveHandle::new(cmd_tx, sink);
         tokio::task::yield_now().await; // the hub reaches its backoff sleep
@@ -1125,14 +1139,15 @@ pub(super) mod tests {
     /// reconnect on its own, however long it waits, until they rotate.
     #[tokio::test(start_paused = true)]
     async fn a_mid_stream_auth_rejection_parks_until_credentials_rotate() {
-        let (creds_tx, connector) = FakeConnector::with_watched_credentials(vec![
+        let (creds_tx, sources) = watched_credentials();
+        let connector = FakeConnector::scripted(vec![
             Ok(FakeUpstream::failing_with(Refused(
                 StreamFailure::Unauthenticated,
             ))),
             Ok(FakeUpstream::idle()),
         ]);
         let connects = connector.connect_count();
-        let (_hub, _cmd_tx) = spawn_hub(connector);
+        let (_hub, _cmd_tx) = spawn_hub(connector, sources);
         tokio::time::sleep(Duration::from_hours(1)).await;
         assert_eq!(
             connects.load(Ordering::SeqCst),
@@ -1154,18 +1169,19 @@ pub(super) mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_unauthenticated_connect_with_unwatched_credentials_backs_off() {
         let (settings_tx, settings_rx) = watch::channel(Some(()));
-        let connector = FakeConnector {
+        let sources = HubSources {
             // A watched settings source, so a settings change can force the
             // reconnect after the route is in place.
             settings: SettingsSource::Watch(settings_rx),
-            ..FakeConnector::scripted(vec![
-                Ok(FakeUpstream::idle()),
-                Err(Refused(StreamFailure::Unauthenticated)),
-            ])
+            ..static_sources()
         };
-        assert!(matches!(connector.credentials, CredentialsSource::Env));
+        assert!(matches!(sources.credentials, CredentialsSource::Env));
+        let connector = FakeConnector::scripted(vec![
+            Ok(FakeUpstream::idle()),
+            Err(Refused(StreamFailure::Unauthenticated)),
+        ]);
         let connects = connector.connect_count();
-        let (_hub, cmd_tx) = spawn_hub(connector);
+        let (_hub, cmd_tx) = spawn_hub(connector, sources);
         let (sink, mut rx) = mpsc::channel(8);
         let handle = SharedLiveHandle::new(cmd_tx, sink);
         handle
@@ -1213,7 +1229,7 @@ pub(super) mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let slot = HubSlot::<FakeConnector>::idle();
+            let slot = HubSlot::<FakeConnector>::new(static_sources());
             let a = slot.ensure(FakeConnector::never_connects);
             let b = slot.ensure(|| unreachable!("a running hub is reused"));
             assert!(a.same_channel(&b));
