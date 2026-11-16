@@ -648,9 +648,10 @@ struct Referrer {
     tx: mpsc::Sender<MarketEvent>,
     pending: Option<PendingGap>,
     /// Controls dropped on a full channel, in `seq` order: at most one per
-    /// kind, except subscription errors, every one of which is kept (see
-    /// [`supersedes`]). Nothing bounds how many of those a referrer that
-    /// has stopped reading is owed.
+    /// kind (see [`supersedes`]), except subscription errors, of which the
+    /// newest [`SEAM_CONTROL_CAP`] are kept, as a backfill's pending ring
+    /// keeps its controls: an older one a referrer that has stopped reading
+    /// was owed is dropped and leaves no `seq` hole.
     owed: Vec<MarketEvent>,
     /// This referrer does not pace a replay.
     unpaced: bool,
@@ -712,6 +713,16 @@ impl Referrer {
                 _ => true,
             });
             self.owed.push(ev.clone());
+            if self
+                .owed
+                .iter()
+                .filter(|ev| is_subscription_error(ev))
+                .count()
+                > SEAM_CONTROL_CAP
+                && let Some(oldest) = self.owed.iter().position(is_subscription_error)
+            {
+                self.owed.remove(oldest);
+            }
         } else {
             absorb_drop(&mut self.pending, ev);
         }
@@ -834,8 +845,9 @@ impl From<mpsc::error::TrySendError<MarketEvent>> for Refused {
 /// Whether `newer` replaces `older` as an owed control: a connect or disconnect
 /// replaces the provider's last one, a fan-out `ProviderError` the provider's
 /// last fan-out error, and a `SubscriptionChanged` the instrument's. A
-/// subscription error is never replaced, and never replaces one: a client
-/// session always delivers it.
+/// subscription error is never replaced, and never replaces one: it has no
+/// copy elsewhere (only the oldest past [`SEAM_CONTROL_CAP`] owed goes, see
+/// [`Referrer::owe`]).
 fn supersedes(newer: &ControlKind, older: &ControlKind) -> bool {
     fn connection_provider(kind: &ControlKind) -> Option<&str> {
         match kind {
@@ -865,6 +877,18 @@ fn supersedes(newer: &ControlKind, older: &ControlKind) -> bool {
         _ => connection_provider(newer)
             .is_some_and(|provider| connection_provider(older) == Some(provider)),
     }
+}
+
+/// Whether `ev` is a subscription error, the one owed control of which a
+/// referrer may be owed more than one.
+fn is_subscription_error(ev: &MarketEvent) -> bool {
+    matches!(
+        ev,
+        MarketEvent::Control(c) if matches!(
+            c.kind,
+            ControlKind::ProviderError { origin: ErrorOrigin::Subscription, .. }
+        )
+    )
 }
 
 /// Fold a dropped event into a referrer's pending gap (starting one if needed).
@@ -2569,7 +2593,7 @@ mod fanout_tests {
 
     use futures::FutureExt as _;
 
-    use super::{FanOut, SubscriberId};
+    use super::{FanOut, SEAM_CONTROL_CAP, SubscriberId};
     use datamancer_core::{
         AssetClass, ControlKind, Instrument, MarketEvent, Price, ProviderId, Seq, Timestamp, Trade,
     };
@@ -2773,6 +2797,35 @@ mod fanout_tests {
             drain_then(&mut fanout, &mut rx, &trade(6, 6)),
             [(3, "connected"), (5, "error"), (6, "data")]
         );
+    }
+
+    /// A referrer that has stopped reading is owed the newest
+    /// [`SEAM_CONTROL_CAP`] subscription errors, and the controls of the
+    /// other kinds beside them.
+    #[test]
+    fn a_stalled_referrer_is_owed_only_the_newest_subscription_errors() {
+        let (mut fanout, _rx) = full_referrer(2);
+        fanout.fanout(&disconnected(2));
+        for seq in 3..=202 {
+            fanout.fanout(&control(
+                seq,
+                ControlKind::subscription_error(
+                    "p",
+                    inst("AAPL"),
+                    datamancer_core::EventKind::Trade,
+                    "fetch failed",
+                ),
+            ));
+        }
+        let owed: Vec<u64> = fanout.subscribers[&SubscriberId(1)]
+            .owed
+            .iter()
+            .map(|ev| ev.seq().unwrap().0)
+            .collect();
+        let newest = (203 - SEAM_CONTROL_CAP as u64)..=202;
+        assert_eq!(owed.len(), 1 + SEAM_CONTROL_CAP);
+        assert_eq!(owed[0], 2, "the disconnect stays owed");
+        assert!(owed[1..].iter().copied().eq(newest), "{owed:?}");
     }
 
     #[test]

@@ -3942,7 +3942,7 @@ async fn client_subscribe_refuses_a_backfill_from_at_or_past_the_live_edge() {
 
 /// A retried backfill over the same range that fails the way the first did
 /// is a second fetch failing, and its `ProviderError` must reach the client:
-/// a `Subscription` error is always delivered, and without it the failure is
+/// a `Subscription` error is never dropped as a copy, and without it the failure is
 /// indistinguishable from an empty range.
 #[tokio::test]
 async fn a_retried_backfill_failing_the_same_way_is_delivered() {

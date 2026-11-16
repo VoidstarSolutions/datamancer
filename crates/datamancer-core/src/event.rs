@@ -64,7 +64,10 @@ use crate::{Instrument, Price, Quantity, SubscriptionRef};
 ///   - a connection control or `SubscriptionChanged` that met a full consumer
 ///     channel, and was superseded by a newer one for the same provider or
 ///     instrument before the channel had room, is dropped and its slot stays
-///     empty.
+///     empty;
+///   - a subscription error that met a full consumer channel, with 64 newer
+///     ones owed to it before the channel had room, is dropped and its slot
+///     stays empty.
 /// - **`SYNTHETIC` is exempt.** [`Seq::SYNTHETIC`] tags out-of-band synthetic
 ///   control events and is exempt from per-`(instrument, kind)` monotonicity.
 ///
