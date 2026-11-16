@@ -704,8 +704,18 @@ impl<C: Connector> Hub<C> {
         loop {
             tokio::select! {
                 () = &mut clock => return Next::Reconnect,
-                _ = self.cred_rx.changed(), if why.wakes_on_rotation() => {
-                    return Next::Reconnect;
+                creds = self.cred_rx.changed_or_gone(), if why.wakes_on_rotation() => {
+                    if creds.is_some() {
+                        return Next::Reconnect;
+                    }
+                    // No rotation can come any more. A rejected pair is then
+                    // retried like a static one, since a rejection may yet
+                    // clear on its own; missing credentials stay missing.
+                    // Boxed because the backoff waits here again, as
+                    // `Reconnecting`, which never takes this arm.
+                    if matches!(why, Disconnected::RejectedCredentials) {
+                        return Box::pin(self.back_off()).await;
+                    }
                 }
                 _ = self.settings_rx.changed() => return Next::Reconnect,
                 cmd = self.cmd_rx.recv() => {
@@ -1764,6 +1774,39 @@ pub(super) mod tests {
         // The hub has read its sources and is inside the connect.
         tokio::task::yield_now().await;
         assert_eq!(connects.load(Ordering::SeqCst), 1);
+        drop(creds_tx);
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            2,
+            "no rotation can come: the hub backed off and retried"
+        );
+        let (sink, _rx) = mpsc::channel(8);
+        let handle = SharedLiveHandle::new(cmd_tx, sink);
+        handle
+            .subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("the retry connected");
+    }
+
+    /// Watched credentials whose sender goes away while the hub is parked on
+    /// their rejection can rotate no more: the park gives way to a backoff
+    /// and a retry, as when the sender was gone before the rejection.
+    #[tokio::test(start_paused = true)]
+    async fn a_park_on_rejected_credentials_backs_off_once_the_sender_goes() {
+        let (creds_tx, sources) = watched_credentials();
+        let connector = FakeConnector::scripted(vec![
+            Err(Refused(StreamFailure::Unauthenticated)),
+            Ok(FakeUpstream::idle()),
+        ]);
+        let connects = connector.connect_count();
+        let (_hub, cmd_tx) = spawn_hub(connector, sources);
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            1,
+            "parked on the rejected credentials"
+        );
         drop(creds_tx);
         tokio::time::sleep(Duration::from_hours(1)).await;
         assert_eq!(

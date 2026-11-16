@@ -60,11 +60,25 @@ impl<T> Watched<T> {
     where
         T: Clone,
     {
+        match self.changed_or_gone().await {
+            Some(value) => value,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// As [`changed`](Self::changed), but a sender that goes away is
+    /// reported, once, as `None`, for a waiter whose wait it ends: the
+    /// receiver is dropped with it, so a later call pends.
+    pub(crate) async fn changed_or_gone(&mut self) -> Option<T>
+    where
+        T: Clone,
+    {
         if let Some(rx) = &mut self.0 {
             if rx.changed().await.is_ok() {
-                return rx.borrow_and_update().clone();
+                return Some(rx.borrow_and_update().clone());
             }
             self.0 = None;
+            return None;
         }
         std::future::pending().await
     }
@@ -278,5 +292,21 @@ mod tests {
     fn watch_changed_ignores_static_sources() {
         let mut cached = SettingsSource::Static(1_u32).watch();
         assert!(!watch_changed(&mut cached));
+    }
+
+    /// A value the sender left comes first, then its going, once; after that
+    /// the wait pends rather than resolving again.
+    #[tokio::test(start_paused = true)]
+    async fn changed_or_gone_reports_a_gone_sender_once() {
+        let (tx, rx) = tokio::sync::watch::channel(0_u32);
+        let mut watched = Watched(Some(rx));
+        tx.send(1).unwrap();
+        drop(tx);
+        assert_eq!(watched.changed_or_gone().await, Some(1));
+        assert_eq!(watched.changed_or_gone().await, None);
+        let later =
+            tokio::time::timeout(std::time::Duration::from_secs(1), watched.changed_or_gone())
+                .await;
+        assert!(later.is_err(), "pends once the sender's going is reported");
     }
 }
