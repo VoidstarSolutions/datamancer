@@ -722,7 +722,7 @@ pub(super) struct SymbolLists<'a> {
 /// The list of a [`SymbolLists`] a streamed [`EventKind`] lands in: the one
 /// classification of the kinds the stream carries, behind both `supports`
 /// and the inserts, so a kind the providers promise is one the lists hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum Slot {
     Trades,
     Quotes,

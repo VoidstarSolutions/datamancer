@@ -436,7 +436,8 @@ struct Hub<C: Connector> {
     /// Authoritative aggregate subscription set, applied to every fresh socket.
     subs: <C::Upstream as Upstream>::Subs,
     /// The next backoff, doubled after each failed connect up to the
-    /// policy's maximum and reset by a connect that succeeds.
+    /// policy's maximum and reset once a fresh connection has the
+    /// subscription set applied.
     backoff_ms: u64,
     /// Whether the routes have heard of the current disable, so the disabled
     /// park tells them once however it is entered.
@@ -452,8 +453,8 @@ struct Hub<C: Connector> {
 enum Wake {
     /// A rotation on the credentials watch.
     Rotation,
-    /// The clock reaching an instant: a backoff running out.
-    At(tokio::time::Instant),
+    /// The clock running out a backoff of this length.
+    After(Duration),
     /// Nothing but the settings.
     Never,
 }
@@ -700,17 +701,12 @@ impl<C: Connector> Hub<C> {
     /// spinning. With every sender gone the hub still answers commands, so
     /// its shutdown (every handle dropped) still works.
     async fn idle(&mut self, wake: Wake, why: Disconnected) -> Next {
-        let deadline = match wake {
-            Wake::At(instant) => Some(instant),
-            Wake::Rotation | Wake::Never => None,
-        };
-        let clock = async {
-            match deadline {
-                Some(instant) => tokio::time::sleep_until(instant).await,
-                None => std::future::pending().await,
+        let mut clock = std::pin::pin!(async {
+            match wake {
+                Wake::After(delay) => tokio::time::sleep(delay).await,
+                Wake::Rotation | Wake::Never => std::future::pending().await,
             }
-        };
-        let mut clock = std::pin::pin!(clock);
+        });
         loop {
             tokio::select! {
                 () = &mut clock => return Next::Reconnect,
@@ -745,9 +741,11 @@ impl<C: Connector> Hub<C> {
             self.backoff_ms
         };
         self.backoff_ms = (self.backoff_ms * 2).min(policy.max_backoff_ms);
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(delay_ms);
-        self.idle(Wake::At(deadline), Disconnected::Reconnecting)
-            .await
+        self.idle(
+            Wake::After(Duration::from_millis(delay_ms)),
+            Disconnected::Reconnecting,
+        )
+        .await
     }
 
     /// Answer a command that arrives while there is no connection. A
