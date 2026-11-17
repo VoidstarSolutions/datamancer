@@ -344,7 +344,9 @@ fn describe_control(kind: &ControlKind) -> String {
             reason,
             cause,
         } => format!("ProviderDisconnected provider={provider} cause={cause:?} reason={reason}"),
-        ControlKind::ProviderError { provider, message } => {
+        ControlKind::ProviderError {
+            provider, message, ..
+        } => {
             format!("ProviderError provider={provider} message={message}")
         }
         ControlKind::SessionClosing => "SessionClosing".to_string(),

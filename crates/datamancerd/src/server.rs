@@ -440,6 +440,8 @@ pub struct Server {
     /// The sessions of the WS surface's connections.
     #[cfg(feature = "ws")]
     ws_sessions: crate::ws::WsSessions,
+    /// The turn a snapshot holds while it reads the cache catalog.
+    snapshot_turn: Arc<tokio::sync::Mutex<()>>,
     /// In-flight historical queries, keyed by id. Ids share `next_client_id`
     /// with clients, so a query's data-service name can never collide with a
     /// client's.
@@ -664,6 +666,7 @@ impl Server {
             closing: Vec::new(),
             #[cfg(feature = "ws")]
             ws_sessions: crate::ws::WsSessions::default(),
+            snapshot_turn: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(not(windows))]
             queries: HashMap::new(),
             #[cfg(not(windows))]
@@ -1204,6 +1207,8 @@ impl Server {
             Request::Unsubscribe { client, spec } => {
                 return self.unsubscribe(&client, spec, reply);
             }
+            // A snapshot waits on the cache catalog's disk read.
+            Request::Snapshot => return self.snapshot(reply),
             Request::CloseClient { client } => {
                 if self.clients.contains_key(&client) {
                     self.teardown_client(&client);
@@ -1214,10 +1219,6 @@ impl Server {
             }
             Request::ListClients => Reply::clients(self.clients.keys().cloned().collect()),
             Request::Ping => Reply::pong(env!("CARGO_PKG_VERSION"), self.credential_backend),
-            Request::Snapshot => match self.dm.snapshot().await {
-                Ok(snapshot) => Reply::snapshot(snapshot),
-                Err(e) => reply_from_library_error(&e),
-            },
             // Dispatched off-actor in `handle_connection` (a catalog request
             // awaits live provider REST and must not stall the actor). This
             // arm only exists for match exhaustiveness / defense in depth —
@@ -1546,6 +1547,22 @@ impl Server {
     #[allow(clippy::unused_self)] // symmetric with the unix arm's `&mut self`
     fn abort_all_queries(&mut self) {}
 
+    /// Take a snapshot from a task that replies once the cache catalog is
+    /// read, so a slow disk stalls no other request. One snapshot reads at a
+    /// time and later ones wait their turn, so requests against a stalled
+    /// disk do not pile up catalog reads. The drain does not wait on the
+    /// task; the runtime's shutdown, bounded by the exit deadline, stops one
+    /// still reading.
+    fn snapshot(&self, reply: oneshot::Sender<Reply>) {
+        let dm = self.dm.clone();
+        answer_in_turn(Arc::clone(&self.snapshot_turn), reply, async move {
+            match dm.snapshot().await {
+                Ok(snapshot) => Reply::snapshot(snapshot),
+                Err(e) => reply_from_library_error(&e),
+            }
+        });
+    }
+
     /// Queue `client`'s subscribe on its session, then answer from a task once
     /// the provider has the pair, or `session_closed` if the client is torn
     /// down first. Queueing here, on the actor, is what applies a client's
@@ -1639,6 +1656,19 @@ async fn wait_for_ws_sessions(
         }
     };
     tokio::time::timeout_at(deadline, ended).await.is_ok()
+}
+
+/// Answer `reply` with `answer` from a task of its own, which runs `answer`
+/// only once it holds `turn`: one such answer is computed at a time.
+fn answer_in_turn(
+    turn: Arc<tokio::sync::Mutex<()>>,
+    reply: oneshot::Sender<Reply>,
+    answer: impl Future<Output = Reply> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let _turn = turn.lock().await;
+        let _ = reply.send(answer.await);
+    });
 }
 
 /// The reply to a request on a client that is being torn down.
@@ -2427,10 +2457,19 @@ impl ExitDeadlines {
     fn from_now(shutdown_timeout: Duration) -> Self {
         let now = tokio::time::Instant::now();
         Self {
-            steps: now + shutdown_timeout / 2,
-            exit: now + shutdown_timeout,
+            steps: deadline_after(now, shutdown_timeout / 2),
+            exit: deadline_after(now, shutdown_timeout),
         }
     }
+}
+
+/// A wait too long ever to end, and short enough to add to any `Instant`.
+pub(crate) const FAR: Duration = Duration::from_hours(30 * 365 * 24);
+
+/// `now + timeout`, or a deadline too far out ever to arrive when that sum
+/// would overflow an `Instant`.
+fn deadline_after(now: tokio::time::Instant, timeout: Duration) -> tokio::time::Instant {
+    now.checked_add(timeout).unwrap_or_else(|| now + FAR)
 }
 
 /// The deadline of one bounded web or WS drain step: 5 s from now, or
@@ -2490,6 +2529,13 @@ fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exit_deadline_past_instant_range_does_not_panic() {
+        let now = tokio::time::Instant::now();
+        let deadlines = ExitDeadlines::from_now(Duration::MAX);
+        assert!(deadlines.exit > now && deadlines.steps > now);
+    }
 
     /// The effective prefix is the configured value scoped to this process,
     /// and a name derived from it parses back to that scoped prefix and the
@@ -2882,6 +2928,142 @@ mod tests {
             .expect("runtime")
             .datamancer;
         (dm, dir)
+    }
+
+    /// A cache whose catalog read waits until `release` is notified.
+    struct BlockingCatalogCache {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl datamancer::HistoricalCache for BlockingCatalogCache {
+        async fn lookup(
+            &self,
+            _key: &datamancer::CacheKey,
+        ) -> datamancer::Result<Option<datamancer::CacheCoverage>> {
+            Ok(None)
+        }
+        async fn store(
+            &self,
+            _key: &datamancer::CacheKey,
+            _events: &[datamancer::MarketEvent],
+        ) -> datamancer::Result<()> {
+            Ok(())
+        }
+        async fn catalog(&self) -> datamancer::Result<Vec<datamancer::CacheCatalogEntry>> {
+            self.release.notified().await;
+            Ok(Vec::new())
+        }
+        fn as_replay_source(
+            &self,
+            _key: datamancer::CacheKey,
+        ) -> Box<dyn datamancer::ReplaySource> {
+            unimplemented!("never replayed")
+        }
+    }
+
+    /// A server around `dm` with no anchors, clients or tap log.
+    fn test_server(dm: Datamancer, dir: &std::path::Path) -> Server {
+        let config = Config::parse("").expect("empty config parses to defaults");
+        let store = datamancer_credentials::CredentialStore::with_backend(Box::new(
+            datamancer_credentials::FileBackend::new(dir.join("creds.json")),
+        ));
+        let (hub, _sources) = CredentialHub::with_store(store, &["alpaca"]);
+        let (config_hub, _settings) =
+            crate::config_hub::ConfigHub::bootstrap(config.clone(), dir.join("config.toml"));
+        Server {
+            dm,
+            #[cfg(not(windows))]
+            node: create_node().expect("node"),
+            tap_log: None,
+            anchors: Vec::new(),
+            clients: HashMap::new(),
+            closing: Vec::new(),
+            #[cfg(feature = "ws")]
+            ws_sessions: crate::ws::WsSessions::default(),
+            snapshot_turn: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(not(windows))]
+            queries: HashMap::new(),
+            #[cfg(not(windows))]
+            max_queries: 1,
+            #[cfg(not(windows))]
+            query_persistence: datamancer::PersistenceOptions::none(),
+            #[cfg(not(windows))]
+            next_client_id: 0,
+            #[cfg(not(windows))]
+            service_prefix: effective_service_prefix("datamancerd-test").expect("prefix"),
+            #[cfg(not(windows))]
+            max_clients: 1,
+            admin_socket: dir.join("admin.sock"),
+            shutdown_timeout: Duration::from_secs(1),
+            diag_interval: Duration::from_secs(1),
+            #[cfg(feature = "web-ui")]
+            web: None,
+            #[cfg(feature = "ws")]
+            ws: None,
+            #[cfg(feature = "web-ui")]
+            config_state: crate::web::ConfigState::new(
+                dir.join("config.toml"),
+                config,
+                config_hub.clone(),
+            ),
+            hub: Arc::new(hub),
+            config_hub,
+            credential_backend: "file",
+            #[cfg(windows)]
+            allow_any_integrity: false,
+            draining: false,
+        }
+    }
+
+    /// A snapshot whose cache catalog read blocks leaves the actor answering
+    /// `ping`, and replies once the read returns.
+    #[tokio::test]
+    async fn a_snapshot_waiting_on_the_cache_does_not_stall_ping() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dm = Datamancer::builder()
+            .historical_cache(Box::new(BlockingCatalogCache {
+                release: release.clone(),
+            }))
+            .build()
+            .expect("build");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut server = test_server(dm, dir.path());
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<ServerCommand>(4);
+
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        let handled = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.handle(
+                ServerCommand::Request {
+                    request: Request::Snapshot,
+                    reply: snapshot_tx,
+                },
+                &cmd_tx,
+            ),
+        )
+        .await;
+        assert!(handled.is_ok(), "the actor waited on the cache catalog");
+
+        let (ping_tx, ping_rx) = oneshot::channel();
+        let _ = server
+            .handle(
+                ServerCommand::Request {
+                    request: Request::Ping,
+                    reply: ping_tx,
+                },
+                &cmd_tx,
+            )
+            .await;
+        let pong = ping_rx.await.expect("ping answered");
+        assert!(pong.ok, "{pong:?}");
+
+        release.notify_one();
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), snapshot_rx)
+            .await
+            .expect("snapshot answered once the catalog returns")
+            .expect("reply sent");
+        assert!(snapshot.ok, "{snapshot:?}");
     }
 
     #[tokio::test]
@@ -3299,6 +3481,39 @@ always_on = true
         assert!(wait_for_ws_sessions(&dm, &ws, tokio::time::Instant::now() + LIMIT).await);
         let _ = stuck.close().await;
         let _ = other.close().await;
+    }
+
+    /// Answers computed in turn never overlap: the second starts only once
+    /// the first has been sent.
+    #[tokio::test]
+    async fn answers_in_turn_are_computed_one_at_a_time() {
+        let turn = Arc::new(tokio::sync::Mutex::new(()));
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let second_started = Arc::new(AtomicBool::new(false));
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+
+        let gate = Arc::clone(&release_first);
+        answer_in_turn(Arc::clone(&turn), first_tx, async move {
+            gate.notified().await;
+            Reply::ok()
+        });
+        let started = Arc::clone(&second_started);
+        answer_in_turn(turn, second_tx, async move {
+            started.store(true, Ordering::Release);
+            Reply::ok()
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !second_started.load(Ordering::Acquire),
+            "the second answer started while the first was still being computed"
+        );
+
+        release_first.notify_one();
+        assert!(first_rx.await.expect("first answer").ok);
+        assert!(second_rx.await.expect("second answer").ok);
     }
 
     /// A refusal at the client cap says how many slots closed clients still

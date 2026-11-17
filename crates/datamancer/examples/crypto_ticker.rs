@@ -109,7 +109,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Surface provider-level state changes to stderr so the
                             // table itself stays clean; useful when debugging with
                             // `RUST_LOG=…` since the table redraws over stdout.
-                            if let ControlKind::ProviderError { provider, message } = &c.kind {
+                            if let ControlKind::ProviderError {
+                                provider, message, ..
+                            } = &c.kind
+                            {
                                 eprintln!("provider {provider} error: {message}");
                             }
                         }

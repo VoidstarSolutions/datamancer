@@ -104,8 +104,8 @@ pub trait Client: Sized + Send {
     /// published.
     ///
     /// The terminal `SessionClosing` does NOT distinguish success from provider
-    /// failure: the iceoryx2 data plane suppresses connection-scoped controls
-    /// (`ProviderError`/`ProviderDisconnected`), so a failed fetch is delivered
+    /// failure: the iceoryx2 data plane suppresses connection controls and
+    /// every `ProviderError`, a failed fetch's own included, so one is delivered
     /// as an empty or truncated stream ending in a clean `SessionClosing`.
     /// Consult the diagnostics plane or daemon log to distinguish a failure
     /// from a legitimately empty range; per-query error surfacing is a

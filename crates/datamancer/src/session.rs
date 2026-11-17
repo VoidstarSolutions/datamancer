@@ -1230,10 +1230,9 @@ impl DatamancerBuilder {
     /// resume buffer, and an overflow is a `Gap`. A subscribe that joins an
     /// existing session does not count.
     ///
-    /// # Panics
-    ///
-    /// [`build`](Self::build) panics if `limit` exceeds
-    /// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS).
+    /// A `limit` above
+    /// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS) is
+    /// taken as that maximum.
     #[must_use]
     pub fn max_concurrent_client_backfills(mut self, limit: std::num::NonZeroUsize) -> Self {
         self.max_concurrent_client_backfills = Some(limit);
@@ -1284,7 +1283,7 @@ impl DatamancerBuilder {
                 max_client_backfill: self.max_client_backfill,
                 client_backfill_permits: self
                     .max_concurrent_client_backfills
-                    .map(|limit| Arc::new(Semaphore::new(limit.get()))),
+                    .map(|limit| Arc::new(Semaphore::new(limit.get().min(Semaphore::MAX_PERMITS)))),
                 resume_buffer_events: self
                     .resume_buffer_events
                     .unwrap_or(DEFAULT_RESUME_BUFFER_EVENTS),
@@ -1863,10 +1862,12 @@ impl Controller {
             source_ts,
             rx_ts: source_ts,
             seq: Seq(0),
-            kind: ControlKind::ProviderError {
-                provider: self.provider.id().to_string(),
+            kind: ControlKind::subscription_error(
+                self.provider.id(),
+                self.inner.instrument.clone(),
+                self.inner.kind,
                 message,
-            },
+            ),
         }))
         .await;
     }
@@ -3033,7 +3034,7 @@ struct EventRing {
 }
 
 /// Provider controls a pending ring keeps past its capacity.
-const SEAM_CONTROL_CAP: usize = 64;
+pub(crate) const SEAM_CONTROL_CAP: usize = 64;
 
 impl EventRing {
     fn new(capacity: usize) -> Self {
@@ -3847,5 +3848,20 @@ mod backfill_window_tests {
             BackfillWindow::of(LiveScope::default(), Timestamp(5)).unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::Datamancer;
+
+    #[test]
+    fn a_backfill_limit_past_max_permits_builds() {
+        let limit =
+            std::num::NonZeroUsize::new(tokio::sync::Semaphore::MAX_PERMITS + 1).expect("nonzero");
+        Datamancer::builder()
+            .max_concurrent_client_backfills(limit)
+            .build()
+            .expect("a limit past MAX_PERMITS is taken as MAX_PERMITS");
     }
 }
