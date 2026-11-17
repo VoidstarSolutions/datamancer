@@ -21,10 +21,9 @@
 //! - the `SessionClosing`-before-stream-end assert is relaxed to
 //!   "best-effort, always checked, never hard-failed" for the iceoryx2
 //!   transport specifically. `iceoryx2.rs`'s own `Client::close` doc records a
-//!   known race: the poll loop can observe the shared-memory service go away
-//!   (ending the stream) before it drains the daemon's final `SessionClosing`
-//!   sample, because the transport is same-host shared-memory rather than a
-//!   single ordered socket. The WS transport has no such race (single-writer
+//!   known race: `close` stops the poll loop before the daemon tears the
+//!   client down, so the stream can end before it delivers the daemon's final
+//!   `SessionClosing` sample. The WS transport has no such race (single-writer
 //!   socket), so its test keeps the assert strict.
 //!
 //! Needs a live iceoryx2 runtime, the spawned daemon binary (built WITH the
@@ -185,9 +184,9 @@ port = {ws_port}
 /// the concrete transport chosen only by the type parameter.
 ///
 /// `tolerate_missed_closing`: iceoryx2-only escape hatch for the documented
-/// race in `iceoryx2.rs`'s `Client::close` (the poll loop can observe the shared
-/// memory service go away before draining the final `SessionClosing` sample);
-/// the WS transport has no such race and always passes `false`.
+/// race in `iceoryx2.rs`'s `Client::close` (the stop flag is set before
+/// `close-client`, so the poll loop can stop before the final `SessionClosing`
+/// sample); the WS transport has no such race and always passes `false`.
 async fn exercise<C: Client>(cfg: C::Config, tolerate_missed_closing: bool) {
     let (mut client, mut events) = C::connect(cfg).await.expect("connect");
 

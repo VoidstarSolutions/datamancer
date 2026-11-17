@@ -35,7 +35,9 @@ pub trait Client: Sized + Send {
     type Error: std::error::Error + Send + Sync + 'static;
     /// The multiplexed event stream, yielded in delivery order. `'static` so
     /// generic consumers can `tokio::spawn` the drain task — the point of
-    /// the split `(handle, events)` pair.
+    /// the split `(handle, events)` pair. Unlike [`Client::Query`], its items
+    /// are plain events: loss is reported in-band as the transport's loss
+    /// contract says, and the stream's end does not say why it ended.
     type Events: Stream<Item = MarketEvent> + Send + Unpin + 'static;
 
     /// Connect and return the split pair: the control handle and the owned
@@ -93,15 +95,24 @@ pub trait Client: Sized + Send {
     fn close(self) -> impl Future<Output = Result<(), ClientError<Self::Error>>> + Send;
 
     /// A bounded historical event stream. Yields the query's events in source
-    /// order, then ends. A terminal `Control::SessionClosing` marks the end of
-    /// the stream — it does NOT distinguish success from provider failure: the
-    /// iceoryx2 data plane suppresses connection-scoped controls
+    /// order, then ends after a terminal
+    /// [`SessionClosing`](datamancer_core::ControlKind::SessionClosing). A stream
+    /// that does not get that far yields the error that ended it as its last
+    /// item ([`ClientError::QueryDropped`], or [`ClientError::Transport`]), so
+    /// a stream that ends without one delivered everything the daemon
+    /// published.
+    ///
+    /// The terminal `SessionClosing` does NOT distinguish success from provider
+    /// failure: the iceoryx2 data plane suppresses connection-scoped controls
     /// (`ProviderError`/`ProviderDisconnected`), so a failed fetch is delivered
     /// as an empty or truncated stream ending in a clean `SessionClosing`.
     /// Consult the diagnostics plane or daemon log to distinguish a failure
     /// from a legitimately empty range; per-query error surfacing is a
     /// follow-up.
-    type Query: Stream<Item = MarketEvent> + Send + Unpin + 'static;
+    type Query: Stream<Item = Result<MarketEvent, ClientError<Self::Error>>>
+        + Send
+        + Unpin
+        + 'static;
 
     /// Open a bounded historical query. Unlike [`Client::subscribe`], this is
     /// not part of the multiplexed live stream: the query owns its own channel
@@ -118,6 +129,8 @@ pub trait Client: Sized + Send {
     /// - `bad_request` — the range is inverted (`from > to`).
     /// - `service_cap_exceeded` — the daemon's `max_queries` cap is reached.
     /// - `unsupported_transport` — this transport cannot serve queries (WS).
+    /// - [`ClientError::QueryDropped`] — the daemon gave up on the query
+    ///   before this call attached to it.
     fn query(
         &mut self,
         spec: &QuerySpec,
@@ -196,7 +209,7 @@ mod tests {
             Ok(())
         }
 
-        type Query = Empty<MarketEvent>;
+        type Query = Empty<Result<MarketEvent, ClientError<NeverError>>>;
 
         // `WsClient` has no cheap constructor for a disconnected instance (its
         // fields all come from a live socket split), so the

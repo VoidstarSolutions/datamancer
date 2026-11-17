@@ -14,7 +14,7 @@ use datamancer_core::{
     ControlKind, InstrumentEntry, InstrumentInfo, MarketEvent, ProviderId, Subscribed,
     SystemSnapshot,
 };
-use datamancer_transport_iceoryx2::{DataServiceName, DataSubscriber};
+use datamancer_transport_iceoryx2::{DataServiceName, DataSubscriber, Polled, TransportError};
 use futures::Stream;
 // `::` prefix: this module is itself named `iceoryx2`, so the extern crate is
 // named explicitly (bare paths here happen to resolve to the crate today, but
@@ -72,6 +72,71 @@ pub enum Iceoryx2ClientError {
     /// errors `datamancer-transport-iceoryx2` funnels into `Transport`.
     #[error("iceoryx2 node creation failed: {0}")]
     Node(String),
+}
+
+/// The failure of a query's attach: a query whose service is gone, or is
+/// being removed by the daemon, was [dropped](ClientError::QueryDropped).
+fn attach_error(query: QueryId, error: Iceoryx2ClientError) -> ClientError<Iceoryx2ClientError> {
+    match error {
+        Iceoryx2ClientError::Transport(
+            TransportError::ServiceNotFound(_) | TransportError::StaleService(_),
+        ) => ClientError::QueryDropped { query },
+        other => ClientError::Transport(other),
+    }
+}
+
+/// How a service's event stream ended on its own.
+#[derive(Debug, Clone, PartialEq)]
+enum StreamEnd {
+    /// The daemon dropped the service after everything it sent was received.
+    Closed,
+    /// Receiving from the service failed.
+    Failed(TransportError),
+}
+
+/// What a service's subscriber thread forwards: an event, or last how the
+/// stream ended.
+type Forwarded = Result<MarketEvent, StreamEnd>;
+
+/// Forward what `poll` returns into `items` through `wrap`, sleeping
+/// `poll_interval` after an empty poll, until `stop` is set, the consumer
+/// drops its receiver, or the service's stream ends. How it ended is forwarded
+/// last; whatever `wrap` maps to `None` is not forwarded.
+fn forward_events<T>(
+    mut poll: impl FnMut() -> Result<Polled, TransportError>,
+    items: &mpsc::Sender<T>,
+    wrap: fn(Forwarded) -> Option<T>,
+    stop: &AtomicBool,
+    poll_interval: Duration,
+) {
+    let end = loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match poll() {
+            Ok(Polled::Events(polled)) if polled.is_empty() => {
+                // With no events flowing `blocking_send`'s error can never
+                // fire, so an idle pass checks for a consumer that vanished
+                // without `close()` running (#64's wedge).
+                if items.is_closed() {
+                    return;
+                }
+                std::thread::sleep(poll_interval);
+            }
+            Ok(Polled::Events(polled)) => {
+                for item in polled.into_iter().filter_map(|ev| wrap(Ok(ev))) {
+                    if items.blocking_send(item).is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(Polled::Closed) => break StreamEnd::Closed,
+            Err(e) => break StreamEnd::Failed(e),
+        }
+    };
+    if let Some(item) = wrap(Err(end)) {
+        let _ = items.blocking_send(item);
+    }
 }
 
 /// Map a control [`Reply`] to the two-layer error model.
@@ -224,26 +289,21 @@ impl ControlHandle {
     }
 }
 
-/// Attach to the data service for `service_id` and stream its events.
+/// Attach to the data service `service` and stream what `wrap` makes of its
+/// events and of how its stream ended.
 ///
 /// The attach happens on the blocking task (the `Node` must live on the thread
 /// that polls it) and its result is signalled back over a oneshot, so an attach
 /// failure surfaces as a `ClientError::Transport` instead of a silently-ended
 /// stream. Used for both the client's live stream and each query's stream — a
 /// query channel is byte-identical to a client channel, only short-lived.
-///
-/// The poll loop's `Err(_) => return` arm ends the stream on any service
-/// failure, which carries two different meanings depending on the caller: for
-/// a client's live stream it means the daemon dropped the client's services
-/// (a lost connection); for a query it is the **normal** end, reached when the
-/// daemon reaps the finished query's service once it has delivered every
-/// event.
-async fn spawn_subscriber(
+async fn spawn_subscriber<T: Send + 'static>(
     service: DataServiceName,
     poll_interval: Duration,
     event_buffer: usize,
     stop: Arc<AtomicBool>,
-) -> Result<ReceiverStream<MarketEvent>, Iceoryx2ClientError> {
+    wrap: fn(Forwarded) -> Option<T>,
+) -> Result<ReceiverStream<T>, Iceoryx2ClientError> {
     let (ev_tx, ev_rx) = mpsc::channel(event_buffer.max(1));
     let (attach_tx, attach_rx) = tokio::sync::oneshot::channel::<Result<(), Iceoryx2ClientError>>();
     tokio::task::spawn_blocking(move || {
@@ -269,33 +329,7 @@ async fn spawn_subscriber(
             // polling. `subscriber`/`node` drop here, releasing the attach.
             return;
         }
-        while !stop.load(Ordering::Relaxed) {
-            match subscriber.poll() {
-                Ok(events) if events.is_empty() => {
-                    // The consumer can vanish without `close()` running (a
-                    // dropped stream, or a panic unwinding past the client):
-                    // with no events flowing, `blocking_send`'s error can
-                    // never fire, so an idle pass must check for a closed
-                    // channel or this thread never exits — and the tokio
-                    // runtime drop then blocks joining it (#64's wedge).
-                    if ev_tx.is_closed() {
-                        return;
-                    }
-                    std::thread::sleep(poll_interval);
-                }
-                Ok(events) => {
-                    for ev in events {
-                        if ev_tx.blocking_send(ev).is_err() {
-                            return; // consumer dropped the stream
-                        }
-                    }
-                }
-                // Service gone: for a client's live stream the daemon dropped
-                // the client's services; for a query this is the normal end,
-                // reached when the daemon reaps the finished query's service.
-                Err(_) => return,
-            }
-        }
+        forward_events(|| subscriber.poll(), &ev_tx, wrap, &stop, poll_interval);
     });
 
     match attach_rx.await {
@@ -307,47 +341,71 @@ async fn spawn_subscriber(
     }
 }
 
+/// What the daemon is doing with a [`QueryStream`]'s query, as far as the
+/// stream has seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryState {
+    /// Nothing says the daemon has finished with it.
+    InFlight,
+    /// The stream yielded its terminal `SessionClosing`.
+    Delivered,
+    /// The daemon dropped its service without one.
+    Dropped,
+}
+
 /// A bounded historical event stream.
+///
+/// It yields the query's events and ends after its terminal
+/// [`ControlKind::SessionClosing`]. If the query does not get that far, the
+/// last item is the error that ended it: [`ClientError::QueryDropped`], or
+/// [`ClientError::Transport`] when receiving failed.
 ///
 /// **Dropping this stream cancels the query** — an abandoned backtest must not
 /// keep the daemon fetching. Cancellation is a fire-and-forget `cancel-query`
 /// on the control task's unbounded channel, which is why `Drop` can send it
-/// without awaiting. A stream that already observed `SessionClosing` sends
-/// nothing: the daemon has already reaped that query, and asking it to cancel
-/// an id it no longer has would only produce `unknown_query` and log noise.
+/// without awaiting. A stream that already yielded
+/// [`ControlKind::SessionClosing`] or [`ClientError::QueryDropped`] sends
+/// nothing: the daemon has already
+/// reaped that query, and asking it to cancel an id it no longer has would
+/// only produce `unknown_query` and log noise.
 pub struct QueryStream {
-    inner: ReceiverStream<MarketEvent>,
+    inner: ReceiverStream<Forwarded>,
     id: QueryId,
     control: ControlHandle,
     stop: Arc<AtomicBool>,
-    finished: bool,
+    state: QueryState,
 }
 
 impl Stream for QueryStream {
-    type Item = MarketEvent;
+    type Item = Result<MarketEvent, ClientError<Iceoryx2ClientError>>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
-        match &polled {
-            std::task::Poll::Ready(None) => self.finished = true,
-            std::task::Poll::Ready(Some(MarketEvent::Control(control)))
-                if matches!(control.kind, ControlKind::SessionClosing) =>
-            {
-                self.finished = true;
+        let forwarded = std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_next(cx));
+        std::task::Poll::Ready(match forwarded {
+            Some(Ok(ev)) => {
+                if matches!(&ev, MarketEvent::Control(c) if c.kind == ControlKind::SessionClosing) {
+                    self.state = QueryState::Delivered;
+                }
+                Some(Ok(ev))
             }
-            _ => {}
-        }
-        polled
+            Some(Err(_)) if self.state == QueryState::Delivered => None,
+            Some(Err(StreamEnd::Closed)) => {
+                self.state = QueryState::Dropped;
+                Some(Err(ClientError::QueryDropped { query: self.id }))
+            }
+            Some(Err(StreamEnd::Failed(e))) => Some(Err(ClientError::Transport(e.into()))),
+            None => None,
+        })
     }
 }
 
 impl Drop for QueryStream {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if !self.finished {
+        if self.state == QueryState::InFlight {
             self.control.fire(Request::CancelQuery { query: self.id });
         }
     }
@@ -356,7 +414,8 @@ impl Drop for QueryStream {
 /// A connected same-host client. See [`Client`] for the transport-agnostic
 /// contract; iceoryx2-specific behavior: loss surfaces **in-band** as
 /// `Control::Gap` (the daemon's resume buffer numbers evictions), and the
-/// event stream ends when the daemon drops the per-client services.
+/// event stream ends when the daemon drops the per-client services. A killed
+/// daemon drops nothing: its stream may stay silent instead of ending.
 pub struct Iceoryx2Client {
     control: ControlHandle,
     client_name: String,
@@ -429,6 +488,7 @@ impl Client for Iceoryx2Client {
             cfg.poll_interval,
             cfg.event_buffer,
             Arc::clone(&stop),
+            Result::ok,
         )
         .await
         .map_err(ClientError::Transport)?;
@@ -544,15 +604,13 @@ impl Client for Iceoryx2Client {
         })
     }
 
-    /// Graceful close. **Known race:** the daemon emits a terminal
-    /// `SessionClosing` on the data plane before tearing the service down,
-    /// but this client's poll loop can observe the service go away (an
-    /// `Err` from `subscriber.poll()`, which ends the event stream) before it
-    /// drains that final sample. The closer already knows the close was
-    /// intentional — it is the one that called `close` — so this is narrow
-    /// and pre-existing; stream-readers on the iceoryx2 transport should not
-    /// rely on always observing the `SessionClosing` marker (unlike the WS
-    /// transport, which is single-writer and does not have this race).
+    /// Graceful close. **Known race:** this stops the local poll loop before
+    /// asking the daemon to tear the client down, so the event stream can end
+    /// before it delivers the daemon's terminal `SessionClosing`. The closer
+    /// already knows the close was intentional, as it is the one that called
+    /// `close`; stream-readers on the iceoryx2 transport should not rely on
+    /// always observing the `SessionClosing` marker (unlike the WS transport,
+    /// which is single-writer and does not have this race).
     async fn close(mut self) -> Result<(), ClientError<Self::Error>> {
         // `close` consumes the client, so this is the caller's last chance to
         // signal the poll task. Set the stop flag unconditionally *before* the
@@ -579,15 +637,18 @@ impl Client for Iceoryx2Client {
     ///
     /// # Attach race
     ///
-    /// The daemon starts pumping the query as soon as it replies, so a query
-    /// that completes almost immediately (empty range, fully cached) can drain
-    /// — and have the daemon reap its service — before this call attaches.
-    /// That surfaces as `ClientError::Transport` for what was a legitimately
-    /// empty result, indistinguishable from a real attach failure. This race
-    /// is documented and accepted, not mitigated — the daemon does not hold
-    /// the service open to cover it. Callers that must tell the two apart
-    /// should treat a transport error on a very short/empty range as
-    /// inconclusive and retry the query.
+    /// The daemon publishes nothing until this call attaches, and holds the
+    /// query for a bounded grace period. Attaching within it delivers the
+    /// whole query. Otherwise the daemon has given up on the query and nothing
+    /// is delivered: this call fails, or, when the attach coincides with the
+    /// daemon giving up, the stream's only item is the same error. If the
+    /// daemon is killed, the stream may stay silent instead of ending, so a
+    /// consumer that must notice bounds its wait for the next item.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::query`]: [`ClientError::QueryDropped`] is the daemon
+    /// having given up on the query before this call attached.
     async fn query(
         &mut self,
         spec: &QuerySpec,
@@ -625,13 +686,14 @@ impl Client for Iceoryx2Client {
             self.poll_interval,
             self.event_buffer,
             Arc::clone(&stop),
+            Some,
         )
         .await
         {
             Ok(events) => events,
             Err(e) => {
                 self.control.fire(Request::CancelQuery { query: id });
-                return Err(ClientError::Transport(e));
+                return Err(attach_error(id, e));
             }
         };
         Ok((
@@ -641,7 +703,7 @@ impl Client for Iceoryx2Client {
                 id,
                 control: self.control.clone(),
                 stop,
-                finished: false,
+                state: QueryState::InFlight,
             },
         ))
     }
@@ -685,7 +747,10 @@ mod tests {
     #[cfg(unix)]
     use super::Iceoryx2ClientError;
     #[cfg(unix)]
-    use super::{ControlConn, ControlHandle, QueryStream};
+    use super::{
+        ControlConn, ControlHandle, Forwarded, QueryState, QueryStream, StreamEnd, attach_error,
+        forward_events,
+    };
     #[cfg(unix)]
     use crate::codes;
     #[cfg(unix)]
@@ -694,6 +759,8 @@ mod tests {
     use crate::protocol::uds::{Reply, Request};
     #[cfg(unix)]
     use datamancer_core::{Control, ControlKind, MarketEvent, Seq, Timestamp};
+    #[cfg(unix)]
+    use datamancer_transport_iceoryx2::{Polled, TransportError};
     #[cfg(unix)]
     use std::sync::Arc;
     #[cfg(unix)]
@@ -942,17 +1009,182 @@ mod tests {
     #[cfg(unix)]
     fn query_stream_for_tests(
         control: ControlHandle,
-        finished: bool,
-    ) -> (QueryStream, tokio::sync::mpsc::Sender<MarketEvent>) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<MarketEvent>(4);
+        state: QueryState,
+    ) -> (QueryStream, tokio::sync::mpsc::Sender<Forwarded>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
         let stream = QueryStream {
             inner: ReceiverStream::new(rx),
             id: 42,
             control,
             stop: Arc::new(AtomicBool::new(false)),
-            finished,
+            state,
         };
         (stream, tx)
+    }
+
+    /// Everything a query stream yields when its subscriber thread forwards
+    /// `forwarded` and ends, the stream itself, and the lines its fake daemon
+    /// has received.
+    #[cfg(unix)]
+    async fn query_stream_fed(
+        forwarded: Vec<Forwarded>,
+    ) -> (
+        Vec<Result<MarketEvent, ClientError<Iceoryx2ClientError>>>,
+        QueryStream,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        use futures::StreamExt as _;
+        let (path, seen) = fake_uds_recording(vec![]);
+        let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
+        let (mut stream, tx) = query_stream_for_tests(control, QueryState::InFlight);
+        for item in forwarded {
+            tx.send(item).await.unwrap();
+        }
+        drop(tx);
+        let mut yielded = Vec::new();
+        while let Some(item) = stream.next().await {
+            yielded.push(item);
+        }
+        (yielded, stream, seen)
+    }
+
+    /// The first request the fake daemon receives within half a second.
+    #[cfg(unix)]
+    async fn first_request(seen: &Mutex<Vec<String>>) -> Option<Request> {
+        for _ in 0..50 {
+            if let Some(line) = seen.lock().unwrap().first() {
+                return Some(serde_json::from_str(line).expect("parse recorded request"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// Forward what `polls` yields, in order, through `wrap` into a channel;
+    /// returns what the channel received.
+    #[cfg(unix)]
+    fn forward<T>(
+        polls: Vec<Result<Polled, TransportError>>,
+        wrap: fn(Forwarded) -> Option<T>,
+    ) -> Vec<T> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut polls = polls.into_iter();
+        forward_events(
+            || polls.next().expect("the forwarding ends within the script"),
+            &tx,
+            wrap,
+            &AtomicBool::new(false),
+            std::time::Duration::ZERO,
+        );
+        drop(tx);
+        let mut received = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            received.push(item);
+        }
+        received
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_service_is_forwarded_after_its_events() {
+        let received = forward(
+            vec![
+                Ok(Polled::Events(vec![session_closing_event()])),
+                Ok(Polled::Events(Vec::new())),
+                Ok(Polled::Closed),
+            ],
+            Some,
+        );
+        assert_eq!(
+            received,
+            vec![Ok(session_closing_event()), Err(StreamEnd::Closed)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_receive_failure_is_forwarded_as_a_failure() {
+        let failure = TransportError::Receive("receive failed".to_string());
+        let received = forward(vec![Err(failure.clone())], Some);
+        assert_eq!(received, vec![Err(StreamEnd::Failed(failure))]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_live_stream_carries_events_only() {
+        let received = forward(
+            vec![
+                Ok(Polled::Events(vec![session_closing_event()])),
+                Ok(Polled::Closed),
+            ],
+            Result::ok,
+        );
+        assert_eq!(received, vec![session_closing_event()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_query_closed_after_session_closing_ends_without_an_error() {
+        let (yielded, stream, seen) =
+            query_stream_fed(vec![Ok(session_closing_event()), Err(StreamEnd::Closed)]).await;
+        assert!(matches!(yielded.as_slice(), [Ok(MarketEvent::Control(_))]));
+
+        drop(stream);
+        assert_eq!(first_request(&seen).await, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_query_closed_without_session_closing_ends_with_query_dropped() {
+        let (yielded, stream, seen) = query_stream_fed(vec![Err(StreamEnd::Closed)]).await;
+        assert!(matches!(
+            yielded.as_slice(),
+            [Err(ClientError::QueryDropped { query: 42 })]
+        ));
+
+        drop(stream);
+        assert_eq!(first_request(&seen).await, None, "the daemon dropped it");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_query_whose_receive_fails_ends_with_the_failure_and_is_cancelled_on_drop() {
+        let failure = TransportError::Receive("receive failed".to_string());
+        let (yielded, stream, seen) =
+            query_stream_fed(vec![Err(StreamEnd::Failed(failure.clone()))]).await;
+        assert!(matches!(
+            yielded.as_slice(),
+            [Err(ClientError::Transport(Iceoryx2ClientError::Transport(e)))] if *e == failure
+        ));
+
+        drop(stream);
+        assert_eq!(
+            first_request(&seen).await,
+            Some(Request::CancelQuery { query: 42 })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attaching_to_a_reaped_query_reports_it_dropped() {
+        let reaped = Iceoryx2ClientError::Transport(TransportError::ServiceNotFound(
+            "p/v3/data/7".to_string(),
+        ));
+        assert!(matches!(
+            attach_error(7, reaped),
+            ClientError::QueryDropped { query: 7 }
+        ));
+        let being_removed =
+            Iceoryx2ClientError::Transport(TransportError::StaleService("p/v3/data/7".to_string()));
+        assert!(matches!(
+            attach_error(7, being_removed),
+            ClientError::QueryDropped { query: 7 }
+        ));
+        let other = Iceoryx2ClientError::Node("no shared memory".to_string());
+        assert!(matches!(
+            attach_error(7, other),
+            ClientError::Transport(Iceoryx2ClientError::Node(_))
+        ));
     }
 
     /// A terminal `MarketEvent::Control(SessionClosing)`, built with the same
@@ -970,63 +1202,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn dropping_an_unfinished_query_stream_cancels_it() {
+    async fn dropping_a_query_stream_still_in_flight_cancels_it() {
         let (path, seen) = fake_uds_recording(vec![]);
         let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
-        let (stream, _tx) = query_stream_for_tests(control, false);
+        let (stream, _tx) = query_stream_for_tests(control, QueryState::InFlight);
 
         drop(stream);
 
-        // `fire` enqueues synchronously; let the control task drain and write.
-        for _ in 0..50 {
-            if !seen.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let lines = seen.lock().unwrap().clone();
-        let sent: Request = serde_json::from_str(lines.first().expect("a cancel was sent"))
-            .expect("parse recorded request");
-        assert_eq!(sent, Request::CancelQuery { query: 42 });
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_finished_query_stream_sends_nothing_on_drop() {
-        let (path, seen) = fake_uds_recording(vec![]);
-        let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
-        let (stream, _tx) = query_stream_for_tests(control, true);
-
-        drop(stream);
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "a completed query was already reaped; cancelling it would only log noise"
+        assert_eq!(
+            first_request(&seen).await,
+            Some(Request::CancelQuery { query: 42 })
         );
     }
 
-    /// The `finished` flag is what suppresses the cancel, and it is set by
-    /// polling a terminal `SessionClosing` through the stream — so exercise
-    /// that path rather than setting the flag by hand.
     #[cfg(unix)]
     #[tokio::test]
-    async fn polling_session_closing_marks_the_stream_finished() {
+    async fn a_query_stream_that_yielded_session_closing_sends_nothing_on_drop() {
         use futures::StreamExt as _;
 
         let (path, seen) = fake_uds_recording(vec![]);
         let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
-        let (mut stream, tx) = query_stream_for_tests(control, false);
+        let (mut stream, tx) = query_stream_for_tests(control, QueryState::InFlight);
 
-        tx.send(session_closing_event()).await.expect("send");
+        tx.send(Ok(session_closing_event())).await.expect("send");
         let event = stream.next().await.expect("the terminal control");
-        assert!(matches!(event, MarketEvent::Control(_)));
+        assert!(matches!(event, Ok(MarketEvent::Control(_))));
 
         drop(stream);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "observing SessionClosing must suppress the drop-cancel"
+        assert_eq!(
+            first_request(&seen).await,
+            None,
+            "a delivered query was already reaped; cancelling it would only log noise"
         );
     }
 
@@ -1056,7 +1262,7 @@ mod tests {
         // A live query stream keeps a clone of the control handle alive past
         // the client's drop — the case that made the implicit EOF teardown
         // stop working.
-        let (_query, _tx) = query_stream_for_tests(control.clone(), true);
+        let (_query, _tx) = query_stream_for_tests(control.clone(), QueryState::Delivered);
 
         drop(client_for_tests(control, Arc::clone(&stop)));
 

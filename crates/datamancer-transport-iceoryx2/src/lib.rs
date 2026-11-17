@@ -34,7 +34,7 @@ pub use error::{Result, TransportError};
 pub use naming::{BootScopedPrefix, DataServiceName, ServicePrefix, WIRE_VERSION};
 pub use payload::{ControlTag, DataPayload, FromPodError, PayloadKind, from_pod, to_pod};
 pub use sink::Iceoryx2DataSink;
-pub use subscriber::{DataSubscriber, HoldBuffer};
+pub use subscriber::{DataSubscriber, HoldBuffer, Polled};
 pub use symbol_table::{
     InstrumentTooLong, SYMBOL_STRING_CAPACITY, SymbolAnnouncement, SymbolDecodeError, SymbolId,
     SymbolResolver, SymbolTable,

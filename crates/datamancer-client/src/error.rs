@@ -5,6 +5,8 @@
 
 use datamancer_core::LiveScope;
 
+use crate::spec::QueryId;
+
 /// Error from a [`crate::Client`] operation.
 ///
 /// `#[non_exhaustive]`: future variants (e.g. a client-side timeout) must
@@ -30,5 +32,16 @@ pub enum ClientError<E: std::error::Error> {
         asked: LiveScope,
         /// The scope the daemon created.
         got: LiveScope,
+    },
+    /// The daemon ended the query without its terminal
+    /// [`SessionClosing`](datamancer_core::ControlKind::SessionClosing),
+    /// whatever the cause: no client had attached when it gave up waiting,
+    /// the query was cancelled, the daemon shut down, or its pump failed. The
+    /// cause is not carried. Events the stream already yielded are a prefix
+    /// of the query.
+    #[error("the daemon dropped query {query} before delivering all of it")]
+    QueryDropped {
+        /// The dropped query.
+        query: QueryId,
     },
 }

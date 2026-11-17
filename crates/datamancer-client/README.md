@@ -42,8 +42,12 @@ task without contention.
 `(QueryId, Self::Query)` — a second, query-scoped stream that is independent of
 the client's subscription stream. It needs no prior subscription: the daemon
 opens its own historical session, allocates a dedicated data service for it, and
-pumps the bounded range into it. A query that runs to completion ends with a
-terminal `SessionClosing` control. `cancel_query(QueryId)` aborts one in flight;
+pumps the bounded range into it. The stream's items are `Result`s: a query
+that runs to completion ends after a terminal `SessionClosing` control, and one
+that does not get that far ends with an `Err` as its last item
+(`ClientError::QueryDropped` when the daemon dropped the query first, or
+`ClientError::Transport` when receiving failed). `cancel_query(QueryId)` aborts
+one in flight;
 `unknown_query` back means it had already finished, which is not an error for
 most callers.
 
@@ -86,9 +90,9 @@ transports and regression-guarded by tests. Treat these as an operator contract:
 
 **iceoryx2 close race (known, narrow):** on `Iceoryx2Client::close`, the
 daemon emits the terminal `SessionClosing` sample before dropping the
-per-client service, but this client's background poll loop can observe the
-service disappear (an `Err` from the shared-memory poll, which ends the
-event stream) before it drains that final sample. The caller that invoked
+per-client service, but `close` also stops this client's background poll
+loop, which can end the event stream before it drains that final sample. The
+caller that invoked
 `close` already knows the shutdown was intentional; it is stream-readers on
 a *different* task that should not assume they will always observe the
 `SessionClosing` marker on this transport. The WS transport does not have

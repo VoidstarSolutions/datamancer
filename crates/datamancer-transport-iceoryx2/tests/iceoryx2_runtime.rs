@@ -12,6 +12,7 @@
 //! runs do not collide on service names.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use datamancer_core::{
     AssetClass, CacheSnapshot, ConnectionState, Control, ControlKind, EventSink, HealthView,
@@ -20,8 +21,8 @@ use datamancer_core::{
 };
 use datamancer_transport_iceoryx2::{
     DataServiceName, DataSubscriber, Iceoryx2DataSink, Iceoryx2DiagnosticsPublisher,
-    Iceoryx2DiagnosticsSubscriber, Iceoryx2HealthPublisher, Iceoryx2HealthSubscriber,
-    ServicePrefix,
+    Iceoryx2DiagnosticsSubscriber, Iceoryx2HealthPublisher, Iceoryx2HealthSubscriber, Polled,
+    ServicePrefix, TransportError,
 };
 use iceoryx2::prelude::{Node, NodeBuilder, ipc_threadsafe};
 
@@ -69,16 +70,24 @@ fn trade(symbol: &str, seq: u64, price: i64) -> MarketEvent {
     })
 }
 
+/// What one poll of a service that still has its publisher returned.
+fn arrived(sub: &mut DataSubscriber) -> Vec<MarketEvent> {
+    match sub.poll().expect("poll") {
+        Polled::Events(events) => events,
+        Polled::Closed => panic!("the service closed"),
+    }
+}
+
 /// Drain the subscriber until it has produced `expected` events or attempts run
 /// out (bounded so a missing announcement does not hang the test).
 fn drain_until(sub: &mut DataSubscriber, expected: usize) -> Vec<MarketEvent> {
     let mut out = Vec::new();
     for _ in 0..1000 {
-        out.extend(sub.poll().expect("poll"));
+        out.extend(arrived(sub));
         if out.len() >= expected {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
     }
     out
 }
@@ -149,7 +158,6 @@ async fn flush_drains_before_exit() {
 #[ignore = "needs the iceoryx2 runtime"]
 async fn a_full_subscriber_makes_publish_wait_until_it_reads() {
     use std::sync::Arc;
-    use std::time::Duration;
 
     let node = node();
     let sink = Arc::new(Iceoryx2DataSink::new(&node, name(unique_client_id())).expect("sink"));
@@ -191,7 +199,7 @@ async fn a_full_subscriber_makes_publish_wait_until_it_reads() {
             tokio::time::Instant::now() < deadline,
             "drain timed out: {seqs:?}"
         );
-        for ev in sub.poll().expect("poll") {
+        for ev in arrived(&mut sub) {
             if let MarketEvent::Trade(t) = ev {
                 seqs.push(t.seq.0);
             }
@@ -306,6 +314,119 @@ async fn late_joiner_resolves_all_symbols() {
     }
 }
 
+#[test]
+#[ignore = "needs the iceoryx2 runtime"]
+fn opening_a_service_nobody_created_fails() {
+    let client = unique_client_id();
+    let node = node();
+    let name = name(client);
+    assert_eq!(
+        DataSubscriber::open(&node, &name).err(),
+        Some(TransportError::ServiceNotFound(name.to_string())),
+        "the attach must not create the service"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_sink_waits_until_its_subscriber_attaches() {
+    const WITHIN: Duration = Duration::from_secs(5);
+    const JUST_INSIDE: Duration = Duration::from_millis(4_900);
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    let started = tokio::time::Instant::now();
+
+    let (attached, sub) = tokio::join!(sink.wait_for_subscriber(WITHIN), async {
+        tokio::time::sleep(JUST_INSIDE).await;
+        DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber")
+    });
+
+    assert!(attached, "an attach just inside the wait is seen");
+    assert!(started.elapsed() < WITHIN);
+    drop(sub);
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_sink_stops_waiting_when_no_subscriber_attaches() {
+    const WITHIN: Duration = Duration::from_secs(5);
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    let started = tokio::time::Instant::now();
+
+    assert!(!sink.wait_for_subscriber(WITHIN).await);
+    assert_eq!(started.elapsed(), WITHIN);
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_sink_does_not_count_a_subscriber_that_left() {
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    drop(DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber"));
+
+    assert!(!sink.wait_for_subscriber(Duration::from_millis(50)).await);
+}
+
+#[tokio::test]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_sample_whose_symbol_was_announced_before_the_attach_stays_held_at_close() {
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    sink.publish(trade("AAPL", 0, 100)).await;
+    let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
+    assert!(sink.wait_for_subscriber(Duration::from_secs(1)).await);
+    sink.publish(trade("AAPL", 1, 100)).await;
+    drop(sink);
+
+    while sub.poll().expect("poll") != Polled::Closed {}
+    assert_eq!(sub.held_len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_poll_that_fails_on_an_announcement_keeps_the_data_it_drained() {
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
+    // A symbol holding the tuple's field separator announces a malformed tuple.
+    sink.publish(trade("GOOD", 0, 100)).await;
+    sink.publish(trade("BAD\u{1f}X", 1, 100)).await;
+
+    let failed = sub.poll();
+    assert!(
+        matches!(failed, Err(TransportError::Interning(_))),
+        "{failed:?}"
+    );
+
+    let delivered = arrived(&mut sub);
+    assert!(
+        matches!(delivered.as_slice(), [MarketEvent::Trade(t)] if t.seq.0 == 0),
+        "{delivered:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the iceoryx2 runtime"]
+async fn a_subscriber_receives_everything_before_its_service_closes() {
+    let client = unique_client_id();
+    let node = node();
+    let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
+    let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
+    assert_eq!(sub.poll().expect("idle poll"), Polled::Events(Vec::new()));
+
+    sink.publish(trade("BTC/USD", 0, 100)).await;
+    drop(sink);
+
+    assert_eq!(drain_until(&mut sub, 1).len(), 1);
+    assert_eq!(sub.poll().expect("poll"), Polled::Closed);
+}
+
 #[tokio::test]
 #[ignore = "needs the iceoryx2 runtime"]
 async fn diagnostics_subscriber_reconstructs_snapshot() {
@@ -340,7 +461,7 @@ async fn diagnostics_subscriber_reconstructs_snapshot() {
             received = Some(s);
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(received, Some(snapshot));
 }
@@ -382,7 +503,7 @@ async fn health_subscriber_reconstructs_view() {
             received = Some(v);
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(received, Some(view));
 }

@@ -55,6 +55,10 @@ const DEFAULT_DATA_HISTORY: usize = 16;
 /// joiners to at most this many events (independent of `flush` cadence).
 const REANNOUNCE_INTERVAL: u64 = 256;
 
+/// How often a wait for a subscriber looks for one: iceoryx2 0.10 has no
+/// attach event to wait on.
+const ATTACH_POLL: Duration = Duration::from_millis(5);
+
 /// First wait before a data sample a full subscriber refused is sent again.
 const RESEND_FIRST_WAIT: Duration = Duration::from_millis(1);
 
@@ -77,6 +81,7 @@ pub struct Iceoryx2DataSink {
     /// advertises in its `open-client` / `open-query` reply.
     name: DataServiceName,
     data_service: PortFactory<ipc_threadsafe::Service, DataPayload, ()>,
+    ann_service: PortFactory<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
     data: Publisher<ipc_threadsafe::Service, DataPayload, ()>,
     announcements: Publisher<ipc_threadsafe::Service, SymbolAnnouncement, ()>,
     state: Mutex<State>,
@@ -139,6 +144,7 @@ impl Iceoryx2DataSink {
         Ok(Self {
             name,
             data_service,
+            ann_service,
             data,
             announcements,
             state: Mutex::new(State {
@@ -155,6 +161,28 @@ impl Iceoryx2DataSink {
     #[must_use]
     pub fn data_service_name(&self) -> &DataServiceName {
         &self.name
+    }
+
+    /// Wait for a subscriber to attach to both the data and the announcement
+    /// service. Returns `true` once one has, and it then receives everything
+    /// published from here on, resolving a symbol announced before it
+    /// attached only once [`flush`](EventSink::flush) has republished the
+    /// announcements; returns `false` if none has after `within`.
+    ///
+    /// # Arguments
+    ///
+    /// * `within` - how long to wait for the attach.
+    pub async fn wait_for_subscriber(&self, within: Duration) -> bool {
+        let attached = async {
+            while !self.has_subscriber() {
+                tokio::time::sleep(ATTACH_POLL).await;
+            }
+        };
+        tokio::time::timeout(within, attached).await.is_ok()
+    }
+
+    fn has_subscriber(&self) -> bool {
+        self.has_data_subscriber() && self.ann_service.dynamic_config().number_of_subscribers() > 0
     }
 
     /// Publish one announcement sample.
@@ -331,7 +359,21 @@ mod tests {
     use iceoryx2::prelude::{NodeBuilder, ipc_threadsafe};
 
     use super::Iceoryx2DataSink;
-    use crate::{DataServiceName, DataSubscriber, ServicePrefix};
+    use crate::{DataServiceName, DataSubscriber, Polled, ServicePrefix};
+
+    /// The `seq` of each trade one poll of an open service returned.
+    fn trade_seqs(subscriber: &mut DataSubscriber) -> Vec<u64> {
+        let Polled::Events(events) = subscriber.poll().expect("poll") else {
+            panic!("the service closed");
+        };
+        events
+            .into_iter()
+            .filter_map(|ev| match ev {
+                MarketEvent::Trade(t) => Some(t.seq.0),
+                _ => None,
+            })
+            .collect()
+    }
 
     fn trade(seq: u64) -> MarketEvent {
         let ts = i64::try_from(seq).expect("small");
@@ -375,22 +417,14 @@ mod tests {
 
         let mut seqs = Vec::new();
         for _ in 0..200 {
-            for ev in subscriber.poll().expect("poll") {
-                if let MarketEvent::Trade(t) = ev {
-                    seqs.push(t.seq.0);
-                }
-            }
+            seqs.extend(trade_seqs(&mut subscriber));
             if seqs.len() >= 2 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        for ev in subscriber.poll().expect("poll") {
-            if let MarketEvent::Trade(t) = ev {
-                seqs.push(t.seq.0);
-            }
-        }
+        seqs.extend(trade_seqs(&mut subscriber));
         assert_eq!(seqs, vec![0, 1]);
     }
 }
