@@ -43,6 +43,8 @@ struct Shared {
     history_pause: Option<(usize, Arc<tokio::sync::Notify>)>,
     /// When set, the next `LiveHandle::subscribe` waits for one notification.
     subscribe_gate: Option<Arc<tokio::sync::Notify>>,
+    /// When set, the next `LiveHandle::unsubscribe` waits for one notification.
+    unsubscribe_gate: Option<Arc<tokio::sync::Notify>>,
     /// How many `fetch_history` calls have started.
     fetches: usize,
 }
@@ -111,6 +113,10 @@ impl Ctrl {
 
     async fn gate_next_subscribe(&self, gate: Arc<tokio::sync::Notify>) {
         self.shared.lock().await.subscribe_gate = Some(gate);
+    }
+
+    async fn gate_next_unsubscribe(&self, gate: Arc<tokio::sync::Notify>) {
+        self.shared.lock().await.unsubscribe_gate = Some(gate);
     }
 
     async fn pause_history_after(&self, served: usize, gate: Arc<tokio::sync::Notify>) {
@@ -242,6 +248,10 @@ impl LiveHandle for FakeLiveHandle {
     }
     async fn unsubscribe(&self, instrument: Instrument, _kind: EventKind) -> Result<()> {
         self.unsubscribes.fetch_add(1, Ordering::SeqCst);
+        let gate = self.shared.lock().await.unsubscribe_gate.take();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         self.shared.lock().await.sinks.remove(instrument.symbol());
         Ok(())
     }
@@ -319,6 +329,399 @@ async fn wait_until(mut cond: impl FnMut() -> bool) {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Queued commands take effect in the order they were queued, whichever
+/// answer is awaited first.
+#[tokio::test]
+async fn queued_commands_apply_in_the_order_they_were_queued() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+
+    let subscribed = client
+        .queue_subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .expect("queue the subscribe");
+    let unsubscribed = client
+        .queue_unsubscribe(inst("AAPL"), EventKind::Trade)
+        .expect("queue the unsubscribe");
+
+    unsubscribed
+        .await
+        .expect("the unsubscribe follows the subscribe");
+    subscribed.await.expect("the subscribe was applied first");
+    assert!(client.subscriptions().await.is_empty());
+    let _ = client.close().await;
+}
+
+/// Adversarial review probe: a `Queued` the session refused can be polled
+/// again after it resolved (it answers `SessionClosed`); one the session
+/// answered cannot.
+#[tokio::test]
+async fn a_queued_answer_polled_again_reports_a_closed_session() {
+    let (provider, _ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let mut unsubscribed = client
+        .queue_unsubscribe(inst("AAPL"), EventKind::Trade)
+        .expect("queue the unsubscribe");
+    let first = (&mut unsubscribed).await;
+    assert!(
+        matches!(first, Err(datamancer::Error::NotSubscribed { .. })),
+        "{first:?}"
+    );
+    let again = (&mut unsubscribed).await;
+    assert!(again.is_err(), "{again:?}");
+    let _ = client.close().await;
+}
+
+/// A session takes as many queued commands as its queue holds and refuses
+/// the next at the call; the ones it took are unaffected.
+#[tokio::test]
+async fn a_full_command_queue_refuses_the_next_queued_command() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_next_subscribe(gate.clone()).await;
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let client = dm.client_session();
+    let queue = |symbol: String| {
+        client.queue_subscribe(
+            inst(&symbol),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+    };
+
+    // The first waits on the provider; the session holds the rest queued.
+    let first = queue("FIRST".to_string()).expect("queue the first");
+    wait_until(|| ctrl.live_starts() == 1).await;
+    let mut taken = Vec::new();
+    let refusal = loop {
+        match queue(format!("S{}", taken.len())) {
+            Ok(next) => taken.push(next),
+            Err(refusal) => break refusal,
+        }
+        assert!(taken.len() < 100_000, "the queue never filled");
+    };
+
+    assert!(
+        matches!(refusal, datamancer::Error::SessionBusy),
+        "{refusal:?}"
+    );
+    gate.notify_one();
+    first.await.expect("the first subscribe");
+    for subscribe in taken {
+        subscribe.await.expect("a queued subscribe");
+    }
+    let _ = client.close().await;
+}
+
+/// A subscribe does not wait for ever on the pair's old session: past the
+/// limit it fails with the provider's name and can be retried, and the old
+/// session's unsubscribe is still not overtaken.
+#[tokio::test(start_paused = true)]
+async fn a_resubscribe_gives_up_on_an_old_session_that_never_finishes() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let first = dm.client_session();
+    first
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_next_unsubscribe(gate.clone()).await;
+    first
+        .unsubscribe(inst("AAPL"), EventKind::Trade)
+        .await
+        .unwrap();
+    wait_until(|| ctrl.unsubscribes() == 1).await;
+
+    let second = dm.client_session();
+    let started = tokio::time::Instant::now();
+    let stalled = second
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await;
+
+    assert!(
+        matches!(&stalled, Err(datamancer::Error::Provider { provider, .. }) if provider == "fake"),
+        "{stalled:?}"
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(30));
+    assert_eq!(ctrl.live_starts(), 1, "the provider was not asked");
+
+    gate.notify_one();
+    second
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .expect("the retry, once the old session has finished");
+    let _ = second.close().await;
+    let _ = first.close().await;
+}
+
+/// A pair's old session has finished unsubscribing at the provider before the
+/// pair's next session subscribes there, so a provider that keeps one route
+/// per pair cannot have the old teardown remove the new subscription.
+#[tokio::test]
+async fn a_resubscribed_pair_waits_for_its_old_sessions_unsubscribe() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let first = dm.client_session();
+    first
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_next_unsubscribe(gate.clone()).await;
+    first
+        .unsubscribe(inst("AAPL"), EventKind::Trade)
+        .await
+        .unwrap();
+    wait_until(|| ctrl.unsubscribes() == 1).await;
+
+    let second = dm.client_session();
+    let mut stream = second.take_events().await.unwrap();
+    let mut subscribing = second
+        .queue_subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .expect("queue the subscribe");
+    let early = tokio::time::timeout(Duration::from_millis(200), &mut subscribing).await;
+    assert!(
+        early.is_err(),
+        "the subscribe must wait for the old session's unsubscribe"
+    );
+    assert_eq!(ctrl.live_starts(), 1, "the provider was not asked yet");
+
+    gate.notify_one();
+    subscribing.await.expect("subscribe after the unsubscribe");
+    ctrl.push("AAPL", trade("AAPL", 1)).await;
+    let (data, _) = drain_data(&mut stream, 1).await;
+    assert_eq!(data.len(), 1, "the new subscription's route survived");
+    let _ = second.close().await;
+    let _ = first.close().await;
+}
+
+/// Two clients' subscribes to a pair a third client is still creating are
+/// not failed by that third client giving up: each looks again and joins
+/// or creates a live session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_joins_survive_the_creator_giving_up() {
+    let mut failures = Vec::new();
+    for round in 0..200 {
+        let (provider, ctrl) = FakeProvider::new("fake", false);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        ctrl.gate_next_subscribe(gate.clone()).await;
+        let dm = Datamancer::builder()
+            .provider_arc(provider)
+            .build()
+            .unwrap();
+        let creator = dm.client_session();
+        let joiners = [dm.client_session(), dm.client_session()];
+        let subscribe = |client: &datamancer::ClientSession| {
+            client
+                .queue_subscribe(
+                    inst("AAPL"),
+                    EventKind::Trade,
+                    live(),
+                    PersistenceOptions::none(),
+                )
+                .expect("queue the subscribe")
+        };
+        let creating = subscribe(&creator);
+        wait_until(|| ctrl.live_starts() == 1).await;
+        let joining = joiners.each_ref().map(subscribe);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The creator's caller gives up; its provider subscribe then returns.
+        drop(creating);
+        gate.notify_one();
+
+        for (i, join) in joining.into_iter().enumerate() {
+            let joined = tokio::time::timeout(Duration::from_secs(5), join)
+                .await
+                .expect("the join was never answered");
+            if let Err(e) = joined {
+                failures.push(format!("round {round} joiner {i}: {e:?}"));
+            }
+        }
+        for client in joiners {
+            let _ = client.close().await;
+        }
+        let _ = creator.close().await;
+    }
+    assert!(
+        failures.is_empty(),
+        "{} joins failed in 200 rounds: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(4)]
+    );
+}
+
+/// Every client subscribing to a pair whose old session never finishes gives
+/// up at the limit: each waits on the old session for itself, and none waits
+/// on another's wait.
+#[tokio::test(start_paused = true)]
+async fn every_subscriber_of_a_stuck_pair_gives_up_at_the_limit() {
+    const CLIENTS: usize = 12;
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let first = dm.client_session();
+    first
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_next_unsubscribe(gate.clone()).await;
+    first
+        .unsubscribe(inst("AAPL"), EventKind::Trade)
+        .await
+        .unwrap();
+    wait_until(|| ctrl.unsubscribes() == 1).await;
+
+    let started = tokio::time::Instant::now();
+    let mut waiting = tokio::task::JoinSet::new();
+    for n in 0..CLIENTS {
+        let client = dm.client_session();
+        waiting.spawn(async move {
+            let answer = client
+                .subscribe(
+                    inst("AAPL"),
+                    EventKind::Trade,
+                    live(),
+                    PersistenceOptions::none(),
+                )
+                .await;
+            (n, started.elapsed(), answer.map(|_| ()), client)
+        });
+    }
+    let mut outcomes = Vec::new();
+    while let Some(done) = waiting.join_next().await {
+        let (n, waited, answer, client) = done.unwrap();
+        outcomes.push((n, waited, answer));
+        drop(client);
+    }
+    outcomes.sort_by_key(|(_, waited, _)| *waited);
+    let report: Vec<String> = outcomes
+        .iter()
+        .map(|(n, waited, answer)| format!("client {n}: {}s {answer:?}", waited.as_secs()))
+        .collect();
+    assert_eq!(ctrl.live_starts(), 1, "the provider was not asked");
+    assert!(
+        outcomes.iter().all(|(_, waited, answer)| {
+            *waited <= Duration::from_secs(30)
+                && matches!(answer, Err(datamancer::Error::Provider { .. }))
+        }),
+        "not every subscribe failed with Error::Provider at 30 s:\n{}",
+        report.join("\n")
+    );
+    gate.notify_one();
+    let _ = first.close().await;
+}
+
+/// Two clients waiting on a pair's old session both end subscribed once it
+/// finishes: one creates the pair's new session and the other joins it.
+#[tokio::test]
+async fn two_waiters_on_an_old_session_share_the_new_one() {
+    let (provider, ctrl) = FakeProvider::new("fake", false);
+    let dm = Datamancer::builder()
+        .provider_arc(provider)
+        .build()
+        .unwrap();
+    let first = dm.client_session();
+    first
+        .subscribe(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    ctrl.gate_next_unsubscribe(gate.clone()).await;
+    first
+        .unsubscribe(inst("AAPL"), EventKind::Trade)
+        .await
+        .unwrap();
+    wait_until(|| ctrl.unsubscribes() == 1).await;
+
+    let waiters = [dm.client_session(), dm.client_session()];
+    let waiting = waiters.each_ref().map(|client| {
+        client
+            .queue_subscribe(
+                inst("AAPL"),
+                EventKind::Trade,
+                live(),
+                PersistenceOptions::none(),
+            )
+            .expect("queue the subscribe")
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(ctrl.live_starts(), 1, "the provider was not asked yet");
+
+    gate.notify_one();
+    for subscribe in waiting {
+        subscribe
+            .await
+            .expect("subscribed once the old session finished");
+    }
+    assert_eq!(ctrl.live_starts(), 2, "one new session serves both");
+    for client in waiters {
+        let _ = client.close().await;
+    }
+    let _ = first.close().await;
+}
 
 #[tokio::test]
 async fn multiplex_interleaves_two_instruments_in_arrival_order() {

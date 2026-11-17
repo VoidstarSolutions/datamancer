@@ -271,7 +271,16 @@ that attaches later receives those and nothing before them, a `seq` hole with
 no `gap`.
 
 A graceful `close-client` or a connection **EOF** tears the client down,
-flushing its sink and releasing its authoritative refcounts.
+flushing its sink and releasing its authoritative refcounts. `close-client`
+answers at once and the client leaves `list-clients`; the flush and close
+run on, and until they finish the client still counts toward `max_clients`.
+An `open-client` refused at the cap meanwhile says so: its
+`service_cap_exceeded` message counts the closed clients still holding slots.
+A stalled reader holds that up for about 4 s at most: up to 2 s for the
+session to hand over its stream, then up to 2 s for the sink. While a
+`subscribe` of that client waits for its provider, the subscribe answers
+`session_closed`; the client's stream ends with `SessionClosing` and its
+refcounts are released once the provider's connect returns.
 
 ### Lifecycle anchors
 
@@ -510,6 +519,26 @@ One JSON object per line; one reply line per request.
 
 `subscribe` opens an unbounded subscription:
 
+- The reply comes once the provider has the pair, which on a provider not yet
+  connected includes its connect. If the pair's previous session is still
+  unsubscribing at the provider, the subscribe waits for it, and after 30 s
+  answers `provider`; it can be retried. The daemon answers other requests
+  meanwhile, and a connection's next request is read after the reply. A
+  client's `subscribe` and `unsubscribe` requests take effect in the order
+  the daemon received them, whichever connections sent them, so an
+  `unsubscribe` of the same client from another connection waits for that
+  subscribe. A client's session queues a bounded number of requests (1024)
+  behind the one it is working on and takes no more until one answers: the
+  next is `session_busy`, to be retried once one of that client's requests
+  has answered. An `open-client` with more initial subscriptions than a
+  session queues can never fit and is `bad_request`, with at most the
+  one in hand made at the provider and then removed. A client whose
+  `open-client` has not answered yet takes no other
+  request: one that names it is `unknown_client`, with a message saying
+  it is still opening. A `close-client` meanwhile
+  answers at once and the subscribe
+  answers `session_closed`; the client's stream ends with `SessionClosing`
+  once the provider's connect returns.
 - `provider` is a provider id, and only that provider serves the subscription.
   An id no provider owns is `unknown_provider`, here and on `open-query`.
 - `scope` is `live` (the default) or `live_backfill`.
@@ -559,9 +588,14 @@ One JSON object per line; one reply line per request.
 
 The `subscriptions` of `open-client` follow the same rules and are live-only:
 `seed` is honored and any other scope is `bad_request`, checked for all of
-them before any subscribes. A client that wants a backfill subscribes after
-opening. An unknown key in a control frame, in an `open-client` `subscriptions`
-element, or in any WS request frame is `bad_request`.
+them before any subscribes, and the reply waits for them as a `subscribe` reply
+does. While it waits, the client is named by `list-clients` and counts toward
+`max_clients`, and a second `open-client` of the name is `duplicate_client`. On
+a refusal the client is closed and the reply carries the refusal; the client
+keeps its `max_clients` slot until that close ends. A client that wants a
+backfill subscribes after opening. An unknown key in a control frame, in an
+`open-client` `subscriptions` element, or in any WS request frame is
+`bad_request`.
 
 How a backfill seams into the live tail is in the
 [library README](../datamancer/README.md#subscriptions).
@@ -760,7 +794,8 @@ Errors reply `{"ok":false,"code":"…","message":"…"}` with **stable codes**
 `unknown_provider`, `provider_disabled` (from `subscribe`, creating or joining,
 `open-client` subscriptions, `open-query` under a policy that does not read the
 cache, `instruments` filtered to that provider, and `capabilities`),
-`unknown_client`, `duplicate_client`, `service_cap_exceeded`, `bad_request`,
+`unknown_client`, `duplicate_client`, `service_cap_exceeded`, `session_busy`,
+`bad_request`,
 `shutting_down`, `credentials_missing`, `credential_backend_unavailable`,
 `permission_denied`, `unknown_config_field`, `unknown_query` (`cancel-query`
 named an id that is not in flight), `unsupported_on_windows` (the query ops
@@ -1060,19 +1095,26 @@ ordering as every other consumer.
 
 ## Shutdown
 
-SIGTERM/SIGINT triggers a bounded, serialized drain: drain the web server (if
-enabled) → **stop accepting new WS connections and tear down in-flight ones**
-(feature `ws`) → **abort every in-flight historical query** (its service is
-released; a bounded fetch has no graceful finish worth waiting on, so queries
-are aborted, not drained) → stop accepting control requests → stop the
-diagnostics ticker → per client close the session and drain its pump (so a terminal
-`SessionClosing` reaches the sink instead of being severed) → drop the startup
-anchors → **flush the tap log** (the durable record) → per client flush the
-sink → drop the clients/sinks. The web server (and WS surface) are drained
-first so they stop reporting on / mutating a data plane about to be torn down;
-the tap log flushes **before** the best-effort per-client sink flushes (the
-load-bearing tap-log-before-sink-flush contract) so a stall in those
-best-effort steps cannot lose durable writes. `server.shutdown_timeout_secs`
+SIGTERM/SIGINT triggers a bounded drain: drain the web server (if enabled) →
+**stop accepting new WS connections and tear down in-flight ones** (feature
+`ws`; a surface past its limit is aborted, and its sessions get up to a second
+to end) → **abort every in-flight historical query** (its service is released;
+queries are aborted, not drained) → stop accepting control requests → stop the
+diagnostics ticker → close every client concurrently, each draining its pump
+(so a terminal `SessionClosing` reaches the sink instead of being severed) →
+drop the startup anchors → **flush the tap log** (the durable record) → flush
+it once more → per client flush the sink → drop the clients/sinks. The client
+closes share one time limit, half of what is left of the deadline; a close
+cut off by it has its pump stopped. A client whose subscribe waits for its
+provider does not hold up the anchor drop or the first tap-log flush: it
+closes alongside them. The second flush covers what was released between
+the two. A client still waiting on its provider at the limit, or a close the
+limit cut off, keeps its sessions until the provider's connect returns; what
+those sessions write to the tap log after the second flush is not flushed.
+A client `close-client` was still tearing down is drained with the
+rest, so its sink flush and service drop also come after the tap-log flush.
+The tap log flushes **before** the best-effort per-client sink flushes (the
+load-bearing tap-log-before-sink-flush contract). `server.shutdown_timeout_secs`
 (at least 1) bounds the whole exit, counted from the signal: the web and WS
 drains (5 s each at most, and half the budget together), the drain and the
 runtime's own shutdown share that one deadline, so a disk-stalled tap-log flush

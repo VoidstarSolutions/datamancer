@@ -26,7 +26,7 @@ use crate::ws::{WsHealthPush, WsReply, WsRequest};
 
 /// Accept the WS handshake (enforcing the bearer token if configured), then run
 /// the bridge until the socket closes or the client session ends.
-// 8 params: transport + auth + the two health-push inputs + shutdown. Bundling
+// 9 params: transport + auth + the two health-push inputs + shutdown. Bundling
 // them into a struct would add indirection without added clarity.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_connection(
@@ -38,6 +38,7 @@ pub async fn handle_connection(
     credential_backend: &'static str,
     diag_interval: Duration,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    sessions: super::WsSessions,
 ) {
     let ws = match accept_with_auth(tcp, auth_token).await {
         Ok(ws) => ws,
@@ -72,6 +73,8 @@ pub async fn handle_connection(
             return;
         }
     };
+    let session_id = session.id();
+    sessions.opened(session_id);
     // Per-connection cancel: the pump signals this on slow-consumer overrun so the
     // read loop breaks into the shared teardown path (tearing the socket down)
     // rather than leaving the connection silently stalled. `notify_one` stores a
@@ -168,6 +171,7 @@ pub async fn handle_connection(
         task.abort();
     }
     let _ = session.close().await;
+    sessions.closed(session_id);
     if tokio::time::timeout(Duration::from_secs(2), pump)
         .await
         .is_err()

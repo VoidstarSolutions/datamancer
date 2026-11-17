@@ -22,7 +22,7 @@ pub enum Request {
     /// Register a client and create its per-client data-plane service.
     OpenClient {
         client: String,
-        /// Live-only subscriptions, made before the client opens.
+        /// Live-only subscriptions, made before the reply.
         #[serde(default)]
         subscriptions: Vec<SubscriptionSpec>,
     },
@@ -38,7 +38,8 @@ pub enum Request {
         #[serde(flatten)]
         spec: UnsubscribeSpec,
     },
-    /// Tear down a client (graceful).
+    /// Tear down a client (graceful). The reply comes when the teardown starts;
+    /// the client counts toward `max_clients` until it ends.
     CloseClient { client: String },
     /// Open a bounded historical query. Ungated (a read, like `snapshot`).
     /// Not a subscription: it needs no prior `open-client`, opens its own
@@ -661,6 +662,11 @@ mod tests {
         assert_eq!(pong["version"], "0.3.0");
         assert_eq!(pong["credential_backend"], "keychain");
         assert!(pong.get("credentials").is_none());
+    }
+
+    #[test]
+    fn the_session_busy_code_is_stable() {
+        assert_eq!(crate::codes::SESSION_BUSY, "session_busy");
     }
 
     #[test]

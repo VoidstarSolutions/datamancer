@@ -12,30 +12,51 @@
 //! consumer-transport design, explicitly out of scope.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex, Weak};
 
 use datamancer_core::CacheKey;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-/// Hands out a per-`CacheKey` async guard with mutual exclusion. Cheap to
-/// clone (an `Arc` around the shared map); every clone shares one registry.
-#[derive(Clone, Default)]
-pub(crate) struct FetchLocks {
-    map: Arc<Mutex<HashMap<CacheKey, Weak<AsyncMutex<()>>>>>,
+/// Hands out a per-key async guard with mutual exclusion. Cheap to clone (an
+/// `Arc` around the shared map); every clone shares one registry. The module
+/// docs describe its first use, [`FetchLocks`]; a live pair's turn at its
+/// provider is another.
+pub(crate) struct KeyedLocks<K> {
+    map: Arc<Mutex<HashMap<K, Weak<AsyncMutex<()>>>>>,
 }
 
-impl FetchLocks {
-    /// Acquire the fetch slot for `key`, waiting if another task holds it.
+/// The single-flight registry for historical fetches.
+pub(crate) type FetchLocks = KeyedLocks<CacheKey>;
+
+impl<K> Clone for KeyedLocks<K> {
+    fn clone(&self) -> Self {
+        Self {
+            map: Arc::clone(&self.map),
+        }
+    }
+}
+
+impl<K> Default for KeyedLocks<K> {
+    fn default() -> Self {
+        Self {
+            map: Arc::default(),
+        }
+    }
+}
+
+impl<K: Clone + Eq + Hash> KeyedLocks<K> {
+    /// Acquire the slot for `key`, waiting if another task holds it.
     ///
     /// The map holds a `Weak` to each key's lock so an entry whose holders
     /// have all gone away is replaced on the next request for that same key.
     /// Unlike the `live_sessions` registry (which reaps via a drop guard),
-    /// dead entries here are *not* reaped — a key fetched once and never again
+    /// dead entries here are *not* reaped — a key acquired once and never again
     /// leaves a tombstone `Weak` for the lifetime of this `Datamancer`. Growth
     /// is therefore bounded by distinct-key cardinality, not by concurrency;
     /// reaping is deferred alongside the parked cache-eviction work. Distinct
     /// keys never block one another.
-    pub(crate) async fn acquire(&self, key: &CacheKey) -> OwnedMutexGuard<()> {
+    pub(crate) async fn acquire(&self, key: &K) -> OwnedMutexGuard<()> {
         let lock = {
             let mut map = self.map.lock().expect("fetch-locks mutex poisoned");
             if let Some(existing) = map.get(key).and_then(Weak::upgrade) {

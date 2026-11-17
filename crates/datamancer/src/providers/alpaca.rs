@@ -882,95 +882,13 @@ async fn run_hub_task(cfg: AlpacaProviderConfig, mut cmd_rx: mpsc::Receiver<HubC
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(HubCommand::Subscribe { instrument, kind, sink, ack }) => {
-                            routes.insert((instrument.clone(), kind), sink);
-                            apply_pair_to_list(&mut subs, &instrument, kind, true);
-                            let res = client
-                                .add_subscriptions(&subs)
-                                .await
-                                .map(|_| ())
-                                .map_err(|e| Error::Provider {
-                                    provider: PROVIDER_ID.to_string(),
-                                    message: format!("add_subscriptions: {}", error_chain(&e)),
-                                });
-                            if res.is_err() {
-                                // Roll back so reconnect doesn't keep trying to
-                                // apply a subscription the server rejected.
-                                routes.remove(&(instrument.clone(), kind));
-                                apply_pair_to_list(&mut subs, &instrument, kind, false);
-                            } else {
-                                // We are in the connected loop, so the provider is
-                                // up. `ProviderConnected` is otherwise only
-                                // broadcast on the connect *edge*, which a route
-                                // that subscribes afterward misses — leaving its
-                                // connection state Unknown even as data flows. Tell
-                                // the freshly-subscribed route the provider is up.
-                                broadcast_control_to(
-                                    routes.get(&(instrument.clone(), kind)),
-                                    ControlKind::ProviderConnected {
-                                        provider: PROVIDER_ID.to_string(),
-                                    },
-                                )
-                                .await;
-                                broadcast_control_to(
-                                    routes.get(&(instrument.clone(), kind)),
-                                    ControlKind::SubscriptionChanged {
-                                        provider: PROVIDER_ID.to_string(),
-                                        instrument,
-                                        kind,
-                                        active: true,
-                                    },
-                                )
-                                .await;
-                            }
-                            let _ = ack.send(res);
-                        }
-                        Some(HubCommand::Unsubscribe { instrument, kind, ack }) => {
-                            apply_pair_to_list(&mut subs, &instrument, kind, false);
-                            // A list containing only the pair being removed;
-                            // that's what the Alpaca API expects in
-                            // remove_subscriptions.
-                            let mut removal = StockSubscriptionList::new();
-                            apply_pair_to_list(&mut removal, &instrument, kind, true);
-                            let res = client
-                                .remove_subscriptions(&removal)
-                                .await
-                                .map(|_| ())
-                                .map_err(|e| Error::Provider {
-                                    provider: PROVIDER_ID.to_string(),
-                                    message: format!("remove_subscriptions: {}", error_chain(&e)),
-                                });
-                            if res.is_ok() {
-                                // Drop the route after the upstream ack so any
-                                // tail events still in flight are routable.
-                                let removed = routes.remove(&(instrument.clone(), kind));
-                                broadcast_control_to(
-                                    removed.as_ref(),
-                                    ControlKind::SubscriptionChanged {
-                                        provider: PROVIDER_ID.to_string(),
-                                        instrument,
-                                        kind,
-                                        active: false,
-                                    },
-                                )
-                                .await;
-                            } else {
-                                // Roll back so the upstream server's view stays
-                                // consistent with ours: the pair is still
-                                // streaming, so reconnect must re-apply it.
-                                apply_pair_to_list(&mut subs, &instrument, kind, true);
-                            }
-                            let _ = ack.send(res);
-                        }
-                        None => {
-                            // The provider and every handle are gone; no
-                            // command can ever arrive again. Close the
-                            // websocket and exit.
-                            let _ = client.shut_down().await;
-                            return;
-                        }
-                    }
+                    let Some(cmd) = cmd else {
+                        // The provider and every handle are gone; no command
+                        // can ever arrive again. Close the websocket and exit.
+                        let _ = client.shut_down().await;
+                        return;
+                    };
+                    handle_route_command(&mut routes, &mut subs, &mut client, cmd).await;
                 }
                 next = client.next_message() => {
                     match next {
@@ -1210,6 +1128,149 @@ fn event_route_key(ev: &MarketEvent) -> Option<(Instrument, EventKind)> {
         MarketEvent::Bar(b) => Some((b.instrument.clone(), EventKind::Bar(b.interval))),
         _ => None,
     }
+}
+
+/// The upstream calls a session's subscribe or unsubscribe makes on the
+/// connected socket.
+trait RouteUpstream {
+    /// Apply the aggregate subscription set `subs`.
+    async fn add(&mut self, subs: &StockSubscriptionList) -> Result<()>;
+    /// Remove the pairs in `removal`.
+    async fn remove(&mut self, removal: &StockSubscriptionList) -> Result<()>;
+}
+
+impl RouteUpstream for StreamingStockClient {
+    async fn add(&mut self, subs: &StockSubscriptionList) -> Result<()> {
+        self.add_subscriptions(subs)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("add_subscriptions: {}", error_chain(&e)),
+            })
+    }
+
+    async fn remove(&mut self, removal: &StockSubscriptionList) -> Result<()> {
+        self.remove_subscriptions(removal)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Provider {
+                provider: PROVIDER_ID.to_string(),
+                message: format!("remove_subscriptions: {}", error_chain(&e)),
+            })
+    }
+}
+
+/// Apply one session's subscribe or unsubscribe on the connected socket and
+/// answer it.
+async fn handle_route_command(
+    routes: &mut HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    subs: &mut StockSubscriptionList,
+    upstream: &mut impl RouteUpstream,
+    cmd: HubCommand,
+) {
+    match cmd {
+        HubCommand::Subscribe {
+            instrument,
+            kind,
+            sink,
+            ack,
+        } => {
+            let res = subscribe_route(routes, subs, upstream, instrument, kind, sink).await;
+            let _ = ack.send(res);
+        }
+        HubCommand::Unsubscribe {
+            instrument,
+            kind,
+            ack,
+        } => {
+            let res = unsubscribe_route(routes, subs, upstream, instrument, kind).await;
+            let _ = ack.send(res);
+        }
+    }
+}
+
+/// Route `(instrument, kind)` to `sink` and subscribe it upstream. If the
+/// upstream refuses, the route and the pair are dropped again, so a
+/// reconnect does not apply a subscription the server rejected. That also
+/// clears a route left behind by a session whose unsubscribe never arrived.
+async fn subscribe_route(
+    routes: &mut HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    subs: &mut StockSubscriptionList,
+    upstream: &mut impl RouteUpstream,
+    instrument: Instrument,
+    kind: EventKind,
+    sink: mpsc::Sender<MarketEvent>,
+) -> Result<()> {
+    let key = (instrument, kind);
+    routes.insert(key.clone(), sink);
+    apply_pair_to_list(subs, &key.0, kind, true);
+    let res = upstream.add(subs).await;
+    if res.is_err() {
+        routes.remove(&key);
+        apply_pair_to_list(subs, &key.0, kind, false);
+        return res;
+    }
+    // We are in the connected loop, so the provider is up.
+    // `ProviderConnected` is otherwise only broadcast on the connect *edge*,
+    // which a route that subscribes afterward misses — leaving its connection
+    // state Unknown even as data flows. Tell the freshly-subscribed route the
+    // provider is up.
+    let route = routes.get(&key);
+    broadcast_control_to(
+        route,
+        ControlKind::ProviderConnected {
+            provider: PROVIDER_ID.to_string(),
+        },
+    )
+    .await;
+    broadcast_control_to(
+        route,
+        ControlKind::SubscriptionChanged {
+            provider: PROVIDER_ID.to_string(),
+            instrument: key.0.clone(),
+            kind,
+            active: true,
+        },
+    )
+    .await;
+    res
+}
+
+/// Remove the route for `(instrument, kind)`: drop the pair from `subs`,
+/// remove it upstream, then drop the route and tell its sink the
+/// subscription ended. A failed upstream removal keeps the pair in `subs`,
+/// so a reconnect applies it again.
+async fn unsubscribe_route(
+    routes: &mut HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+    subs: &mut StockSubscriptionList,
+    upstream: &mut impl RouteUpstream,
+    instrument: Instrument,
+    kind: EventKind,
+) -> Result<()> {
+    apply_pair_to_list(subs, &instrument, kind, false);
+    let mut removal = StockSubscriptionList::new();
+    apply_pair_to_list(&mut removal, &instrument, kind, true);
+    let res = upstream.remove(&removal).await;
+    if res.is_ok() {
+        // Drop the route after the upstream ack so any tail events still in
+        // flight are routable.
+        let removed = routes.remove(&(instrument.clone(), kind));
+        broadcast_control_to(
+            removed.as_ref(),
+            ControlKind::SubscriptionChanged {
+                provider: PROVIDER_ID.to_string(),
+                instrument,
+                kind,
+                active: false,
+            },
+        )
+        .await;
+    } else {
+        // The pair is still streaming upstream, so a reconnect must apply it.
+        apply_pair_to_list(subs, &instrument, kind, true);
+    }
+    res
 }
 
 fn is_empty(list: &StockSubscriptionList) -> bool {
@@ -2455,5 +2516,111 @@ mod tests {
             )),
             StreamFailure::Transient
         );
+    }
+
+    /// Records the upstream calls a route command makes; refuses `add` while
+    /// `refuse_add` is set.
+    #[derive(Default)]
+    struct FakeUpstream {
+        adds: usize,
+        removals: Vec<StockSubscriptionList>,
+        refuse_add: bool,
+    }
+
+    impl RouteUpstream for FakeUpstream {
+        async fn add(&mut self, _subs: &StockSubscriptionList) -> Result<()> {
+            self.adds += 1;
+            if self.refuse_add {
+                return Err(Error::Provider {
+                    provider: PROVIDER_ID.to_string(),
+                    message: "refused".to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        async fn remove(&mut self, removal: &StockSubscriptionList) -> Result<()> {
+            self.removals.push(removal.clone());
+            Ok(())
+        }
+    }
+
+    /// A connected hub's route state, served one command at a time.
+    struct FakeHub {
+        cmd_tx: mpsc::Sender<HubCommand>,
+        cmd_rx: mpsc::Receiver<HubCommand>,
+        routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
+        subs: StockSubscriptionList,
+        upstream: FakeUpstream,
+    }
+
+    impl FakeHub {
+        fn new() -> Self {
+            let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            Self {
+                cmd_tx,
+                cmd_rx,
+                routes: HashMap::new(),
+                subs: StockSubscriptionList::new(),
+                upstream: FakeUpstream::default(),
+            }
+        }
+
+        /// A session's handle onto this hub and the receiver of its sink.
+        fn handle(&self) -> (Box<SharedLiveHandle>, mpsc::Receiver<MarketEvent>) {
+            let (sink, rx) = mpsc::channel(8);
+            let handle = SharedLiveHandle {
+                cmd_tx: self.cmd_tx.clone(),
+                sink,
+                subscribed: Mutex::new(None),
+            };
+            (Box::new(handle), rx)
+        }
+
+        async fn serve_one(&mut self) {
+            let cmd = self.cmd_rx.recv().await.expect("a command");
+            handle_route_command(&mut self.routes, &mut self.subs, &mut self.upstream, cmd).await;
+        }
+    }
+
+    /// A subscribe the upstream refuses also clears a route an earlier
+    /// session left behind, so nothing re-applies the pair on a reconnect.
+    #[tokio::test]
+    async fn a_refused_subscribe_clears_a_route_left_behind() {
+        let instrument = provider_instrument("AAPL");
+        let mut hub = FakeHub::new();
+        let (left_behind, _left_rx) = hub.handle();
+        let (successor, _successor_rx) = hub.handle();
+        let (subscribed, ()) = tokio::join!(
+            left_behind.subscribe(instrument.clone(), EventKind::Trade),
+            hub.serve_one()
+        );
+        subscribed.expect("the first session subscribes");
+
+        hub.upstream.refuse_add = true;
+        let (refused, ()) = tokio::join!(
+            successor.subscribe(instrument, EventKind::Trade),
+            hub.serve_one()
+        );
+        assert!(refused.is_err(), "the upstream refused the successor");
+        assert!(hub.routes.is_empty());
+        assert_eq!(hub.subs.trades, None);
+    }
+
+    /// A first subscribe the upstream refuses leaves no route, and no pair to
+    /// re-apply on the next connect.
+    #[tokio::test]
+    async fn a_refused_first_subscribe_leaves_nothing_behind() {
+        let instrument = provider_instrument("AAPL");
+        let mut hub = FakeHub::new();
+        let (session, _rx) = hub.handle();
+        hub.upstream.refuse_add = true;
+        let (refused, ()) = tokio::join!(
+            session.subscribe(instrument.clone(), EventKind::Trade),
+            hub.serve_one()
+        );
+        assert!(refused.is_err(), "the upstream refused the subscribe");
+        assert!(hub.routes.is_empty());
+        assert_eq!(hub.subs.trades, None);
     }
 }

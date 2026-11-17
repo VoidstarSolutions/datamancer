@@ -26,6 +26,7 @@ pub fn error_code(err: &datamancer::Error) -> &'static str {
         Error::UnknownProvider(_) => codes::UNKNOWN_PROVIDER,
         Error::ProviderDisabled { .. } => codes::PROVIDER_DISABLED,
         Error::SessionClosed => codes::SESSION_CLOSED,
+        Error::SessionBusy => codes::SESSION_BUSY,
         Error::EventsAlreadyTaken => codes::EVENTS_ALREADY_TAKEN,
         Error::Storage(_) => codes::STORAGE,
         Error::Config(_) => codes::CONFIG,
@@ -66,6 +67,7 @@ mod tests {
             error_code(&Error::PersistenceRequired),
             codes::PERSISTENCE_REQUIRED
         );
+        assert_eq!(error_code(&Error::SessionBusy), codes::SESSION_BUSY);
         assert_eq!(
             error_code(&Error::BackfillFromNotInPast {
                 from: datamancer::Timestamp(2),

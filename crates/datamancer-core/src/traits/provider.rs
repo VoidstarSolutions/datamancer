@@ -223,7 +223,13 @@ pub trait LiveHandle: Send + Sync {
     /// for returning after it.
     async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()>;
 
-    /// Deactivate `(instrument, kind)`. Symmetric with `subscribe`.
+    /// Deactivate `(instrument, kind)`.
+    ///
+    /// Whoever drives a provider's handles must not let them overlap on a
+    /// pair: a pair's next `subscribe`, on this handle or another, is issued
+    /// only after this call has returned. datamancer's sessions do so, and an
+    /// implementation that keeps one route per pair then has no other
+    /// handle's subscription to protect.
     async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()>;
 
     /// Tear down the live connection. Implementations should drop the event
