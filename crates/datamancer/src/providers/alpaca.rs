@@ -71,12 +71,12 @@ use oxidized_alpaca::{
         messages::stock::{StockBar, StockQuoteEvent, StockTradeEvent},
     },
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use super::alpaca_common::SymbolLists;
 use super::credentials::{AlpacaCredentials, CredentialsSource, PresentCredentials, Resolved};
 use super::hub::{Connector, HubSlot, HubSources, SubscriptionSet, Upstream, wall_clock_ts};
-use super::runtime::SettingsSource;
+use super::runtime::{SettingsSource, Watched};
 use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca-backed provider.
@@ -342,12 +342,10 @@ fn build_rest(cfg: &AlpacaProviderConfig) -> RestClients {
 /// await) guards both so the check-and-rebuild is atomic.
 struct RestState {
     clients: RestClients,
-    /// `Some` only for [`CredentialsSource::Watch`]; `has_changed` on this
-    /// cached receiver is the rebuild trigger.
-    cred_rx: Option<watch::Receiver<Option<AlpacaCredentials>>>,
-    /// `Some` only for [`SettingsSource::Watch`]; `has_changed` on this
-    /// cached receiver is the rebuild trigger.
-    settings_rx: Option<watch::Receiver<Option<AlpacaSettings>>>,
+    /// The credentials watch; a change on it is a rebuild trigger.
+    cred_rx: Watched<Option<AlpacaCredentials>>,
+    /// The settings watch; a change on it is a rebuild trigger.
+    settings_rx: Watched<Option<AlpacaSettings>>,
 }
 
 /// Alpaca-backed [`Provider`].
@@ -370,8 +368,8 @@ impl AlpacaProvider {
         // (Capturing after building would mark an in-between rotation seen
         // while the cached clients are stale.) Applies to both the
         // credentials and the settings receiver.
-        let cred_rx = cfg.credentials.watch();
-        let settings_rx = cfg.settings.watch();
+        let cred_rx = cfg.credentials.read().into_watch();
+        let settings_rx = cfg.settings.read().into_watch();
         let rest = std::sync::Mutex::new(RestState {
             clients: build_rest(&cfg),
             cred_rx,
@@ -391,8 +389,8 @@ impl AlpacaProvider {
     pub fn with_rest(cfg: AlpacaProviderConfig, rest: MarketDataClient) -> Self {
         // Ordering invariant — receiver before build: a rotation after
         // capture triggers rebuild; before capture is included in the build.
-        let cred_rx = cfg.credentials.watch();
-        let settings_rx = cfg.settings.watch();
+        let cred_rx = cfg.credentials.read().into_watch();
+        let settings_rx = cfg.settings.read().into_watch();
         let mut clients = build_rest(&cfg);
         clients.market_data = Some(rest);
         let rest = std::sync::Mutex::new(RestState {
@@ -427,8 +425,7 @@ impl AlpacaProvider {
     /// handles).
     fn rest_clients(&self) -> RestClients {
         let mut state = self.rest.lock().expect("REST client state poisoned");
-        let changed = super::runtime::watch_changed(&mut state.cred_rx)
-            | super::runtime::watch_changed(&mut state.settings_rx);
+        let changed = state.cred_rx.take_change() | state.settings_rx.take_change();
         if changed {
             state.clients = build_rest(&self.cfg);
         }

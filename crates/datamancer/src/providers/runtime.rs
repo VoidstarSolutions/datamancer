@@ -82,6 +82,28 @@ impl<T> Watched<T> {
         }
         std::future::pending().await
     }
+
+    /// Whether a change has landed since the read this watch came from, or
+    /// since the last call, marking it seen. A sender that has gone is
+    /// asked once more for a value it left unseen, and the receiver goes
+    /// with it, so every later call is `false`.
+    pub(crate) fn take_change(&mut self) -> bool {
+        let Some(rx) = &mut self.0 else {
+            return false;
+        };
+        match rx.has_changed() {
+            Ok(true) => {
+                rx.borrow_and_update();
+                true
+            }
+            Ok(false) => false,
+            Err(_) => {
+                let changed = rx.borrow_and_update().has_changed();
+                self.0 = None;
+                changed
+            }
+        }
+    }
 }
 
 /// One read of a source for a connect: its value with the watch on which the
@@ -96,6 +118,15 @@ pub(crate) enum WatchRead<V, W = V> {
     Value { value: V, rx: Watched<Option<W>> },
     /// No value yet, and the watch that delivers one.
     Empty(Watched<Option<W>>),
+}
+
+impl<V, W> WatchRead<V, W> {
+    /// The watch alone, for a reader that takes its value elsewhere.
+    pub(crate) fn into_watch(self) -> Watched<Option<W>> {
+        match self {
+            Self::Value { rx, .. } | Self::Empty(rx) => rx,
+        }
+    }
 }
 
 /// Read `rx` for one connect. The value and the seen-marker come from one
@@ -136,53 +167,11 @@ impl<T: Clone> SettingsSource<T> {
             Self::Watch(rx) => read_watch(rx),
         }
     }
-
-    /// The watch receiver, when this source is watchable. The clone is
-    /// returned with the current value marked seen (tokio's
-    /// `Receiver::clone` copies the *original* receiver's seen version;
-    /// without `mark_unchanged` every clone handed out after the first
-    /// change would report `has_changed` immediately — the reconnect-storm
-    /// bug from cycle 2).
-    pub(crate) fn watch(&self) -> Option<watch::Receiver<Option<T>>> {
-        match self {
-            Self::Watch(rx) => {
-                let mut rx = rx.clone();
-                rx.mark_unchanged();
-                Some(rx)
-            }
-            Self::Static(_) => None,
-        }
-    }
-}
-
-/// Whether a cached watch receiver has an unseen change, consuming the
-/// marker. Shared by the providers' REST rebuild-on-use guards for both the
-/// credential and the settings receivers.
-///
-/// On a closed channel (sender dropped) tokio's `has_changed` returns `Err`
-/// even when a final unseen value is pending, so `Err` counts as changed —
-/// the caller rebuilds once with the last value — and the receiver is
-/// dropped so subsequent calls return `false` instead of rebuilding forever.
-pub(crate) fn watch_changed<T>(rx_slot: &mut Option<watch::Receiver<T>>) -> bool {
-    let Some(rx) = rx_slot.as_mut() else {
-        return false;
-    };
-    match rx.has_changed() {
-        Ok(true) => {
-            let _ = rx.borrow_and_update();
-            true
-        }
-        Ok(false) => false,
-        Err(_) => {
-            *rx_slot = None;
-            true
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingsSource, WatchRead, Watched, watch_changed};
+    use super::{SettingsSource, WatchRead, Watched};
 
     /// A read of a watched source carries the receiver with its value, and
     /// that receiver reports only a change after the read; a disabled source
@@ -235,7 +224,7 @@ mod tests {
     fn static_source_is_always_enabled() {
         let src = SettingsSource::Static(7_u32);
         assert_eq!(src.current(), Some(7));
-        assert!(src.watch().is_none());
+        assert!(src.read().into_watch().0.is_none());
     }
 
     #[test]
@@ -247,51 +236,91 @@ mod tests {
         assert_eq!(src.current(), Some(7));
     }
 
+    /// A watch taken from a read reports only what lands after the read,
+    /// once each.
     #[test]
-    fn watch_clone_does_not_see_pre_clone_sends() {
+    fn take_change_reports_each_change_after_the_read_once() {
         let (tx, rx) = tokio::sync::watch::channel(None);
         let src = SettingsSource::Watch(rx);
         tx.send(Some(1_u32)).unwrap();
-        let fresh = src.watch().expect("watchable");
-        assert_eq!(fresh.has_changed().ok(), Some(false));
+        let mut watched = src.read().into_watch();
+        assert!(!watched.take_change(), "a send before the read is seen");
+        tx.send(Some(2)).unwrap();
+        assert!(watched.take_change());
+        assert!(!watched.take_change());
     }
 
+    /// A value the sender left before going is reported once; after that,
+    /// with nothing left to change, never again.
     #[test]
-    fn watch_clone_sees_post_clone_sends() {
+    fn take_change_reports_a_last_value_once_the_sender_goes() {
         let (tx, rx) = tokio::sync::watch::channel(None);
         let src = SettingsSource::Watch(rx);
-        let fresh = src.watch().expect("watchable");
-        tx.send(Some(1_u32)).unwrap();
-        assert_eq!(fresh.has_changed().ok(), Some(true));
-    }
-
-    #[test]
-    fn watch_changed_consumes_the_marker() {
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        let src = SettingsSource::Watch(rx);
-        let mut cached = src.watch();
-        assert!(!watch_changed(&mut cached));
-        tx.send(Some(1_u32)).unwrap();
-        assert!(watch_changed(&mut cached));
-        assert!(!watch_changed(&mut cached));
-    }
-
-    #[test]
-    fn watch_changed_syncs_once_on_closed_channel() {
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        let src = SettingsSource::Watch(rx);
-        let mut cached = src.watch();
+        let mut watched = src.read().into_watch();
         tx.send(Some(1_u32)).unwrap();
         drop(tx);
-        assert!(watch_changed(&mut cached));
-        assert!(!watch_changed(&mut cached));
-        assert!(!watch_changed(&mut cached));
+        assert!(watched.take_change());
+        assert!(watched.0.is_none(), "the receiver is dropped");
+        assert!(!watched.take_change());
+    }
+
+    /// A sender that goes having left nothing unseen is no change.
+    #[test]
+    fn take_change_ignores_a_sender_gone_with_nothing_new() {
+        let (tx, rx) = tokio::sync::watch::channel(Some(1_u32));
+        let mut watched = Watched(Some(rx));
+        drop(tx);
+        assert!(!watched.take_change());
+        assert!(watched.0.is_none(), "the receiver is dropped");
+    }
+
+    /// A send landing while `take_change` runs is never marked seen
+    /// without being reported: once a send has completed, a later call
+    /// reports it unless an earlier one already did.
+    #[test]
+    fn take_change_never_swallows_a_concurrent_send() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+        for iteration in 0..20_000 {
+            let (tx, rx) = tokio::sync::watch::channel(Some(0_u32));
+            let mut watched = SettingsSource::Watch(rx).read().into_watch();
+            let sent = Arc::new(AtomicBool::new(false));
+            let start = Arc::new(Barrier::new(2));
+            let writer = {
+                let sent = Arc::clone(&sent);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..fastrand::u32(0..200) {
+                        std::hint::spin_loop();
+                    }
+                    tx.send(Some(1)).unwrap();
+                    sent.store(true, Ordering::SeqCst);
+                    tx
+                })
+            };
+            start.wait();
+            let reported = loop {
+                if watched.take_change() {
+                    break true;
+                }
+                if sent.load(Ordering::SeqCst) {
+                    break watched.take_change();
+                }
+            };
+            let _tx = writer.join().unwrap();
+            assert!(reported, "send swallowed on iteration {iteration}");
+        }
     }
 
     #[test]
-    fn watch_changed_ignores_static_sources() {
-        let mut cached = SettingsSource::Static(1_u32).watch();
-        assert!(!watch_changed(&mut cached));
+    fn take_change_ignores_static_sources() {
+        assert!(
+            !SettingsSource::Static(1_u32)
+                .read()
+                .into_watch()
+                .take_change()
+        );
     }
 
     /// A value the sender left comes first, then its going, once; after that

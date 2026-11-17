@@ -125,27 +125,6 @@ impl CredentialsSource {
         }
     }
 
-    /// The watch receiver, when this source is watchable (the streaming
-    /// loops select on it for hot reconnect).
-    ///
-    /// The clone is returned with the current value marked seen: tokio's
-    /// `Receiver::clone` copies the *original* receiver's seen version, and
-    /// the stored receiver never advances (`current()` uses `borrow`), so
-    /// without `mark_unchanged` every clone handed out after the first
-    /// rotation would report `has_changed` immediately — turning the
-    /// per-connect clones in the streaming loops into an unbounded
-    /// reconnect storm.
-    pub(crate) fn watch(&self) -> Option<tokio::sync::watch::Receiver<Option<AlpacaCredentials>>> {
-        match self {
-            Self::Watch(rx) => {
-                let mut rx = rx.clone();
-                rx.mark_unchanged();
-                Some(rx)
-            }
-            _ => None,
-        }
-    }
-
     /// Read the source for one connect (see [`WatchRead`]): the credentials
     /// to connect with, or `Empty` while a `Watch` source has none. A `Watch`
     /// source is read as [`read_watch`] says; an `Env` source names the pair
@@ -265,29 +244,6 @@ mod tests {
             Resolved::Creds(c) => assert_eq!(c.key_id, "A"),
             other => panic!("expected Creds, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn watch_clone_does_not_see_pre_clone_sends() {
-        // tokio's `Receiver::clone` copies the *original* receiver's seen
-        // version, and `current()` never advances it (it uses `borrow`).
-        // Without `mark_unchanged` on the clone, every receiver handed out
-        // after the first rotation would report `has_changed` immediately —
-        // the reconnect-storm bug.
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        let source = CredentialsSource::Watch(rx);
-        tx.send(Some(creds("A"))).unwrap();
-        let fresh = source.watch().expect("watchable");
-        assert_eq!(fresh.has_changed().ok(), Some(false));
-    }
-
-    #[test]
-    fn watch_clone_sees_post_clone_sends() {
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        let source = CredentialsSource::Watch(rx);
-        let fresh = source.watch().expect("watchable");
-        tx.send(Some(creds("A"))).unwrap();
-        assert_eq!(fresh.has_changed().ok(), Some(true));
     }
 
     #[test]
