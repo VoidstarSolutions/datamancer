@@ -2438,7 +2438,7 @@ impl Controller {
                 .run_backfill(window, &mut provider_rx, &mut cmd_rx, &mut remove_rx)
                 .await
         {
-            self.teardown_upstream(&live).await;
+            self.teardown_upstream(&live, provider_rx).await;
             return;
         }
         loop {
@@ -2505,7 +2505,7 @@ impl Controller {
                 }
             }
         }
-        self.teardown_upstream(&live).await;
+        self.teardown_upstream(&live, provider_rx).await;
     }
 
     /// End the seed's pending window: every subscriber is passed what follows.
@@ -2552,7 +2552,14 @@ impl Controller {
     /// Nothing to release on the provider's connection state: it is derived at
     /// snapshot time from the substreams still in the live registry, and this
     /// one leaves the registry when its `AuthoritativeSession` drops.
-    async fn teardown_upstream(&mut self, live: &Arc<Mutex<Option<Box<dyn LiveHandle>>>>) {
+    async fn teardown_upstream(
+        &mut self,
+        live: &Arc<Mutex<Option<Box<dyn LiveHandle>>>>,
+        provider_rx: mpsc::Receiver<MarketEvent>,
+    ) {
+        // Nothing reads the provider channel from here on: let a provider
+        // blocked sending into it go, so it can hear the unsubscribe.
+        drop(provider_rx);
         if let Some(h) = live.lock().await.take() {
             self.accounting.record_unsubscribe();
             let _ = h
