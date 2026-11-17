@@ -36,17 +36,17 @@
 //! exponential backoff per the configured [`ReconnectPolicy`], and
 //! reconnects — re-applying the aggregate subscription set. A
 //! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast to
-//! every active sink so consumers see the gap window in the event stream. A
-//! credential pair rejected (`402`) at connect, on the re-subscribe after a
-//! reconnect, or mid-stream parks until the credentials rotate when they
-//! come from a watched source, and backs off like any other failure
-//! otherwise; a `406` or any other server error is transient and backs off
-//! (see the `Classify` impl in `alpaca_common` for the upstream caveat). A `402` that
-//! refuses a session's own subscribe is answered to that subscribe as
-//! unauthenticated and does not park. A parked or backing-off hub still
-//! hears a disable, and a session that closes while the hub is parked or
-//! backing off takes its pair with it rather than leaving it for the next
-//! connect.
+//! every active sink so consumers see the gap window in the event stream.
+//! Which failures, at connect, on the re-subscribe after a reconnect, or
+//! mid-stream, mean rejected credentials and which are transient is decided
+//! in one place, the `Classify` impl in `alpaca_common`, which also records
+//! where upstream cannot tell them apart. Rejected credentials park until
+//! they rotate when they come from a watched source, and back off like any
+//! other failure otherwise. A session's own subscribe refused for its
+//! credentials is answered to that subscribe as unauthenticated and does not
+//! park the hub. A parked or backing-off hub still hears a disable, and a
+//! session that closes while the hub is parked or backing off takes its pair
+//! with it rather than leaving it for the next connect.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1757,7 +1757,7 @@ pub(super) mod tests {
     /// rejected credential too (see the classifier's docs for the upstream
     /// limitation).
     #[test]
-    fn stream_failures_park_on_402_and_back_off_on_406() {
+    fn stream_failures_classify_402_as_unauthenticated_and_406_as_transient() {
         let mid_stream = oxidized_alpaca::Error::StreamingError;
         assert_eq!(
             server_error(mid_stream, StreamErrorCode::AuthFailed).classify(),

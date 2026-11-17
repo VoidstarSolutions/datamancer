@@ -1499,9 +1499,10 @@ pub(super) mod tests {
         assert!(
             matches!(
                 hub.another_subscribe().await,
-                Err(Error::Unauthenticated { .. })
+                Err(Error::Unauthenticated { ref message, .. })
+                    if message == "waiting for new credentials after auth rejection"
             ),
-            "a subscribe to the parked hub says why"
+            "the park refuses the subscribe, not the upstream"
         );
         hub.rotate_credentials().await;
         assert_eq!(hub.connects(), 3, "a rotation reconnects it");

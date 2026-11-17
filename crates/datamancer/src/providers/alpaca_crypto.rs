@@ -23,17 +23,12 @@
 //!
 //! # Reconnect
 //!
-//! On websocket failure the hub tears down the client, sleeps with
-//! exponential backoff per the configured [`ReconnectPolicy`], and
-//! reconnects, re-applying the active subscription set. A
-//! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast
-//! to all active sinks so consumers see the gap window. A rejected
-//! credential pair (`402`), at connect, on the re-subscribe after a
-//! reconnect, or mid-stream, parks until the credentials rotate when they
-//! come from a watched source, and backs off like any other failure
-//! otherwise; a `406` or any other server error is transient and backs off.
-//! A parked or backing-off hub still hears a disable, and a session that
-//! closes while the hub is parked or backing off takes its pair with it.
+//! The crypto stream runs on the same hub code as the stock stream, so it
+//! reconnects, parks and backs off exactly as
+//! [the stock provider](super::alpaca#reconnect) does, under the
+//! configured [`ReconnectPolicy`]. Which of its failures are rejected
+//! credentials and which are transient is the `Classify` impl's to say, in
+//! `alpaca_common`.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -967,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn crypto_stream_failures_park_on_402_and_back_off_on_406() {
+    fn crypto_stream_failures_classify_402_as_unauthenticated_and_406_as_transient() {
         assert_eq!(
             oxidized_alpaca::Error::StreamingAuth.classify(),
             StreamFailure::Unauthenticated
