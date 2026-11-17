@@ -85,6 +85,19 @@ impl Disconnected {
     const fn wakes_on_rotation(self) -> bool {
         matches!(self, Self::MissingCredentials | Self::RejectedCredentials)
     }
+
+    /// What the routes are told on entering this state, once, unless they
+    /// last heard the same cause; `None` where the failure that led here
+    /// has told them already.
+    const fn announcement(self) -> Option<(DisconnectCause, &'static str)> {
+        match self {
+            Self::Disabled => Some((DisconnectCause::Disabled, "provider disabled")),
+            Self::MissingCredentials => {
+                Some((DisconnectCause::Unauthenticated, "credentials missing"))
+            }
+            Self::RejectedCredentials | Self::Reconnecting(_) => None,
+        }
+    }
 }
 
 /// A provider's aggregate subscription set, as its upstream takes it.
@@ -456,6 +469,8 @@ type SettingsRx<S> = Watched<Option<S>>;
 enum Next {
     /// Resolve the sources again and connect.
     Reconnect,
+    /// Sleep out the current backoff, then connect.
+    BackOff,
     /// The provider and every handle are gone: exit.
     Exit,
 }
@@ -492,6 +507,63 @@ impl FailurePoint {
     }
 }
 
+/// Why a connection, or the attempt at one, ended: what the routes are
+/// told and what the hub does next. [`Hub::end_connection`] is where every
+/// ending is told, before the socket closes.
+enum Ending {
+    /// The credentials watch delivered a new pair: reconnect with it.
+    CredentialsRotated,
+    /// The credentials watch was cleared: reconnect into the park that
+    /// waits for a pair.
+    CredentialsCleared,
+    /// The settings watch delivered new settings: reconnect with them.
+    SettingsChanged,
+    /// The settings watch disabled the provider: reconnect into the park.
+    Disabled,
+    /// The connect, the re-subscribe or the stream failed as `failure`,
+    /// with the error's `chain`.
+    Failed {
+        point: FailurePoint,
+        failure: StreamFailure,
+        chain: String,
+    },
+}
+
+impl Ending {
+    /// A failure at `point`, classified.
+    fn failed<E: std::error::Error + Classify + 'static>(point: FailurePoint, err: &E) -> Self {
+        Self::Failed {
+            point,
+            failure: err.classify(),
+            chain: error_chain(err),
+        }
+    }
+
+    /// The cause and reason the routes are told.
+    fn announcement(&self) -> (DisconnectCause, String) {
+        match self {
+            Self::CredentialsRotated => (DisconnectCause::Error, "credentials rotated".to_string()),
+            Self::CredentialsCleared => (
+                DisconnectCause::Unauthenticated,
+                "credentials cleared".to_string(),
+            ),
+            Self::SettingsChanged => (DisconnectCause::Error, "settings changed".to_string()),
+            Self::Disabled => (DisconnectCause::Disabled, "provider disabled".to_string()),
+            Self::Failed {
+                point,
+                failure,
+                chain,
+            } => (
+                match failure {
+                    StreamFailure::Unauthenticated => DisconnectCause::Unauthenticated,
+                    StreamFailure::Transient => DisconnectCause::Error,
+                },
+                point.reason(chain),
+            ),
+        }
+    }
+}
+
 /// One hub task: the connector and sources it connects with, the command
 /// channel its handles reach it over, and the state that outlives any one
 /// connection.
@@ -509,7 +581,8 @@ struct Hub<C: Connector> {
     /// subscription set applied.
     backoff_ms: u64,
     /// The cause the routes last heard a disconnect for, until the next
-    /// connect, so a disable is told once however the hub comes to it.
+    /// connect, so a park's cause (a disable, missing credentials) is told
+    /// once however the hub comes to it.
     routes_heard: Option<DisconnectCause>,
     /// The credentials watch of the current cycle, taken at its read.
     cred_rx: CredentialsRx,
@@ -534,7 +607,14 @@ async fn run_hub<C: Connector>(
         cred_rx: Watched(None),
         settings_rx: Watched(None),
     };
-    while hub.cycle().await == Next::Reconnect {}
+    let mut next = Next::Reconnect;
+    loop {
+        next = match next {
+            Next::Reconnect => hub.cycle().await,
+            Next::BackOff => hub.back_off().await,
+            Next::Exit => return,
+        };
+    }
 }
 
 impl<C: Connector> Hub<C> {
@@ -547,11 +627,9 @@ impl<C: Connector> Hub<C> {
                 self.settings_rx = rx;
                 value
             }
-            // Disabled: tell the routes, then park until the settings watch
-            // delivers a value.
+            // Disabled: park until the settings watch delivers a value.
             WatchRead::Empty(rx) => {
                 self.settings_rx = rx;
-                self.tell_routes_disabled().await;
                 return self.idle(Disconnected::Disabled).await;
             }
         };
@@ -580,7 +658,10 @@ impl<C: Connector> Hub<C> {
                 .await;
                 upstream
             }
-            Err(err) => return self.fail(FailurePoint::Connect, &err).await,
+            Err(err) => {
+                let ending = Ending::failed(FailurePoint::Connect, &err);
+                return self.end_connection(None, ending).await;
+            }
         };
 
         // Re-apply the aggregate subscription set on a fresh socket. A
@@ -598,8 +679,8 @@ impl<C: Connector> Hub<C> {
             Ok(()) => self.reset_backoff(),
             Err(err) => match err.classify() {
                 StreamFailure::Unauthenticated => {
-                    upstream.shut_down().await;
-                    return self.fail(FailurePoint::Resubscribe, &err).await;
+                    let ending = Ending::failed(FailurePoint::Resubscribe, &err);
+                    return self.end_connection(Some(upstream), ending).await;
                 }
                 StreamFailure::Transient => {
                     broadcast_error::<C>(
@@ -640,79 +721,76 @@ impl<C: Connector> Hub<C> {
                             }
                         }
                         Err(err) => {
-                            drop(upstream);
-                            return self.fail(FailurePoint::Stream, &err).await;
+                            let ending = Ending::failed(FailurePoint::Stream, &err);
+                            return self.end_connection(Some(upstream), ending).await;
                         }
                     }
                 }
-                _ = self.cred_rx.changed() => {
-                    tracing::info!(
-                        provider = C::PROVIDER_ID,
-                        "credentials changed; reconnecting"
-                    );
-                    // Same in-band control the failure path broadcasts,
-                    // then reconnect at once with the new credentials.
-                    self.broadcast_disconnected(
-                        "credentials rotated".to_string(),
-                        DisconnectCause::Error,
-                    )
-                    .await;
-                    upstream.shut_down().await;
-                    return Next::Reconnect;
+                creds = self.cred_rx.changed() => {
+                    let ending = if creds.is_some() {
+                        Ending::CredentialsRotated
+                    } else {
+                        Ending::CredentialsCleared
+                    };
+                    return self.end_connection(Some(upstream), ending).await;
                 }
                 settings = self.settings_rx.changed() => {
-                    // The connection ends either way, and the routes hear it
-                    // end before anything else.
-                    if settings.is_some() {
-                        tracing::info!(
-                            provider = C::PROVIDER_ID,
-                            "settings changed; reconnecting"
-                        );
-                        self.broadcast_disconnected(
-                            "settings changed".to_string(),
-                            DisconnectCause::Error,
-                        )
-                        .await;
+                    let ending = if settings.is_some() {
+                        Ending::SettingsChanged
                     } else {
-                        self.tell_routes_disabled().await;
-                    }
-                    upstream.shut_down().await;
-                    return Next::Reconnect;
+                        Ending::Disabled
+                    };
+                    return self.end_connection(Some(upstream), ending).await;
                 }
             }
         }
     }
 
-    /// A failed connect, refused re-subscribe or failed stream: classify it,
-    /// log it, tell every route how the provider disconnected, then park
-    /// until the credentials rotate when it is a rejected credential from a
-    /// watched source (retrying cannot help, provisioning can), or back off
-    /// (a static source cannot rotate, and anything else may clear on its
-    /// own).
-    async fn fail(&mut self, point: FailurePoint, err: &FailureOf<C>) -> Next {
-        let failure = err.classify();
-        let unauthenticated = failure == StreamFailure::Unauthenticated;
-        let chain = error_chain(err);
-        tracing::warn!(
-            provider = C::PROVIDER_ID,
-            ?failure,
-            error = %chain,
-            "{}",
-            point.log_message()
-        );
-        self.broadcast_disconnected(
-            point.reason(&chain),
-            if unauthenticated {
-                DisconnectCause::Unauthenticated
-            } else {
-                DisconnectCause::Error
-            },
-        )
-        .await;
-        if unauthenticated && self.cred_rx.may_change() {
-            return self.idle(Disconnected::RejectedCredentials).await;
+    /// End a connection, or the attempt at one, as `ending` says: log it,
+    /// tell every route how the provider disconnected, then close the
+    /// socket, if there is one, so the routes hear the gap before anything
+    /// that follows it. A rejected credential from a watched source parks
+    /// until the credentials rotate (retrying cannot help, provisioning
+    /// can); any other failure backs off (a static source cannot rotate,
+    /// and anything else may clear on its own); every other ending
+    /// reconnects at once.
+    async fn end_connection(&mut self, upstream: Option<C::Upstream>, ending: Ending) -> Next {
+        let (cause, reason) = ending.announcement();
+        if let Ending::Failed {
+            point,
+            failure,
+            chain,
+        } = &ending
+        {
+            tracing::warn!(
+                provider = C::PROVIDER_ID,
+                ?failure,
+                error = %chain,
+                "{}",
+                point.log_message()
+            );
+        } else {
+            tracing::info!(provider = C::PROVIDER_ID, "{reason}; reconnecting");
         }
-        self.back_off().await
+        self.broadcast_disconnected(cause, reason).await;
+        if let Some(upstream) = upstream {
+            match ending {
+                // The stream has already failed: nothing to close cleanly.
+                Ending::Failed {
+                    point: FailurePoint::Stream,
+                    ..
+                } => drop(upstream),
+                _ => upstream.shut_down().await,
+            }
+        }
+        match ending {
+            Ending::Failed {
+                failure: StreamFailure::Unauthenticated,
+                ..
+            } if self.cred_rx.may_change() => self.idle(Disconnected::RejectedCredentials).await,
+            Ending::Failed { .. } => Next::BackOff,
+            _ => Next::Reconnect,
+        }
     }
 
     /// Start the backoff ladder over: a fresh connection has its
@@ -721,19 +799,9 @@ impl<C: Connector> Hub<C> {
         self.backoff_ms = self.sources.reconnect.initial_backoff_ms;
     }
 
-    /// Tell the routes the provider was disabled, unless that is the last
-    /// thing they heard.
-    async fn tell_routes_disabled(&mut self) {
-        if self.routes_heard == Some(DisconnectCause::Disabled) {
-            return;
-        }
-        tracing::info!(provider = C::PROVIDER_ID, "provider disabled");
-        self.broadcast_disconnected("provider disabled".to_string(), DisconnectCause::Disabled)
-            .await;
-    }
-
-    /// Tell every route the provider disconnected, for `reason`.
-    async fn broadcast_disconnected(&mut self, reason: String, cause: DisconnectCause) {
+    /// Tell every route the provider disconnected with `cause`, for
+    /// `reason`.
+    async fn broadcast_disconnected(&mut self, cause: DisconnectCause, reason: String) {
         self.routes_heard = Some(cause);
         broadcast_control(
             &self.routes,
@@ -752,6 +820,12 @@ impl<C: Connector> Hub<C> {
     /// rather than spinning. With every sender gone the hub still answers
     /// commands, so its shutdown (every handle dropped) still works.
     async fn idle(&mut self, why: Disconnected) -> Next {
+        if let Some((cause, reason)) = why.announcement()
+            && self.routes_heard != Some(cause)
+        {
+            tracing::info!(provider = C::PROVIDER_ID, "{reason}");
+            self.broadcast_disconnected(cause, reason.to_string()).await;
+        }
         let mut clock = std::pin::pin!(async {
             match why {
                 Disconnected::Reconnecting(delay) => tokio::time::sleep(delay).await,
@@ -768,10 +842,8 @@ impl<C: Connector> Hub<C> {
                     // No rotation can come any more. A rejected pair is then
                     // retried like a static one, since a rejection may yet
                     // clear on its own; missing credentials stay missing.
-                    // Boxed because the backoff waits here again, as
-                    // `Reconnecting`, which never takes this arm.
                     if matches!(why, Disconnected::RejectedCredentials) {
-                        return Box::pin(self.back_off()).await;
+                        return Next::BackOff;
                     }
                 }
                 _ = self.settings_rx.changed() => return Next::Reconnect,
@@ -801,7 +873,7 @@ impl<C: Connector> Hub<C> {
         } else {
             self.backoff_ms
         };
-        self.backoff_ms = (self.backoff_ms * 2).min(policy.max_backoff_ms);
+        self.backoff_ms = self.backoff_ms.saturating_mul(2).min(policy.max_backoff_ms);
         self.idle(Disconnected::Reconnecting(Duration::from_millis(delay_ms)))
             .await
     }
@@ -2217,6 +2289,49 @@ pub(super) mod tests {
         drop(handle);
     }
 
+    /// Credentials cleared while connected end the connection as
+    /// unauthenticated, once, and the park that follows says why.
+    #[tokio::test(start_paused = true)]
+    async fn clearing_the_credentials_while_connected_is_unauthenticated() {
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![]).await;
+        hub.creds_tx.send(None).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            disconnect_causes(&mut hub.rx),
+            [DisconnectCause::Unauthenticated]
+        );
+        assert_eq!(hub.connects(), 1, "parked until credentials arrive");
+        assert!(matches!(
+            hub.another_subscribe().await,
+            Err(Error::Unauthenticated { ref message, .. }) if message == "waiting for credentials"
+        ));
+    }
+
+    /// Credentials cleared and provisioned again while the connection shuts
+    /// down still show the routes the gap: they hear the disconnect before
+    /// the reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn credentials_cleared_and_restored_during_shut_down_still_show_the_gap() {
+        let (_hub, mut hub) = ConnectedHub::on(
+            FakeUpstream {
+                yields_on_shut_down: true,
+                ..FakeUpstream::idle()
+            },
+            vec![Ok(FakeUpstream::idle())],
+        )
+        .await;
+        hub.creds_tx.send(None).unwrap();
+        tokio::task::yield_now().await; // the hub takes the clear and shuts down
+        hub.creds_tx.send(Some(test_credentials())).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(hub.connects(), 2, "the hub reconnected with the new pair");
+        assert_eq!(
+            disconnect_causes(&mut hub.rx),
+            [DisconnectCause::Unauthenticated],
+            "the routes heard the gap"
+        );
+    }
+
     /// A subscribe from a session whose stream is already gone subscribes
     /// nothing upstream and is answered as closed, never `Ok` for a pair no
     /// add carried.
@@ -2343,6 +2458,26 @@ pub(super) mod tests {
             .unsubscribe(aapl(), EventKind::Trade)
             .await
             .expect("the first pair is still routed");
+    }
+
+    /// A backoff near the top of `u64` stops at the policy's maximum
+    /// instead of overflowing when it doubles.
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_near_the_top_of_u64_does_not_overflow() {
+        let sources = HubSources {
+            reconnect: ReconnectPolicy {
+                initial_backoff_ms: u64::MAX / 2 + 1,
+                max_backoff_ms: u64::MAX,
+                jitter: false,
+            },
+            ..static_sources()
+        };
+        let (hub, _cmd_tx) = spawn_hub(
+            FakeConnector::scripted(vec![Err(Refused(StreamFailure::Transient))]),
+            sources,
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!hub.is_finished(), "the hub is sleeping out its backoff");
     }
 
     /// A spawn that panics while the slot is locked (here: outside a tokio
