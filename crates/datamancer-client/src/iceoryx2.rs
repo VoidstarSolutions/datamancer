@@ -433,6 +433,9 @@ impl Drop for QueryStream {
 /// event stream ends when the daemon drops the per-client services, or, with
 /// no item saying why, on a receive failure or a malformed announcement. A
 /// killed daemon drops nothing: its stream may stay silent instead of ending.
+/// A [`snapshot`](Client::snapshot) asked while another snapshot request on
+/// the daemon's control socket is still being answered gets that request's
+/// answer.
 pub struct Iceoryx2Client {
     control: ControlHandle,
     client_name: String,

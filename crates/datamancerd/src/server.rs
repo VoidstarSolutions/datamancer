@@ -440,8 +440,8 @@ pub struct Server {
     /// The sessions of the WS surface's connections.
     #[cfg(feature = "ws")]
     ws_sessions: crate::ws::WsSessions,
-    /// The turn a snapshot holds while it reads the cache catalog.
-    snapshot_turn: Arc<tokio::sync::Mutex<()>>,
+    /// The snapshots waiting on the cache catalog read in flight, if one is.
+    snapshot_waiters: SnapshotWaiters,
     /// In-flight historical queries, keyed by id. Ids share `next_client_id`
     /// with clients, so a query's data-service name can never collide with a
     /// client's.
@@ -666,7 +666,7 @@ impl Server {
             closing: Vec::new(),
             #[cfg(feature = "ws")]
             ws_sessions: crate::ws::WsSessions::default(),
-            snapshot_turn: Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_waiters: SnapshotWaiters::default(),
             #[cfg(not(windows))]
             queries: HashMap::new(),
             #[cfg(not(windows))]
@@ -1548,18 +1548,21 @@ impl Server {
     fn abort_all_queries(&mut self) {}
 
     /// Take a snapshot from a task that replies once the cache catalog is
-    /// read, so a slow disk stalls no other request. One snapshot reads at a
-    /// time and later ones wait their turn, so requests against a stalled
-    /// disk do not pile up catalog reads. The drain does not wait on the
-    /// task; the runtime's shutdown, bounded by the exit deadline, stops one
-    /// still reading.
+    /// read, so a slow disk stalls no other request. A snapshot asked for
+    /// while one is reading gets that read's answer. The drain does not wait
+    /// on the task; the runtime's shutdown, bounded by the exit deadline,
+    /// stops one still reading.
     fn snapshot(&self, reply: oneshot::Sender<Reply>) {
+        let Some(read) = self.snapshot_waiters.join(reply) else {
+            return;
+        };
         let dm = self.dm.clone();
-        answer_in_turn(Arc::clone(&self.snapshot_turn), reply, async move {
-            match dm.snapshot().await {
+        tokio::spawn(async move {
+            let answer = match dm.snapshot().await {
                 Ok(snapshot) => Reply::snapshot(snapshot),
                 Err(e) => reply_from_library_error(&e),
-            }
+            };
+            read.answer(&answer);
         });
     }
 
@@ -1658,17 +1661,63 @@ async fn wait_for_ws_sessions(
     tokio::time::timeout_at(deadline, ended).await.is_ok()
 }
 
-/// Answer `reply` with `answer` from a task of its own, which runs `answer`
-/// only once it holds `turn`: one such answer is computed at a time.
-fn answer_in_turn(
-    turn: Arc<tokio::sync::Mutex<()>>,
-    reply: oneshot::Sender<Reply>,
-    answer: impl Future<Output = Reply> + Send + 'static,
-) {
-    tokio::spawn(async move {
-        let _turn = turn.lock().await;
-        let _ = reply.send(answer.await);
-    });
+/// The snapshots waiting on one cache catalog read: `None` while no read is
+/// in flight.
+type Waiting = Arc<std::sync::Mutex<Option<Vec<oneshot::Sender<Reply>>>>>;
+
+/// Where a snapshot joins the cache catalog read in flight, or starts one.
+#[derive(Default)]
+struct SnapshotWaiters(Waiting);
+
+impl SnapshotWaiters {
+    /// Wait on the read in flight, or, with none, start the wait a new read
+    /// answers and return that read.
+    fn join(&self, reply: oneshot::Sender<Reply>) -> Option<SnapshotRead> {
+        let mut waiting = self.0.lock().expect("snapshot waiters mutex poisoned");
+        if let Some(waiters) = waiting.as_mut() {
+            waiters.push(reply);
+            None
+        } else {
+            *waiting = Some(vec![reply]);
+            Some(SnapshotRead(Some(Arc::clone(&self.0))))
+        }
+    }
+}
+
+/// The one cache catalog read its [`SnapshotWaiters`] wait on, and the only
+/// way to end that wait. Dropped without an [`answer`](Self::answer), as by
+/// a panicking task, it answers them `internal`.
+struct SnapshotRead(Option<Waiting>);
+
+impl SnapshotRead {
+    fn answer(mut self, answer: &Reply) {
+        self.finish(answer);
+    }
+
+    /// Answer every waiter and end the wait, so the next snapshot starts a
+    /// fresh read.
+    fn finish(&mut self, answer: &Reply) {
+        let Some(waiting) = self.0.take() else {
+            return;
+        };
+        let waiters = waiting
+            .lock()
+            .expect("snapshot waiters mutex poisoned")
+            .take()
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(answer.clone());
+        }
+    }
+}
+
+impl Drop for SnapshotRead {
+    fn drop(&mut self) {
+        self.finish(&Reply::error(
+            codes::INTERNAL,
+            "the snapshot read ended without an answer",
+        ));
+    }
 }
 
 /// The reply to a request on a client that is being torn down.
@@ -2529,6 +2578,7 @@ fn unix_terminate() -> Result<tokio::signal::unix::Signal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn an_exit_deadline_past_instant_range_does_not_panic() {
@@ -2933,6 +2983,7 @@ mod tests {
     /// A cache whose catalog read waits until `release` is notified.
     struct BlockingCatalogCache {
         release: Arc<tokio::sync::Notify>,
+        reads: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -2951,6 +3002,7 @@ mod tests {
             Ok(())
         }
         async fn catalog(&self) -> datamancer::Result<Vec<datamancer::CacheCatalogEntry>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             self.release.notified().await;
             Ok(Vec::new())
         }
@@ -2981,7 +3033,7 @@ mod tests {
             closing: Vec::new(),
             #[cfg(feature = "ws")]
             ws_sessions: crate::ws::WsSessions::default(),
-            snapshot_turn: Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_waiters: SnapshotWaiters::default(),
             #[cfg(not(windows))]
             queries: HashMap::new(),
             #[cfg(not(windows))]
@@ -3024,6 +3076,7 @@ mod tests {
         let dm = Datamancer::builder()
             .historical_cache(Box::new(BlockingCatalogCache {
                 release: release.clone(),
+                reads: Arc::default(),
             }))
             .build()
             .expect("build");
@@ -3064,6 +3117,54 @@ mod tests {
             .expect("snapshot answered once the catalog returns")
             .expect("reply sent");
         assert!(snapshot.ok, "{snapshot:?}");
+    }
+
+    /// Snapshots asked for while one reads the cache catalog share that read:
+    /// against a stalled disk they wait on one read rather than queue a read
+    /// each.
+    #[tokio::test]
+    async fn snapshots_asked_during_a_catalog_read_share_it() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let dm = Datamancer::builder()
+            .historical_cache(Box::new(BlockingCatalogCache {
+                release: release.clone(),
+                reads: reads.clone(),
+            }))
+            .build()
+            .expect("build");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut server = test_server(dm, dir.path());
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<ServerCommand>(4);
+
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = oneshot::channel();
+            let _ = server
+                .handle(
+                    ServerCommand::Request {
+                        request: Request::Snapshot,
+                        reply: tx,
+                    },
+                    &cmd_tx,
+                )
+                .await;
+            answers.push(rx);
+        }
+        // Let the first read reach the catalog before it is released.
+        while reads.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_one();
+
+        for answer in answers {
+            let snapshot = tokio::time::timeout(Duration::from_secs(5), answer)
+                .await
+                .expect("every waiting snapshot answered by the one read")
+                .expect("reply sent");
+            assert!(snapshot.ok, "{snapshot:?}");
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3483,37 +3584,49 @@ always_on = true
         let _ = other.close().await;
     }
 
-    /// Answers computed in turn never overlap: the second starts only once
-    /// the first has been sent.
+    /// A snapshot that joins an open read gets that read's answer, and the
+    /// first snapshot after the answer starts a fresh read.
     #[tokio::test]
-    async fn answers_in_turn_are_computed_one_at_a_time() {
-        let turn = Arc::new(tokio::sync::Mutex::new(()));
-        let release_first = Arc::new(tokio::sync::Notify::new());
-        let second_started = Arc::new(AtomicBool::new(false));
+    async fn snapshot_waiters_share_one_read_and_the_next_starts_another() {
+        let waiters = SnapshotWaiters::default();
         let (first_tx, first_rx) = oneshot::channel();
         let (second_tx, second_rx) = oneshot::channel();
 
-        let gate = Arc::clone(&release_first);
-        answer_in_turn(Arc::clone(&turn), first_tx, async move {
-            gate.notified().await;
-            Reply::ok()
-        });
-        let started = Arc::clone(&second_started);
-        answer_in_turn(turn, second_tx, async move {
-            started.store(true, Ordering::Release);
-            Reply::ok()
-        });
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        let read = waiters
+            .join(first_tx)
+            .expect("no read in flight: this one reads");
         assert!(
-            !second_started.load(Ordering::Acquire),
-            "the second answer started while the first was still being computed"
+            waiters.join(second_tx).is_none(),
+            "joined the read in flight"
         );
+        read.answer(&Reply::ok());
 
-        release_first.notify_one();
         assert!(first_rx.await.expect("first answer").ok);
         assert!(second_rx.await.expect("second answer").ok);
+        let (third_tx, _third_rx) = oneshot::channel();
+        assert!(
+            waiters.join(third_tx).is_some(),
+            "a snapshot after the answer starts a fresh read"
+        );
+    }
+
+    /// A read that ends without an answer, as a panicking task does, still
+    /// answers its waiters and frees the next snapshot to read.
+    #[tokio::test]
+    async fn a_snapshot_read_dropped_unanswered_answers_internal() {
+        let waiters = SnapshotWaiters::default();
+        let (first_tx, first_rx) = oneshot::channel();
+
+        let read = waiters.join(first_tx).expect("no read in flight");
+        drop(read);
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), first_rx)
+            .await
+            .expect("answered on drop")
+            .expect("reply sent");
+        assert_eq!(reply.code.as_deref(), Some(codes::INTERNAL));
+        let (next_tx, _next_rx) = oneshot::channel();
+        assert!(waiters.join(next_tx).is_some(), "the wait ended");
     }
 
     /// A refusal at the client cap says how many slots closed clients still

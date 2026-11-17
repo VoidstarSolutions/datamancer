@@ -518,7 +518,8 @@ One JSON object per line; one reply line per request.
 ```
 
 `snapshot` reads the cache catalog, which can wait on the disk; the daemon
-answers other requests meanwhile.
+answers other requests meanwhile. A `snapshot` asked while another is reading
+the catalog gets that read's answer rather than reading again.
 
 `subscribe` opens an unbounded subscription:
 
