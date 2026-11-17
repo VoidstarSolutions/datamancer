@@ -525,8 +525,14 @@ the catalog gets that read's answer rather than reading again.
 
 - The reply comes once the provider has the pair, which on a provider not yet
   connected includes its connect. If the pair's previous session is still
-  unsubscribing at the provider, the subscribe waits for it, and after 30 s
-  answers `provider`; it can be retried. The daemon answers other requests
+  tearing down (unsubscribing at the provider, then flushing its tap log),
+  the subscribe waits for it, and after 30 s answers `provider`; it can be
+  retried. While a client's subscribe waits, for the connect or for that
+  teardown, the client's session forwards none
+  of its other subscriptions' events: a busy one fills its channel and the
+  rest becomes a `Gap`, and the client's teardown after a `close-client`
+  (which answers at once) waits behind it, holding the client's
+  `max_clients` slot meanwhile (#139). The daemon answers other requests
   meanwhile, and a connection's next request is read after the reply. A
   client's `subscribe` and `unsubscribe` requests take effect in the order
   the daemon received them, whichever connections sent them, so an
