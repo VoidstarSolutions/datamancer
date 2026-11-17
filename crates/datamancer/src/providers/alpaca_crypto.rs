@@ -19,7 +19,9 @@
 //!
 //! The session-registry rule (at most one live session per pair) makes the
 //! routing unambiguous: each `(instrument, kind)` key maps to exactly one
-//! sink at any time.
+//! sink at any time. As for [the stock provider](super::alpaca), a hub task
+//! that ends closes the sinks of its subscribed sessions, unless the caller
+//! kept a clone of the sender it handed to `start_live`.
 //!
 //! # Reconnect
 //!
@@ -503,10 +505,6 @@ impl SubscriptionSet for CryptoSubscriptionList {
 
     fn insert(&mut self, instrument: &Instrument, kind: EventKind) {
         crypto_symbol_lists(self).insert(instrument, kind);
-    }
-
-    fn remove(&mut self, instrument: &Instrument, kind: EventKind) {
-        crypto_symbol_lists(self).remove(instrument, kind);
     }
 }
 

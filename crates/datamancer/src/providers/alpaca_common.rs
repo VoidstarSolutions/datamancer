@@ -42,7 +42,7 @@ impl Classify for oxidized_alpaca::Error {
 /// The symbol lists of an Alpaca subscription list that the hub fills, one
 /// per streamed [`EventKind`]. The stock and crypto lists both have these
 /// four, as `Option<Vec<String>>` that is `None` when empty, and the hub
-/// subscribes to nothing else, so one insert and remove serve both.
+/// subscribes to nothing else, so one insert serves both.
 pub(super) struct SymbolLists<'a> {
     pub(super) trades: &'a mut Option<Vec<String>>,
     pub(super) quotes: &'a mut Option<Vec<String>>,
@@ -89,18 +89,6 @@ impl<'a> SymbolLists<'a> {
             let list = field.get_or_insert_with(Vec::new);
             if !list.iter().any(|s| s == instrument.symbol()) {
                 list.push(instrument.symbol().to_string());
-            }
-        }
-    }
-
-    /// Drop `instrument` from the list for `kind`; an emptied list is `None`.
-    pub(super) fn remove(self, instrument: &Instrument, kind: EventKind) {
-        if let Some(field) = self.list(kind)
-            && let Some(list) = field.as_mut()
-        {
-            list.retain(|s| s != instrument.symbol());
-            if list.is_empty() {
-                *field = None;
             }
         }
     }

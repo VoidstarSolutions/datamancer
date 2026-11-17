@@ -28,7 +28,10 @@
 //! command channel. The hub owns the upstream socket, applies the aggregate
 //! subscription set to it, and routes incoming events to the right
 //! per-session sink by `(instrument, kind)`. The session-registry rule (at
-//! most one live session per pair) keeps that routing a function.
+//! most one live session per pair) keeps that routing a function. While a
+//! handle is subscribed, the hub's route holds the sink handed to
+//! `start_live`, so if the hub task ends the sink closes and the stream
+//! ends, unless the caller kept a clone of that sender.
 //!
 //! # Reconnect
 //!
@@ -653,10 +656,6 @@ impl SubscriptionSet for StockSubscriptionList {
     fn insert(&mut self, instrument: &Instrument, kind: EventKind) {
         stock_symbol_lists(self).insert(instrument, kind);
     }
-
-    fn remove(&mut self, instrument: &Instrument, kind: EventKind) {
-        stock_symbol_lists(self).remove(instrument, kind);
-    }
 }
 
 /// The lists of `list` the hub fills.
@@ -1273,10 +1272,9 @@ pub(super) mod tests {
     }
 
     /// A pair inserted lands in the list for its kind, once however often it
-    /// is inserted; removed, it leaves an emptied list as `None`, and a
-    /// removal of a pair not held changes nothing.
+    /// is inserted.
     #[test]
-    fn subscription_list_insert_and_remove() {
+    fn subscription_list_insert() {
         let mut list = StockSubscriptionList::new();
         let aapl = provider_instrument("AAPL");
         SubscriptionSet::insert(&mut list, &aapl, EventKind::Trade);
@@ -1284,12 +1282,6 @@ pub(super) mod tests {
         SubscriptionSet::insert(&mut list, &aapl, EventKind::Bar(BarInterval::OneMinute));
         assert_eq!(list.trades.as_deref(), Some(&["AAPL".to_string()][..]));
         assert_eq!(list.bars.as_deref(), Some(&["AAPL".to_string()][..]));
-        assert!(list.quotes.is_none());
-        SubscriptionSet::remove(&mut list, &aapl, EventKind::Quote);
-        SubscriptionSet::remove(&mut list, &aapl, EventKind::Trade);
-        SubscriptionSet::remove(&mut list, &aapl, EventKind::Bar(BarInterval::OneMinute));
-        assert!(list.trades.is_none());
-        assert!(list.bars.is_none());
         assert!(list.quotes.is_none());
     }
 
@@ -1299,8 +1291,6 @@ pub(super) mod tests {
         assert!(SubscriptionSet::is_empty(&set));
         set.insert(&provider_instrument("AAPL"), EventKind::Trade);
         assert!(!SubscriptionSet::is_empty(&set));
-        set.remove(&provider_instrument("AAPL"), EventKind::Trade);
-        assert!(SubscriptionSet::is_empty(&set));
     }
 
     #[test]

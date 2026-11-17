@@ -10,6 +10,7 @@
 //! per-message path stays monomorphic.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -94,8 +95,6 @@ pub(super) trait SubscriptionSet: Clone + Send + Sync + 'static {
     fn is_empty(&self) -> bool;
     /// Add one `(instrument, kind)` pair; one already held stays as it is.
     fn insert(&mut self, instrument: &Instrument, kind: EventKind);
-    /// Remove one `(instrument, kind)` pair; one not held changes nothing.
-    fn remove(&mut self, instrument: &Instrument, kind: EventKind);
 }
 
 /// How a failure reads, as a [`StreamFailure`], which says what the hub
@@ -283,14 +282,31 @@ enum HubCommand {
     Subscribe {
         instrument: Instrument,
         kind: EventKind,
+        owner: HandleId,
         sink: mpsc::Sender<MarketEvent>,
         ack: oneshot::Sender<Result<()>>,
     },
+    /// Answered with the route's sink when the hub drops `owner`'s route,
+    /// and `None` when `owner` has no route for the pair.
     Unsubscribe {
         instrument: Instrument,
         kind: EventKind,
-        ack: oneshot::Sender<Result<()>>,
+        owner: HandleId,
+        ack: oneshot::Sender<Result<Option<mpsc::Sender<MarketEvent>>>>,
     },
+}
+
+/// Which handle a route belongs to, so a handle's commands reach only its
+/// own route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HandleId(u64);
+
+impl HandleId {
+    /// An id no other handle has.
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 /// One session's handle onto the shared hub: it carries the session's sink
@@ -298,11 +314,25 @@ enum HubCommand {
 /// itself belongs to the hub, never to a handle.
 pub(super) struct SharedLiveHandle {
     cmd_tx: mpsc::Sender<HubCommand>,
-    /// Per-session sink the hub will route events to once subscribed.
-    sink: mpsc::Sender<MarketEvent>,
-    /// Tracks the pair this handle is subscribed to so `close` can clean it
-    /// up. With a per-session handle this is at most one pair.
-    subscribed: Mutex<Option<(Instrument, EventKind)>>,
+    id: HandleId,
+    state: Mutex<HandleState>,
+}
+
+/// Where a handle's session sink is. The sink moves to the hub with a
+/// subscribe and comes back with the unsubscribe's answer, so while a pair
+/// is routed the hub's route is its only strong sender: the sink closes
+/// when the hub drops the route, however the hub ends, a panic included,
+/// and the session sees its stream end rather than going silent.
+enum HandleState {
+    /// Not routed: the handle holds the sink for its next subscribe.
+    Idle(mpsc::Sender<MarketEvent>),
+    /// The hub routes `pair` to the sink.
+    Routed {
+        pair: (Instrument, EventKind),
+        sink: mpsc::WeakSender<MarketEvent>,
+    },
+    /// The sink has closed with the hub that held it.
+    Closed,
 }
 
 impl SharedLiveHandle {
@@ -311,68 +341,93 @@ impl SharedLiveHandle {
     fn new(cmd_tx: mpsc::Sender<HubCommand>, sink: mpsc::Sender<MarketEvent>) -> Self {
         Self {
             cmd_tx,
-            sink,
-            subscribed: Mutex::new(None),
+            id: HandleId::next(),
+            state: Mutex::new(HandleState::Idle(sink)),
         }
+    }
+
+    /// Ask the hub to drop this handle's route for `pair`: its sink when it
+    /// did, `None` when the handle had no route there.
+    async fn send_unsubscribe(
+        &self,
+        (instrument, kind): (Instrument, EventKind),
+    ) -> Result<Option<mpsc::Sender<MarketEvent>>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(HubCommand::Unsubscribe {
+                instrument,
+                kind,
+                owner: self.id,
+                ack: tx,
+            })
+            .await
+            .map_err(|_| Error::SessionClosed)?;
+        rx.await.map_err(|_| Error::SessionClosed)?
     }
 }
 
 #[async_trait]
 impl LiveHandle for SharedLiveHandle {
     async fn subscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let pair = (instrument, kind);
+        // A refused subscribe leaves the handle as it was, so it keeps a
+        // sender until the hub answers.
+        let sink = match &*state {
+            HandleState::Idle(sink) => sink.clone(),
+            HandleState::Routed { pair: routed, sink } if *routed == pair => {
+                sink.upgrade().ok_or(Error::SessionClosed)?
+            }
+            HandleState::Routed {
+                pair: (instrument, kind),
+                ..
+            } => {
+                return Err(Error::DuplicateSubscription {
+                    instrument: instrument.clone(),
+                    kind: *kind,
+                });
+            }
+            HandleState::Closed => return Err(Error::SessionClosed),
+        };
+        let weak = sink.downgrade();
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(HubCommand::Subscribe {
-                instrument: instrument.clone(),
+                instrument: pair.0.clone(),
                 kind,
-                sink: self.sink.clone(),
+                owner: self.id,
+                sink,
                 ack: tx,
             })
             .await
             .map_err(|_| Error::SessionClosed)?;
-        let res = rx.await.map_err(|_| Error::SessionClosed)?;
-        if res.is_ok() {
-            *self.subscribed.lock().await = Some((instrument, kind));
-        }
-        res
+        rx.await.map_err(|_| Error::SessionClosed)??;
+        *state = HandleState::Routed { pair, sink: weak };
+        Ok(())
     }
 
     async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(HubCommand::Unsubscribe {
-                instrument: instrument.clone(),
-                kind,
-                ack: tx,
-            })
-            .await
-            .map_err(|_| Error::SessionClosed)?;
-        let res = rx.await.map_err(|_| Error::SessionClosed)?;
-        if res.is_ok() {
-            let mut slot = self.subscribed.lock().await;
-            if slot.as_ref() == Some(&(instrument, kind)) {
-                *slot = None;
-            }
+        let mut state = self.state.lock().await;
+        let pair = (instrument, kind);
+        let returned = self.send_unsubscribe(pair.clone()).await?;
+        if let HandleState::Routed { pair: routed, sink } = &*state
+            && *routed == pair
+        {
+            *state = match returned.or_else(|| sink.upgrade()) {
+                Some(sink) => HandleState::Idle(sink),
+                None => HandleState::Closed,
+            };
         }
-        res
+        Ok(())
     }
 
     async fn close(self: Box<Self>) -> Result<()> {
         // If the session never explicitly unsubscribed, do it now so the hub
         // drops the route. The hub itself is shared; its lifetime is tied to
         // the provider, not any one session.
-        let pair = self.subscribed.lock().await.take();
-        if let Some((instrument, kind)) = pair {
-            let (tx, rx) = oneshot::channel();
-            let _ = self
-                .cmd_tx
-                .send(HubCommand::Unsubscribe {
-                    instrument,
-                    kind,
-                    ack: tx,
-                })
-                .await;
-            let _ = rx.await;
+        let state = std::mem::replace(&mut *self.state.lock().await, HandleState::Closed);
+        if let HandleState::Routed { pair, .. } = state {
+            let _ = self.send_unsubscribe(pair).await;
         }
         Ok(())
     }
@@ -382,8 +437,15 @@ impl LiveHandle for SharedLiveHandle {
 // Hub task
 // ---------------------------------------------------------------------------
 
-/// The sinks of the live sessions, keyed by the pair each owns.
-pub(super) type Routes = HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>;
+/// A live session's route: the handle it belongs to and the sink its
+/// events go to.
+pub(super) struct Route {
+    owner: HandleId,
+    sink: mpsc::Sender<MarketEvent>,
+}
+
+/// The routes of the live sessions, keyed by the pair each owns.
+pub(super) type Routes = HashMap<(Instrument, EventKind), Route>;
 /// The credentials watch of one connect cycle.
 type CredentialsRx = Watched<Option<AlpacaCredentials>>;
 /// The settings watch of one connect cycle.
@@ -437,11 +499,11 @@ struct Hub<C: Connector> {
     connector: Arc<C>,
     sources: HubSources<C::Settings>,
     cmd_rx: mpsc::Receiver<HubCommand>,
-    /// Per-session sinks keyed by the pair they own; the session registry's
-    /// at-most-one-live-session-per-pair rule keeps this a function.
+    /// The live sessions' routes, keyed by the pair each owns; the session
+    /// registry's at-most-one-live-session-per-pair rule keeps this a
+    /// function. The pairs whose sinks are still open are the aggregate
+    /// subscription set (see [`open_set`]).
     routes: Routes,
-    /// Authoritative aggregate subscription set, applied to every fresh socket.
-    subs: <C::Upstream as Upstream>::Subs,
     /// The next backoff, doubled after each failed connect up to the
     /// policy's maximum and reset once a fresh connection has the
     /// subscription set applied.
@@ -468,7 +530,6 @@ async fn run_hub<C: Connector>(
         sources,
         cmd_rx,
         routes: HashMap::new(),
-        subs: <C::Upstream as Upstream>::Subs::empty(),
         routes_heard: None,
         cred_rx: Watched(None),
         settings_rx: Watched(None),
@@ -527,10 +588,11 @@ impl<C: Connector> Hub<C> {
         // server says so, and ends this connection like a failed stream; any
         // other refusal is broadcast and the stream stays up, since a
         // reconnect would only be refused again.
-        let applied = if self.subs.is_empty() {
+        let subs = open_set::<C>(&mut self.routes);
+        let applied = if subs.is_empty() {
             Ok(())
         } else {
-            upstream.add(&self.subs).await
+            upstream.add(&subs).await
         };
         match applied {
             Ok(()) => self.reset_backoff(),
@@ -564,13 +626,8 @@ impl<C: Connector> Hub<C> {
                         upstream.shut_down().await;
                         return Next::Exit;
                     };
-                    let applied = handle_route_command::<C>(
-                        &mut self.routes,
-                        &mut self.subs,
-                        &mut upstream,
-                        cmd,
-                    )
-                    .await;
+                    let applied =
+                        handle_route_command::<C>(&mut self.routes, &mut upstream, cmd).await;
                     if applied {
                         self.reset_backoff();
                     }
@@ -752,11 +809,11 @@ impl<C: Connector> Hub<C> {
     /// Answer a command that arrives while there is no connection. A
     /// subscribe is refused as `why` says, so the session sees a clear
     /// error rather than stalling. An unsubscribe has no socket to reach,
-    /// so it is applied here, to the routes and the aggregate set, and
-    /// answered `Ok`: a session that closes while the hub is parked or
-    /// backing off takes its pair with it, rather than leaving it for the
-    /// next connect to subscribe for nobody, against the account's symbol
-    /// limit, until another session takes the pair.
+    /// so it is applied here, to the routes, and answered `Ok`: a session
+    /// that closes while the hub is parked or backing off takes its pair
+    /// with it, rather than leaving it for the next connect to subscribe
+    /// for nobody, against the account's symbol limit, until another
+    /// session takes the pair.
     async fn handle_disconnected_command(&mut self, cmd: HubCommand, why: Disconnected) {
         match cmd {
             HubCommand::Subscribe { ack, .. } => {
@@ -765,11 +822,11 @@ impl<C: Connector> Hub<C> {
             HubCommand::Unsubscribe {
                 instrument,
                 kind,
+                owner,
                 ack,
             } => {
-                self.subs.remove(&instrument, kind);
-                end_route::<C>(&mut self.routes, instrument, kind).await;
-                let _ = ack.send(Ok(()));
+                let sink = end_route::<C>(&mut self.routes, owner, (instrument, kind)).await;
+                let _ = ack.send(Ok(sink));
             }
         }
     }
@@ -780,13 +837,13 @@ impl<C: Connector> Hub<C> {
 /// provider-level state changes.
 pub(super) async fn dispatch_event(routes: &Routes, ev: MarketEvent) {
     if let Some(key) = event_route_key(&ev) {
-        if let Some(sink) = routes.get(&key) {
-            let _ = sink.send(ev).await;
+        if let Some(route) = routes.get(&key) {
+            let _ = route.sink.send(ev).await;
         }
         return;
     }
-    for sink in routes.values() {
-        let _ = sink.send(ev.clone()).await;
+    for route in routes.values() {
+        let _ = route.sink.send(ev.clone()).await;
     }
 }
 
@@ -810,12 +867,24 @@ fn ack_error<C: Connector>(what: &str, failure: &FailureOf<C>) -> Error {
     }
 }
 
+/// The aggregate subscription set: the pairs of the routes whose sinks are
+/// still open. A route whose session has gone is dropped here, so a pair
+/// nobody listens to leaves the set whether or not the upstream ever
+/// acknowledged its removal.
+fn open_set<C: Connector>(routes: &mut Routes) -> <C::Upstream as Upstream>::Subs {
+    routes.retain(|_, route| !route.sink.is_closed());
+    let mut subs = <C::Upstream as Upstream>::Subs::empty();
+    for (instrument, kind) in routes.keys() {
+        subs.insert(instrument, *kind);
+    }
+    subs
+}
+
 /// Apply one session's subscribe or unsubscribe on the connected socket and
 /// answer it. Returns whether a subscribe applied the aggregate set, since a
 /// subscribe sends the whole set and its success is the set applied.
 async fn handle_route_command<C: Connector>(
     routes: &mut Routes,
-    subs: &mut <C::Upstream as Upstream>::Subs,
     upstream: &mut C::Upstream,
     cmd: HubCommand,
 ) -> bool {
@@ -823,10 +892,12 @@ async fn handle_route_command<C: Connector>(
         HubCommand::Subscribe {
             instrument,
             kind,
+            owner,
             sink,
             ack,
         } => {
-            let res = subscribe_route::<C>(routes, subs, upstream, instrument, kind, sink).await;
+            let route = Route { owner, sink };
+            let res = subscribe_route::<C>(routes, upstream, (instrument, kind), route).await;
             let applied = res.is_ok();
             let _ = ack.send(res);
             applied
@@ -834,33 +905,44 @@ async fn handle_route_command<C: Connector>(
         HubCommand::Unsubscribe {
             instrument,
             kind,
+            owner,
             ack,
         } => {
-            let res = unsubscribe_route::<C>(routes, subs, upstream, instrument, kind).await;
+            let res = unsubscribe_route::<C>(routes, upstream, owner, (instrument, kind)).await;
             let _ = ack.send(res);
             false
         }
     }
 }
 
-/// Route `(instrument, kind)` to `sink` and subscribe it upstream. If the
-/// upstream refuses, the route and the pair are dropped again, so a
-/// reconnect does not apply a subscription the server rejected. That also
-/// clears a route left behind by a session whose unsubscribe never arrived.
+/// Route `key` as `route` says and subscribe the aggregate set upstream.
+/// If the upstream refuses, the route is dropped again, so a reconnect does
+/// not apply a subscription the server rejected. That also clears a route
+/// another handle left behind when its unsubscribe never arrived; the same
+/// handle's earlier route, kept by a refused unsubscribe, stays.
 async fn subscribe_route<C: Connector>(
     routes: &mut Routes,
-    subs: &mut <C::Upstream as Upstream>::Subs,
     upstream: &mut C::Upstream,
-    instrument: Instrument,
-    kind: EventKind,
-    sink: mpsc::Sender<MarketEvent>,
+    key: (Instrument, EventKind),
+    route: Route,
 ) -> Result<()> {
-    let key = (instrument, kind);
-    routes.insert(key.clone(), sink);
-    subs.insert(&key.0, kind);
-    if let Err(failure) = upstream.add(subs).await {
-        routes.remove(&key);
-        subs.remove(&key.0, kind);
+    let owner = route.owner;
+    let previous = routes.insert(key.clone(), route);
+    let subs = open_set::<C>(routes);
+    // `open_set` pruned the route if the session went before its subscribe
+    // was served; subscribe nothing for it.
+    if !routes.contains_key(&key) {
+        return Err(Error::SessionClosed);
+    }
+    if let Err(failure) = upstream.add(&subs).await {
+        match previous {
+            Some(previous) if previous.owner == owner => {
+                routes.insert(key, previous);
+            }
+            _ => {
+                routes.remove(&key);
+            }
+        }
         return Err(ack_error::<C>("add_subscriptions", &failure));
     }
     // We are in the connected loop, so the provider is up.
@@ -868,7 +950,7 @@ async fn subscribe_route<C: Connector>(
     // which a route that subscribes afterward misses — leaving its connection
     // state Unknown even as data flows. Tell the freshly-subscribed route the
     // provider is up.
-    let route = routes.get(&key);
+    let route = routes.get(&key).map(|route| &route.sink);
     broadcast_control_to(
         route,
         ControlKind::ProviderConnected {
@@ -881,7 +963,7 @@ async fn subscribe_route<C: Connector>(
         ControlKind::SubscriptionChanged {
             provider: C::PROVIDER_ID.to_string(),
             instrument: key.0.clone(),
-            kind,
+            kind: key.1,
             active: true,
         },
     )
@@ -889,51 +971,57 @@ async fn subscribe_route<C: Connector>(
     Ok(())
 }
 
-/// Remove the route for `(instrument, kind)`: drop the pair from `subs`,
-/// remove it upstream, then drop the route and tell its sink the
-/// subscription ended. A failed upstream removal keeps the pair in `subs`,
-/// so a reconnect applies it again.
+/// Remove `owner`'s pair upstream, then drop its route, tell its sink the
+/// subscription ended and hand the sink back. A pair routed to another
+/// handle is left alone. A pair with no route, its session's closed sink
+/// pruned, is still removed upstream, where it stays live until then. A
+/// refused removal keeps the route, so a reconnect applies the pair again
+/// while its session listens; once the session has gone, its closed sink
+/// takes the pair out of the set.
 async fn unsubscribe_route<C: Connector>(
     routes: &mut Routes,
-    subs: &mut <C::Upstream as Upstream>::Subs,
     upstream: &mut C::Upstream,
-    instrument: Instrument,
-    kind: EventKind,
-) -> Result<()> {
-    let key = (instrument, kind);
-    subs.remove(&key.0, kind);
+    owner: HandleId,
+    key: (Instrument, EventKind),
+) -> Result<Option<mpsc::Sender<MarketEvent>>> {
+    if routes.get(&key).is_some_and(|route| route.owner != owner) {
+        return Ok(None);
+    }
     let mut removal = <C::Upstream as Upstream>::Subs::empty();
-    removal.insert(&key.0, kind);
+    removal.insert(&key.0, key.1);
     match upstream.remove(&removal).await {
-        Ok(()) => {
-            // Drop the route after the upstream ack so any tail events still
-            // in flight are routable.
-            end_route::<C>(routes, key.0, kind).await;
-            Ok(())
-        }
-        Err(failure) => {
-            // The pair is still streaming upstream, so a reconnect must apply it.
-            subs.insert(&key.0, kind);
-            Err(ack_error::<C>("remove_subscriptions", &failure))
-        }
+        // Drop the route after the upstream ack so any tail events still in
+        // flight are routable.
+        Ok(()) => Ok(end_route::<C>(routes, owner, key).await),
+        Err(failure) => Err(ack_error::<C>("remove_subscriptions", &failure)),
     }
 }
 
-/// Drop the route for `(instrument, kind)` and tell its sink, if it has one,
-/// that the subscription ended.
-async fn end_route<C: Connector>(routes: &mut Routes, instrument: Instrument, kind: EventKind) {
-    let key = (instrument, kind);
-    let removed = routes.remove(&key);
+/// Drop `owner`'s route for `key`, tell its sink that the subscription
+/// ended, and return the sink. A route another handle owns stays.
+async fn end_route<C: Connector>(
+    routes: &mut Routes,
+    owner: HandleId,
+    key: (Instrument, EventKind),
+) -> Option<mpsc::Sender<MarketEvent>> {
+    let Entry::Occupied(entry) = routes.entry(key) else {
+        return None;
+    };
+    if entry.get().owner != owner {
+        return None;
+    }
+    let ((instrument, kind), Route { sink, .. }) = entry.remove_entry();
     broadcast_control_to(
-        removed.as_ref(),
+        Some(&sink),
         ControlKind::SubscriptionChanged {
             provider: C::PROVIDER_ID.to_string(),
-            instrument: key.0,
+            instrument,
             kind,
             active: false,
         },
     )
     .await;
+    Some(sink)
 }
 
 /// A control event stamped with the current wall clock.
@@ -950,8 +1038,8 @@ pub(super) fn control_event(kind: ControlKind) -> MarketEvent {
 /// Fan a control out to every active sink.
 async fn broadcast_control(routes: &Routes, kind: ControlKind) {
     let ev = control_event(kind);
-    for sink in routes.values() {
-        let _ = sink.send(ev.clone()).await;
+    for route in routes.values() {
+        let _ = route.sink.send(ev.clone()).await;
     }
 }
 
@@ -1029,20 +1117,6 @@ pub(super) mod tests {
     #[derive(Debug, Clone, Default)]
     struct PairSet(BTreeSet<(Instrument, EventKind)>);
 
-    impl PairSet {
-        /// The trade symbols held, in the shape a stock list's `trades`
-        /// field takes: `None` when there are none.
-        fn trades(&self) -> Option<Vec<String>> {
-            let symbols: Vec<String> = self
-                .0
-                .iter()
-                .filter(|(_, kind)| *kind == EventKind::Trade)
-                .map(|(instrument, _)| instrument.symbol().to_string())
-                .collect();
-            (!symbols.is_empty()).then_some(symbols)
-        }
-    }
-
     impl SubscriptionSet for PairSet {
         fn empty() -> Self {
             Self::default()
@@ -1054,10 +1128,6 @@ pub(super) mod tests {
 
         fn insert(&mut self, instrument: &Instrument, kind: EventKind) {
             self.0.insert((instrument.clone(), kind));
-        }
-
-        fn remove(&mut self, instrument: &Instrument, kind: EventKind) {
-            self.0.remove(&(instrument.clone(), kind));
         }
     }
 
@@ -1071,6 +1141,10 @@ pub(super) mod tests {
         adds: Arc<AtomicUsize>,
         removals: Vec<PairSet>,
         refuse_add: Option<Refused>,
+        /// Refuse every `remove` with this.
+        refuse_remove: Option<Refused>,
+        /// Whether `shut_down` panics, taking the hub task down with it.
+        panics_on_shut_down: bool,
         /// Refuse the first `add` only, with this.
         refuse_first_add: Option<Refused>,
         events: VecDeque<std::result::Result<Vec<MarketEvent>, Refused>>,
@@ -1121,7 +1195,7 @@ pub(super) mod tests {
 
         async fn remove(&mut self, removal: &PairSet) -> std::result::Result<(), Refused> {
             self.removals.push(removal.clone());
-            Ok(())
+            self.refuse_remove.map_or(Ok(()), Err)
         }
 
         async fn next_events(&mut self) -> std::result::Result<Vec<MarketEvent>, Refused> {
@@ -1132,6 +1206,7 @@ pub(super) mod tests {
         }
 
         async fn shut_down(self) {
+            assert!(!self.panics_on_shut_down, "the scripted shut-down panics");
             if self.yields_on_shut_down {
                 tokio::task::yield_now().await;
             }
@@ -1327,9 +1402,17 @@ pub(super) mod tests {
         async fn with_later_connects(
             later: Vec<std::result::Result<FakeUpstream, Refused>>,
         ) -> (JoinHandle<()>, Self) {
+            Self::on(FakeUpstream::idle(), later).await
+        }
+
+        /// As `with_later_connects`, but the first connection is `first`.
+        async fn on(
+            first: FakeUpstream,
+            later: Vec<std::result::Result<FakeUpstream, Refused>>,
+        ) -> (JoinHandle<()>, Self) {
             let (creds_tx, sources) = watched_credentials();
             let (settings_tx, sources) = with_watched_settings(sources);
-            let mut connects = vec![Ok(FakeUpstream::idle())];
+            let mut connects = vec![Ok(first)];
             connects.extend(later);
             let connector = FakeConnector::scripted(connects);
             let connect_count = connector.connect_count();
@@ -2023,6 +2106,245 @@ pub(super) mod tests {
         );
     }
 
+    /// A session that closes while the connected upstream refuses its
+    /// unsubscribe still leaves the set once its sink is gone: the next
+    /// connect subscribes nothing for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_session_whose_unsubscribe_was_refused_leaves_the_set() {
+        let next = FakeUpstream::idle();
+        let adds = next.add_count();
+        let (_hub, hub) = ConnectedHub::on(
+            FakeUpstream {
+                refuse_remove: Some(Refused(StreamFailure::Transient)),
+                ..FakeUpstream::idle()
+            },
+            vec![Ok(next)],
+        )
+        .await;
+        let ConnectedHub {
+            handle,
+            rx,
+            settings_tx,
+            connects,
+            ..
+        } = hub;
+        handle.close().await.expect("close answers Ok");
+        drop(rx);
+
+        settings_tx.send(Some(())).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(connects.load(Ordering::SeqCst), 2, "the hub reconnected");
+        assert_eq!(
+            adds.load(Ordering::SeqCst),
+            0,
+            "nobody listens, so nothing is subscribed"
+        );
+    }
+
+    /// An unsubscribe the connected upstream refuses, from a session that
+    /// lives on, is answered with the refusal and leaves the pair applied:
+    /// the session still holds it, so the next connect subscribes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_unsubscribe_from_a_live_session_keeps_the_pair() {
+        let next = FakeUpstream::idle();
+        let adds = next.add_count();
+        let (_hub, hub) = ConnectedHub::on(
+            FakeUpstream {
+                refuse_remove: Some(Refused(StreamFailure::Transient)),
+                ..FakeUpstream::idle()
+            },
+            vec![Ok(next)],
+        )
+        .await;
+        assert!(matches!(
+            hub.handle.unsubscribe(aapl(), EventKind::Trade).await,
+            Err(Error::Provider { .. })
+        ));
+        hub.change_settings().await;
+        assert_eq!(hub.connects(), 2, "the hub reconnected");
+        assert_eq!(adds.load(Ordering::SeqCst), 1, "the pair is applied again");
+    }
+
+    /// A handle that unsubscribes keeps its stream and can subscribe again.
+    #[tokio::test(start_paused = true)]
+    async fn a_handle_subscribes_again_after_unsubscribing() {
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![]).await;
+        hub.handle
+            .unsubscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("unsubscribes");
+        hub.handle
+            .subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("subscribes again on the same handle");
+        assert!(
+            matches!(
+                control_kinds(&mut hub.rx).as_slice(),
+                [
+                    ControlKind::SubscriptionChanged { active: false, .. },
+                    ControlKind::ProviderConnected { .. },
+                    ControlKind::SubscriptionChanged { active: true, .. },
+                ]
+            ),
+            "the stream stayed open across the two"
+        );
+    }
+
+    /// A hub that panics closes the sinks of its sessions, so each one sees
+    /// its stream end instead of going silent while it reads as connected.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicked_hub_ends_its_sessions_streams() {
+        let (settings_tx, sources) = with_watched_settings(static_sources());
+        let connector = FakeConnector::scripted(vec![Ok(FakeUpstream {
+            panics_on_shut_down: true,
+            ..FakeUpstream::idle()
+        })]);
+        let (hub, cmd_tx) = spawn_hub(connector, sources);
+        let (sink, mut rx) = mpsc::channel(8);
+        let handle = SharedLiveHandle::new(cmd_tx, sink);
+        handle
+            .subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("subscribes on the first connection");
+
+        settings_tx.send(Some(())).unwrap();
+        assert!(hub.await.expect_err("the hub panicked").is_panic());
+        let ended = tokio::time::timeout(Duration::from_secs(1), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(ended.is_ok(), "the session's stream ended");
+        drop(handle);
+    }
+
+    /// A subscribe from a session whose stream is already gone subscribes
+    /// nothing upstream and is answered as closed, never `Ok` for a pair no
+    /// add carried.
+    #[tokio::test(start_paused = true)]
+    async fn a_subscribe_whose_sink_is_closed_sends_nothing_upstream() {
+        let first = FakeUpstream::idle();
+        let adds = first.add_count();
+        let (_hub, cmd_tx) = spawn_hub(FakeConnector::scripted(vec![Ok(first)]), static_sources());
+        let (sink, rx) = mpsc::channel(8);
+        drop(rx);
+        let handle = SharedLiveHandle::new(cmd_tx, sink);
+        assert!(matches!(
+            handle.subscribe(aapl(), EventKind::Trade).await,
+            Err(Error::SessionClosed)
+        ));
+        assert_eq!(adds.load(Ordering::SeqCst), 0, "no add for nobody");
+    }
+
+    /// After a refused unsubscribe the session may subscribe its pair again;
+    /// a refusal of that keeps the route it still has, so its stream stays
+    /// open and the handle can subscribe later.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_resubscribe_after_a_refused_unsubscribe_keeps_the_route() {
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![Ok(FakeUpstream {
+            refuse_add: Some(Refused(StreamFailure::Transient)),
+            refuse_remove: Some(Refused(StreamFailure::Transient)),
+            ..FakeUpstream::idle()
+        })])
+        .await;
+        hub.change_settings().await;
+        assert_eq!(hub.connects(), 2);
+        assert!(
+            hub.handle
+                .unsubscribe(aapl(), EventKind::Trade)
+                .await
+                .is_err()
+        );
+        assert!(
+            hub.handle
+                .subscribe(aapl(), EventKind::Trade)
+                .await
+                .is_err()
+        );
+        control_kinds(&mut hub.rx);
+        assert!(
+            matches!(hub.rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the stream is still open"
+        );
+        assert!(matches!(
+            hub.handle.subscribe(aapl(), EventKind::Trade).await,
+            Err(Error::Provider { .. })
+        ));
+    }
+
+    /// A session whose unsubscribe was refused, closing after a successor
+    /// took its pair, removes nothing of the successor's: the route is the
+    /// successor's, and so is the pair the next connect applies.
+    #[tokio::test(start_paused = true)]
+    async fn a_predecessors_late_close_leaves_its_successors_route() {
+        let next = FakeUpstream::idle();
+        let adds = next.add_count();
+        let (_hub, hub) = ConnectedHub::on(
+            FakeUpstream {
+                refuse_remove: Some(Refused(StreamFailure::Transient)),
+                ..FakeUpstream::idle()
+            },
+            vec![Ok(next)],
+        )
+        .await;
+        let ConnectedHub {
+            handle: predecessor,
+            cmd_tx,
+            settings_tx,
+            connects,
+            ..
+        } = hub;
+        assert!(
+            predecessor
+                .unsubscribe(aapl(), EventKind::Trade)
+                .await
+                .is_err()
+        );
+        let (sink, mut rx) = mpsc::channel(8);
+        let successor = SharedLiveHandle::new(cmd_tx, sink);
+        successor
+            .subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("the successor takes the pair");
+        control_kinds(&mut rx);
+
+        settings_tx.send(None).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        predecessor.close().await.expect("close answers Ok");
+        assert_eq!(
+            disconnect_causes(&mut rx),
+            [DisconnectCause::Disabled],
+            "the successor hears the disable and nothing of the close"
+        );
+        settings_tx.send(Some(())).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(connects.load(Ordering::SeqCst), 2, "the hub reconnected");
+        assert_eq!(
+            adds.load(Ordering::SeqCst),
+            1,
+            "the successor's pair is applied"
+        );
+    }
+
+    /// A handle carries one pair: a subscribe to a second while the first
+    /// is routed is refused, and the first stays routed.
+    #[tokio::test(start_paused = true)]
+    async fn a_routed_handle_refuses_a_second_pair() {
+        let (_hub, mut hub) = ConnectedHub::with_later_connects(vec![]).await;
+        assert!(matches!(
+            hub.handle.subscribe(instrument("SPY"), EventKind::Trade).await,
+            Err(Error::DuplicateSubscription { ref instrument, kind: EventKind::Trade })
+                if instrument.symbol() == "AAPL"
+        ));
+        assert!(
+            control_kinds(&mut hub.rx).is_empty(),
+            "nothing reached the hub"
+        );
+        hub.handle
+            .unsubscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("the first pair is still routed");
+    }
+
     /// A spawn that panics while the slot is locked (here: outside a tokio
     /// runtime) poisons the lock but leaves the state consistent, so the
     /// slot still serves: the next `ensure` inside a runtime spawns the hub.
@@ -2093,8 +2415,8 @@ pub(super) mod tests {
         let mut routes = HashMap::new();
         let (aapl_tx, mut aapl_rx) = mpsc::channel(8);
         let (spy_tx, mut spy_rx) = mpsc::channel(8);
-        routes.insert((instrument("AAPL"), EventKind::Trade), aapl_tx);
-        routes.insert((instrument("SPY"), EventKind::Quote), spy_tx);
+        routes.insert((instrument("AAPL"), EventKind::Trade), route(aapl_tx));
+        routes.insert((instrument("SPY"), EventKind::Quote), route(spy_tx));
 
         dispatch_event(&routes, trade("AAPL")).await;
         assert!(matches!(
@@ -2148,6 +2470,14 @@ pub(super) mod tests {
         ids
     }
 
+    /// A route to `sink`, owned by a handle of its own.
+    fn route(sink: mpsc::Sender<MarketEvent>) -> Route {
+        Route {
+            owner: HandleId::next(),
+            sink,
+        }
+    }
+
     /// Two routes on distinct pairs, and the receivers of their sinks.
     pub(in crate::providers) fn two_routes() -> (
         Routes,
@@ -2157,8 +2487,8 @@ pub(super) mod tests {
         let (a_tx, a_rx) = mpsc::channel(8);
         let (b_tx, b_rx) = mpsc::channel(8);
         let mut routes = HashMap::new();
-        routes.insert((instrument("AAPL"), EventKind::Trade), a_tx);
-        routes.insert((instrument("SPY"), EventKind::Quote), b_tx);
+        routes.insert((instrument("AAPL"), EventKind::Trade), route(a_tx));
+        routes.insert((instrument("SPY"), EventKind::Quote), route(b_tx));
         (routes, a_rx, b_rx)
     }
 
@@ -2204,8 +2534,7 @@ pub(super) mod tests {
     struct FakeHub {
         cmd_tx: mpsc::Sender<HubCommand>,
         cmd_rx: mpsc::Receiver<HubCommand>,
-        routes: HashMap<(Instrument, EventKind), mpsc::Sender<MarketEvent>>,
-        subs: PairSet,
+        routes: Routes,
         upstream: FakeUpstream,
     }
 
@@ -2216,7 +2545,6 @@ pub(super) mod tests {
                 cmd_tx,
                 cmd_rx,
                 routes: HashMap::new(),
-                subs: PairSet::empty(),
                 upstream: FakeUpstream::idle(),
             }
         }
@@ -2230,14 +2558,36 @@ pub(super) mod tests {
 
         async fn serve_one(&mut self) {
             let cmd = self.cmd_rx.recv().await.expect("a command");
-            handle_route_command::<FakeConnector>(
-                &mut self.routes,
-                &mut self.subs,
-                &mut self.upstream,
-                cmd,
-            )
-            .await;
+            handle_route_command::<FakeConnector>(&mut self.routes, &mut self.upstream, cmd).await;
         }
+    }
+
+    /// A session whose stream went before its unsubscribe, its route pruned
+    /// meanwhile by another session's subscribe, still has its pair taken
+    /// off the live socket when it unsubscribes.
+    #[tokio::test]
+    async fn an_unsubscribe_after_its_route_was_pruned_still_removes_the_pair() {
+        let mut hub = FakeHub::new();
+        let (a, a_rx) = hub.handle();
+        let (b, _b_rx) = hub.handle();
+        let (res, ()) = tokio::join!(a.subscribe(aapl(), EventKind::Trade), hub.serve_one());
+        res.expect("a subscribes");
+        drop(a_rx);
+        let (res, ()) = tokio::join!(
+            b.subscribe(instrument("SPY"), EventKind::Trade),
+            hub.serve_one()
+        );
+        res.expect("b subscribes, pruning a's route");
+        let (res, ()) = tokio::join!(a.unsubscribe(aapl(), EventKind::Trade), hub.serve_one());
+        res.expect("a's unsubscribe answers Ok");
+        assert!(
+            hub.upstream
+                .removals
+                .iter()
+                .any(|removal| removal.0.contains(&(aapl(), EventKind::Trade))),
+            "AAPL trades were removed upstream: {:?}",
+            hub.upstream.removals
+        );
     }
 
     /// A subscribe the upstream refuses also clears a route an earlier
@@ -2261,7 +2611,6 @@ pub(super) mod tests {
         );
         assert!(refused.is_err(), "the upstream refused the successor");
         assert!(hub.routes.is_empty());
-        assert_eq!(hub.subs.trades(), None);
     }
 
     /// A first subscribe the upstream refuses leaves no route, and no pair to
@@ -2278,7 +2627,6 @@ pub(super) mod tests {
         );
         assert!(refused.is_err(), "the upstream refused the subscribe");
         assert!(hub.routes.is_empty());
-        assert_eq!(hub.subs.trades(), None);
     }
 
     /// A subscribe the upstream rejects as a bad credential is answered as
