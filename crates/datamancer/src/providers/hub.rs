@@ -451,7 +451,7 @@ impl LiveHandle for SharedLiveHandle {
         // the provider, not any one session.
         let state = std::mem::replace(&mut *self.state.lock().await, HandleState::Closed);
         if let HandleState::Routed { pair, .. } = state {
-            let _ = self.send_unsubscribe(pair).await;
+            self.send_unsubscribe(pair).await?;
         }
         Ok(())
     }
@@ -2198,9 +2198,31 @@ pub(super) mod tests {
         );
     }
 
+    /// A close after a refused unsubscribe sends the removal again, and a
+    /// second refusal is the close's answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_after_a_refused_unsubscribe_answers_the_second_refusal() {
+        let (_hub, hub) = ConnectedHub::on(
+            FakeUpstream {
+                refuse_remove: Some(Refused(StreamFailure::Transient)),
+                ..FakeUpstream::idle()
+            },
+            vec![],
+        )
+        .await;
+        assert!(matches!(
+            hub.handle.unsubscribe(aapl(), EventKind::Trade).await,
+            Err(Error::Provider { .. })
+        ));
+        assert!(matches!(
+            hub.handle.close().await,
+            Err(Error::Provider { .. })
+        ));
+    }
+
     /// A session that closes while the connected upstream refuses its
-    /// unsubscribe still leaves the set once its sink is gone: the next
-    /// connect subscribes nothing for it.
+    /// unsubscribe hears the refusal from its close, and still leaves the set
+    /// once its sink is gone: the next connect subscribes nothing for it.
     #[tokio::test(start_paused = true)]
     async fn a_closed_session_whose_unsubscribe_was_refused_leaves_the_set() {
         let next = FakeUpstream::idle();
@@ -2220,7 +2242,7 @@ pub(super) mod tests {
             connects,
             ..
         } = hub;
-        handle.close().await.expect("close answers Ok");
+        assert!(matches!(handle.close().await, Err(Error::Provider { .. })));
         drop(rx);
 
         settings_tx.send(Some(())).unwrap();
