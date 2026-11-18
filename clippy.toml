@@ -1,0 +1,9 @@
+# turso 0.6 silently drops a same-connection write issued while an earlier
+# read's cursor is not drained, so every read goes through the draining
+# helper in crates/datamancer/src/storage/turso_common.rs.
+disallowed-methods = [
+    { path = "turso::Connection::query", reason = "use turso_common::query_rows, which drains the cursor" },
+    { path = "turso::Statement::query", reason = "use turso_common::query_rows, which drains the cursor" },
+    { path = "turso::Statement::query_row", reason = "use turso_common::query_rows, which drains the cursor" },
+    { path = "turso::Connection::pragma_query", reason = "it stops stepping on the first callback error; use turso_common::query_rows" },
+]

@@ -23,16 +23,6 @@
 //!
 //! All mutations go through the one mutex-guarded write connection inside a
 //! `BEGIN`/`COMMIT` (see `turso_common` for why single-writer is load-bearing).
-//!
-//! # The drain-cursor hazard (turso 0.6.1)
-//!
-//! A write issued on a connection whose earlier `query()` `Rows` cursor is
-//! un-drained is **silently lost** — visible in-connection, never reaches
-//! disk (see `turso_common::preflight_user_version` for the first
-//! occurrence of this). The coverage and event-count reads inside
-//! `store`'s transaction run a `query()` on the *write* connection, so
-//! both fully drain their cursor (loop `rows.next()` to `None`) in an
-//! inner scope before the transaction issues its next `execute`.
 
 use std::path::Path;
 
