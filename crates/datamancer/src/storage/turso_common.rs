@@ -1,5 +1,6 @@
 //! Shared plumbing for the Turso-backed stores: database open, connection
-//! init, bounded busy-retry, and the `PRAGMA user_version` schema guard.
+//! init, bounded busy-retry, fully drained reads ([`query_rows`]), and the
+//! `PRAGMA user_version` schema guard.
 //!
 //! # Single-writer discipline (load-bearing)
 //!
@@ -113,24 +114,11 @@ pub(crate) async fn preflight_user_version(
     expected: i64,
     store: &str,
 ) -> Result<bool> {
-    let version: i64 = {
-        let mut rows = conn
-            .query("PRAGMA user_version", ())
-            .await
-            .map_err(map_err)?;
-        let first = rows.next().await.map_err(map_err)?;
-        // Defer the decode until the cursor is fully drained: an un-stepped
-        // `Rows` leaves its statement unfinalized, and turso 0.6.1 silently
-        // drops a same-connection write issued while an earlier read
-        // statement is still open (observed via a spike where
-        // `PRAGMA user_version = N` read back correctly in-connection but
-        // never reached disk). Erroring out of this scope before the drain
-        // would leave the connection in exactly that state.
-        let raw = first.map(|row| row.get::<i64>(0));
-        while rows.next().await.map_err(map_err)?.is_some() {}
-        raw.ok_or_else(|| Error::Storage("PRAGMA user_version returned no row".to_string()))?
-            .map_err(map_err)?
-    };
+    let version = query_rows(conn, "PRAGMA user_version", (), |row| row.get::<i64>(0))
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Storage("PRAGMA user_version returned no row".to_string()))?;
     if version == expected {
         return Ok(false);
     }
@@ -142,6 +130,34 @@ pub(crate) async fn preflight_user_version(
          read it with a matching build or delete the file (data is recoverable \
          from providers)"
     )))
+}
+
+/// Runs `sql`, decodes each row, and steps its cursor to the end even after
+/// `decode` fails, so no statement is left open on `conn` whatever `decode`
+/// returns. Under turso 0.6.1 a read dropped before its last row can end the
+/// transaction it ran in: the writes after it commit one by one and the
+/// closing `COMMIT` fails because no transaction is active.
+///
+/// An error stepping the cursor is returned at once, without draining the
+/// rest.
+pub(crate) async fn query_rows<T>(
+    conn: &::turso::Connection,
+    sql: &str,
+    params: impl ::turso::IntoParams,
+    mut decode: impl FnMut(&::turso::Row) -> std::result::Result<T, ::turso::Error>,
+) -> Result<Vec<T>> {
+    let mut rows = conn.query(sql, params).await.map_err(map_err)?;
+    let mut decoded = Vec::new();
+    let mut failed = None;
+    while let Some(row) = rows.next().await.map_err(map_err)? {
+        if failed.is_none() {
+            match decode(&row) {
+                Ok(value) => decoded.push(value),
+                Err(e) => failed = Some(e),
+            }
+        }
+    }
+    failed.map_or(Ok(decoded), |e| Err(map_err(e)))
 }
 
 /// Stamp a fresh file's `PRAGMA user_version` — call only after schema
@@ -224,7 +240,7 @@ pub(crate) fn asset_class_from_tag(tag: &str) -> Option<AssetClass> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DbLocation, connect, execute_retry, open_database, preflight_user_version,
+        DbLocation, connect, execute_retry, open_database, preflight_user_version, query_rows,
         stamp_user_version,
     };
 
@@ -288,5 +304,106 @@ mod tests {
             .await
             .expect_err("real SQL errors must not be retried into oblivion");
         assert!(err.to_string().contains("turso"), "unexpected error: {err}");
+    }
+
+    async fn file_with_ids(path: &std::path::Path, ids: &[i64]) -> ::turso::Connection {
+        let db = open_database(&DbLocation::File(path.to_path_buf()))
+            .await
+            .unwrap();
+        let conn = connect(&db).await.unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .await
+            .unwrap();
+        for id in ids {
+            conn.execute("INSERT INTO t (id) VALUES (?1)", (*id,))
+                .await
+                .unwrap();
+        }
+        conn
+    }
+
+    async fn ids_on_disk(path: &std::path::Path) -> Vec<i64> {
+        let db = open_database(&DbLocation::File(path.to_path_buf()))
+            .await
+            .unwrap();
+        let conn = connect(&db).await.unwrap();
+        query_rows(&conn, "SELECT id FROM t ORDER BY id", (), |row| row.get(0))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn query_rows_returns_every_row_in_order() {
+        let db = open_database(&DbLocation::Memory).await.unwrap();
+        let conn = connect(&db).await.unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", ())
+            .await
+            .unwrap();
+        for (id, name) in [(3, "c"), (1, "a"), (2, "b")] {
+            conn.execute("INSERT INTO t (id, name) VALUES (?1, ?2)", (id, name))
+                .await
+                .unwrap();
+        }
+        let rows: Vec<(i64, String)> = query_rows(
+            &conn,
+            "SELECT id, name FROM t WHERE id >= ?1 ORDER BY id",
+            (1,),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string())
+            ]
+        );
+    }
+
+    // The `COMMIT` is what fails if the read is left undrained: the
+    // transaction has ended, so there is none to commit.
+    #[tokio::test]
+    async fn decode_error_inside_a_transaction_leaves_the_connection_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = file_with_ids(&path, &[1, 2, 3]).await;
+            conn.execute("BEGIN", ()).await.unwrap();
+            let err = query_rows(&conn, "SELECT id FROM t ORDER BY id", (), |row| {
+                row.get::<i64>(1)
+            })
+            .await
+            .expect_err("a one-column row has no column 1");
+            assert!(err.to_string().contains("turso"), "unexpected error: {err}");
+            conn.execute("INSERT INTO t (id) VALUES (4)", ())
+                .await
+                .unwrap();
+            conn.execute("COMMIT", ()).await.unwrap();
+        }
+        assert_eq!(ids_on_disk(&path).await, vec![1, 2, 3, 4]);
+    }
+
+    // Cannot fail on turso 0.6.1, since `query_rows` drains; it guards
+    // against a turso upgrade that changes read-then-write in a transaction.
+    #[tokio::test]
+    async fn read_then_write_in_one_transaction_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = file_with_ids(&path, &[1, 2, 3]).await;
+            conn.execute("BEGIN", ()).await.unwrap();
+            let ids: Vec<i64> =
+                query_rows(&conn, "SELECT id FROM t ORDER BY id", (), |row| row.get(0))
+                    .await
+                    .unwrap();
+            assert!(!ids.contains(&4));
+            conn.execute("INSERT INTO t (id) VALUES (4)", ())
+                .await
+                .unwrap();
+            conn.execute("COMMIT", ()).await.unwrap();
+        }
+        assert_eq!(ids_on_disk(&path).await, vec![1, 2, 3, 4]);
     }
 }
