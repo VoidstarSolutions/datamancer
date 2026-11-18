@@ -102,7 +102,7 @@ pub trait HistoricalCache: Send + Sync {
     /// Distinct from [`gaps`](HistoricalCache::gaps) / [`lookup`](HistoricalCache::lookup),
     /// which answer coverage for *one* key: `catalog` is a whole-cache
     /// enumeration with each key's real covered segments. It carries **no
-    /// `seq`** — `seq` is a live, per-symbol property, never a cache property.
+    /// `seq`** — `seq` is a live, per-pair property, never a cache property.
     ///
     /// Default returns an empty catalog; backends that cannot enumerate opt out.
     async fn catalog(&self) -> Result<Vec<CacheCatalogEntry>> {

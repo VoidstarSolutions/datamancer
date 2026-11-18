@@ -17,7 +17,7 @@
 //! `Option`.
 //!
 //! Reads are sampled (`Relaxed`) with no cross-field consistency guarantee — the
-//! snapshot is diagnostic, and determinism is per-symbol, so a few-nanosecond
+//! snapshot is diagnostic, and determinism is per pair, so a few-nanosecond
 //! skew across counters is acceptable.
 
 use std::sync::atomic::{AtomicU64, Ordering};

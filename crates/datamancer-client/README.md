@@ -261,8 +261,9 @@ while let Some(event) = events.next().await {
 
 `AppHandle::health()` returns a [`HealthView`] (from `datamancer-core`,
 re-exported via the orchestrator too): a versioned, per-`(instrument, kind)`
-reduction of the daemon's snapshot for app rendering. It's per-symbol only —
-there is no cross-instrument aggregate — and its latency/liveness fields are
+reduction of the daemon's snapshot for app rendering. Stream health is per
+pair — there is no aggregate of it across pairs, though each provider's state
+summarizes that provider's pairs — and its latency/liveness fields are
 wall-clock observability, never engine-decision inputs. Schema 3 judges
 health on evidence, not silence: a provider enabled with nothing requested is
 `Idle` (not an error), except that a known fault — `Unauthenticated` — wins

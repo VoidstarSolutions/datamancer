@@ -277,10 +277,10 @@ impl Attached {
 }
 
 // ---------------------------------------------------------------------------
-// Live stats (per-symbol atomics; Phase 3 reads these)
+// Live stats (per-pair atomics; Phase 3 reads these)
 // ---------------------------------------------------------------------------
 
-/// Per-symbol, per-field atomic counters on an [`AuthoritativeSession`].
+/// Per-pair, per-field atomic counters on an [`AuthoritativeSession`].
 ///
 /// Lock-free reads for the Phase 3 diagnostics plane; **no composite-consistency
 /// guarantee** across fields (each is read independently). Phase 2 only updates
@@ -306,7 +306,7 @@ pub(crate) struct LiveStats {
     connection: std::sync::Mutex<StreamConnection>,
 }
 
-/// Bounded per-symbol recent-gap detail (oldest evicted).
+/// Bounded per-pair recent-gap detail (oldest evicted).
 const RECENT_GAPS_CAP: usize = 8;
 
 /// What a connect/disconnect control did to a substream's phase
@@ -2167,9 +2167,10 @@ pub(crate) fn spawn_client(
 /// subscriptions presented as **one multiplexed stream**. Single-owner; not
 /// `Clone`, mirroring [`crate::Session`].
 ///
-/// Determinism is **per symbol only**: each instrument's substream is
-/// `seq`-monotonic (source-stamped); there is no cross-instrument ordering
-/// (arrival order). Subscriptions are unbounded: pure-live, or a backfill
+/// Determinism is **per `(instrument, kind)` pair only**: each pair's
+/// substream is [`Seq`]-monotonic (source-stamped); there is no
+/// ordering across pairs (arrival order), not even between one instrument's
+/// trades and quotes. Subscriptions are unbounded: pure-live, or a backfill
 /// seamed into the live tail.
 pub struct ClientSession {
     handle: ClientHandle,

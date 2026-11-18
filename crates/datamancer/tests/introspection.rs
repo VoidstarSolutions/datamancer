@@ -1,5 +1,5 @@
 //! Phase 3 introspection: provider accounting, the cache catalog in the
-//! snapshot, and per-symbol live state through `Datamancer::snapshot()`.
+//! snapshot, and per-pair live state through `Datamancer::snapshot()`.
 
 #![cfg(feature = "storage-turso")]
 

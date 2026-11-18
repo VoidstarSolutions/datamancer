@@ -1,10 +1,11 @@
 //! App-facing health reduction of [`SystemSnapshot`] (spec 2026-07-05, cycle 4).
 //!
 //! Pure types + a pure reduction — assembly stays in `datamancer`, transport
-//! in `datamancer-client`. Per-symbol only: no cross-instrument aggregate is
-//! ever computed. `Liveness`/`latency` derive from wall-clock fields
-//! (`captured_at`, `last_rx_ts`, `latency_ns`) — observability only, never
-//! engine logic.
+//! in `datamancer-client`. Stream health is per pair: no aggregate of
+//! stream health across pairs is ever computed (a provider's state does
+//! summarize its pairs' connections). `Liveness`/`latency` derive from
+//! wall-clock fields (`captured_at`, `last_rx_ts`, `latency_ns`) —
+//! observability only, never engine logic.
 //!
 //! The schema judges health on evidence, not silence. `Stale` is a soft error
 //! (the substream is down on a fault — its own disconnect, not a deliberate
@@ -39,8 +40,10 @@ use crate::{
 
 /// A typed, versioned, app-renderable reduction of [`SystemSnapshot`]:
 /// "is my market data healthy?" for an end-user application. One entry per
-/// `(instrument, kind)` in [`streams`](Self::streams) — no cross-symbol
-/// aggregate exists or is implied.
+/// `(instrument, kind)` in [`streams`](Self::streams) — no aggregate of
+/// stream health across pairs exists or is implied; each provider's state in
+/// [`providers`](Self::providers) folds only its pairs' connection phases,
+/// not their liveness or gaps.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthView {
@@ -119,7 +122,7 @@ pub enum ProviderState {
     Idle,
 }
 
-/// Per-`(instrument, kind)` stream health. Per-symbol only.
+/// Per-`(instrument, kind)` stream health. Per-pair only.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamHealth {
@@ -129,7 +132,7 @@ pub struct StreamHealth {
     /// Provider-reported market time of the last live data event (a
     /// latest-value seed is not one).
     pub last_event_source_ts: Option<Timestamp>,
-    /// Cumulative per-symbol `Control::Gap` count.
+    /// Cumulative per-pair `Control::Gap` count.
     pub gap_count: u64,
     /// `rx_ts`-derived; observability only, never engine logic.
     pub latency: Option<LatencySummary>,

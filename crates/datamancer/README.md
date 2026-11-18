@@ -1,6 +1,6 @@
 # Datamancer
 
-A unified subscription and replay layer for financial market data. Datamancer talks to whatever providers it's configured against, normalizes their messages into typed events, and presents them through a multiplexed client-session stream that downstream consumers (analysis engines, persistence sinks, UIs) consume without caring which provider any given event came from. Ordering is **per symbol** — each instrument's substream is a source-stamped within-instrument total order (`(instrument, seq)`); across instruments the multiplex interleaves in arrival order rather than computing a global order.
+A unified subscription and replay layer for financial market data. Datamancer talks to whatever providers it's configured against, normalizes their messages into typed events, and presents them through a multiplexed client-session stream that downstream consumers (analysis engines, persistence sinks, UIs) consume without caring which provider any given event came from. Ordering is **per `(instrument, kind)` pair** — each pair's substream is a source-stamped total order (`(instrument, kind, seq)`); trades and quotes on one instrument are not ordered against each other, and across pairs the multiplex interleaves in arrival order rather than computing a global order.
 
 ## Status and Scope
 
@@ -23,8 +23,8 @@ The supported providers are Alpaca equities and Alpaca crypto. Provider integrat
 
 ## What Datamancer Does Not Do
 
-- **Per-instrument demultiplexing.** A client session presents one multiplexed stream over its subscription set (per-symbol deterministic, arrival-order across symbols); consumers that want per-instrument streams demux downstream.
-- **Global / cross-symbol ordering.** There is no total order across instruments. The multiplex interleaves (ordering key `(instrument, seq)`); a globally merged, cross-symbol-sorted stream is an explicit non-goal. Consumers needing strict global timestamp order buffer themselves.
+- **Per-instrument demultiplexing.** A client session presents one multiplexed stream over its subscription set (deterministic per `(instrument, kind)` pair, arrival-order across pairs); consumers that want per-instrument streams demux downstream.
+- **Global / cross-pair ordering.** There is no total order across pairs. The multiplex interleaves (ordering key `(instrument, kind, seq)`); a globally merged, cross-pair-sorted stream is an explicit non-goal. Consumers needing strict global timestamp order buffer themselves.
 - **Semantic enrichment.** No "join this trade with the most recent quote to compute the trade side." Datamancer surfaces the events; analysis on top of them belongs to consumers.
 - **Provider-side time reordering.** Events are emitted in the order they were received, not re-sorted by source timestamp. Consumers that need strict timestamp ordering buffer themselves.
 - **Throttled or wall-clock-paced replay.** Replay produces events as fast as the consumer drains. Modeling latency or simulating real-time pacing is a research-tool concern, not a data-layer one.
@@ -51,7 +51,7 @@ whole finite kind space, which is what makes per-instrument capability discovery
 Every data variant carries three timestamp/identifier fields, with distinct roles that should not be conflated:
 
 - **`source_ts`** — the timestamp the provider reported for the event. Source of truth for "when did this happen in the market" and the **only** timestamp engine logic should reason about. Sourced verbatim from provider data; never assigned by datamancer.
-- **`seq: u64`** — a per-symbol ordering number stamped **once at the source** of the authoritative per-`(instrument, kind)` stream, in canonical delivery order, before any sink — so it is identical across all consumers of that symbol (not a per-consumer poll artifact). **The sole ordering field** for the stream, and per-symbol only (there is no cross-instrument order; the multiplex key is `(instrument, seq)`). Live mode stamps `seq` in arrival order, so replaying a symbol's substream in `seq` order reproduces that substream exactly (per-symbol; not the cross-symbol interleave of the multiplexed stream). Historical fetch stamps `seq` in source-timestamp order during fetch, so `seq` order matches market order. The delivered stream is contiguous *only while no data is lost*: a consumer that loses data (a resume-buffer or backfill-seam overflow) sees a real `seq` hole, surfaced in-band as a `Control::Gap`. A late joiner has lost nothing: `Subscribed` says what its stream carries.
+- **`seq: u64`** — an ordering number stamped **once at the source** of the authoritative per-`(instrument, kind)` stream, in canonical delivery order, before any sink — so it is identical across all consumers of that pair (not a per-consumer poll artifact). **The sole ordering field** for the stream, and per pair only: one instrument's trades and quotes carry independent counters, and there is no cross-pair order (the multiplex key is `(instrument, kind, seq)`). Live mode stamps `seq` in arrival order, so replaying a pair's substream in `seq` order reproduces that substream exactly (not the cross-pair interleave of the multiplexed stream). Historical fetch stamps `seq` in source-timestamp order during fetch, so `seq` order matches market order. The delivered stream is contiguous *only while no data is lost*: a consumer that loses data (a resume-buffer or backfill-seam overflow) sees a real `seq` hole, surfaced in-band as a `Control::Gap`. A `Gap` names the instrument, not the pair: with two kinds on one instrument it does not say which kind lost data (see `ControlKind::Gap`). A late joiner has lost nothing: `Subscribed` says what its stream carries.
 - **`rx_ts`** — wall-clock at the moment the bytes were received from the provider, captured pre-parse. **Observability only.** Used for measuring provider-to-engine latency (`rx_ts - source_ts`), correlating engine state with external wall-clock events (logs, traces, debugger sessions), and operational monitoring. **Engine decision logic must never depend on `rx_ts`** — doing so re-introduces wall-clock as a determinism hazard. For replay-from-historical-fetch, where there is no live arrival to record, `rx_ts` collapses to `source_ts`.
 
 `Control` events ride the same stream as data events because connectivity changes are part of the session's truth: a gap can invalidate downstream signals, and forcing consumers to acknowledge it in-band is safer than offering it as a separate stream they may forget to subscribe to.
@@ -350,10 +350,10 @@ transport or daemon. It composes three things:
   bytes_per_row`; it ignores index/MVCC overhead). The catalog reports the
   adjustment rows are **stored** under, so trades/quotes always read `Raw`
   regardless of the requested mode. It carries no `seq` (seq is a live,
-  per-symbol property, not a cache property).
+  per-pair property, not a cache property).
 - **Live state** — per-`(instrument, kind)` `AuthoritativeSessionSnapshot`
   (subscriber refcount, last source/rx timestamps, `latency_ns =
-  rx_ts − source_ts`, per-symbol gap count, seq position, the substream's own
+  rx_ts − source_ts`, per-pair gap count, seq position, the substream's own
   `connection` phase — `pending`/`up`/`down`, each with the receipt time of the
   control that entered it; a `ProviderError`, whether sent to every stream or
   about one subscription, lands in the provider's `last_error`, not here) and per-client
@@ -364,10 +364,10 @@ transport or daemon. It composes three things:
   snapshot, not live traffic, so a stream that has seen only its seed has no
   timestamps or latency yet and its health reads `AwaitingData`.
 
-The snapshot is **sampled, not transactional**: per-symbol fields are read from
+The snapshot is **sampled, not transactional**: per-pair fields are read from
 `Relaxed` atomics and the session registry lock is held only to clone handles
-(never across an `.await`), so fields may skew by nanoseconds across symbols —
-fine, because determinism is per-symbol. `latency_ns`/`rx_ts` are
+(never across an `.await`), so fields may skew by nanoseconds across pairs —
+fine, because determinism is per pair. `latency_ns`/`rx_ts` are
 **observability only** and must never feed engine logic.
 
 ## Transports
@@ -379,14 +379,14 @@ carries a client's multiplexed stream to a separate consumer process. Two planes
 ride one logical client connection:
 
 - **Data plane** — one iceoryx2 pub-sub service per client carrying that client's
-  multiplexed `(instrument, seq)` interleave as a flat `#[repr(C)]` POD
+  multiplexed `(instrument, kind, seq)` interleave as a flat `#[repr(C)]` POD
   `DataPayload`. The payload carries a compact, **sink-local** `SymbolId` instead
   of the heap-backed `Instrument`; a low-rate per-client *announcement* service
   publishes the `SymbolId → Instrument` mapping. `SymbolId`/interning are a
   transport compaction handle only — **not** a public-API or global-identity
   concept (two clients may map the same id to different instruments). The data
-  plane carries the per-symbol-deterministic interleave and makes **no
-  cross-symbol ordering claim** — the multiplex is an interleave, never a global
+  plane carries the per-pair-deterministic interleave and makes **no
+  cross-pair ordering claim** — the multiplex is an interleave, never a global
   merge-sort.
 - **Diagnostics plane** — a separate service publishing the serialized
   `SystemSnapshot` (provider health/connectivity, cache catalog, live state).

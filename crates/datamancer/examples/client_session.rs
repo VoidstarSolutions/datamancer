@@ -3,8 +3,8 @@
 //! Opens a single [`datamancer::ClientSession`], subscribes to the Trade stream
 //! for two crypto pairs, and drains the **one multiplexed stream** the client
 //! presents. Demonstrates the Phase 2 primary consumer handle: a mutable
-//! subscription set behind one interleaved stream (per-symbol deterministic,
-//! arrival-order across symbols — no merge-sort).
+//! subscription set behind one interleaved stream (deterministic per
+//! `(instrument, kind)` pair, arrival-order across pairs — no merge-sort).
 //!
 //! Run with:
 //!

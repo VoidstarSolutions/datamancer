@@ -9,14 +9,14 @@
 //! # Consistency contract
 //!
 //! A [`SystemSnapshot`] is a **sampled** point-in-time view, not a transactional
-//! one: per-symbol fields are read from `Relaxed` atomics and the registry lock
-//! is held only long enough to clone handles. Fields may skew across symbols by
+//! one: per-pair fields are read from `Relaxed` atomics and the registry lock
+//! is held only long enough to clone handles. Fields may skew across pairs by
 //! nanoseconds — acceptable because the snapshot is diagnostic and determinism
-//! is **per-symbol** (cross-symbol consistency is a non-goal).
+//! is **per `(instrument, kind)` pair** (cross-pair consistency is a non-goal).
 //!
 //! `rx_ts` / `latency_ns` are **observability only** (per CLAUDE.md): the
 //! latency field is exactly that sanctioned use and must never feed engine
-//! logic. The snapshot implies no cross-instrument ordering.
+//! logic. The snapshot implies no cross-pair ordering.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -65,7 +65,7 @@ pub enum ConnectionState {
 }
 
 /// A consolidated, serializable view of datamancer's runtime state: provider
-/// accounting, the cache catalog, and per-symbol live state (authoritative +
+/// accounting, the cache catalog, and per-pair live state (authoritative +
 /// client sessions). The single artifact consumed by the in-process embedder
 /// ([`crate`] re-exports the assembler), the diagnostics plane, and the UI.
 ///
@@ -251,7 +251,7 @@ pub struct CacheSnapshot {
     pub total_disk_bytes: Option<u64>,
 }
 
-/// Per-`(instrument, kind)` authoritative live state. Sampled; per-symbol only.
+/// Per-`(instrument, kind)` authoritative live state. Sampled; per-pair only.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthoritativeSessionSnapshot {
@@ -259,7 +259,7 @@ pub struct AuthoritativeSessionSnapshot {
     pub kind: EventKind,
     /// Number of client referrers onto this authoritative session.
     pub subscriber_refcount: u32,
-    /// Last-assigned per-symbol source `seq`, or `None` before any event.
+    /// Last-assigned per-pair source `seq`, or `None` before any event.
     pub seq_position: Option<Seq>,
     /// `source_ts` of the last live data event, or `None` before any. The
     /// pure-live latest-value seed counts toward `seq_position` but not here.
@@ -273,10 +273,10 @@ pub struct AuthoritativeSessionSnapshot {
     /// (clock skew). It is not a pure network latency and must never feed engine
     /// logic.
     pub latency_ns: Option<i64>,
-    /// Per-symbol provider/source `Control::Gap` count. Per-client resume-buffer
+    /// Per-pair provider/source `Control::Gap` count. Per-client resume-buffer
     /// drops live on [`ClientSessionSnapshot`] instead.
     pub gap_count: u64,
-    /// Most recent per-symbol `Control::Gap` spans (bounded ring; oldest
+    /// Most recent per-pair `Control::Gap` spans (bounded ring; oldest
     /// evicted). Detail behind `gap_count`.
     #[serde(default)]
     pub recent_gaps: Vec<GapSpan>,
@@ -501,7 +501,7 @@ impl AuthoritativeSessionSnapshot {
         self
     }
 
-    /// Set the last-assigned per-symbol source `seq`.
+    /// Set the last-assigned per-pair source `seq`.
     #[must_use]
     pub fn with_seq_position(mut self, seq: Option<Seq>) -> Self {
         self.seq_position = seq;

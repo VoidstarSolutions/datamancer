@@ -766,12 +766,12 @@ async fn multiplex_interleaves_two_instruments_in_arrival_order() {
     let (data, _) = drain_data(&mut stream, 3).await;
     // Every event appears.
     assert_eq!(data.len(), 3);
-    // Each symbol's substream is internally seq-monotonic (source-stamped).
+    // Each (instrument, kind) substream is internally seq-monotonic (source-stamped).
     let aapl: Vec<u64> = data.iter().filter(|d| d.0 == "AAPL").map(|d| d.2).collect();
     let msft: Vec<u64> = data.iter().filter(|d| d.0 == "MSFT").map(|d| d.2).collect();
     assert_eq!(aapl, vec![0, 1]);
     assert_eq!(msft, vec![0]);
-    // No cross-symbol order is asserted (arrival order only).
+    // No cross-pair order is asserted (arrival order only).
     let _ = client.close().await;
 }
 

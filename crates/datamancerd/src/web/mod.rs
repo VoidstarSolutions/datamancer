@@ -414,9 +414,9 @@ mod tests {
             serde_json::from_slice(&body_bytes(send(Method::GET, "/api/sessions").await).await)
                 .unwrap();
         let auth = sessions["authoritative_sessions"].as_array().unwrap();
-        assert_eq!(auth.len(), 2, "two distinct per-symbol units");
+        assert_eq!(auth.len(), 2, "two distinct per-pair units");
 
-        // seq lives only inside each per-symbol unit, keyed by instrument+kind.
+        // seq lives only inside each per-pair unit, keyed by instrument+kind.
         let mut by_symbol = std::collections::BTreeMap::new();
         for entry in auth {
             assert!(entry.get("seq_position").is_some(), "per-unit seq present");
