@@ -10,6 +10,8 @@ pub mod alpaca_crypto;
 #[cfg(feature = "provider-alpaca")]
 pub mod credentials;
 #[cfg(feature = "provider-alpaca")]
+mod hub;
+#[cfg(feature = "provider-alpaca")]
 pub mod runtime;
 
 #[cfg(feature = "provider-alpaca")]
