@@ -9,7 +9,7 @@
 //! # Single shared connection
 //!
 //! Alpaca's crypto websocket allows only one concurrent connection per
-//! credential pair. Calling [`Provider::start_live`] multiple times on the
+//! key pair. Calling [`Provider::start_live`] multiple times on the
 //! same provider therefore must not open multiple sockets. This provider
 //! lazily spawns a single hub task on first `start_live`; every subsequent
 //! `start_live` returns a [`LiveHandle`] that talks to that hub via a
@@ -27,7 +27,8 @@
 //!
 //! The crypto stream runs on the same hub code as the stock stream, so it
 //! reconnects, parks and backs off exactly as
-//! [the stock provider](super::alpaca#reconnect) does, under the
+//! the stock provider does ([reconnect](super::alpaca#reconnect),
+//! [rejected credentials](super::alpaca#rejected-credentials)), under the
 //! configured [`ReconnectPolicy`]. Which of its failures are rejected
 //! credentials and which are transient is the `Classify` impl's to say, in
 //! `alpaca_common`.
@@ -160,7 +161,7 @@ fn venue_location(
 /// subset of its configuration, delivered through a [`SettingsSource`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlpacaCryptoSettings {
-    /// Paper or live account; selects which credential pair is loaded from
+    /// Paper or live account; selects which key pair is loaded from
     /// the environment by `oxidized_alpaca`.
     pub account_type: AccountType,
     /// Which crypto venue to connect to.

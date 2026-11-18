@@ -32,7 +32,8 @@ and the loss contract per transport.
 
 ```bash
 cargo run -p datamancerd -- --config datamancerd.toml
-# end-to-end tests need a live iceoryx2 runtime and are #[ignore]d:
+# end-to-end tests need a live iceoryx2 runtime (some also Alpaca credentials)
+# and are #[ignore]d:
 cargo test -p datamancerd --test daemon_e2e -- --ignored
 # the hermetic suite against the scripted provider needs no credentials:
 cargo test -p datamancerd --all-features --test scripted_e2e -- --ignored --test-threads=1
@@ -845,6 +846,13 @@ Nothing credential-shaped lives in the config file.
   rebuilds its REST clients on next use. No restart, no resubscribe — the
   session and its `seq` stream carry across the rotation (consumers see the
   usual in-band reconnect controls).
+- **A rejected key parks the provider.** Each provider holds one upstream
+  stream connection that all its live sessions share. When the provider
+  rejects the stored keys, the stream stops retrying until `set-credentials`
+  delivers new ones or `configure-provider` changes its settings; meanwhile a
+  subscribe that opens a new pair answers `provider`. The exact rules,
+  including the cases that do not park, are in the `datamancer` crate's
+  `providers::alpaca` docs ("Rejected credentials").
 - **Clear does not un-apply.** `clear-credentials` empties the store only. A
   running provider keeps its last applied credentials until the daemon
   restarts — there is deliberately no live revocation half-state.

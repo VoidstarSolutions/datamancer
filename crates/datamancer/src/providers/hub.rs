@@ -29,14 +29,14 @@ use crate::session::ReconnectPolicy;
 
 /// How a failure's [`Classify::classify`] reads a failed connect, a refused
 /// re-subscribe or a failed stream, and so what the hub does about it. A
-/// rejected credential pair from a watched source parks the hub until a
-/// rotation (retrying cannot help, provisioning can); one from a static
-/// source, and everything transient, backs off. A session's subscribe the
-/// upstream refuses is only answered by its class and never parks the hub;
-/// the hub's own re-subscribe on a fresh connection, refused as a rejected
-/// credential, ends that connection like a failed stream. Which of an
-/// upstream's failures are which is the failure type's to say, in its
-/// [`Classify`] impl.
+/// rejected key pair from a watched source parks the hub (retrying cannot
+/// help, provisioning can; [`Disconnected`] says what ends a park); one
+/// from a static source, and everything transient, backs off. A session's
+/// subscribe the upstream refuses is only answered by its class and never
+/// parks the hub; the hub's own re-subscribe on a fresh connection, refused
+/// as a rejected credential, ends that connection like a failed stream.
+/// Which of an upstream's failures are which is the failure type's to say,
+/// in its [`Classify`] impl.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StreamFailure {
     Unauthenticated,
@@ -54,7 +54,9 @@ enum Disconnected {
     Disabled,
     /// Parked until a watched credential source delivers its first value.
     MissingCredentials,
-    /// Parked until a watched credential source rotates a rejected pair.
+    /// Parked until a watched credential source rotates a rejected key pair;
+    /// if that source's sender goes away the park ends and the hub backs off
+    /// ([`Reconnecting`](Self::Reconnecting)).
     RejectedCredentials,
     /// Sleeping out a backoff of this length before the next connect.
     Reconnecting(Duration),

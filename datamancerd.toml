@@ -2,18 +2,22 @@
 #
 # Run with:  cargo run -p datamancerd -- --config datamancerd.toml
 #
-# Provider credentials are NOT in this file — `account_type` selects which
-# environment credential pair oxidized_alpaca loads:
+# Provider credentials are NOT in this file — they live in the daemon's
+# credential store, provisioned with the `set-credentials` control op. For the
+# deprecated env-var fallback only (read when the store has no entry),
+# `account_type` selects which environment pair is read:
 #   paper -> ALPACA_PAPER_API_KEY_ID / ALPACA_PAPER_API_SECRET_KEY
 #   live  -> ALPACA_LIVE_API_KEY_ID  / ALPACA_LIVE_API_SECRET_KEY
 #
-# Every section below is optional except [provider] (at least one provider must
-# be configured). The values shown for non-provider sections are the defaults;
-# delete a section to accept its defaults. Unknown keys are rejected.
+# Every section below is optional. With no [provider.*] section the daemon
+# boots with every provider disabled; `configure-provider` enables one at
+# runtime. Unless a comment says otherwise, the values shown for non-provider
+# sections are the defaults; delete a section to accept its defaults. Unknown
+# keys are rejected.
 
 # ── Providers ──────────────────────────────────────────────────────────────
-# Configure at least one. Crypto needs no special entitlements on a paper key,
-# so it is the easiest first run.
+# Crypto needs no special entitlements on a paper key, so it is the easiest
+# first run.
 [provider.alpaca_crypto]
 account_type = "paper"            # paper | live
 venue = "us"                      # us | us_kraken | eu_kraken
@@ -29,7 +33,7 @@ venue = "us"                      # us | us_kraken | eu_kraken
 # (create them and chown to the service user first).
 [cache]
 backend = "embedded"              # embedded | memory
-path = "./.datamancerd/cache.db"  # required for embedded; a database file, not a directory
+path = "./.datamancerd/cache.db"  # a database file, not a directory; default <data dir>/cache.db
 
 [tap_log]
 backend = "embedded"
@@ -39,12 +43,13 @@ path = "./.datamancerd/taplog.db"
 [session]
 resume_buffer_events = 65536      # bounded per-client resume buffer
 adjustment = "all"                # raw | split | dividend | spin_off | all
+query_persistence = "cached"      # cache policy for every open-query; same values as a startup session's persistence
 max_backfill_days = 7             # oldest start a client's live_backfill may ask for
 
 # ── Control surface + service naming ───────────────────────────────────────
 [server]
-admin_socket = "./.datamancerd/admin.sock"     # newline-JSON control socket (use /run/datamancerd/admin.sock in prod)
-service_prefix = "datamancerd"                 # iceoryx2 service-name prefix
+admin_socket = "./.datamancerd/admin.sock"     # newline-JSON control socket; default: the per-user control.sock clients discover
+service_prefix = "datamancerd"                 # iceoryx2 service-name prefix: {prefix}/{boot_id}/v3/...
 shutdown_timeout_secs = 30                      # bounds the graceful exit; at least 1
 max_concurrent_backfills = 2                    # client backfills fetching history at once
 
@@ -56,12 +61,13 @@ cache_catalog_interval_ms = 30000 # slower cache-catalog refresh
 # ── iceoryx2 transport caps ────────────────────────────────────────────────
 [iceoryx2]
 max_clients = 64                  # per-client data-plane service cap
+max_queries = 2                   # concurrent in-flight historical-query cap
 
 # ── Optional read-only web introspection UI (feature `web-ui`, default on) ──
 [web_ui]
-enabled = true                    # off unless explicitly enabled
+enabled = true                    # default false: off unless explicitly enabled
 bind = "127.0.0.1"                # loopback only; a non-loopback bind is rejected
-port = 9080
+port = 9080                       # default 8080
 # assets_dir = "/usr/share/datamancerd/ui"   # optional static assets
 live_state_cadence_ms = 1000      # fast: live-state swap + SSE
 cache_catalog_cadence_ms = 30000  # slow: cache-catalog swap (/api/cache)
@@ -76,5 +82,6 @@ symbol = "BTC/USD"
 kind = "trade"                    # trade | quote | bar1s | bar1m | bar5m | bar15m | bar1h | bar1d
 scope = "live"                    # live | live_backfill
 # backfill_from = "2026-06-01T00:00:00Z"   # required iff scope = live_backfill
+# seed = false                    # live only: no latest-value seed (default true)
 persistence = "cached_with_tap"   # none | cached | cached_with_tap | read_only | refresh | tap_only
 always_on = true                  # hold for the process lifetime regardless of clients

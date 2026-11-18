@@ -13,20 +13,20 @@ A unified subscription and replay layer for financial market data — usable two
 The library is primary; the server is a thin wrapper that adds composition, process
 lifecycle, and a control surface — **no** new ordering, transport, or event semantics.
 
-> **Status:** early-stage (`0.9.x`). The public API is co-evolving with its first
+> **Status:** early-stage (`0.x`). The public API is co-evolving with its first
 > consumers; expect breaking changes until it stabilizes. Pre-1.0, a `feat!:` bump is a
 > *minor* release, so **every minor is potentially breaking**. Dual-licensed
 > `MIT OR Apache-2.0` — see [Licensing](#licensing).
 
-## Core design rule: per-symbol determinism
+## Core design rule: per-pair determinism
 
-Ordering is **per symbol only**. Each instrument's substream is a source-stamped,
-within-instrument total order per data kind — the key is `(instrument, kind, seq)`, so
-a symbol's trades and quotes count separately. Across instruments the multiplexed
-stream *interleaves* in arrival order; it does **not** compute a global, cross-symbol
-order, and a globally merge-sorted stream is an explicit non-goal. Two consumers of the
-same instrument observe byte-identical `(seq, source_ts)` because they share one
-authoritative per-`(instrument, kind)` session.
+Ordering is **per `(instrument, kind)` pair only**. Each pair's substream is a
+source-stamped total order — the key is `(instrument, kind, seq)`, so a symbol's trades
+and quotes count separately and are not ordered against each other. Across pairs the
+multiplexed stream *interleaves* in arrival order; it does **not** compute a global,
+cross-pair order, and a globally merge-sorted stream is an explicit non-goal. Two
+consumers of the same pair observe byte-identical `(seq, source_ts)` because they share
+one authoritative per-`(instrument, kind)` session.
 
 Every data event carries three distinct timestamp/identity fields:
 
@@ -78,7 +78,7 @@ Every non-Windows build of every crate stays `forbid`. `datamancer-client` is `f
 ```bash
 cargo build                                              # workspace, default features
 cargo test                                               # all unit + integration tests (skips #[ignore])
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings   # what CI runs
 cargo fmt
 ```
 
@@ -87,7 +87,9 @@ Ignored tests need live resources:
 ```bash
 cargo test --test alpaca_real -- --ignored               # hits real Alpaca; needs credentials
 cargo test -p datamancer-transport-iceoryx2 -- --ignored # needs a live iceoryx2 runtime
-cargo test -p datamancerd --test daemon_e2e -- --ignored # spawns the binary + iceoryx2 runtime
+cargo test -p datamancerd --test daemon_e2e -- --ignored # spawns the binary + iceoryx2 runtime; some need credentials
+cargo test -p datamancerd --all-features --test scripted_e2e -- --ignored --test-threads=1
+                                                         # hermetic daemon e2e on the scripted provider; no credentials
 ```
 
 Before opening a PR, run the CI gates that only fail in CI:
@@ -130,6 +132,9 @@ cargo run --example client_session    # multiplexed client session over several 
 cargo run --example resume            # drop and re-take a live stream
 cargo run --example tap_replay        # replay from a tap log
 ```
+
+[`datamancer-client`](crates/datamancer-client/examples) has a runnable `backfill_tape`
+example against a running daemon, and `datamancerd` a `ws_consumer` example.
 
 ## Running the server
 
@@ -247,6 +252,7 @@ Windows builds need LLVM and the MSVC toolchain — see
 | `datamancerd` | `web-ui` | ✅ | Embedded read-only introspection UI + JSON API |
 | `datamancerd` | `ws` | — | Remote WebSocket client surface |
 | `datamancerd` | `metrics` | — | Prometheus `/metrics` endpoint |
+| `datamancerd` | `scripted-provider` | — | Network-free scripted test provider for the hermetic e2e suites |
 
 Pulling in a new provider or transport should always be additive and feature-gated.
 
@@ -255,14 +261,14 @@ Pulling in a new provider or transport should always be additive and feature-gat
 | Provider | Live | History | Status |
 | --- | :-: | :-: | --- |
 | Alpaca equities | ✅ | ✅ | shipped |
-| Alpaca crypto | ✅ | ✅ | shipped |
+| Alpaca crypto | ✅ | — | shipped; live only (history is not wired up, `latest` seeds a live subscription) |
 | IBKR (TWS / IB Gateway) | — | — | **reserved, not built** — credential and health shapes exist in core; no provider implementation |
 
 ## What Datamancer does *not* do
 
 It produces events; it is not an analysis framework, a general-purpose time-series store,
 or a cross-venue reconciler. There is no semantic enrichment, no source-timestamp
-re-sorting, no wall-clock-paced replay, and no cross-symbol/global ordering. Consumers that
+re-sorting, no wall-clock-paced replay, and no cross-pair/global ordering. Consumers that
 need any of those build them on top.
 
 ## Licensing

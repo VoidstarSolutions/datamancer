@@ -5,14 +5,16 @@
 //! their messages into typed [`MarketEvent`]s, and presents them through a
 //! multiplexed [`ClientSession`] stream that downstream consumers (analysis
 //! engines, persistence sinks, UIs) consume without caring which provider any
-//! given event came from. Ordering is **per symbol** (`(instrument, seq)`,
-//! source-stamped within each instrument; arrival-order across instruments) —
-//! the multiplex interleaves rather than computing a global order.
+//! given event came from. Ordering is **per `(instrument, kind)` pair**: each
+//! pair's stream is source-stamped by [`Seq`]; across pairs the multiplex
+//! interleaves in arrival order rather than computing a global order.
 //!
 //! See `README.md` in this crate for the design rationale and intended scope.
-//! Provider and storage implementations live in sibling crates and depend on
-//! [`datamancer-core`](datamancer_core) — the types and trait surface this
-//! crate re-exports — without pulling in the session orchestrator below.
+//! The bundled provider and storage implementations live in this crate behind
+//! cargo features (`provider-alpaca`, `storage-turso`). Storage depends only
+//! on [`datamancer-core`](datamancer_core), the types and trait surface this
+//! crate re-exports; the Alpaca providers also take [`ReconnectPolicy`] from
+//! this crate's session orchestrator.
 //!
 //! # Layering
 //!
