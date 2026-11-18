@@ -28,19 +28,21 @@ nature. Async callers wrap calls in `tokio::task::spawn_blocking`.
 
 ## Backend selection
 
-- **This task:** `FileBackend` only — one JSON file
-  (`{provider: ProviderCredentials}`), created with owner-only permissions
-  (`0o600` on Unix) and written atomically (tmp file + rename), the same
-  pattern `datamancerd` uses for its own config writes.
-- **Task 4** adds a keychain backend (via the `keyring` crate) and
-  `CredentialStore::open_default()`, which prefers the keychain and falls
-  back to `FileBackend` on headless hosts where no keychain/secret-service is
-  reachable. The active choice is never silent — `CredentialStore::backend_name()`
-  surfaces it, and `datamancerd` threads it through `HealthView` so an
-  unexpected fallback is visible to an operator.
-- **Windows** (Credential Manager) is additive later, as another
-  implementation of the same trait — not a widened enum or a new code path
-  in the store.
+- **`KeychainBackend`** — the OS store via the `keyring` crate: macOS
+  Keychain (`"keychain"`), Linux Secret Service over D-Bus
+  (`"secret-service"`), Windows Credential Manager (`"credential-manager"`).
+  Entries live under service `"datamancer"`, username = provider id.
+- **`FileBackend`** — one JSON file (`{provider: ProviderCredentials}`),
+  created with owner-only permissions (`0o600` on Unix) and written
+  atomically (tmp file + rename), the same pattern `datamancerd` uses for its
+  own config writes.
+- **`CredentialStore::open_default()`** prefers the keychain and falls back
+  to `FileBackend` at `default_file_path()` on headless hosts where no
+  keychain/secret-service is reachable; with neither (no keychain and no home
+  directory) it fails. The active choice is never silent —
+  `CredentialStore::backend_name()` surfaces it, and `datamancerd` threads it
+  through `ping` and `HealthView` so an unexpected fallback is visible to an
+  operator.
 
 ### Testing/ops override: `DATAMANCER_CREDENTIALS_FILE`
 
@@ -81,8 +83,8 @@ pub fn contract_tests(backend: &dyn CredentialBackend);
 
 The shared behavior every backend must satisfy — round-trip, overwrite,
 per-provider isolation, and clear semantics (absent is `Ok`, and only removes
-the named provider). `pub` so Task 4's keychain backend runs the identical
-suite (including its `#[ignore]`d, platform-only tests) instead of
+the named provider). `pub` so the keychain backend runs the identical suite
+(in its `#[ignore]`d test, which touches the real OS keychain) instead of
 duplicating assertions.
 
 [`CredentialBackend`]: ./src/lib.rs

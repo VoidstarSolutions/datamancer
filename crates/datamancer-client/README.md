@@ -213,13 +213,13 @@ for info in client.instruments(None).await? {
 
 ## App facade (feature `app`)
 
-Behind feature `app` (implies `iceoryx2`, off by default), `AppHandle` is a
-higher-level entry point for consumer apps that don't want to hand-roll
-discovery: find a running `datamancerd` on the (default or configured)
-control socket, or spawn one, wait for it to become ready, and connect —
-returning the same split `(handle, events)` shape as `Iceoryx2Client::connect`.
-It adds no protocol semantics; every `AppHandle` method maps to an existing
-control-surface op.
+Behind feature `app` (implies `iceoryx2` and `ws`, off by default; `ws` carries
+the data plane on Windows), `AppHandle` is a higher-level entry point for
+consumer apps that don't want to hand-roll discovery: find a running
+`datamancerd` on the (default or configured) control socket, or spawn one, wait
+for it to become ready, and connect — returning the same split
+`(handle, events)` shape as `Iceoryx2Client::connect`. It adds no protocol
+semantics; every `AppHandle` method maps to an existing control-surface op.
 
 ```rust,no_run
 use datamancer_client::app::{AppHandle, EnsureConfig};

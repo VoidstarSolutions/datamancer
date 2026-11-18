@@ -37,7 +37,7 @@ impl AlpacaCredentials {
     /// Read the pair from the environment for `account_type` (see
     /// [`env_var_names`]). The streaming path needs the credentials in hand
     /// rather than `oxidized_alpaca`'s env-var constructor, because that
-    /// constructor couples the credential pair *and* the stream host to one
+    /// constructor couples the key pair *and* the stream host to one
     /// account type (see `alpaca::STREAM_ACCOUNT_TYPE`). A missing variable
     /// surfaces as the same [`oxidized_alpaca::Error`] the upstream
     /// constructor raises, so callers classify it identically.

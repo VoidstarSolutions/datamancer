@@ -12,7 +12,7 @@ The supported providers are Alpaca equities and Alpaca crypto. Provider integrat
 
 ## What Datamancer Does
 
-- **Provider integration.** Per-provider transports (websocket for live, REST for historical), authentication, rate-limit handling, and reconnect logic, isolated behind a unified surface.
+- **Provider integration.** Per-provider transports (websocket for live, REST for historical), authentication, rate-limit handling, and reconnect logic, isolated behind a unified surface. Each Alpaca provider holds one upstream stream connection shared by all its live sessions: rejected credentials from a watched source park it, and any other failed connection backs off and reconnects; the exact rules are in the `providers::alpaca` module docs ("Rejected credentials").
 - **Typed event production.** Provider-native messages are converted into datamancer's public event types. Consumers never see provider-specific shapes.
 - **Subscription management.** A live session's subscription set is mutable at runtime: instruments and event kinds can be added or removed without tearing down the underlying connection.
 - **Historical fetch.** Pulling bar (and eventually trade and quote) history for an instrument set over a date range, with pagination and rate-limit handling abstracted away.
@@ -101,7 +101,10 @@ Both expose:
 - `close()` — explicit shutdown.
 
 `ClientSession` additionally exposes `subscribe` / `unsubscribe` to mutate its set at
-runtime without tearing down the underlying connection.
+runtime without tearing down the underlying connection, and `queue_subscribe` /
+`queue_unsubscribe` to place a command in the session's order without waiting for it. A
+session queues a bounded number of commands; past that the queue call is refused
+with `Error::SessionBusy` and nothing is queued, so the caller retries the call.
 
 The choice of explicit `close` over reference-counted lifetime keeps subscription teardown visible in code, which matters once persistence is wired up and shutdown order affects whether buffered events make it to disk.
 
@@ -169,17 +172,20 @@ A subscriber that stops pacing gets a `Gap`. A client with no attached stream bu
 its resume buffer. `subscribe` returns a `Subscribed`: the pair's authoritative session is created
 with its first subscriber's scope and later subscribers join it as is. `Subscribed::history_from`
 gives the start of the history this subscriber created, and the type's docs say what a joiner
-receives. A start at or past the live edge is `Error::BackfillFromNotInPast`. Bounded ranges are a
-`Session` concern (`Scope::Historical`).
+receives. A start at or past the live edge is `Error::BackfillFromNotInPast`. The builder can
+limit how far back a client backfill may start (`max_client_backfill`, past it
+`Error::BackfillTooOld`) and how many client backfills fetch at once
+(`max_concurrent_client_backfills`). Bounded ranges are a `Session` concern (`Scope::Historical`).
 
-Subscriptions accumulate; the client session's multiplexed stream **interleaves** everything that has been requested — per-symbol deterministic (`(instrument, seq)`, source-stamped within each instrument), arrival-order across symbols, never globally merge-sorted. Each `(instrument, kind)` pair is backed by a refcounted shared **authoritative session**, so two consumers of the same pair observe identical `(seq, source_ts)`. Adding the same instrument with a new event kind extends the subscription set rather than duplicating it.
+Subscriptions accumulate; the client session's multiplexed stream **interleaves** everything that has been requested — deterministic per `(instrument, kind)` pair (`(instrument, kind, seq)`, source-stamped within each pair), arrival-order across pairs, never globally merge-sorted. Each `(instrument, kind)` pair is backed by a refcounted shared **authoritative session**, so two consumers of the same pair observe identical `(seq, source_ts)`. Adding the same instrument with a new event kind extends the subscription set rather than duplicating it.
 
 ## Configuration
 
 There is no monolithic session config. What a session needs is split across three places:
 
 **The builder** (`DatamancerBuilder`) registers providers, the optional `HistoricalCache`
-and `TapLog`, and process-wide knobs such as the per-client resume-buffer size.
+and `TapLog`, and process-wide knobs such as the per-client resume-buffer size and the
+client backfill limits.
 
 **Per-session arguments** — `Scope` (`LiveScope` for `subscribe()`) and `PersistenceOptions`
 — are passed at `session()` / `subscribe()` time, so one `Datamancer` serves bounded-replay,
@@ -423,8 +429,8 @@ The library stays primary: embedders that want zero hops consume a `Session` /
 wrapper** — a same-host daemon that builds a `Datamancer` from a TOML config,
 serves multiple consumer processes (one iceoryx2 data-plane service per client),
 holds authoritative sessions alive as the cross-process lifecycle anchor, and
-exposes a Unix-socket + newline-JSON control surface. It adds no new semantics;
-see `crates/datamancerd/README.md`.
+exposes a newline-JSON control surface over a Unix socket (a named pipe on
+Windows). It adds no new semantics; see `crates/datamancerd/README.md`.
 
 **Subscriber rule.** The data and announcement services are two independent
 iceoryx2 services with **no mutual delivery-order guarantee**: a data sample can
@@ -445,4 +451,5 @@ deliver, but makes no guarantee a crashed/slow subscriber consumed them
 
 ## License
 
-To be determined. Datamancer will be released under a permissive open-source license once one is selected.
+Licensed under either of Apache License, Version 2.0 or MIT license at your option
+(`MIT OR Apache-2.0`); see `LICENSE-APACHE` and `LICENSE-MIT` at the repository root.

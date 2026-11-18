@@ -13,7 +13,7 @@
 //!    diagnostics plane.
 //! 3. Hold authoritative sessions alive as the cross-process lifecycle anchor.
 //! 4. Expose a control surface for runtime `subscribe`/`unsubscribe`.
-//! 5. Graceful shutdown: stop accepting, flush sinks + tap log, drain.
+//! 5. Graceful shutdown: a bounded drain in a fixed order (see `shutdown`).
 //!
 //! Access control is **same-host, single-operator**: Unix gates each
 //! privileged op on the peer's uid (`SO_PEERCRED`); Windows restricts the pipe
