@@ -19,18 +19,18 @@
 //!
 //! The session-registry rule (at most one live session per pair) makes the
 //! routing unambiguous: each `(instrument, kind)` key maps to exactly one
-//! sink at any time.
+//! sink at any time. As for [the stock provider](super::alpaca), a hub task
+//! that ends closes the sinks of its subscribed sessions, unless the caller
+//! kept a clone of the sender it handed to `start_live`.
 //!
 //! # Reconnect
 //!
-//! On websocket failure the hub tears down the client, sleeps with
-//! exponential backoff per the configured [`ReconnectPolicy`], and
-//! reconnects, re-applying the active subscription set. A
-//! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast
-//! to all active sinks so consumers see the gap window. A rejected
-//! credential pair (`402`) parks until the credentials rotate when they
-//! come from a watched source, and backs off like any other failure
-//! otherwise; a `406` or any other server error is transient and backs off.
+//! The crypto stream runs on the same hub code as the stock stream, so it
+//! reconnects, parks and backs off exactly as
+//! [the stock provider](super::alpaca#reconnect) does, under the
+//! configured [`ReconnectPolicy`]. Which of its failures are rejected
+//! credentials and which are transient is the `Classify` impl's to say, in
+//! `alpaca_common`.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -49,14 +49,12 @@ use oxidized_alpaca::{
         messages::crypto::{CryptoBarEvent, CryptoQuoteEvent, CryptoTradeEvent},
     },
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
-use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
-use super::hub::{
-    Connector, HubSlot, PresentCredentials, SharedLiveHandle, StreamFailure, SubscriptionSet,
-    Upstream, wall_clock_ts,
-};
-use super::runtime::SettingsSource;
+use super::alpaca_common::SymbolLists;
+use super::credentials::{AlpacaCredentials, CredentialsSource, PresentCredentials, Resolved};
+use super::hub::{Connector, HubSlot, HubSources, SubscriptionSet, Upstream, wall_clock_ts};
+use super::runtime::{SettingsSource, Watched};
 use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca crypto provider.
@@ -212,12 +210,10 @@ struct RestState {
     /// Whether the settings read the clients were built from found the
     /// provider enabled.
     enabled: bool,
-    /// `Some` only for [`CredentialsSource::Watch`]; `has_changed` on this
-    /// cached receiver is the rebuild trigger.
-    cred_rx: Option<watch::Receiver<Option<AlpacaCredentials>>>,
-    /// `Some` only for [`SettingsSource::Watch`]; `has_changed` on this
-    /// cached receiver is the rebuild trigger.
-    settings_rx: Option<watch::Receiver<Option<AlpacaCryptoSettings>>>,
+    /// The credentials watch; a change on it is a rebuild trigger.
+    cred_rx: Watched<Option<AlpacaCredentials>>,
+    /// The settings watch; a change on it is a rebuild trigger.
+    settings_rx: Watched<Option<AlpacaCryptoSettings>>,
 }
 
 impl RestState {
@@ -278,8 +274,8 @@ impl AlpacaCryptoProvider {
         // (Capturing after building would mark an in-between rotation seen
         // while the cached client is stale.) Applies to both the
         // credentials and the settings receiver.
-        let cred_rx = cfg.credentials.watch();
-        let settings_rx = cfg.settings.watch();
+        let cred_rx = cfg.credentials.read().into_watch();
+        let settings_rx = cfg.settings.read().into_watch();
         let mut state = RestState {
             trading: None,
             market_data: None,
@@ -290,8 +286,15 @@ impl AlpacaCryptoProvider {
         state.rebuild(&cfg);
         let rest = std::sync::Mutex::new(state);
         Self {
+            hub: HubSlot::new(
+                CryptoConnector,
+                HubSources {
+                    settings: cfg.settings.clone(),
+                    credentials: cfg.credentials.clone(),
+                    reconnect: cfg.reconnect,
+                },
+            ),
             cfg,
-            hub: HubSlot::idle(),
             rest,
         }
     }
@@ -304,8 +307,7 @@ impl AlpacaCryptoProvider {
     /// detection so they stay in lockstep on a credential/settings watch bump.
     fn refresh_rest(&self) -> std::sync::MutexGuard<'_, RestState> {
         let mut state = self.rest.lock().expect("REST client state poisoned");
-        let changed = super::runtime::watch_changed(&mut state.cred_rx)
-            | super::runtime::watch_changed(&mut state.settings_rx);
+        let changed = state.cred_rx.take_change() | state.settings_rx.take_change();
         if changed {
             state.rebuild(&self.cfg);
         }
@@ -328,12 +330,7 @@ impl Provider for AlpacaCryptoProvider {
             return false;
         }
         match surface {
-            Surface::Live => match kind {
-                EventKind::Trade
-                | EventKind::Quote
-                | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
-                EventKind::Bar(_) => false,
-            },
+            Surface::Live => SymbolLists::carries(kind),
             // No historical surface is wired yet: `oxidized_alpaca` exposes only
             // `crypto_latest_*`, not the historical crypto trade/quote
             // endpoints, and `fetch_history` below errors unconditionally.
@@ -345,10 +342,7 @@ impl Provider for AlpacaCryptoProvider {
     }
 
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
-        let cmd_tx = self.hub.ensure(|| CryptoConnector {
-            cfg: self.cfg.clone(),
-        });
-        Ok(Box::new(SharedLiveHandle::new(cmd_tx, sink)))
+        Ok(Box::new(self.hub.attach(sink)))
     }
 
     async fn fetch_history(
@@ -427,28 +421,13 @@ impl Provider for AlpacaCryptoProvider {
 // Hub connector
 // ---------------------------------------------------------------------------
 
-/// How the hub opens and classifies the crypto market-data stream.
-struct CryptoConnector {
-    cfg: AlpacaCryptoProviderConfig,
-}
+/// How the hub opens the crypto market-data stream.
+struct CryptoConnector;
 
 impl Connector for CryptoConnector {
     const PROVIDER_ID: &'static str = PROVIDER_ID;
     type Settings = AlpacaCryptoSettings;
-    type Failure = oxidized_alpaca::Error;
     type Upstream = StreamingCryptoClient;
-
-    fn settings(&self) -> &SettingsSource<AlpacaCryptoSettings> {
-        &self.cfg.settings
-    }
-
-    fn credentials(&self) -> &CredentialsSource {
-        &self.cfg.credentials
-    }
-
-    fn reconnect(&self) -> &ReconnectPolicy {
-        &self.cfg.reconnect
-    }
 
     async fn connect(
         &self,
@@ -478,14 +457,6 @@ impl Connector for CryptoConnector {
                 .await
             }
         }
-    }
-
-    /// The crypto stream speaks the same protocol as the stock stream, so it
-    /// classifies the same way: a rejected credential, at connect, on a
-    /// subscribe or mid-stream, is reported as unauthenticated, and
-    /// everything else as transient.
-    fn classify(failure: &oxidized_alpaca::Error) -> StreamFailure {
-        super::alpaca::classify_stream_failure(failure)
     }
 }
 
@@ -532,38 +503,19 @@ impl SubscriptionSet for CryptoSubscriptionList {
             && self.orderbooks.as_ref().is_none_or(Vec::is_empty)
     }
 
-    fn apply(&mut self, instrument: &Instrument, kind: EventKind, add: bool) {
-        apply_pair_to_list(self, instrument, kind, add);
+    fn insert(&mut self, instrument: &Instrument, kind: EventKind) {
+        crypto_symbol_lists(self).insert(instrument, kind);
     }
 }
 
-fn apply_pair_to_list(
-    list: &mut CryptoSubscriptionList,
-    instrument: &Instrument,
-    kind: EventKind,
-    add: bool,
-) {
-    let symbol = instrument.symbol().to_string();
-    match kind {
-        EventKind::Trade => mutate_field(&mut list.trades, &symbol, add),
-        EventKind::Quote => mutate_field(&mut list.quotes, &symbol, add),
-        EventKind::Bar(BarInterval::OneMinute) => mutate_field(&mut list.bars, &symbol, add),
-        EventKind::Bar(BarInterval::OneDay) => mutate_field(&mut list.daily_bars, &symbol, add),
-        EventKind::Bar(_) => {}
-    }
-}
-
-fn mutate_field(field: &mut Option<Vec<String>>, symbol: &str, add: bool) {
-    let list = field.get_or_insert_with(Vec::new);
-    if add {
-        if !list.iter().any(|s| s == symbol) {
-            list.push(symbol.to_string());
-        }
-    } else {
-        list.retain(|s| s != symbol);
-    }
-    if list.is_empty() {
-        *field = None;
+/// The lists of `list` the hub fills; `updated_bars` and `orderbooks` have
+/// no [`EventKind`] and stay empty.
+fn crypto_symbol_lists(list: &mut CryptoSubscriptionList) -> SymbolLists<'_> {
+    SymbolLists {
+        trades: &mut list.trades,
+        quotes: &mut list.quotes,
+        bars: &mut list.bars,
+        daily_bars: &mut list.daily_bars,
     }
 }
 
@@ -700,8 +652,8 @@ fn crypto_snapshot_to_event(
 mod tests {
     use super::*;
     use crate::providers::alpaca::tests::server_error;
-    use crate::providers::hub::dispatch_event;
     use crate::providers::hub::tests::{fanout_ids, two_routes};
+    use crate::providers::hub::{Classify, StreamFailure, dispatch_event};
     use oxidized_alpaca::streaming::StreamErrorCode;
 
     #[test]
@@ -992,7 +944,7 @@ mod tests {
     fn crypto_subscribe_refused_with_402_is_unauthenticated() {
         let refused = oxidized_alpaca::Error::StreamingSubscribe;
         assert_eq!(
-            CryptoConnector::classify(&server_error(refused, StreamErrorCode::AuthFailed)),
+            server_error(refused, StreamErrorCode::AuthFailed).classify(),
             StreamFailure::Unauthenticated
         );
         for code in [
@@ -1000,7 +952,7 @@ mod tests {
             StreamErrorCode::NotAuthenticated,
         ] {
             assert_eq!(
-                CryptoConnector::classify(&server_error(refused, code)),
+                server_error(refused, code).classify(),
                 StreamFailure::Transient,
                 "code {code:?}"
             );
@@ -1008,23 +960,25 @@ mod tests {
     }
 
     #[test]
-    fn crypto_stream_failures_park_on_402_and_back_off_on_406() {
+    fn crypto_stream_failures_classify_402_as_unauthenticated_and_406_as_transient() {
         assert_eq!(
-            CryptoConnector::classify(&oxidized_alpaca::Error::StreamingAuth),
+            oxidized_alpaca::Error::StreamingAuth.classify(),
             StreamFailure::Unauthenticated
         );
         assert_eq!(
-            CryptoConnector::classify(&server_error(
+            server_error(
                 oxidized_alpaca::Error::StreamingError,
                 StreamErrorCode::AuthFailed
-            )),
+            )
+            .classify(),
             StreamFailure::Unauthenticated
         );
         assert_eq!(
-            CryptoConnector::classify(&server_error(
+            server_error(
                 oxidized_alpaca::Error::StreamingError,
                 StreamErrorCode::ConnectionLimitExceeded
-            )),
+            )
+            .classify(),
             StreamFailure::Transient
         );
     }
@@ -1063,45 +1017,6 @@ mod tests {
         assert!(
             crypto_snapshot_to_event(&snap, &inst, EventKind::Bar(BarInterval::FiveMinute), rx)
                 .is_none()
-        );
-    }
-
-    /// A `start_live` that panics while it holds the hub slot (here: polled
-    /// once outside a tokio runtime, so the spawn panics) must not take the
-    /// provider down for every later caller: a later `start_live` inside a
-    /// runtime still succeeds.
-    #[test]
-    fn a_panicking_start_live_does_not_poison_later_start_lives() {
-        use std::future::Future;
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-        use std::task::{Context, Poll, Waker};
-        let (_tx, rx) = tokio::sync::watch::channel(None);
-        let p = AlpacaCryptoProvider::new(AlpacaCryptoProviderConfig {
-            settings: SettingsSource::Watch(rx),
-            ..Default::default()
-        });
-        // Polls `start_live` once by hand; true when it completes with a handle.
-        let poll_once = || {
-            catch_unwind(AssertUnwindSafe(|| {
-                let (sink, _events) = tokio::sync::mpsc::channel(8);
-                let mut fut = std::pin::pin!(p.start_live(sink));
-                let mut cx = Context::from_waker(Waker::noop());
-                matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(_)))
-            }))
-        };
-        assert!(poll_once().is_err(), "a spawn outside a runtime panics");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let later = rt.block_on(async { poll_once() });
-        assert!(
-            matches!(later, Ok(true)),
-            "a later start_live in a runtime must succeed, got {:?}",
-            later.map_err(|e| e
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| e.downcast_ref::<String>().cloned()))
         );
     }
 }

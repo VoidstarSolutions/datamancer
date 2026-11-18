@@ -28,7 +28,10 @@
 //! command channel. The hub owns the upstream socket, applies the aggregate
 //! subscription set to it, and routes incoming events to the right
 //! per-session sink by `(instrument, kind)`. The session-registry rule (at
-//! most one live session per pair) keeps that routing a function.
+//! most one live session per pair) keeps that routing a function. While a
+//! handle is subscribed, the hub's route holds the sink handed to
+//! `start_live`, so if the hub task ends the sink closes and the stream
+//! ends, unless the caller kept a clone of that sender.
 //!
 //! # Reconnect
 //!
@@ -36,14 +39,17 @@
 //! exponential backoff per the configured [`ReconnectPolicy`], and
 //! reconnects — re-applying the aggregate subscription set. A
 //! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast to
-//! every active sink so consumers see the gap window in the event stream. A
-//! credential pair rejected (`402`) at connect or mid-stream parks until the
-//! credentials rotate when they come from a watched source, and backs off
-//! like any other failure otherwise; a `406` or any other server error is
-//! transient and backs off (see `classify_stream_failure` for the upstream
-//! caveat). A `402` that refuses a subscribe is answered to that subscribe as
-//! unauthenticated and does not park; one that refuses the re-subscribe after
-//! a reconnect is broadcast as a provider error, and the stream stays up.
+//! every active sink so consumers see the gap window in the event stream.
+//! Which failures, at connect, on the re-subscribe after a reconnect, or
+//! mid-stream, mean rejected credentials and which are transient is decided
+//! in one place, the `Classify` impl in `alpaca_common`, which also records
+//! where upstream cannot tell them apart. Rejected credentials park until
+//! they rotate when they come from a watched source, and back off like any
+//! other failure otherwise. A session's own subscribe refused for its
+//! credentials is answered to that subscribe as unauthenticated and does not
+//! park the hub. A parked or backing-off hub still hears a disable, and a
+//! session that closes while the hub is parked or backing off takes its pair
+//! with it rather than leaving it for the next connect.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -64,18 +70,16 @@ use oxidized_alpaca::{
         trading::assets::{Asset, AssetClass as AlpacaAssetClass, Status as AlpacaAssetStatus},
     },
     streaming::{
-        StockStreamMessage, StockSubscriptionList, StreamErrorCode, StreamingStockClient,
+        StockStreamMessage, StockSubscriptionList, StreamingStockClient,
         messages::stock::{StockBar, StockQuoteEvent, StockTradeEvent},
     },
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
-use super::credentials::{AlpacaCredentials, CredentialsSource, Resolved};
-use super::hub::{
-    Connector, HubSlot, PresentCredentials, SharedLiveHandle, StreamFailure, SubscriptionSet,
-    Upstream, wall_clock_ts,
-};
-use super::runtime::SettingsSource;
+use super::alpaca_common::SymbolLists;
+use super::credentials::{AlpacaCredentials, CredentialsSource, PresentCredentials, Resolved};
+use super::hub::{Connector, HubSlot, HubSources, SubscriptionSet, Upstream, wall_clock_ts};
+use super::runtime::{SettingsSource, Watched};
 use crate::session::ReconnectPolicy;
 
 /// Stable provider identifier for the Alpaca-backed provider.
@@ -341,12 +345,10 @@ fn build_rest(cfg: &AlpacaProviderConfig) -> RestClients {
 /// await) guards both so the check-and-rebuild is atomic.
 struct RestState {
     clients: RestClients,
-    /// `Some` only for [`CredentialsSource::Watch`]; `has_changed` on this
-    /// cached receiver is the rebuild trigger.
-    cred_rx: Option<watch::Receiver<Option<AlpacaCredentials>>>,
-    /// `Some` only for [`SettingsSource::Watch`]; `has_changed` on this
-    /// cached receiver is the rebuild trigger.
-    settings_rx: Option<watch::Receiver<Option<AlpacaSettings>>>,
+    /// The credentials watch; a change on it is a rebuild trigger.
+    cred_rx: Watched<Option<AlpacaCredentials>>,
+    /// The settings watch; a change on it is a rebuild trigger.
+    settings_rx: Watched<Option<AlpacaSettings>>,
 }
 
 /// Alpaca-backed [`Provider`].
@@ -369,17 +371,17 @@ impl AlpacaProvider {
         // (Capturing after building would mark an in-between rotation seen
         // while the cached clients are stale.) Applies to both the
         // credentials and the settings receiver.
-        let cred_rx = cfg.credentials.watch();
-        let settings_rx = cfg.settings.watch();
+        let cred_rx = cfg.credentials.read().into_watch();
+        let settings_rx = cfg.settings.read().into_watch();
         let rest = std::sync::Mutex::new(RestState {
             clients: build_rest(&cfg),
             cred_rx,
             settings_rx,
         });
         Self {
+            hub: HubSlot::new(StockConnector::new(&cfg), hub_sources(&cfg)),
             cfg,
             rest,
-            hub: HubSlot::idle(),
         }
     }
 
@@ -390,8 +392,8 @@ impl AlpacaProvider {
     pub fn with_rest(cfg: AlpacaProviderConfig, rest: MarketDataClient) -> Self {
         // Ordering invariant — receiver before build: a rotation after
         // capture triggers rebuild; before capture is included in the build.
-        let cred_rx = cfg.credentials.watch();
-        let settings_rx = cfg.settings.watch();
+        let cred_rx = cfg.credentials.read().into_watch();
+        let settings_rx = cfg.settings.read().into_watch();
         let mut clients = build_rest(&cfg);
         clients.market_data = Some(rest);
         let rest = std::sync::Mutex::new(RestState {
@@ -400,9 +402,9 @@ impl AlpacaProvider {
             settings_rx,
         });
         Self {
+            hub: HubSlot::new(StockConnector::new(&cfg), hub_sources(&cfg)),
             cfg,
             rest,
-            hub: HubSlot::idle(),
         }
     }
 
@@ -426,8 +428,7 @@ impl AlpacaProvider {
     /// handles).
     fn rest_clients(&self) -> RestClients {
         let mut state = self.rest.lock().expect("REST client state poisoned");
-        let changed = super::runtime::watch_changed(&mut state.cred_rx)
-            | super::runtime::watch_changed(&mut state.settings_rx);
+        let changed = state.cred_rx.take_change() | state.settings_rx.take_change();
         if changed {
             state.clients = build_rest(&self.cfg);
         }
@@ -453,16 +454,10 @@ impl Provider for AlpacaProvider {
             return false;
         }
         match surface {
-            // The equity websocket streams trades, quotes, and only minute and
-            // daily bars, all decoded as equities.
+            // The equity websocket streams the kinds the subscription list has
+            // a symbol list for, all decoded as equities.
             Surface::Live => {
-                instrument.asset_class() == AssetClass::Equity
-                    && match kind {
-                        EventKind::Trade
-                        | EventKind::Quote
-                        | EventKind::Bar(BarInterval::OneMinute | BarInterval::OneDay) => true,
-                        EventKind::Bar(_) => false,
-                    }
+                instrument.asset_class() == AssetClass::Equity && SymbolLists::carries(kind)
             }
             // The REST bar surface is wider than the streamed one: `stock_bars`
             // accepts every interval `fetch_history_via` maps except one-second,
@@ -479,10 +474,7 @@ impl Provider for AlpacaProvider {
     async fn start_live(&self, sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
         // Every `start_live` goes through the one slot, so the provider never
         // holds more than one upstream socket.
-        let cmd_tx = self.hub.ensure(|| StockConnector {
-            cfg: self.cfg.clone(),
-        });
-        Ok(Box::new(SharedLiveHandle::new(cmd_tx, sink)))
+        Ok(Box::new(self.hub.attach(sink)))
     }
 
     async fn fetch_history(
@@ -561,75 +553,49 @@ impl Provider for AlpacaProvider {
     }
 }
 
-/// Classify a connect-time, subscribe or mid-stream error from
-/// `oxidized_alpaca`.
-///
-/// `406 connection limit exceeded` is transient: another connection on the
-/// same key pair holds the slot, which clears when it closes. Only
-/// `402 auth failed` means the credentials themselves are rejected, whether
-/// it arrives mid-stream (`Error::StreamingError`) or as the server's
-/// refusal of a subscribe (`Error::StreamingSubscribe`). Any other code on
-/// either variant, `401 not authenticated` included, is transient.
-///
-/// Limitation to know about: at **connect** time `oxidized_alpaca` 0.0.10
-/// (and 0.0.11) collapses every non-`authenticated` auth response into the
-/// payload-less `Error::StreamingAuth` and only logs the envelope, so a 406
-/// there is indistinguishable from a 402 and lands in the park. The hub
-/// itself never opens a second connection, so a connect-time rejection is
-/// treated as the credential case it is in practice; once upstream carries
-/// the `StreamError` on that path, it classifies through the same arm as
-/// the mid-stream case below with no further change here.
-pub(super) fn classify_stream_failure(err: &oxidized_alpaca::Error) -> StreamFailure {
-    match err {
-        oxidized_alpaca::Error::StreamingAuth => StreamFailure::Unauthenticated,
-        oxidized_alpaca::Error::StreamingError(e)
-        | oxidized_alpaca::Error::StreamingSubscribe(e) => match e.code {
-            StreamErrorCode::AuthFailed => StreamFailure::Unauthenticated,
-            _ => StreamFailure::Transient,
-        },
-        _ => StreamFailure::Transient,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Hub connector
 // ---------------------------------------------------------------------------
 
-/// How the hub opens and classifies the stock market-data stream.
+/// What the hub reads from `cfg`.
+fn hub_sources(cfg: &AlpacaProviderConfig) -> HubSources<AlpacaSettings> {
+    HubSources {
+        settings: cfg.settings.clone(),
+        credentials: cfg.credentials.clone(),
+        reconnect: cfg.reconnect,
+    }
+}
+
+/// How the hub opens the stock market-data stream.
 struct StockConnector {
-    cfg: AlpacaProviderConfig,
+    stream_feed: AlpacaStreamFeed,
+}
+
+impl StockConnector {
+    fn new(cfg: &AlpacaProviderConfig) -> Self {
+        Self {
+            stream_feed: cfg.stream_feed,
+        }
+    }
 }
 
 impl Connector for StockConnector {
     const PROVIDER_ID: &'static str = PROVIDER_ID;
     type Settings = AlpacaSettings;
-    type Failure = oxidized_alpaca::Error;
     type Upstream = StreamingStockClient;
-
-    fn settings(&self) -> &SettingsSource<AlpacaSettings> {
-        &self.cfg.settings
-    }
-
-    fn credentials(&self) -> &CredentialsSource {
-        &self.cfg.credentials
-    }
-
-    fn reconnect(&self) -> &ReconnectPolicy {
-        &self.cfg.reconnect
-    }
 
     async fn connect(
         &self,
         settings: &AlpacaSettings,
         credentials: PresentCredentials,
     ) -> std::result::Result<StreamingStockClient, oxidized_alpaca::Error> {
-        let feed = streaming_feed(self.cfg.stream_feed);
+        let feed = streaming_feed(self.stream_feed);
         // Every path connects through `new_with_credentials` so the account
         // type it sees is `STREAM_ACCOUNT_TYPE` (the production data host);
         // the configured account type only picks which env pair `Env` reads.
         tracing::info!(
             provider = PROVIDER_ID,
-            url = stream_url(self.cfg.stream_feed),
+            url = stream_url(self.stream_feed),
             account_type = ?settings.account_type,
             "connecting to the market-data stream"
         );
@@ -643,10 +609,6 @@ impl Connector for StockConnector {
             credentials.to_api_key(),
         )
         .await
-    }
-
-    fn classify(failure: &oxidized_alpaca::Error) -> StreamFailure {
-        classify_stream_failure(failure)
     }
 }
 
@@ -691,39 +653,18 @@ impl SubscriptionSet for StockSubscriptionList {
             && self.trades.as_ref().is_none_or(Vec::is_empty)
     }
 
-    fn apply(&mut self, instrument: &Instrument, kind: EventKind, add: bool) {
-        apply_pair_to_list(self, instrument, kind, add);
+    fn insert(&mut self, instrument: &Instrument, kind: EventKind) {
+        stock_symbol_lists(self).insert(instrument, kind);
     }
 }
 
-fn apply_pair_to_list(
-    list: &mut StockSubscriptionList,
-    instrument: &Instrument,
-    kind: EventKind,
-    add: bool,
-) {
-    let symbol = instrument.symbol().to_string();
-    match kind {
-        EventKind::Trade => mutate_field(&mut list.trades, &symbol, add),
-        EventKind::Quote => mutate_field(&mut list.quotes, &symbol, add),
-        EventKind::Bar(BarInterval::OneMinute) => mutate_field(&mut list.bars, &symbol, add),
-        EventKind::Bar(BarInterval::OneDay) => mutate_field(&mut list.daily_bars, &symbol, add),
-        // Unsupported intervals were rejected by `supports`; ignore here.
-        EventKind::Bar(_) => {}
-    }
-}
-
-fn mutate_field(field: &mut Option<Vec<String>>, symbol: &str, add: bool) {
-    let list = field.get_or_insert_with(Vec::new);
-    if add {
-        if !list.iter().any(|s| s == symbol) {
-            list.push(symbol.to_string());
-        }
-    } else {
-        list.retain(|s| s != symbol);
-    }
-    if list.is_empty() {
-        *field = None;
+/// The lists of `list` the hub fills.
+fn stock_symbol_lists(list: &mut StockSubscriptionList) -> SymbolLists<'_> {
+    SymbolLists {
+        trades: &mut list.trades,
+        quotes: &mut list.quotes,
+        bars: &mut list.bars,
+        daily_bars: &mut list.daily_bars,
     }
 }
 
@@ -1084,9 +1025,10 @@ async fn fetch_history_via(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::providers::hub::dispatch_event;
     use crate::providers::hub::tests::{fanout_ids, two_routes};
+    use crate::providers::hub::{Classify, StreamFailure, dispatch_event};
     use datamancer_core::ErrorOrigin;
+    use oxidized_alpaca::streaming::StreamErrorCode;
     use std::time::Duration;
 
     const ALL_STREAM_FEEDS: [AlpacaStreamFeed; 4] = [
@@ -1329,38 +1271,26 @@ pub(super) mod tests {
         }
     }
 
+    /// A pair inserted lands in the list for its kind, once however often it
+    /// is inserted.
     #[test]
-    fn subscription_list_apply_add_remove() {
+    fn subscription_list_insert() {
         let mut list = StockSubscriptionList::new();
         let aapl = provider_instrument("AAPL");
-        apply_pair_to_list(&mut list, &aapl, EventKind::Trade, true);
-        apply_pair_to_list(
-            &mut list,
-            &aapl,
-            EventKind::Bar(BarInterval::OneMinute),
-            true,
-        );
+        SubscriptionSet::insert(&mut list, &aapl, EventKind::Trade);
+        SubscriptionSet::insert(&mut list, &aapl, EventKind::Trade);
+        SubscriptionSet::insert(&mut list, &aapl, EventKind::Bar(BarInterval::OneMinute));
         assert_eq!(list.trades.as_deref(), Some(&["AAPL".to_string()][..]));
         assert_eq!(list.bars.as_deref(), Some(&["AAPL".to_string()][..]));
-        apply_pair_to_list(&mut list, &aapl, EventKind::Trade, false);
-        apply_pair_to_list(
-            &mut list,
-            &aapl,
-            EventKind::Bar(BarInterval::OneMinute),
-            false,
-        );
-        assert!(list.trades.is_none());
-        assert!(list.bars.is_none());
+        assert!(list.quotes.is_none());
     }
 
     #[test]
-    fn stock_set_is_empty_until_a_pair_is_applied() {
+    fn stock_set_is_empty_until_a_pair_is_inserted() {
         let mut set = <StockSubscriptionList as SubscriptionSet>::empty();
         assert!(SubscriptionSet::is_empty(&set));
-        set.apply(&provider_instrument("AAPL"), EventKind::Trade, true);
+        set.insert(&provider_instrument("AAPL"), EventKind::Trade);
         assert!(!SubscriptionSet::is_empty(&set));
-        set.apply(&provider_instrument("AAPL"), EventKind::Trade, false);
-        assert!(SubscriptionSet::is_empty(&set));
     }
 
     #[test]
@@ -1440,45 +1370,6 @@ pub(super) mod tests {
         for surface in [Surface::Live, Surface::History] {
             assert!(!p.supports(&crypto, EventKind::Trade, surface));
         }
-    }
-
-    /// A `start_live` that panics while it holds the hub slot (here: polled
-    /// once outside a tokio runtime, so the spawn panics) must not take the
-    /// provider down for every later caller: a later `start_live` inside a
-    /// runtime still succeeds.
-    #[test]
-    fn a_panicking_start_live_does_not_poison_later_start_lives() {
-        use std::future::Future;
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-        use std::task::{Context, Poll, Waker};
-        let (_tx, rx) = tokio::sync::watch::channel(None);
-        let p = AlpacaProvider::new(AlpacaProviderConfig {
-            settings: SettingsSource::Watch(rx),
-            ..Default::default()
-        });
-        // Polls `start_live` once by hand; true when it completes with a handle.
-        let poll_once = || {
-            catch_unwind(AssertUnwindSafe(|| {
-                let (sink, _events) = tokio::sync::mpsc::channel(8);
-                let mut fut = std::pin::pin!(p.start_live(sink));
-                let mut cx = Context::from_waker(Waker::noop());
-                matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(_)))
-            }))
-        };
-        assert!(poll_once().is_err(), "a spawn outside a runtime panics");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let later = rt.block_on(async { poll_once() });
-        assert!(
-            matches!(later, Ok(true)),
-            "a later start_live in a runtime must succeed, got {:?}",
-            later.map_err(|e| e
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| e.downcast_ref::<String>().cloned()))
-        );
     }
 
     #[tokio::test]
@@ -1856,10 +1747,10 @@ pub(super) mod tests {
     /// rejected credential too (see the classifier's docs for the upstream
     /// limitation).
     #[test]
-    fn stream_failures_park_on_402_and_back_off_on_406() {
+    fn stream_failures_classify_402_as_unauthenticated_and_406_as_transient() {
         let mid_stream = oxidized_alpaca::Error::StreamingError;
         assert_eq!(
-            classify_stream_failure(&server_error(mid_stream, StreamErrorCode::AuthFailed)),
+            server_error(mid_stream, StreamErrorCode::AuthFailed).classify(),
             StreamFailure::Unauthenticated
         );
         for code in [
@@ -1870,19 +1761,17 @@ pub(super) mod tests {
             StreamErrorCode::InvalidSyntax,
         ] {
             assert_eq!(
-                classify_stream_failure(&server_error(mid_stream, code)),
+                server_error(mid_stream, code).classify(),
                 StreamFailure::Transient,
                 "code {code:?}"
             );
         }
         assert_eq!(
-            classify_stream_failure(&oxidized_alpaca::Error::StreamingAuth),
+            oxidized_alpaca::Error::StreamingAuth.classify(),
             StreamFailure::Unauthenticated
         );
         assert_eq!(
-            classify_stream_failure(&oxidized_alpaca::Error::UnexpectedConnectionMessage(
-                "boom".to_string()
-            )),
+            oxidized_alpaca::Error::UnexpectedConnectionMessage("boom".to_string()).classify(),
             StreamFailure::Transient
         );
     }
@@ -1894,7 +1783,7 @@ pub(super) mod tests {
     fn stock_subscribe_refused_with_402_is_unauthenticated() {
         let refused = oxidized_alpaca::Error::StreamingSubscribe;
         assert_eq!(
-            StockConnector::classify(&server_error(refused, StreamErrorCode::AuthFailed)),
+            server_error(refused, StreamErrorCode::AuthFailed).classify(),
             StreamFailure::Unauthenticated
         );
         for code in [
@@ -1902,7 +1791,7 @@ pub(super) mod tests {
             StreamErrorCode::NotAuthenticated,
         ] {
             assert_eq!(
-                StockConnector::classify(&server_error(refused, code)),
+                server_error(refused, code).classify(),
                 StreamFailure::Transient,
                 "code {code:?}"
             );
