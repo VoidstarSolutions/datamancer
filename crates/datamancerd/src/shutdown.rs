@@ -28,7 +28,7 @@
 //! from its teardown first and drained like any other. The whole drain is wrapped in a timeout by
 //! the caller so a disk-stalled tap-log flush cannot hang shutdown forever.
 //! The order is the load-bearing contract, exercised by
-//! [`tests::shutdown_drain_order`] with recording fakes.
+//! `tests::shutdown_drain_order` with recording fakes.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

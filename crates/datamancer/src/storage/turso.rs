@@ -29,11 +29,10 @@
 //! A write issued on a connection whose earlier `query()` `Rows` cursor is
 //! un-drained is **silently lost** — visible in-connection, never reaches
 //! disk (see `turso_common::preflight_user_version` for the first
-//! occurrence of this). [`TursoCache::load_coverage`] and
-//! [`TursoCache::count_events_in`] both run a `query()` on the *write*
-//! connection inside `store`'s transaction, so both fully drain their
-//! cursor (loop `rows.next()` to `None`) in an inner scope before the
-//! transaction issues its next `execute`.
+//! occurrence of this). The coverage and event-count reads inside
+//! `store`'s transaction run a `query()` on the *write* connection, so
+//! both fully drain their cursor (loop `rows.next()` to `None`) in an
+//! inner scope before the transaction issues its next `execute`.
 
 use std::path::Path;
 
