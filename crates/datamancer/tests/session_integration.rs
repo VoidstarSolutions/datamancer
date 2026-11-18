@@ -298,7 +298,7 @@ async fn historical_session_streams_provider_fetch_in_order() {
     assert_eq!(bars[0].source_ts.0, 100);
     assert_eq!(bars[1].source_ts.0, 200);
     assert_eq!(bars[2].source_ts.0, 300);
-    // seq is session-monotonic per (instrument, kind).
+    // seq is monotonic per (instrument, kind) pair.
     assert_eq!(bars[0].seq.0, 0);
     assert_eq!(bars[1].seq.0, 1);
     assert_eq!(bars[2].seq.0, 2);

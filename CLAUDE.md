@@ -110,7 +110,7 @@ These are load-bearing design rules — violating them breaks downstream consume
     `Subscribed` says what its stream carries. The tap log persists this
     source `seq` verbatim (it no longer mints its own), so tap-log replay
     reproduces the delivered stream's `seq`. `Seq::SYNTHETIC = Seq(u64::MAX)`
-    tags out-of-band synthetic controls and is exempt from per-symbol
+    tags out-of-band synthetic controls and is exempt from per-pair
     monotonicity.
   - `rx_ts` — wall-clock at byte receipt. **Observability only.** Engine decision logic must never depend on it (re-introduces wall-clock non-determinism). Collapses to `source_ts` in pure-historical replay.
 - **`Control` events ride the data stream.** Connectivity changes, gaps, subscription state — all in-band, not a side channel.

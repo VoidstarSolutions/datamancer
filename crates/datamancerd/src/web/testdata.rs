@@ -1,5 +1,5 @@
 //! Shared fixtures for the web-module unit tests: a known two-symbol snapshot
-//! exercising per-symbol framing (distinct `seq` positions per instrument).
+//! exercising per-pair framing (distinct `seq` positions per `(instrument, kind)`).
 
 #![cfg(test)]
 
@@ -29,7 +29,7 @@ pub(crate) fn msft() -> Instrument {
     )
 }
 
-/// A known snapshot with two per-symbol authoritative sessions (distinct `seq`),
+/// A known snapshot with two per-pair authoritative sessions (distinct `seq`),
 /// one provider, one cache entry, and one client session.
 #[must_use]
 pub(crate) fn snapshot() -> SystemSnapshot {

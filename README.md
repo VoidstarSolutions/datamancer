@@ -117,7 +117,7 @@ let mut session = dm
     .await?;
 
 while let Some(event) = session.events().next().await {
-    // … one multiplexed, per-symbol-deterministic stream of MarketEvent
+    // … one multiplexed, per-pair-deterministic stream of MarketEvent
 }
 ```
 

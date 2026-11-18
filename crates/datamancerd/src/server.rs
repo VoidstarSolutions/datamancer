@@ -1877,7 +1877,7 @@ pub(crate) fn reject_unknown_object_keys(
 }
 
 /// Pump a client's multiplexed stream into its per-client sink, in arrival
-/// order (`(instrument, seq)`; no cross-symbol order is created). A single
+/// order (`(instrument, kind, seq)`; no cross-pair order is created). A single
 /// sequential pump preserves the stream's existing order. Unix/macOS only —
 /// this drives the iceoryx2 `open-client` sink; the WS surface has its own
 /// pump (`ws/conn.rs`).

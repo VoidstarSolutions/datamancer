@@ -6,14 +6,15 @@
 //! immediately so the session begins capturing events even if the consumer
 //! hasn't taken the [`EventStream`] yet.
 //!
-//! The multiplexing handle is [`crate::ClientSession`] (a mutable subscription
-//! set behind one interleaved stream; see `client.rs`). Both it and the live
+//! The multiplexing handle is [`ClientSession`] (a mutable subscription set
+//! behind one interleaved stream; see `client.rs`). Both it and the live
 //! [`Session`] are refcounted **referrers** onto a shared per-`(instrument,
 //! kind)` authoritative session, which owns the provider connection and stamps
-//! the per-symbol `seq` once at the source before any sink. `seq` is therefore
-//! identical across every consumer of a symbol; the multiplex orders by
-//! `(instrument, seq)` and never re-stamps. Historical sessions keep the
-//! single-consumer controller and do not participate in the registry.
+//! that pair's `seq` once at the source before any sink. `seq` is therefore
+//! identical across every consumer of a pair; the multiplex keeps the ordering
+//! key `(instrument, kind, seq)`, interleaves pairs in arrival order, and never
+//! re-stamps. Historical sessions keep the single-consumer controller and do
+//! not participate in the registry.
 //!
 //! # Lifecycle
 //!
@@ -844,14 +845,14 @@ impl Datamancer {
     }
 
     /// Assemble a consolidated, serializable [`SystemSnapshot`] of runtime state:
-    /// provider accounting, the cache catalog, and per-symbol live state
+    /// provider accounting, the cache catalog, and live session state
     /// (authoritative + client sessions).
     ///
-    /// **Sampled, not transactional.** Per-symbol fields are read from `Relaxed`
+    /// **Sampled, not transactional.** Per-pair fields are read from `Relaxed`
     /// atomics; the registry mutex is held only long enough to clone handles and
     /// is **never** held across an `.await` (the `catalog()` call awaits first,
-    /// before any registry lock). Fields may skew by nanoseconds across symbols —
-    /// acceptable because determinism is per-symbol and the snapshot is
+    /// before any registry lock). Fields may skew by nanoseconds across pairs —
+    /// acceptable because determinism is per pair and the snapshot is
     /// diagnostic. See [`datamancer_core::SystemSnapshot`].
     ///
     /// # Errors
@@ -1633,7 +1634,7 @@ struct Controller {
     /// referrer's bounded channel. `None` for a historical session, which
     /// delivers to the single consumer `sink`.
     fanout: Option<FanOut>,
-    /// Per-symbol live stats (lock-free atomics) read by the Phase 3 diagnostics
+    /// Per-pair live stats (lock-free atomics) read by the Phase 3 diagnostics
     /// plane. Updated on the fan-out path only; unused on the historical path.
     stats: Arc<LiveStats>,
     /// Per-provider call/throughput accounting for the diagnostics snapshot.
@@ -2595,7 +2596,7 @@ impl Controller {
             .next_seq
             .checked_add(n)
             .filter(|&next| next != u64::MAX)
-            .expect("per-symbol source seq exhausted the Seq::SYNTHETIC reservation");
+            .expect("per-pair source seq exhausted the Seq::SYNTHETIC reservation");
     }
 
     /// Hand a fully-formed event to the sink; on rejection (consumer dropped
@@ -2604,7 +2605,7 @@ impl Controller {
     /// the ring push, an evicted event is already numbered, so a ring overflow
     /// is a real `seq` hole reported as `Control::Gap`. While detached there is
     /// no other producer into the outbound order, so push order == canonical
-    /// delivery order. The event's [`Arrival`] chooses what the per-symbol
+    /// delivery order. The event's [`Arrival`] chooses what the per-pair
     /// stats record.
     async fn deliver_with(&mut self, ev: MarketEvent, arrival: Arrival) {
         // Live authoritative session: fan the stamped event out to every

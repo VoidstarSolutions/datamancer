@@ -3,8 +3,9 @@
 //! Wraps [`oxidized_alpaca`]'s streaming stock client for live trades, quotes,
 //! and minute/daily bars, and its REST market-data client for bounded
 //! historical fetches. Decoded events are pushed verbatim into the supplied
-//! [`MarketEvent`] sink with a placeholder [`Seq`]; the session merger assigns
-//! the final session-monotonic sequence.
+//! [`MarketEvent`] sink with a placeholder [`Seq`]; the session that asked for
+//! them (the pair's authoritative session when live) stamps the final
+//! per-`(instrument, kind)` sequence.
 //!
 //! # Stream host
 //!

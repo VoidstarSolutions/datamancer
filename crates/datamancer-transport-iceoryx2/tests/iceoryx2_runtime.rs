@@ -100,7 +100,7 @@ async fn data_plane_reconstructs_logical_stream() {
     let sink = Iceoryx2DataSink::new(&node, name(client)).expect("sink");
     let mut sub = DataSubscriber::open(&node, sink.data_service_name()).expect("subscriber");
 
-    // Two symbols interleaved; per-symbol seq is monotonic.
+    // Two symbols' trades, interleaved.
     let events = vec![
         trade("BTC/USD", 0, 100),
         trade("ETH/USD", 0, 200),
@@ -113,8 +113,8 @@ async fn data_plane_reconstructs_logical_stream() {
 
     let received = drain_until(&mut sub, events.len());
 
-    // Per-symbol determinism only: assert seq is monotonic WITHIN each symbol,
-    // with no cross-symbol ordering claim (multiplex_is_per_symbol_only).
+    // Per-pair determinism only: assert seq is monotonic WITHIN each
+    // (instrument, kind) pair, with no cross-pair ordering claim.
     for symbol in ["BTC/USD", "ETH/USD"] {
         let seqs: Vec<u64> = received
             .iter()
@@ -123,7 +123,7 @@ async fn data_plane_reconstructs_logical_stream() {
                 _ => None,
             })
             .collect();
-        assert_eq!(seqs, vec![0, 1], "per-symbol seq order for {symbol}");
+        assert_eq!(seqs, vec![0, 1], "per-pair seq order for {symbol} trades");
     }
 }
 
