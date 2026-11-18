@@ -1,11 +1,10 @@
 //! The WebSocket control protocol: JSON frames over the one WS connection.
 //!
-//! Reuses the UDS control vocabulary — [`SubscriptionSpec`](crate::spec::SubscriptionSpec)
-//! and the stable [`codes`](crate::codes) table — but drops the
-//! per-request `client` field (the connection identifies the client) and adds a
-//! correlation `id` echoed on the reply, because event frames interleave with
-//! replies on the shared socket. `open-client` is implicit on connect and has no
-//! request.
+//! Reuses the UDS control vocabulary — [`SubscriptionSpec`] and the stable
+//! [`codes`](crate::codes) table — but drops the per-request `client` field
+//! (the connection identifies the client) and adds a correlation `id` echoed on
+//! the reply, because event frames interleave with replies on the shared
+//! socket. `open-client` is implicit on connect and has no request.
 
 use datamancer_core::{Subscribed, SystemSnapshot};
 use serde::{Deserialize, Serialize};

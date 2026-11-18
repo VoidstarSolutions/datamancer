@@ -254,10 +254,7 @@ struct DatamancerInner {
     providers: Vec<Arc<dyn Provider>>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
-    /// Live-session registry: at most one live session may be active per
-    /// `(instrument, kind)` pair. Each live `Session` holds an `Arc` to a
-    /// [`RegistrySentinel`]; the map keeps a `Weak` so a stale entry can be
-    /// distinguished from a live one via `strong_count()`.
+    /// Live-session registry (see [`AuthoritativeSession`]).
     live_sessions: LiveSessionRegistry,
     resume_buffer_events: usize,
     /// Single source of truth for the corporate-action adjustment mode.
@@ -1219,21 +1216,21 @@ impl DatamancerBuilder {
         self
     }
 
-    /// Limit how far back a [`ClientSession`](crate::ClientSession) subscribe
-    /// may start a backfill. Unlimited by default; a [`Session`] is not limited.
-    /// A zero `limit` refuses every client backfill.
+    /// Limit how far back a [`ClientSession`] subscribe may start a backfill.
+    /// Unlimited by default; a [`Session`] is not limited. A zero `limit`
+    /// refuses every client backfill.
     #[must_use]
     pub fn max_client_backfill(mut self, limit: Duration) -> Self {
         self.max_client_backfill = Some(limit);
         self
     }
 
-    /// Limit how many [`ClientSession`](crate::ClientSession) backfills fetch
-    /// history at once. Unlimited by default; a [`Session`] is not limited. A
-    /// backfill past the limit waits for one to finish its history, and so does
-    /// one the cache could serve whole. Meanwhile its live arrivals fill the
-    /// resume buffer, and an overflow is a `Gap`. A subscribe that joins an
-    /// existing session does not count.
+    /// Limit how many [`ClientSession`] backfills fetch history at once.
+    /// Unlimited by default; a [`Session`] is not limited. A backfill past the
+    /// limit waits for one to finish its history, and so does one the cache
+    /// could serve whole. Meanwhile its live arrivals fill the resume buffer,
+    /// and an overflow is a `Gap`. A subscribe that joins an existing session
+    /// does not count.
     ///
     /// A `limit` above
     /// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS) is
@@ -1499,7 +1496,7 @@ impl Session {
 ///
 /// `seq` is **not** stamped here. The authoritative controller stamps each
 /// event once at the source, in canonical delivery order, before it reaches
-/// the sink (see [`Controller::stamp`]); this stream is a pass-through.
+/// the sink; this stream is a pass-through.
 pub struct EventStream {
     rx: mpsc::Receiver<MarketEvent>,
 }

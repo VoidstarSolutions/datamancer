@@ -1,5 +1,5 @@
 //! The two independent snapshot-refresh tasks that publish into the
-//! [`WebState`](crate::web::state::WebState) swaps.
+//! [`WebState`] swaps.
 //!
 //! Two tasks, two cadences, two `ArcSwap`s: a **fast live-state** refresh
 //! (`live_state_cadence_ms`) drives the SSE stream and the live JSON endpoints,
