@@ -56,8 +56,8 @@
 //!   (<https://github.com/VoidstarSolutions/datamancer/issues/183>).
 //! - A subscribe or unsubscribe on a [`LiveHandle`] refused for its
 //!   credentials on a live connection parks nothing; the refusal is returned
-//!   to that call as unauthenticated. Session teardown does not surface an
-//!   unsubscribe refusal.
+//!   to that call as unauthenticated. Session teardown logs a refused
+//!   unsubscribe or close as a warning.
 //! - While parked, a subscribe that opens a new `(instrument, kind)` pair is
 //!   refused as unauthenticated.
 //! - Any other connect or stream failure is transient: back off and

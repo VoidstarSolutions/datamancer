@@ -1062,6 +1062,96 @@ async fn open_refused_for_another_reason_reads_idle_with_detail() {
     );
 }
 
+/// A provider whose live handle accepts every subscribe and refuses every
+/// unsubscribe with `error()`; `closed` is notified once the handle is
+/// closed, which teardown does after the unsubscribe.
+#[derive(Clone)]
+struct RefusesUnsubscribe {
+    error: fn() -> datamancer::Error,
+    closed: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Provider for RefusesUnsubscribe {
+    fn id(&self) -> &'static str {
+        "fake"
+    }
+    fn supports(&self, _instrument: &Instrument, _kind: EventKind, _surface: Surface) -> bool {
+        true
+    }
+    async fn start_live(&self, _sink: mpsc::Sender<MarketEvent>) -> Result<Box<dyn LiveHandle>> {
+        Ok(Box::new(self.clone()))
+    }
+    async fn fetch_history(
+        &self,
+        _request: HistoryRequest,
+        _sink: mpsc::Sender<MarketEvent>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl LiveHandle for RefusesUnsubscribe {
+    async fn subscribe(&self, _i: Instrument, _k: EventKind) -> Result<()> {
+        Ok(())
+    }
+    async fn unsubscribe(&self, _i: Instrument, _k: EventKind) -> Result<()> {
+        Err((self.error)())
+    }
+    async fn close(self: Box<Self>) -> Result<()> {
+        self.closed.notify_one();
+        Ok(())
+    }
+}
+
+/// Open a live AAPL trade session on a provider refusing its unsubscribe with
+/// `error()`, close it, and snapshot once its teardown has closed the handle.
+async fn teardown_refused(error: fn() -> datamancer::Error) -> datamancer_core::SystemSnapshot {
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let dm = Datamancer::builder()
+        .provider_arc(Arc::new(RefusesUnsubscribe {
+            error,
+            closed: closed.clone(),
+        }))
+        .build()
+        .unwrap();
+    let session = dm
+        .session(
+            inst("AAPL"),
+            EventKind::Trade,
+            live(),
+            PersistenceOptions::none(),
+        )
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), closed.notified())
+        .await
+        .expect("teardown never closed the live handle");
+    dm.snapshot().await.unwrap()
+}
+
+#[tokio::test]
+async fn a_teardown_unsubscribe_the_provider_refuses_records_no_error() {
+    let snap = teardown_refused(|| datamancer::Error::Provider {
+        provider: "fake".to_string(),
+        message: "venue said no".to_string(),
+    })
+    .await;
+    let p = provider_snap(&snap, "fake");
+    assert_eq!(p.unsubscribes, 1);
+    assert_eq!(p.last_error, None);
+}
+
+#[tokio::test]
+async fn a_teardown_unsubscribe_refused_as_session_closed_records_nothing() {
+    let snap = teardown_refused(|| datamancer::Error::SessionClosed).await;
+    let p = provider_snap(&snap, "fake");
+    assert_eq!(p.unsubscribes, 1);
+    assert_eq!(p.last_error, None);
+}
+
 /// Stamp a control with a wall-clock receipt time.
 fn received_at(ev: MarketEvent, rx: i64) -> MarketEvent {
     match ev {
