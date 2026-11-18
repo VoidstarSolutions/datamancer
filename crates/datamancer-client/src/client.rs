@@ -71,6 +71,11 @@ pub trait Client: Sized + Send {
     /// The daemon's current diagnostics snapshot (provider connectivity,
     /// latency, gap counts). This is where connection-scoped provider state
     /// lives — it is deliberately not on the event stream.
+    ///
+    /// The snapshot may predate the call.
+    /// [`SystemSnapshot::captured_at`] is when its live state was assembled;
+    /// its [`cache`](SystemSnapshot::cache) was read before that, possibly
+    /// before the call.
     fn snapshot(
         &mut self,
     ) -> impl Future<Output = Result<SystemSnapshot, ClientError<Self::Error>>> + Send;

@@ -334,6 +334,10 @@ impl Datamancer {
     ///   the cache. A historical scope that reads the cache opens anyway:
     ///   cached spans are served, every uncached span reports as a `Gap`, and
     ///   the refused fetch reports once in the stream.
+    /// - [`Error::Provider`] — a live open that creates the pair's session:
+    ///   the provider refused or failed the subscribe, or the pair's previous
+    ///   session was still tearing down after [`LIVE_TURN_LIMIT`]; the second
+    ///   can be retried.
     ///
     /// # Panics
     ///
@@ -491,9 +495,10 @@ impl Datamancer {
     }
 
     /// Take `key`'s turn at `provider`, waiting up to [`LIVE_TURN_LIMIT`] for
-    /// the pair's previous session to finish unsubscribing there. `None` if
-    /// another opener claimed the pair's slot meanwhile: that session holds
-    /// the turn now, and is the one to join.
+    /// the pair's previous session to finish tearing down: its unsubscribe
+    /// there, then its tap-log flush. `None` if another opener claimed the
+    /// pair's slot meanwhile: that session holds the turn now, and is the
+    /// one to join.
     ///
     /// The turn is taken before the slot is claimed, so each opener waits on
     /// the previous session for itself and none waits on another opener's
@@ -525,7 +530,7 @@ impl Datamancer {
                     return Err(Error::Provider {
                         provider: provider.to_string(),
                         message: format!(
-                            "the previous session for {} is still unsubscribing after {} s",
+                            "the previous session for {} is still tearing down after {} s",
                             key.0,
                             LIVE_TURN_LIMIT.as_secs()
                         ),
@@ -1548,9 +1553,12 @@ pub(crate) fn default_buffer() -> usize {
     1024
 }
 
-/// How long a pair's new session waits for the pair's previous session to
-/// finish unsubscribing at the provider before its subscribe fails.
-const LIVE_TURN_LIMIT: Duration = Duration::from_secs(30);
+/// How long an open that creates a pair's live session
+/// ([`ClientSession::subscribe`](crate::ClientSession::subscribe), or
+/// [`Datamancer::session`] with a [`Scope::Live`]) waits for the pair's previous
+/// session to finish tearing down (its provider unsubscribe, then its
+/// tap-log flush) before it fails with [`Error::Provider`].
+pub const LIVE_TURN_LIMIT: Duration = Duration::from_secs(30);
 
 /// How many times an opener looks again after meeting a session that tore
 /// down under it, before it reports the pair's session as closed.

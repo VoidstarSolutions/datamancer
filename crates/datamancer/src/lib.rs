@@ -54,7 +54,8 @@ pub use providers::{
     AlpacaCredentials, AlpacaCryptoSettings, AlpacaSettings, CredentialsSource, SettingsSource,
 };
 pub use session::{
-    Datamancer, DatamancerBuilder, EventStream, PersistenceOptions, ReconnectPolicy, Scope, Session,
+    Datamancer, DatamancerBuilder, EventStream, LIVE_TURN_LIMIT, PersistenceOptions,
+    ReconnectPolicy, Scope, Session,
 };
 
 /// iceoryx2 zero-copy transport (data + diagnostics planes), gated behind the

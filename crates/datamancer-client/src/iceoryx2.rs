@@ -85,6 +85,20 @@ fn attach_error(query: QueryId, error: Iceoryx2ClientError) -> ClientError<Iceor
     }
 }
 
+/// Give up on a query whose attach failed, and say why: cancel it unless the
+/// daemon already dropped it.
+fn abandon_attach(
+    control: &ControlHandle,
+    query: QueryId,
+    error: Iceoryx2ClientError,
+) -> ClientError<Iceoryx2ClientError> {
+    let error = attach_error(query, error);
+    if !matches!(error, ClientError::QueryDropped { .. }) {
+        control.fire(Request::CancelQuery { query });
+    }
+    error
+}
+
 /// How a service's event stream ended on its own.
 #[derive(Debug, Clone, PartialEq)]
 enum StreamEnd {
@@ -101,7 +115,8 @@ type Forwarded = Result<MarketEvent, StreamEnd>;
 /// Forward what `poll` returns into `items` through `wrap`, sleeping
 /// `poll_interval` after an empty poll, until `stop` is set, the consumer
 /// drops its receiver, or the service's stream ends. How it ended is forwarded
-/// last; whatever `wrap` maps to `None` is not forwarded.
+/// last; whatever `wrap` maps to `None` is not forwarded. Every `poll` error
+/// ends the stream, [`TransportError::Interning`] included.
 fn forward_events<T>(
     mut poll: impl FnMut() -> Result<Polled, TransportError>,
     items: &mpsc::Sender<T>,
@@ -358,7 +373,8 @@ enum QueryState {
 /// It yields the query's events and ends after its terminal
 /// [`ControlKind::SessionClosing`]. If the query does not get that far, the
 /// last item is the error that ended it: [`ClientError::QueryDropped`], or
-/// [`ClientError::Transport`] when receiving failed.
+/// [`ClientError::Transport`] when receiving failed or an announcement was
+/// malformed ([`TransportError::Interning`]).
 ///
 /// **Dropping this stream cancels the query** — an abandoned backtest must not
 /// keep the daemon fetching. Cancellation is a fire-and-forget `cancel-query`
@@ -414,8 +430,12 @@ impl Drop for QueryStream {
 /// A connected same-host client. See [`Client`] for the transport-agnostic
 /// contract; iceoryx2-specific behavior: loss surfaces **in-band** as
 /// `Control::Gap` (the daemon's resume buffer numbers evictions), and the
-/// event stream ends when the daemon drops the per-client services. A killed
-/// daemon drops nothing: its stream may stay silent instead of ending.
+/// event stream ends when the daemon drops the per-client services, or, with
+/// no item saying why, on a receive failure or a malformed announcement. A
+/// killed daemon drops nothing: its stream may stay silent instead of ending.
+/// A [`snapshot`](Client::snapshot) asked while another snapshot request on
+/// the daemon's control socket is still being answered gets that request's
+/// answer.
 pub struct Iceoryx2Client {
     control: ControlHandle,
     client_name: String,
@@ -665,8 +685,9 @@ impl Client for Iceoryx2Client {
             ))
         })?;
         // The query is already open daemon-side: every failure from here on
-        // must cancel it, or it holds one of the daemon's few query slots
-        // (and keeps paging the provider) until it finishes on its own.
+        // must cancel it unless the daemon has dropped it, or it holds one of
+        // the daemon's few query slots (and keeps paging the provider) until
+        // it finishes on its own.
         let Some(service) = reply.service else {
             self.control.fire(Request::CancelQuery { query: id });
             return Err(ClientError::Transport(Iceoryx2ClientError::Protocol(
@@ -691,10 +712,7 @@ impl Client for Iceoryx2Client {
         .await
         {
             Ok(events) => events,
-            Err(e) => {
-                self.control.fire(Request::CancelQuery { query: id });
-                return Err(attach_error(id, e));
-            }
+            Err(e) => return Err(abandon_attach(&self.control, id, e)),
         };
         Ok((
             id,
@@ -749,8 +767,8 @@ mod tests {
     use super::Iceoryx2ClientError;
     #[cfg(unix)]
     use super::{
-        ControlConn, ControlHandle, Forwarded, QueryState, QueryStream, StreamEnd, attach_error,
-        forward_events,
+        ControlConn, ControlHandle, Forwarded, QueryState, QueryStream, StreamEnd, abandon_attach,
+        attach_error, forward_events,
     };
     #[cfg(unix)]
     use crate::codes;
@@ -1112,6 +1130,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_malformed_announcement_ends_the_stream_though_poll_could_carry_on() {
+        let malformed = TransportError::Interning("bad announcement".to_string());
+        let received = forward(
+            vec![
+                Err(malformed.clone()),
+                Ok(Polled::Events(vec![session_closing_event()])),
+            ],
+            Some,
+        );
+        assert_eq!(received, vec![Err(StreamEnd::Failed(malformed))]);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_live_stream_carries_events_only() {
         let received = forward(
             vec![
@@ -1186,6 +1218,40 @@ mod tests {
             attach_error(7, other),
             ClientError::Transport(Iceoryx2ClientError::Node(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attach_to_a_reaped_query_sends_no_cancel() {
+        let (path, seen) = fake_uds_recording(vec![]);
+        let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
+        let reaped = Iceoryx2ClientError::Transport(TransportError::ServiceNotFound(
+            "p/v3/data/42".to_string(),
+        ));
+
+        let error = abandon_attach(&control, 42, reaped);
+
+        assert!(matches!(error, ClientError::QueryDropped { query: 42 }));
+        assert_eq!(first_request(&seen).await, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_attach_that_fails_otherwise_cancels_the_query() {
+        let (path, seen) = fake_uds_recording(vec![]);
+        let control = ControlHandle::spawn(ControlConn::connect(&path).await.unwrap());
+        let other = Iceoryx2ClientError::Node("no shared memory".to_string());
+
+        let error = abandon_attach(&control, 42, other);
+
+        assert!(matches!(
+            error,
+            ClientError::Transport(Iceoryx2ClientError::Node(_))
+        ));
+        assert_eq!(
+            first_request(&seen).await,
+            Some(Request::CancelQuery { query: 42 })
+        );
     }
 
     /// A terminal `MarketEvent::Control(SessionClosing)`, built with the same

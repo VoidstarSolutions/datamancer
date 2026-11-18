@@ -651,7 +651,7 @@ struct Referrer {
     /// kind (see [`supersedes`]), except subscription errors, of which the
     /// newest [`SEAM_CONTROL_CAP`] are kept, as a backfill's pending ring
     /// keeps its controls: an older one a referrer that has stopped reading
-    /// was owed is dropped and leaves no `seq` hole.
+    /// was owed is dropped and its slot stays empty (see [`Seq`]).
     owed: Vec<MarketEvent>,
     /// This referrer does not pace a replay.
     unpaced: bool,
@@ -2185,10 +2185,10 @@ impl ClientSession {
     /// The pair's authoritative session is created with the first subscriber's
     /// `scope` and every later subscriber joins it as is.
     ///
-    /// A subscribe that creates the session waits for the pair's previous
-    /// session, if one is still tearing down, to finish unsubscribing at the
-    /// provider. After 30 s of that it fails with [`Error::Provider`], and
-    /// can be retried.
+    /// A subscribe that creates the session waits up to
+    /// [`LIVE_TURN_LIMIT`](crate::LIVE_TURN_LIMIT) for the pair's previous
+    /// session, if one is still tearing down, to finish; past that limit it
+    /// fails with [`Error::Provider`] and can be retried.
     ///
     /// # Cancel safety
     ///
@@ -2221,8 +2221,9 @@ impl ClientSession {
     /// - [`Error::ProviderDisabled`] — the session's provider is disabled,
     ///   whether this subscribe would create or join.
     /// - [`Error::Provider`] — the provider refused or failed the subscribe,
-    ///   or the pair's previous session was still unsubscribing there after
-    ///   30 s; the second can be retried.
+    ///   or the pair's previous session was still tearing down after
+    ///   [`LIVE_TURN_LIMIT`](crate::LIVE_TURN_LIMIT); the second can be
+    ///   retried.
     /// - [`Error::SessionClosed`] — the controller has shut down, or the
     ///   pair's session tore down each time this subscribe went to join it;
     ///   the session itself is still usable then, and a retry is safe.
