@@ -46,6 +46,10 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained standalone; no zbus 6 path via secret-service yet" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained standalone; no zbus 6 path via secret-service yet" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained standalone; no zbus 6 path via secret-service yet" },
+    # chrono is marked unmaintained (published 2026-11-17). It is a direct
+    # dependency and also reaches us through oxidized_alpaca and turso, so it
+    # cannot leave the lockfile until those move too. Drop this once they do.
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained; direct and via oxidized_alpaca and turso" },
 ]
 
 [bans]
