@@ -1,0 +1,10 @@
+# Under turso 0.6.1 a read dropped before its last row can end the
+# transaction it ran in: the writes after it commit one by one and the
+# closing COMMIT fails. Every read goes through the draining helper in
+# crates/datamancer/src/storage/turso_common.rs.
+disallowed-methods = [
+    { path = "turso::Connection::query", reason = "use turso_common::query_rows, which drains the cursor" },
+    { path = "turso::Statement::query", reason = "use turso_common::query_rows, which drains the cursor" },
+    { path = "turso::Statement::query_row", reason = "use turso_common::query_rows, which drains the cursor" },
+    { path = "turso::Connection::pragma_query", reason = "it stops stepping on the first callback error; use turso_common::query_rows" },
+]

@@ -146,6 +146,7 @@ pub(crate) async fn query_rows<T>(
     params: impl ::turso::IntoParams,
     mut decode: impl FnMut(&::turso::Row) -> std::result::Result<T, ::turso::Error>,
 ) -> Result<Vec<T>> {
+    #[expect(clippy::disallowed_methods, reason = "the one draining read")]
     let mut rows = conn.query(sql, params).await.map_err(map_err)?;
     let mut decoded = Vec::new();
     let mut failed = None;
