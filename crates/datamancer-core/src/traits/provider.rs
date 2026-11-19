@@ -235,6 +235,13 @@ pub trait LiveHandle: Send + Sync {
     /// only after this call has returned. datamancer's sessions do so, and an
     /// implementation that keeps one route per pair then has no other
     /// handle's subscription to protect.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionClosed`](crate::Error::SessionClosed) when the handle
+    /// or its provider has already closed and holds no subscription to
+    /// release. Any other error is a refusal: the pair may still be active
+    /// upstream.
     async fn unsubscribe(&self, instrument: Instrument, kind: EventKind) -> Result<()>;
 
     /// Tear down the live connection. Implementations should drop the event

@@ -54,9 +54,7 @@ enum Disconnected {
     Disabled,
     /// Parked until a watched credential source delivers its first value.
     MissingCredentials,
-    /// Parked until a watched credential source rotates a rejected key pair;
-    /// if that source's sender goes away the park ends and the hub backs off
-    /// ([`Reconnecting`](Self::Reconnecting)).
+    /// Parked until a watched credential source rotates a rejected key pair.
     RejectedCredentials,
     /// Sleeping out a backoff of this length before the next connect.
     Reconnecting(Duration),
@@ -86,6 +84,17 @@ impl Disconnected {
     /// Whether a credentials rotation ends the wait in this state.
     const fn wakes_on_rotation(self) -> bool {
         matches!(self, Self::MissingCredentials | Self::RejectedCredentials)
+    }
+
+    /// What ends the wait in this state once the watched credential source's
+    /// sender goes, so no rotation can come: a rejected pair is retried like
+    /// a static one after a backoff; `None` where the wait goes on, missing
+    /// credentials staying missing.
+    const fn on_credentials_gone(self) -> Option<Next> {
+        match self {
+            Self::RejectedCredentials => Some(Next::BackOff),
+            Self::Disabled | Self::MissingCredentials | Self::Reconnecting(_) => None,
+        }
     }
 
     /// What the routes are told on entering this state, once, unless they
@@ -442,7 +451,7 @@ impl LiveHandle for SharedLiveHandle {
         // the provider, not any one session.
         let state = std::mem::replace(&mut *self.state.lock().await, HandleState::Closed);
         if let HandleState::Routed { pair, .. } = state {
-            let _ = self.send_unsubscribe(pair).await;
+            self.send_unsubscribe(pair).await?;
         }
         Ok(())
     }
@@ -841,11 +850,8 @@ impl<C: Connector> Hub<C> {
                     if creds.is_some() {
                         return Next::Reconnect;
                     }
-                    // No rotation can come any more. A rejected pair is then
-                    // retried like a static one, since a rejection may yet
-                    // clear on its own; missing credentials stay missing.
-                    if matches!(why, Disconnected::RejectedCredentials) {
-                        return Next::BackOff;
+                    if let Some(next) = why.on_credentials_gone() {
+                        return next;
                     }
                 }
                 _ = self.settings_rx.changed() => return Next::Reconnect,
@@ -1947,6 +1953,18 @@ pub(super) mod tests {
             .expect("the retry connected");
     }
 
+    #[test]
+    fn only_a_rejected_credentials_park_ends_when_the_sender_goes() {
+        let gone = |why: Disconnected| why.on_credentials_gone();
+        assert_eq!(gone(Disconnected::RejectedCredentials), Some(Next::BackOff));
+        assert_eq!(gone(Disconnected::MissingCredentials), None);
+        assert_eq!(gone(Disconnected::Disabled), None);
+        assert_eq!(
+            gone(Disconnected::Reconnecting(Duration::from_secs(1))),
+            None
+        );
+    }
+
     /// Watched credentials whose sender goes away while the hub is parked on
     /// their rejection can rotate no more: the park gives way to a backoff
     /// and a retry, as when the sender was gone before the rejection.
@@ -2180,9 +2198,31 @@ pub(super) mod tests {
         );
     }
 
+    /// A close after a refused unsubscribe sends the removal again, and a
+    /// second refusal is the close's answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_after_a_refused_unsubscribe_answers_the_second_refusal() {
+        let (_hub, hub) = ConnectedHub::on(
+            FakeUpstream {
+                refuse_remove: Some(Refused(StreamFailure::Transient)),
+                ..FakeUpstream::idle()
+            },
+            vec![],
+        )
+        .await;
+        assert!(matches!(
+            hub.handle.unsubscribe(aapl(), EventKind::Trade).await,
+            Err(Error::Provider { .. })
+        ));
+        assert!(matches!(
+            hub.handle.close().await,
+            Err(Error::Provider { .. })
+        ));
+    }
+
     /// A session that closes while the connected upstream refuses its
-    /// unsubscribe still leaves the set once its sink is gone: the next
-    /// connect subscribes nothing for it.
+    /// unsubscribe hears the refusal from its close, and still leaves the set
+    /// once its sink is gone: the next connect subscribes nothing for it.
     #[tokio::test(start_paused = true)]
     async fn a_closed_session_whose_unsubscribe_was_refused_leaves_the_set() {
         let next = FakeUpstream::idle();
@@ -2202,7 +2242,7 @@ pub(super) mod tests {
             connects,
             ..
         } = hub;
-        handle.close().await.expect("close answers Ok");
+        assert!(matches!(handle.close().await, Err(Error::Provider { .. })));
         drop(rx);
 
         settings_tx.send(Some(())).unwrap();
