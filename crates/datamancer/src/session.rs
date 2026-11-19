@@ -6,14 +6,15 @@
 //! immediately so the session begins capturing events even if the consumer
 //! hasn't taken the [`EventStream`] yet.
 //!
-//! The multiplexing handle is [`crate::ClientSession`] (a mutable subscription
-//! set behind one interleaved stream; see `client.rs`). Both it and the live
+//! The multiplexing handle is [`ClientSession`] (a mutable subscription set
+//! behind one interleaved stream; see `client.rs`). Both it and the live
 //! [`Session`] are refcounted **referrers** onto a shared per-`(instrument,
 //! kind)` authoritative session, which owns the provider connection and stamps
-//! the per-symbol `seq` once at the source before any sink. `seq` is therefore
-//! identical across every consumer of a symbol; the multiplex orders by
-//! `(instrument, seq)` and never re-stamps. Historical sessions keep the
-//! single-consumer controller and do not participate in the registry.
+//! that pair's `seq` once at the source before any sink. `seq` is therefore
+//! identical across every consumer of a pair; the multiplex keeps the ordering
+//! key `(instrument, kind, seq)`, interleaves pairs in arrival order, and never
+//! re-stamps. Historical sessions keep the single-consumer controller and do
+//! not participate in the registry.
 //!
 //! # Lifecycle
 //!
@@ -254,10 +255,7 @@ struct DatamancerInner {
     providers: Vec<Arc<dyn Provider>>,
     tap_log: Option<Arc<dyn TapLog>>,
     historical_cache: Option<Arc<dyn HistoricalCache>>,
-    /// Live-session registry: at most one live session may be active per
-    /// `(instrument, kind)` pair. Each live `Session` holds an `Arc` to a
-    /// [`RegistrySentinel`]; the map keeps a `Weak` so a stale entry can be
-    /// distinguished from a live one via `strong_count()`.
+    /// Live-session registry (see [`AuthoritativeSession`]).
     live_sessions: LiveSessionRegistry,
     resume_buffer_events: usize,
     /// Single source of truth for the corporate-action adjustment mode.
@@ -847,14 +845,14 @@ impl Datamancer {
     }
 
     /// Assemble a consolidated, serializable [`SystemSnapshot`] of runtime state:
-    /// provider accounting, the cache catalog, and per-symbol live state
+    /// provider accounting, the cache catalog, and live session state
     /// (authoritative + client sessions).
     ///
-    /// **Sampled, not transactional.** Per-symbol fields are read from `Relaxed`
+    /// **Sampled, not transactional.** Per-pair fields are read from `Relaxed`
     /// atomics; the registry mutex is held only long enough to clone handles and
     /// is **never** held across an `.await` (the `catalog()` call awaits first,
-    /// before any registry lock). Fields may skew by nanoseconds across symbols —
-    /// acceptable because determinism is per-symbol and the snapshot is
+    /// before any registry lock). Fields may skew by nanoseconds across pairs —
+    /// acceptable because determinism is per pair and the snapshot is
     /// diagnostic. See [`datamancer_core::SystemSnapshot`].
     ///
     /// # Errors
@@ -1219,21 +1217,21 @@ impl DatamancerBuilder {
         self
     }
 
-    /// Limit how far back a [`ClientSession`](crate::ClientSession) subscribe
-    /// may start a backfill. Unlimited by default; a [`Session`] is not limited.
-    /// A zero `limit` refuses every client backfill.
+    /// Limit how far back a [`ClientSession`] subscribe may start a backfill.
+    /// Unlimited by default; a [`Session`] is not limited. A zero `limit`
+    /// refuses every client backfill.
     #[must_use]
     pub fn max_client_backfill(mut self, limit: Duration) -> Self {
         self.max_client_backfill = Some(limit);
         self
     }
 
-    /// Limit how many [`ClientSession`](crate::ClientSession) backfills fetch
-    /// history at once. Unlimited by default; a [`Session`] is not limited. A
-    /// backfill past the limit waits for one to finish its history, and so does
-    /// one the cache could serve whole. Meanwhile its live arrivals fill the
-    /// resume buffer, and an overflow is a `Gap`. A subscribe that joins an
-    /// existing session does not count.
+    /// Limit how many [`ClientSession`] backfills fetch history at once.
+    /// Unlimited by default; a [`Session`] is not limited. A backfill past the
+    /// limit waits for one to finish its history, and so does one the cache
+    /// could serve whole. Meanwhile its live arrivals fill the resume buffer,
+    /// and an overflow is a `Gap`. A subscribe that joins an existing session
+    /// does not count.
     ///
     /// A `limit` above
     /// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS) is
@@ -1499,7 +1497,7 @@ impl Session {
 ///
 /// `seq` is **not** stamped here. The authoritative controller stamps each
 /// event once at the source, in canonical delivery order, before it reaches
-/// the sink (see [`Controller::stamp`]); this stream is a pass-through.
+/// the sink; this stream is a pass-through.
 pub struct EventStream {
     rx: mpsc::Receiver<MarketEvent>,
 }
@@ -1636,7 +1634,7 @@ struct Controller {
     /// referrer's bounded channel. `None` for a historical session, which
     /// delivers to the single consumer `sink`.
     fanout: Option<FanOut>,
-    /// Per-symbol live stats (lock-free atomics) read by the Phase 3 diagnostics
+    /// Per-pair live stats (lock-free atomics) read by the Phase 3 diagnostics
     /// plane. Updated on the fan-out path only; unused on the historical path.
     stats: Arc<LiveStats>,
     /// Per-provider call/throughput accounting for the diagnostics snapshot.
@@ -2598,7 +2596,7 @@ impl Controller {
             .next_seq
             .checked_add(n)
             .filter(|&next| next != u64::MAX)
-            .expect("per-symbol source seq exhausted the Seq::SYNTHETIC reservation");
+            .expect("per-pair source seq exhausted the Seq::SYNTHETIC reservation");
     }
 
     /// Hand a fully-formed event to the sink; on rejection (consumer dropped
@@ -2607,7 +2605,7 @@ impl Controller {
     /// the ring push, an evicted event is already numbered, so a ring overflow
     /// is a real `seq` hole reported as `Control::Gap`. While detached there is
     /// no other producer into the outbound order, so push order == canonical
-    /// delivery order. The event's [`Arrival`] chooses what the per-symbol
+    /// delivery order. The event's [`Arrival`] chooses what the per-pair
     /// stats record.
     async fn deliver_with(&mut self, ev: MarketEvent, arrival: Arrival) {
         // Live authoritative session: fan the stamped event out to every

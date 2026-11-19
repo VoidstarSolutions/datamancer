@@ -118,7 +118,7 @@ async fn live_test_feed_delivers_a_trade() {
             .expect("timed out waiting for a Trade")
             .expect("stream closed before a Trade arrived");
 
-        // Sanity-check session-monotonic seq while we're here.
+        // Sanity-check per-pair seq while we're here.
         if let Some(seq) = match &ev {
             MarketEvent::Trade(t) => Some(t.seq.0),
             MarketEvent::Quote(q) => Some(q.seq.0),

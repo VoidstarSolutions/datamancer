@@ -1,6 +1,7 @@
 //! Public event model.
 //!
-//! Datamancer's output is a single ordered stream of [`MarketEvent`]. Variants
+//! Datamancer's output is a stream of [`MarketEvent`], ordered within each
+//! `(instrument, kind)` pair by [`Seq`] and interleaved across pairs. Variants
 //! cover live and historical market data plus in-band [`Control`] entries for
 //! connectivity, subscription state, and gap reporting.
 
@@ -195,9 +196,12 @@ pub enum MarketEvent {
 }
 
 impl MarketEvent {
-    /// The session-monotonic ordering field. `None` for control events that
-    /// do not occupy a sequence slot (none currently — reserved for future
-    /// metadata-only entries).
+    /// The per-`(instrument, kind)` ordering field. A control stamped
+    /// [`Seq::SYNTHETIC`] is in no pair's order. Any other control takes a slot
+    /// in one pair's order, but only `SubscriptionChanged` and a subscription
+    /// `ProviderError` name that pair; the rest occupy an unnamed pair's slot.
+    /// `None` is reserved for future metadata-only entries; nothing returns it
+    /// today.
     #[must_use]
     #[allow(
         clippy::unnecessary_wraps,

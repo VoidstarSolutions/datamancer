@@ -228,7 +228,8 @@ impl ConfigHub {
     /// commit it themselves once this returns `Ok`. A join failure (the
     /// blocking task panicked or was cancelled) is an I/O-shaped failure of
     /// ours, not a validation rejection of the caller's config, so it maps to
-    /// [`DaemonError::Io`] rather than [`DaemonError::ConfigInvalid`].
+    /// [`DaemonError::Io`](crate::error::DaemonError::Io) rather than
+    /// [`DaemonError::ConfigInvalid`](crate::error::DaemonError::ConfigInvalid).
     async fn save_to_disk(&self, candidate: &Config) -> Result<()> {
         let path = self.path.clone();
         let to_write = candidate.clone();
