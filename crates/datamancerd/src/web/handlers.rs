@@ -44,7 +44,7 @@ pub(crate) async fn providers(State(state): State<WebState>) -> Json<Vec<Provide
     Json(state.live_snapshot().providers.clone())
 }
 
-/// The `/api/sessions` projection: the two per-symbol session views, side by
+/// The `/api/sessions` projection: the two session views, side by
 /// side. Authoritative units are shared singletons (with their subscriber
 /// refcount); client sessions are the primary consumer handles with their
 /// subscription sets.
@@ -63,7 +63,8 @@ impl SessionsView {
     }
 }
 
-/// `GET /api/sessions` — live per-symbol session state.
+/// `GET /api/sessions` — authoritative sessions (one per pair) and client
+/// sessions (one per client).
 pub(crate) async fn sessions(State(state): State<WebState>) -> Json<SessionsView> {
     Json(SessionsView::from_snapshot(&state.live_snapshot()))
 }

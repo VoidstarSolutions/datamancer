@@ -167,7 +167,7 @@ pub struct AlpacaCryptoSection {
     pub venue: CryptoVenueCfg,
 }
 
-/// Which environment credential pair `oxidized_alpaca` loads.
+/// Which environment key pair `oxidized_alpaca` loads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountTypeCfg {

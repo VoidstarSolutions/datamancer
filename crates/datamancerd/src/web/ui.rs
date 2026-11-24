@@ -1,15 +1,15 @@
 //! The server-rendered operator page (`maud`).
 //!
 //! Read-only and **button-less**: the page renders the shell and a small inline
-//! bootstrap that subscribes to `GET /api/stream` (SSE) and repaints per-symbol
+//! bootstrap that subscribes to `GET /api/stream` (SSE) and repaints per-pair
 //! panels from each live-state sample, plus a client-side circular buffer
 //! driving a tiny latency sparkline per authoritative unit. No external CDN, no
 //! JS build step; operator interactivity (the Phase-5 control surface) is a
 //! later additive layer (`hx-post`), not present here.
 //!
 //! **Determinism in presentation:** every ordered quantity is shown
-//! per-`(instrument, kind)`. There is no global cross-symbol event count,
-//! stream position, or merged ordering; `seq` is labelled per-symbol and
+//! per-`(instrument, kind)`. There is no global cross-pair event count,
+//! stream position, or merged ordering; `seq` is labelled per-pair and
 //! `latency_ns` is marked observability-only.
 
 use maud::{DOCTYPE, Markup, html};
@@ -28,7 +28,7 @@ pub(crate) async fn index() -> Markup {
             body {
                 header {
                     h1 { "datamancerd" }
-                    p.sub { "read-only introspection · same-host · per-symbol" }
+                    p.sub { "read-only introspection · same-host · per-pair" }
                     p.status { "stream: " span #conn { "connecting…" } " · " a href="/config" { "settings" } }
                     div #banner hidden { "Configuration changed on disk — restart datamancerd to apply." }
                 }
@@ -38,7 +38,7 @@ pub(crate) async fn index() -> Markup {
                         div #providers.cards { "—" }
                     }
                     section {
-                        h2 { "Authoritative sessions " span.note { "(per (instrument, kind); seq is per-symbol)" } }
+                        h2 { "Authoritative sessions " span.note { "(per (instrument, kind); seq is per pair)" } }
                         div #authoritative { "—" }
                     }
                     section {
@@ -74,7 +74,7 @@ canvas { vertical-align: middle; }
 ";
 
 // The live bootstrap. EventSource over /api/stream; each message is a full
-// SystemSnapshot. Panels are repainted per-symbol; a per-unit circular buffer
+// SystemSnapshot. Panels are repainted per-pair; a per-unit circular buffer
 // (capped) feeds a small latency sparkline (client-side history only — no
 // server-side history per the snapshot model).
 const PAGE_JS: &str = r"
@@ -119,7 +119,7 @@ function paint(snap){
     const k = key(s); const h = hist.get(k) || []; if(s.latency_ns!=null){ h.push(s.latency_ns); if(h.length>CAP) h.shift(); hist.set(k,h); }
     return [s.instrument.provider, s.instrument.symbol, JSON.stringify(s.kind), s.subscriber_refcount, (s.seq_position?.[0] ?? s.seq_position ?? '—'), fmtNs(s.latency_ns), s.gap_count, spark(h)];
   });
-  auth.replaceChildren(table(['provider','symbol','kind','refcount','seq (per-symbol)','latency (obs, rx−src)','gaps','latency'], arows));
+  auth.replaceChildren(table(['provider','symbol','kind','refcount','seq (per-pair)','latency (obs, rx−src)','gaps','latency'], arows));
   const cl = document.getElementById('clients');
   cl.replaceChildren(table(['id','subscriptions','buffer occ/cap','dropped'],
     (snap.client_sessions||[]).map(c=>[c.id?.[0]??c.id, (c.subscriptions||[]).map(x=>x.instrument.provider+':'+x.instrument.symbol).join(', '), (c.resume_buffer.occupancy+'/'+c.resume_buffer.capacity), c.resume_buffer.dropped_events])));

@@ -1,9 +1,9 @@
 //! Optional Prometheus `/metrics` endpoint (feature `metrics`).
 //!
 //! Off by default until a scraper is deployed. Translates the snapshot's numeric
-//! fields into Prometheus gauges/counters. Every per-symbol series is **labelled
+//! fields into Prometheus gauges/counters. Every per-pair series is **labelled
 //! per `(instrument, kind)`** — never a single conflated global counter — to
-//! preserve the per-symbol framing (CLAUDE.md). Cardinality is therefore bounded
+//! preserve the per-pair framing (CLAUDE.md). Cardinality is therefore bounded
 //! by the number of *actively-subscribed* `(instrument, kind)` units; enable
 //! this endpoint only once a scraper is actually deployed.
 //!
@@ -54,7 +54,7 @@ pub fn handle() -> Option<&'static PrometheusHandle> {
     HANDLE.get().and_then(|r| r.as_ref().ok())
 }
 
-/// Update the recorded metrics from a freshly-assembled snapshot. Per-symbol
+/// Update the recorded metrics from a freshly-assembled snapshot. Per-pair
 /// series carry `instrument`/`kind` labels. Driven by the live-refresh task
 /// (so only reachable when `web-ui` is also enabled); a `metrics`-only build
 /// retains it for the recorder + render surface.
@@ -127,11 +127,11 @@ mod tests {
         );
         assert!(
             rendered.contains("datamancerd_session_subscriber_refcount"),
-            "per-symbol gauge present: {rendered}"
+            "per-pair gauge present: {rendered}"
         );
         assert!(
             rendered.contains("instrument=\"AAPL\""),
-            "per-symbol label present: {rendered}"
+            "per-pair label present: {rendered}"
         );
     }
 }

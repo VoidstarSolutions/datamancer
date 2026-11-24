@@ -50,7 +50,7 @@ impl InstanceLock {
         Self::acquire_at(&dir.join(LOCK_FILE_NAME))
     }
 
-    /// Testable core of [`acquire`]: the lock path is injected so tests never
+    /// Testable core of [`acquire`](Self::acquire): the lock path is injected so tests never
     /// touch the real data directory.
     fn acquire_at(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent()

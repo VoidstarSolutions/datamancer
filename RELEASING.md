@@ -95,10 +95,11 @@ workspace must stay packageable or **every** release after the first fails
 (release-plz [#2595]). Three rules keep it green:
 
 1. **No git/path dependency without a registry `version`.** Every internal
-   path dep carries `version = "0.5.0"` alongside `path = "..."`
-   (`cargo package` rewrites `path` → registry and needs a version to write),
+   path dep carries `version = "X.Y.Z"` (the current workspace version)
+   alongside `path = "..."` (`cargo package` rewrites `path` → registry and
+   needs a version to write; release-plz bumps these with the workspace),
    and external deps must resolve on crates.io — `oxidized_alpaca` is a
-   published crate (`version = "0.0.9"`), **not** a `git = ` dependency. If you
+   published crate (`version = "0.0.10"`), **not** a `git = ` dependency. If you
    add a `git = ` dependency to any workspace member, `cargo package` cannot
    package it and releases break; publish it (or a fork) to crates.io first.
 2. **No `publish = false` on a crate that another workspace member depends on.**

@@ -28,7 +28,8 @@ theoretical.
 ## Inbound control: `WsRequest`
 
 Reuses the UDS control vocabulary — the same `SubscriptionSpec` body and the
-same stable `codes` error table (`crates/datamancerd/src/control.rs`) — but
+same stable `codes` error table (`datamancer-client`'s `codes`, re-imported by
+`datamancerd`) — but
 drops the per-request `client` field (the connection already identifies the
 client) and adds a correlation `id` that every request carries and every
 reply echoes, because event frames and replies interleave on the shared

@@ -43,6 +43,15 @@ Same-host, zero-copy iceoryx2 transport for datamancer. Two planes:
   data plane (`to_pod` returns `None`) — remote consumers read connectivity from
   the diagnostics `ProviderSnapshot`. Per-symbol `Gap`/`SubscriptionChanged`
   carry their real `SymbolId`; `SessionClosing` routes to `SymbolId::CONNECTION`.
+- **Names are typed and versioned (`naming.rs`).** `ServicePrefix`,
+  `BootScopedPrefix` and `DataServiceName` carry names across the crate
+  boundary; no bare string. Their shapes and `WIRE_VERSION`'s bump rule live
+  in `naming.rs`'s rustdoc; read it before changing a name or a payload. A
+  consumer opens a data service, never creates it.
+- **The end of a stream is not an error.** `DataSubscriber::poll` returns
+  `Ok(Polled::Events(..))` or `Ok(Polled::Closed)`; an `Err` is never the end
+  of a stream. Its variants, and which ones a later poll carries on past, are
+  in `poll`'s `# Errors` rustdoc.
 - **Two services, no mutual order.** Data and announcement services have no
   delivery-order guarantee; a data sample can outrun its `SymbolId`
   announcement. `HoldBuffer` holds unresolved samples and replays them on

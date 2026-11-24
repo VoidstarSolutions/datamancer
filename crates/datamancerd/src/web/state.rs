@@ -42,7 +42,7 @@ pub struct WebState {
 impl WebState {
     /// Build from the two shared swaps, the live-version receiver, and the
     /// bootstrap-time credential-backend name. The daemon wires this; tests
-    /// use [`WebState::fixed`].
+    /// use `WebState::fixed`.
     #[must_use]
     pub fn new(
         live: Arc<ArcSwap<SystemSnapshot>>,

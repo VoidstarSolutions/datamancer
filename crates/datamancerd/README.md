@@ -16,8 +16,8 @@ sessions (and their recording) and read a single multiplexed stream each.
 > surface; run it same-host, single-operator. See
 > [Control transport](#control-transport-platform).
 
-> **Ordering:** determinism is **per symbol** only. The daemon computes **no**
-> cross-instrument or global order. Two clients of the same instrument observe
+> **Ordering:** determinism is **per `(instrument, kind)` pair** only. The daemon
+> computes **no** cross-pair or global order. Two clients of the same pair observe
 > byte-identical `(seq, source_ts)` because they share the one authoritative
 > per-`(instrument, kind)` session.
 
@@ -32,7 +32,8 @@ and the loss contract per transport.
 
 ```bash
 cargo run -p datamancerd -- --config datamancerd.toml
-# end-to-end tests need a live iceoryx2 runtime and are #[ignore]d:
+# end-to-end tests need a live iceoryx2 runtime (some also Alpaca credentials)
+# and are #[ignore]d:
 cargo test -p datamancerd --test daemon_e2e -- --ignored
 # the hermetic suite against the scripted provider needs no credentials:
 cargo test -p datamancerd --all-features --test scripted_e2e -- --ignored --test-threads=1
@@ -338,7 +339,7 @@ handler never serves an empty snapshot and never invokes the on-demand
 | `GET /api/snapshot` | the entire live-state `SystemSnapshot` |
 | `GET /api/cache` | cache catalog (slow swap): keys + ranges + est. bytes |
 | `GET /api/providers` | provider accounting |
-| `GET /api/sessions` | authoritative + client sessions (per-symbol) |
+| `GET /api/sessions` | authoritative sessions (one per `(instrument, kind)`) + client sessions (one per client, with its pair set) |
 | `GET /api/health` | `{"ready": bool, "health": <core HealthView>}` — readiness (at least one enabled provider, every enabled provider `Connected` or `Idle`; disabled providers and idle ones, enabled with nothing requested, never block readiness) plus the full app-facing `HealthView` |
 | `GET /api/stream` | SSE of the live-state envelope, one event per refresh |
 | `GET /api/config` | the on-disk config file + restart-required flag + path |
@@ -401,17 +402,17 @@ full validated config back; `Config::save` re-serializes it, so hand-written
 comments in the file are lost on the first UI-driven save (values survive,
 prose doesn't).
 
-**Per-symbol presentation (load-bearing):** every ordered quantity (`seq`,
+**Per-pair presentation (load-bearing):** every ordered quantity (`seq`,
 coverage, latency, gaps) is shown **per-`(instrument, kind)`**. The UI implies
-**no** cross-symbol order: there is no global event count, stream position, or
-merged sequence; `seq` is labelled per-symbol and `latency_ns` is observability
+**no** cross-pair order: there is no global event count, stream position, or
+merged sequence; `seq` is labelled per pair and `latency_ns` is observability
 only (the sanctioned `rx_ts` use).
 
 ### Metrics (feature `metrics`)
 
 Off by default until a scraper is deployed; usable independently of `web-ui`
 (the recorder installs without the UI; the `/metrics` route registers only when
-`web-ui` is also enabled). Per-symbol series are labelled per `(instrument,
+`web-ui` is also enabled). Per-pair series are labelled per `(instrument,
 kind)`, so cardinality is bounded by the number of actively-subscribed units.
 The Prometheus recorder is **process-global and one-shot** — installed exactly
 once at startup.
@@ -693,7 +694,7 @@ alongside populated capabilities.
 the active credential-store backend; the app facade uses it for
 spawn-readiness and version-skew detection.
 
-`health` returns the app-facing `HealthView` (the versioned, per-symbol-only
+`health` returns the app-facing `HealthView` (the versioned, per-pair-only
 reduction of `SystemSnapshot` — see `datamancer-core`'s `health.rs`), reduced
 and stamped **daemon-side**: `daemon.version` and `daemon.credential_backend`
 are filled from the daemon's own crate version and active credential backend,
@@ -845,6 +846,13 @@ Nothing credential-shaped lives in the config file.
   rebuilds its REST clients on next use. No restart, no resubscribe — the
   session and its `seq` stream carry across the rotation (consumers see the
   usual in-band reconnect controls).
+- **A rejected key parks the provider.** Each provider holds one upstream
+  stream connection that all its live sessions share. When the provider
+  rejects the stored keys, the stream stops retrying until `set-credentials`
+  delivers new ones or `configure-provider` changes its settings; meanwhile a
+  subscribe that opens a new pair answers `provider`. The exact rules,
+  including the cases that do not park, are in the `datamancer` crate's
+  `providers::alpaca` docs ("Rejected credentials").
 - **Clear does not un-apply.** `clear-credentials` empties the store only. A
   running provider keeps its last applied credentials until the daemon
   restarts — there is deliberately no live revocation half-state.

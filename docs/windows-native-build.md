@@ -1,8 +1,9 @@
 # Building datamancer natively on Windows
 
-Native Windows support for the full stack (daemon + transport) is in progress —
-see [`docs/superpowers/specs/2026-07-15-native-windows-support-design.md`](superpowers/specs/2026-07-15-native-windows-support-design.md)
-(#29) for the architecture and phased plan.
+Native Windows support (#29): the daemon runs on Windows with its control
+surface on an owner-only named pipe and its data plane over WS-loopback (no
+iceoryx2 node) — see `crates/datamancerd/README.md`. iceoryx2 shared memory
+stays POSIX-only.
 
 ## Toolchain requirement: LLVM / libclang
 
@@ -31,11 +32,15 @@ same one `rustc`'s `x86_64-pc-windows-msvc` target already uses.
 
 - **The ws-portable subset** (`datamancer-transport-ws` +
   `datamancer-client --features ws`) builds and tests on Windows with no extra
-  toolchain — this is what Windows CI covers.
+  toolchain — this is what the `ws-portable subset (Windows)` CI job covers.
+- **The daemon with `--features ws`** builds and boots WS-only on Windows
+  (needs libclang, since it still compiles the iceoryx2 crate). The
+  `windows-native-check` CI job lints it, runs the named-pipe control and
+  winsec tests, and boots it (`windows_ws_only_boot_smoke`).
 - **The library** (`cargo build -p datamancer`, default features) builds and runs
   on Windows. Scope example runs to the package to avoid pulling in the iceoryx2
   workspace member: `cargo run -p datamancer --example cached_history`.
 - **`datamancer-transport-iceoryx2`** *compiles* on Windows once libclang is
   installed, but iceoryx2 **does not run** on Windows at the pinned version (its
   PAL reads the POSIX user database at node creation). The native-Windows data
-  transport is therefore WS-over-loopback, not iceoryx2 — see the spec above.
+  transport is therefore WS-over-loopback, not iceoryx2.

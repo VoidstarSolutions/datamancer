@@ -11,6 +11,14 @@
 //! - **Diagnostics plane** — a separate service carrying the serialized
 //!   Phase-3 `SystemSnapshot` (not the zero-copy hot path).
 //!
+//! Per-client service naming is typed: [`ServicePrefix`] and its boot-scoped
+//! form [`BootScopedPrefix`] are prefixes, and [`DataServiceName`] is the
+//! service name derived from the latter, or parsed from the name a daemon
+//! advertised. Each data service name embeds [`WIRE_VERSION`], so peers built
+//! against different wire formats never attach to each other's data or
+//! announcement services. The diagnostics and health services keep fixed
+//! names.
+//!
 //! `SymbolId`/interning are sink-local and **not** a global-identity concept.
 //! The forbid-unsafe gate (EXT-1) holds: every payload uses the
 //! `ZeroCopySend` derive plus fixed-size containers only, so this crate keeps

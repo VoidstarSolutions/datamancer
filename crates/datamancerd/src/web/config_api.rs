@@ -1,16 +1,15 @@
 //! The web layer's handle to the daemon's config file.
 //!
 //! Holds the resolved config path and the exact [`Config`] the daemon booted
-//! with, plus the [`ConfigHub`](crate::config_hub::ConfigHub) that is the
-//! daemon's sole hot-path config writer. `write` delegates the full
-//! validate→persist→apply sequence to the hub — this layer no longer touches
-//! the file directly. `restart_required` is `true` when the on-disk file
-//! takes a restart against the boot config (a Cold field differs, or an
-//! `always_on` startup session skipped at boot has its provider enabled and
-//! stays unopened), or when the on-disk file differs from what the hub
-//! currently has applied (an external hand-edit the hub hasn't seen yet) — a
-//! hand-edited hot field still needs a restart to take effect, since hand
-//! edits are boot-time only.
+//! with, plus the [`ConfigHub`] that is the daemon's sole hot-path config
+//! writer. `write` delegates the full validate→persist→apply sequence to the
+//! hub — this layer no longer touches the file directly. `restart_required` is
+//! `true` when the on-disk file takes a restart against the boot config (a Cold
+//! field differs, or an `always_on` startup session skipped at boot has its
+//! provider enabled and stays unopened), or when the on-disk file differs from
+//! what the hub currently has applied (an external hand-edit the hub hasn't
+//! seen yet) — a hand-edited hot field still needs a restart to take effect,
+//! since hand edits are boot-time only.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

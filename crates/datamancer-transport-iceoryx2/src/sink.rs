@@ -68,7 +68,8 @@ const RESEND_MAX_WAIT: Duration = Duration::from_millis(20);
 
 /// Mutable interning state shared behind the sink's lock. `announced` tracks
 /// which interned ids have had their announcement published, so a new symbol is
-/// announced exactly once (plus periodic full-table republish via [`flush`]).
+/// announced exactly once (plus a full-table republish every
+/// [`REANNOUNCE_INTERVAL`] data sends, and on flush).
 struct State {
     table: SymbolTable,
     announced: std::collections::HashSet<u32>,

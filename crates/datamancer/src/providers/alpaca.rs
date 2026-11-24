@@ -3,8 +3,9 @@
 //! Wraps [`oxidized_alpaca`]'s streaming stock client for live trades, quotes,
 //! and minute/daily bars, and its REST market-data client for bounded
 //! historical fetches. Decoded events are pushed verbatim into the supplied
-//! [`MarketEvent`] sink with a placeholder [`Seq`]; the session merger assigns
-//! the final session-monotonic sequence.
+//! [`MarketEvent`] sink with a placeholder [`Seq`]; the session that asked for
+//! them (the pair's authoritative session when live) stamps the final
+//! per-`(instrument, kind)` sequence.
 //!
 //! # Stream host
 //!
@@ -12,10 +13,10 @@
 //! live keys both authenticate on `stream.data.alpaca.markets`. The
 //! `stream.data.sandbox.alpaca.markets` host that `oxidized_alpaca` selects
 //! for [`AccountType::Paper`] is the Broker-API sandbox, which rejects
-//! ordinary paper keys with `402 auth failed`. The streaming client is
-//! therefore always built with [`STREAM_ACCOUNT_TYPE`] (a URL choice only —
-//! see [`stream_url`]); `account_type` keeps selecting the trading/REST host
-//! and, for the env credential source, the credential pair.
+//! ordinary paper keys with `402 auth failed`. The streaming client
+//! therefore always connects to the production market-data host;
+//! `account_type` selects only the trading/REST host and, for the env
+//! credential source, which key pair is loaded.
 //!
 //! # Single shared connection
 //!
@@ -40,16 +41,35 @@
 //! reconnects — re-applying the aggregate subscription set. A
 //! `ProviderDisconnected` / `ProviderConnected` control pair is broadcast to
 //! every active sink so consumers see the gap window in the event stream.
-//! Which failures, at connect, on the re-subscribe after a reconnect, or
-//! mid-stream, mean rejected credentials and which are transient is decided
-//! in one place, the `Classify` impl in `alpaca_common`, which also records
-//! where upstream cannot tell them apart. Rejected credentials park until
-//! they rotate when they come from a watched source, and back off like any
-//! other failure otherwise. A session's own subscribe refused for its
-//! credentials is answered to that subscribe as unauthenticated and does not
-//! park the hub. A parked or backing-off hub still hears a disable, and a
-//! session that closes while the hub is parked or backing off takes its pair
-//! with it rather than leaving it for the next connect.
+//!
+//! # Rejected credentials
+//!
+//! - Credentials rejected at connect, on the hub's own re-subscribe after a
+//!   reconnect, or mid-stream **park** the hub when they come from a watched
+//!   source: it stops connecting until the credentials rotate, the
+//!   provider's settings change (new settings get one more attempt; a
+//!   disable parks it as disabled), or the credentials sender goes away (the
+//!   park becomes a backoff). From a static source they back off instead.
+//! - At connect the upstream client cannot tell a connection-limit `406`
+//!   from a rejected key, so any connect-time auth refusal counts as
+//!   rejected credentials, and parks from a watched source
+//!   (<https://github.com/VoidstarSolutions/datamancer/issues/183>).
+//! - A subscribe or unsubscribe on a [`LiveHandle`] refused for its
+//!   credentials on a live connection parks nothing; the refusal is returned
+//!   to that call as unauthenticated. Session teardown does not surface an
+//!   unsubscribe refusal.
+//! - While parked, a subscribe that opens a new `(instrument, kind)` pair is
+//!   refused as unauthenticated.
+//! - Any other connect or stream failure is transient: back off and
+//!   reconnect. A transient refusal of a subscribe, re-subscribe or
+//!   unsubscribe is reported instead (one on a `LiveHandle` call is returned
+//!   as a provider error, the hub's re-subscribe is broadcast as a
+//!   `ProviderError`) and the stream stays up.
+//!
+//! A parked or backing-off hub still hears a disable, and a session that
+//! closes while the hub is parked or backing off takes its
+//! `(instrument, kind)` pair with it rather than leaving it for the next
+//! connect.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -184,7 +204,7 @@ pub enum AlpacaStreamFeed {
 /// Broker-API sandbox host, which rejects ordinary paper keys, while the
 /// production data host authenticates paper and live keys alike. The
 /// configured [`AlpacaSettings::account_type`] still selects the trading/REST
-/// host and the env credential pair; it never reaches the stream URL choice.
+/// host and the env key pair; it never reaches the stream URL choice.
 const STREAM_ACCOUNT_TYPE: AccountType = AccountType::Live;
 
 /// Map the provider's feed selector onto `oxidized_alpaca`'s.
@@ -233,9 +253,9 @@ pub enum AlpacaHistoryFeed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlpacaSettings {
     /// Paper or live account; selects the trading/REST endpoints and, for
-    /// the legacy `Env` credential source, which env credential pair is
-    /// loaded. The market-data stream host does not depend on it (see
-    /// [`STREAM_ACCOUNT_TYPE`]).
+    /// the legacy `Env` credential source, which env key pair is loaded.
+    /// The market-data stream always uses the production data host,
+    /// regardless of this setting.
     pub account_type: AccountType,
     /// The REST feed historical fetches query. `None` (the default) follows
     /// the stream feed: `Sip` for a SIP stream, otherwise `Iex` — the only

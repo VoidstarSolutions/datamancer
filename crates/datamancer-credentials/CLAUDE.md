@@ -1,7 +1,7 @@
 # datamancer-credentials
 
-Credential storage for datamancer providers: OS keychain (Task 4) with a
-locked-down file fallback.
+Credential storage for datamancer providers: OS keychain (`KeychainBackend`)
+with a locked-down file fallback (`FileBackend`).
 
 ## Invariants / stance
 
@@ -24,14 +24,15 @@ locked-down file fallback.
   value itself (its `Debug` impl in `datamancer-core` already redacts
   secrets, but don't rely on that as the only guard).
 - **`contract_tests` is the shared behavior gate.** Every backend
-  (`FileBackend` here; the keychain backend in Task 4, including its
-  `#[ignore]`d platform tests) runs the identical suite in `lib.rs`. Changing
+  (`FileBackend`, and `KeychainBackend` in its `#[ignore]`d real-keychain
+  test) runs the identical suite in `lib.rs`. Changing
   the contract is a breaking change to every backend at once — do it
   deliberately.
 - **`FileBackend` writes are atomic (tmp + rename) and owner-only
   (`0o600`).** A pre-existing file's mode is not trusted; every `save`
   re-creates the tmp file at `0o600` before the rename, so mode is
   re-established on every write, not just at first creation.
-- **`open_default()` arrives in Task 4** once the keychain backend exists to
-  pick between; this task only exposes `default_file_path()` and
-  `CredentialStore::with_backend`.
+- **`open_default()` picks the backend**: `DATAMANCER_CREDENTIALS_FILE`
+  (non-empty) forces the file backend at that path; otherwise the keychain
+  when it initializes, else the file at `default_file_path()`.
+  `CredentialStore::with_backend` injects any backend directly.
