@@ -6,6 +6,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.10.0...v0.11.0) - 2026-11-24
+
+### Added
+
+- export LIVE_TURN_LIMIT and say what a pair's turn waits for
+- *(providers)* log the crypto stream's connect attempt
+- *(core)* name the subscription a subscription error is about
+- *(core)* [**breaking**] give a provider error an identity
+- *(datamancer)* queue a session command without waiting
+- *(core)* report a provider's history and live surfaces apart
+- *(client)* [**breaking**] let a subscription opt out of the latest-value seed
+- *(core)* [**breaking**] admit a subscription only where its provider can serve it
+- *(datamancer)* limit how many client backfills fetch at once
+- *(daemon)* [**breaking**] limit how far back a client's backfill may start
+- *(client)* [**breaking**] honor scope live_backfill on subscribe
+- *(alpaca)* [**breaking**] name the REST feed on historical fetches
+- *(transport)* [**breaking**] typed service names replace the string helpers
+- *(transport)* [**breaking**] scope iceoryx2 data services by service_prefix
+- *(daemon)* add a scripted provider and hermetic e2e tests
+- *(datamancerd)* read IOX2_LOG_LEVEL in its own boot step
+- *(datamancerd)* honour IOX2_LOG_LEVEL for the iceoryx2 logger
+
+### Fixed
+
+- *(session)* let a blocked provider go before waiting on its unsubscribe
+- *(providers)* route each session by its handle, from the routes still listening
+- *(providers)* back off a credential park whose sender goes away
+- *(providers)* let a subscribe that applies the set reset the backoff
+- *(providers)* count a rotation that landed before its sender went
+- *(providers)* tell a disable from its connection, reset once applied
+- *(providers)* three hub races: ladder, silent disable, dead sender
+- *(providers)* let a backing-off hub hear a disable too
+- *(providers)* apply an unsubscribe while the hub is disconnected
+- *(providers)* let a parked hub hear a disable
+- *(providers)* park on a re-subscribe refused as a rejected credential
+- *(providers)* respawn a hub whose task has ended
+- *(providers)* park the crypto stream on a rejected credential mid-stream
+- *(providers)* answer a rejected-credential subscribe as unauthenticated
+- *(client)* bound the subscription errors a stalled referrer is owed
+- *(datamancer)* take a backfill limit past the semaphore's maximum as the maximum
+- *(datamancer)* finish a pair's unsubscribe before its next subscribe
+- *(datamancer)* look again when the session in a pair's slot has torn down
+- *(session)* [**breaking**] pin a backfill's live edge at the provider's ack
+- *(datamancer)* [**breaking**] keep a client answering while its stream is full
+- *(datamancer)* [**breaking**] pace a backfill to its consumers
+- *(session)* leave a real seq hole where the seam ring evicted
+- *(alpaca)* share one stream connection across live sessions
+- *(alpaca)* stream from the production data host on paper
+- *(transport)* [**breaking**] report the end of a stream on poll's Ok side
+- *(daemon)* [**breaking**] hold a query until its client attaches
+- *(transport)* [**breaking**] names derive only from a typed boot-scoped prefix
+- *(transport)* SystemInFlux is not a stale service
+- *(datamancerd)* [**breaking**] boot-scoped service names and a typed stale error
+- *(daemon)* share one cache catalog read among waiting snapshots
+- *(client)* send no cancel after an attach finds the query dropped
+- *(client)* gate the raw control round-trip on the app feature
+- *(daemon)* [**breaking**] keep the actor answering while a subscribe connects
+- *(daemon)* compute the exit deadline without overflow
+- *(daemon)* take a snapshot off the actor, one catalog read at a time
+- *(daemon)* gate the open-client helpers off Windows
+- *(datamancerd)* reject an empty service_prefix before the boot id
+
+### Other
+
+- bring the docs up to date with what v0.11.0 ships
+- state ordering per (instrument, kind) pair across the workspace
+- fix broken and redundant rustdoc links
+- *(providers)* end every connection in one place
+- *(providers)* point the Alpaca docs at the one classifier
+- *(providers)* one watch reader for the REST rebuild guard
+- *(providers)* share the Alpaca classifier and symbol lists
+- *(providers)* the classifier on its impl, the docs pointing at it
+- *(providers)* what the routes last heard; Classify on the failure
+- *(providers)* let a disconnected state say what ends its wait
+- *(providers)* one wake match, a delay to sleep, when it resets
+- *(providers)* one kind classification, watches held by the hub
+- *(providers)* read a watch in one place, spell an empty one once
+- *(providers)* one read type, and the slot owns its connector
+- *(providers)* one broadcast, end_route and idle loop for the hub
+- *(providers)* read a source with its watch, name the hub's waits
+- *(providers)* keep the hub generic, the codes in the classifier
+- *(providers)* one failure handler for the hub's connections
+- *(providers)* insert and remove on the subscription set
+- *(providers)* shrink the hub's Connector to what differs
+- *(providers)* say a refused subscribe does not park the hub
+- *(providers)* say when the stock stream parks on a rejected credential
+- *(providers)* run the crypto stream on the generic hub
+- *(providers)* move the stock streaming hub into a generic hub module
+- *(providers)* give the Alpaca hubs' route commands one tested home
+- *(core)* [**breaking**] build ProviderSurfaces one named surface at a time
+- *(transport)* the sink owns the wait for a subscriber
+- *(transport)* comment cleanup after the typed-names review
+- *(client)* add a runnable backfill tape example
+- *(daemon)* say what a killed subscriber costs, and drop the restated wait
+- *(daemon)* dropping a query entry cancels it
+- *(daemon)* guard every ws_e2e daemon, fail early without paper creds
+- *(daemon)* pin every spawned test daemon's credential store
+- *(datamancerd)* a query's bars reach a data-plane subscriber
+- *(datamancerd)* trim the boot-scoped prefix docs to the type
+- *(datamancerd)* share one daemon guard between the e2e suites
+- *(datamancerd)* stop e2e daemons gracefully before the next spawn
+
 ## [0.10.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.9.0...v0.10.0) - 2026-10-10
 
 ### Added
