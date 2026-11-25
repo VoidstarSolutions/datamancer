@@ -23,16 +23,6 @@
 //!
 //! All mutations go through the one mutex-guarded write connection inside a
 //! `BEGIN`/`COMMIT` (see `turso_common` for why single-writer is load-bearing).
-//!
-//! # The drain-cursor hazard (turso 0.6.1)
-//!
-//! A write issued on a connection whose earlier `query()` `Rows` cursor is
-//! un-drained is **silently lost** — visible in-connection, never reaches
-//! disk (see `turso_common::preflight_user_version` for the first
-//! occurrence of this). The coverage and event-count reads inside
-//! `store`'s transaction run a `query()` on the *write* connection, so
-//! both fully drain their cursor (loop `rows.next()` to `None`) in an
-//! inner scope before the transaction issues its next `execute`.
 
 use std::path::Path;
 
@@ -48,7 +38,7 @@ use tokio::sync::Mutex;
 use super::coverage::CoverageDoc;
 use super::turso_common::{
     ALL_KINDS, DbLocation, asset_class_from_tag, asset_class_tag, connect, event_columns,
-    execute_retry, map_err, open_database, preflight_user_version, stamp_user_version,
+    execute_retry, open_database, preflight_user_version, query_rows, stamp_user_version,
 };
 
 /// `PRAGMA user_version` for this cache's schema. Fresh lineage (no carry-over
@@ -188,51 +178,34 @@ impl TursoCache {
     }
 
     /// Loads the coverage doc for `key`, if any.
-    ///
-    /// Fully drains the `Rows` cursor — including on the error paths, which
-    /// is why decoding is deferred until after the drain — see the
-    /// module-level drain-cursor note. This matters when `conn` is the write
-    /// connection (called from inside `store`'s transaction): an un-drained
-    /// cursor silently swallows the next `execute` on the same connection
-    /// (which would be the ROLLBACK if this returned an error early).
     async fn load_coverage(
         conn: &::turso::Connection,
         key: &CacheKey,
     ) -> Result<Option<CoverageDoc>> {
-        let raw = {
-            let mut rows = conn
-                .query(
-                    "SELECT segments, event_count, asset_class FROM coverage \
-                     WHERE provider = ?1 AND symbol = ?2 AND kind = ?3 AND adjustment = ?4",
-                    (
-                        key.instrument.provider().as_str(),
-                        key.instrument.symbol(),
-                        Self::table_for(key.kind),
-                        Self::effective_adjustment(key).as_str(),
-                    ),
-                )
-                .await
-                .map_err(map_err)?;
-            let first = rows.next().await.map_err(map_err)?;
-            // Defer column extraction until the cursor is drained so an
-            // extraction error cannot leave the statement unfinalized.
-            let raw = first.map(|row| -> std::result::Result<_, ::turso::Error> {
+        let raw = query_rows(
+            conn,
+            "SELECT segments, event_count, asset_class FROM coverage \
+             WHERE provider = ?1 AND symbol = ?2 AND kind = ?3 AND adjustment = ?4",
+            (
+                key.instrument.provider().as_str(),
+                key.instrument.symbol(),
+                Self::table_for(key.kind),
+                Self::effective_adjustment(key).as_str(),
+            ),
+            |row| {
                 Ok((
                     row.get::<String>(0)?,
                     row.get::<i64>(1)?,
                     row.get::<Option<String>>(2)?,
                 ))
-            });
-            // Drain any remaining rows (there should be none, given the key
-            // is the coverage table's PRIMARY KEY) before the cursor drops,
-            // per the module-level drain-cursor note.
-            while rows.next().await.map_err(map_err)?.is_some() {}
-            raw
-        };
+            },
+        )
+        .await?
+        .into_iter()
+        .next();
         match raw {
             None => Ok(None),
-            Some(raw) => {
-                let (segments_json, event_count, asset_class) = raw.map_err(map_err)?;
+            Some((segments_json, event_count, asset_class)) => {
                 let segments: Vec<(i64, i64)> = serde_json::from_str(&segments_json)
                     .map_err(|e| Error::Storage(format!("coverage segments decode: {e}")))?;
                 Ok(Some(CoverageDoc {
@@ -244,8 +217,7 @@ impl TursoCache {
         }
     }
 
-    /// Counts rows for `key` in `[from, to)`. Same drain discipline as
-    /// [`load_coverage`](Self::load_coverage).
+    /// Counts rows for `key` in `[from, to)`.
     async fn count_events_in(
         conn: &::turso::Connection,
         key: &CacheKey,
@@ -253,36 +225,26 @@ impl TursoCache {
         to: i64,
     ) -> Result<u64> {
         let table = Self::table_for(key.kind);
-        let raw = {
-            let mut rows = conn
-                .query(
-                    &format!(
-                        "SELECT count(*) FROM {table} \
-                         WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
-                         AND source_ts >= ?4 AND source_ts < ?5"
-                    ),
-                    (
-                        key.instrument.provider().as_str(),
-                        key.instrument.symbol(),
-                        Self::effective_adjustment(key).as_str(),
-                        from,
-                        to,
-                    ),
-                )
-                .await
-                .map_err(map_err)?;
-            let first = rows.next().await.map_err(map_err)?;
-            // `count(*)` always returns exactly one row, but defer extraction
-            // and drain trailing cursor state before it drops so a subsequent
-            // same-connection `execute` (this is called on the write
-            // connection from inside `store`'s transaction) is never lost.
-            let raw = first.map(|row| row.get::<i64>(0));
-            while rows.next().await.map_err(map_err)?.is_some() {}
-            raw
-        };
-        let n = raw
-            .ok_or_else(|| Error::Storage("count(*) returned no row".to_string()))?
-            .map_err(map_err)?;
+        let n = query_rows(
+            conn,
+            &format!(
+                "SELECT count(*) FROM {table} \
+                 WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
+                 AND source_ts >= ?4 AND source_ts < ?5"
+            ),
+            (
+                key.instrument.provider().as_str(),
+                key.instrument.symbol(),
+                Self::effective_adjustment(key).as_str(),
+                from,
+                to,
+            ),
+            |row| row.get::<i64>(0),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Storage("count(*) returned no row".to_string()))?;
         Ok(n.cast_unsigned())
     }
 }
@@ -347,24 +309,35 @@ impl HistoricalCache for TursoCache {
 
     async fn catalog(&self) -> Result<Vec<CacheCatalogEntry>> {
         let conn = connect(&self.db).await?;
-        let mut rows = conn
-            .query(
-                "SELECT provider, symbol, kind, adjustment, segments, event_count, asset_class \
-                 FROM coverage",
-                (),
-            )
-            .await
-            .map_err(map_err)?;
+        let rows = query_rows(
+            &conn,
+            "SELECT provider, symbol, kind, adjustment, segments, event_count, asset_class \
+             FROM coverage",
+            (),
+            |row| {
+                Ok((
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                    row.get::<String>(4)?,
+                    row.get::<i64>(5)?,
+                    row.get::<Option<String>>(6)?,
+                ))
+            },
+        )
+        .await?;
         let mut entries = Vec::new();
-        while let Some(row) = rows.next().await.map_err(map_err)? {
-            let provider: String = row.get(0).map_err(map_err)?;
-            let symbol: String = row.get(1).map_err(map_err)?;
-            let kind_token: String = row.get(2).map_err(map_err)?;
-            let adjustment_token: String = row.get(3).map_err(map_err)?;
-            let segments_json: String = row.get(4).map_err(map_err)?;
-            let event_count: i64 = row.get(5).map_err(map_err)?;
-            let asset_class: Option<String> = row.get(6).map_err(map_err)?;
-
+        for (
+            provider,
+            symbol,
+            kind_token,
+            adjustment_token,
+            segments_json,
+            event_count,
+            asset_class,
+        ) in rows
+        {
             let Some(kind) = Self::kind_for(&kind_token) else {
                 tracing::warn!(provider = %provider, symbol = %symbol, kind = %kind_token,
                     "skipping coverage row with unknown kind token");
@@ -593,90 +566,81 @@ impl ReplaySource for TursoCacheReplaySource {
         let instrument = self.key.instrument.clone();
         let events: Vec<MarketEvent> = match kind {
             EventKind::Trade => {
-                let mut rows = conn
-                    .query(
-                        "SELECT source_ts, rx_ts, price_raw, size_raw FROM trades \
-                         WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
-                         AND source_ts >= ?4 AND source_ts < ?5 \
-                         ORDER BY source_ts ASC",
-                        params,
-                    )
-                    .await
-                    .map_err(map_err)?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next().await.map_err(map_err)? {
-                    let size_raw: i64 = row.get(3).map_err(map_err)?;
-                    out.push(MarketEvent::Trade(Trade {
-                        instrument: instrument.clone(),
-                        source_ts: Timestamp(row.get(0).map_err(map_err)?),
-                        rx_ts: Timestamp(row.get(1).map_err(map_err)?),
-                        seq: Seq(0),
-                        price: Price::from_raw(row.get(2).map_err(map_err)?),
-                        size: Quantity::from_raw(size_raw.cast_unsigned()),
-                    }));
-                }
-                out
+                query_rows(
+                    &conn,
+                    "SELECT source_ts, rx_ts, price_raw, size_raw FROM trades \
+                     WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
+                     AND source_ts >= ?4 AND source_ts < ?5 \
+                     ORDER BY source_ts ASC",
+                    params,
+                    |row| {
+                        let size_raw: i64 = row.get(3)?;
+                        Ok(MarketEvent::Trade(Trade {
+                            instrument: instrument.clone(),
+                            source_ts: Timestamp(row.get(0)?),
+                            rx_ts: Timestamp(row.get(1)?),
+                            seq: Seq(0),
+                            price: Price::from_raw(row.get(2)?),
+                            size: Quantity::from_raw(size_raw.cast_unsigned()),
+                        }))
+                    },
+                )
+                .await?
             }
             EventKind::Quote => {
-                let mut rows = conn
-                    .query(
-                        "SELECT source_ts, rx_ts, bid_raw, bid_size_raw, ask_raw, ask_size_raw \
-                         FROM quotes \
-                         WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
-                         AND source_ts >= ?4 AND source_ts < ?5 \
-                         ORDER BY source_ts ASC",
-                        params,
-                    )
-                    .await
-                    .map_err(map_err)?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next().await.map_err(map_err)? {
-                    let bid_size: i64 = row.get(3).map_err(map_err)?;
-                    let ask_size: i64 = row.get(5).map_err(map_err)?;
-                    out.push(MarketEvent::Quote(Quote {
-                        instrument: instrument.clone(),
-                        source_ts: Timestamp(row.get(0).map_err(map_err)?),
-                        rx_ts: Timestamp(row.get(1).map_err(map_err)?),
-                        seq: Seq(0),
-                        bid: Price::from_raw(row.get(2).map_err(map_err)?),
-                        bid_size: Quantity::from_raw(bid_size.cast_unsigned()),
-                        ask: Price::from_raw(row.get(4).map_err(map_err)?),
-                        ask_size: Quantity::from_raw(ask_size.cast_unsigned()),
-                    }));
-                }
-                out
+                query_rows(
+                    &conn,
+                    "SELECT source_ts, rx_ts, bid_raw, bid_size_raw, ask_raw, ask_size_raw \
+                     FROM quotes \
+                     WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
+                     AND source_ts >= ?4 AND source_ts < ?5 \
+                     ORDER BY source_ts ASC",
+                    params,
+                    |row| {
+                        let bid_size: i64 = row.get(3)?;
+                        let ask_size: i64 = row.get(5)?;
+                        Ok(MarketEvent::Quote(Quote {
+                            instrument: instrument.clone(),
+                            source_ts: Timestamp(row.get(0)?),
+                            rx_ts: Timestamp(row.get(1)?),
+                            seq: Seq(0),
+                            bid: Price::from_raw(row.get(2)?),
+                            bid_size: Quantity::from_raw(bid_size.cast_unsigned()),
+                            ask: Price::from_raw(row.get(4)?),
+                            ask_size: Quantity::from_raw(ask_size.cast_unsigned()),
+                        }))
+                    },
+                )
+                .await?
             }
             EventKind::Bar(interval) => {
-                let mut rows = conn
-                    .query(
-                        &format!(
-                            "SELECT source_ts, rx_ts, open_raw, high_raw, low_raw, close_raw, \
-                             volume_raw FROM {table} \
-                             WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
-                             AND source_ts >= ?4 AND source_ts < ?5 \
-                             ORDER BY source_ts ASC"
-                        ),
-                        params,
-                    )
-                    .await
-                    .map_err(map_err)?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next().await.map_err(map_err)? {
-                    let volume_raw: i64 = row.get(6).map_err(map_err)?;
-                    out.push(MarketEvent::Bar(Bar {
-                        instrument: instrument.clone(),
-                        interval,
-                        source_ts: Timestamp(row.get(0).map_err(map_err)?),
-                        rx_ts: Timestamp(row.get(1).map_err(map_err)?),
-                        seq: Seq(0),
-                        open: Price::from_raw(row.get(2).map_err(map_err)?),
-                        high: Price::from_raw(row.get(3).map_err(map_err)?),
-                        low: Price::from_raw(row.get(4).map_err(map_err)?),
-                        close: Price::from_raw(row.get(5).map_err(map_err)?),
-                        volume: Quantity::from_raw(volume_raw.cast_unsigned()),
-                    }));
-                }
-                out
+                query_rows(
+                    &conn,
+                    &format!(
+                        "SELECT source_ts, rx_ts, open_raw, high_raw, low_raw, close_raw, \
+                         volume_raw FROM {table} \
+                         WHERE provider = ?1 AND symbol = ?2 AND adjustment = ?3 \
+                         AND source_ts >= ?4 AND source_ts < ?5 \
+                         ORDER BY source_ts ASC"
+                    ),
+                    params,
+                    |row| {
+                        let volume_raw: i64 = row.get(6)?;
+                        Ok(MarketEvent::Bar(Bar {
+                            instrument: instrument.clone(),
+                            interval,
+                            source_ts: Timestamp(row.get(0)?),
+                            rx_ts: Timestamp(row.get(1)?),
+                            seq: Seq(0),
+                            open: Price::from_raw(row.get(2)?),
+                            high: Price::from_raw(row.get(3)?),
+                            low: Price::from_raw(row.get(4)?),
+                            close: Price::from_raw(row.get(5)?),
+                            volume: Quantity::from_raw(volume_raw.cast_unsigned()),
+                        }))
+                    },
+                )
+                .await?
             }
         };
         Ok(stream::iter(events).boxed())
@@ -685,7 +649,7 @@ impl ReplaySource for TursoCacheReplaySource {
 
 #[cfg(test)]
 mod tests {
-    use super::super::turso_common::{DbLocation, connect, open_database};
+    use super::super::turso_common::{DbLocation, connect, open_database, query_rows};
     use super::super::turso_tap_log::{TursoTapLog, TursoTapLogConfig};
     use super::{TursoCache, TursoCacheConfig};
 
@@ -711,16 +675,17 @@ mod tests {
 
         let db = open_database(&DbLocation::File(path)).await.unwrap();
         let conn = connect(&db).await.unwrap();
-        let mut rows = conn
-            .query(
-                "SELECT name FROM sqlite_master WHERE name IN ('coverage', 'trades')",
-                (),
-            )
-            .await
-            .unwrap();
+        let leaked: Vec<String> = query_rows(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE name IN ('coverage', 'trades')",
+            (),
+            |row| row.get(0),
+        )
+        .await
+        .unwrap();
         assert!(
-            rows.next().await.unwrap().is_none(),
-            "cache DDL leaked into a tap-log file"
+            leaked.is_empty(),
+            "cache DDL leaked into a tap-log file: {leaked:?}"
         );
     }
 }

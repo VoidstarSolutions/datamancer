@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::turso_common::{
     DbLocation, asset_class_from_tag, asset_class_tag, connect, event_columns, execute_retry,
-    map_err, open_database, preflight_user_version, stamp_user_version,
+    open_database, preflight_user_version, query_rows, stamp_user_version,
 };
 
 /// `PRAGMA user_version` for the tap log's schema. Deliberately disjoint from
@@ -173,24 +173,55 @@ fn event_seq(ev: &MarketEvent) -> u64 {
 /// that actually exist: reusing a live ordinal would point two registry rows
 /// at one shard table and cross-attribute their events on replay.
 async fn recompute_next_shard(conn: &::turso::Connection, persisted: u64) -> Result<u64> {
-    let mut floor = persisted;
-    let mut rows = conn
-        .query(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'tap_%'",
-            (),
-        )
-        .await
-        .map_err(map_err)?;
-    while let Some(row) = rows.next().await.map_err(map_err)? {
-        let name: String = row.get(0).map_err(map_err)?;
-        if let Some(n) = name
-            .strip_prefix("tap_")
-            .and_then(|d| d.parse::<u64>().ok())
-        {
-            floor = floor.max(n.saturating_add(1));
+    let names: Vec<String> = query_rows(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'tap_%'",
+        (),
+        |row| row.get(0),
+    )
+    .await?;
+    Ok(names
+        .iter()
+        .filter_map(|name| name.strip_prefix("tap_")?.parse::<u64>().ok())
+        .fold(persisted, |floor, n| floor.max(n.saturating_add(1))))
+}
+
+/// Every usable `streams` row as `(instrument, kind, shard_table)`; rows with
+/// an unknown tag or a shard name this store never generates are skipped.
+async fn load_registry(conn: &::turso::Connection) -> Result<Vec<(Instrument, EventKind, String)>> {
+    let rows = query_rows(
+        conn,
+        "SELECT provider, asset_class, symbol, kind_tag, shard_table FROM streams",
+        (),
+        |row| {
+            Ok((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<String>(2)?,
+                row.get::<String>(3)?,
+                row.get::<String>(4)?,
+            ))
+        },
+    )
+    .await?;
+    let mut registry = Vec::new();
+    for (provider, asset_class, symbol, kind_tag_s, shard_table) in rows {
+        let (Some(asset), Some(kind)) = (
+            asset_class_from_tag(&asset_class),
+            kind_from_tag(&kind_tag_s),
+        ) else {
+            continue;
+        };
+        if !is_valid_shard_name(&shard_table) {
+            tracing::warn!(provider = %provider, symbol = %symbol,
+                shard_table = %shard_table,
+                "skipping streams row whose shard_table is not a generated tap_N name");
+            continue;
         }
+        let instrument = Instrument::new(ProviderId::new(provider), asset, &symbol);
+        registry.push((instrument, kind, shard_table));
     }
-    Ok(floor)
+    Ok(registry)
 }
 
 // ---------------------------------------------------------------------------
@@ -246,63 +277,27 @@ impl TursoTapLog {
         }
 
         // Load counters + registry (shard tables persist across reopen; no
-        // re-DDL needed, unlike the prior backend's re-DEFINE quirk). Both queries
-        // fully drain their `Rows` cursor to `None` in an inner scope before
-        // the connection is handed to the writer task — an un-drained cursor
-        // silently swallows the next same-connection write under turso 0.6.1
-        // (see `turso_common::preflight_user_version`).
-        let (next_shard, next_ord) = {
-            let mut rows = conn
-                .query("SELECT next_shard, next_ord FROM meta WHERE id = 0", ())
-                .await
-                .map_err(map_err)?;
-            let counters = match rows.next().await.map_err(map_err)? {
-                Some(row) => {
-                    let shard: i64 = row.get(0).map_err(map_err)?;
-                    let ord: i64 = row.get(1).map_err(map_err)?;
-                    (shard.cast_unsigned(), ord.cast_unsigned())
-                }
-                None => (0, 0),
-            };
-            // Drain any remaining rows (there should be at most one, `id = 0`
-            // being the primary key) before the cursor drops.
-            while rows.next().await.map_err(map_err)?.is_some() {}
-            counters
-        };
+        // re-DDL needed, unlike the prior backend's re-DEFINE quirk).
+        let (next_shard, next_ord) = query_rows(
+            &conn,
+            "SELECT next_shard, next_ord FROM meta WHERE id = 0",
+            (),
+            |row| {
+                let shard: i64 = row.get(0)?;
+                let ord: i64 = row.get(1)?;
+                Ok((shard.cast_unsigned(), ord.cast_unsigned()))
+            },
+        )
+        .await?
+        .into_iter()
+        .next()
+        .unwrap_or((0, 0));
         let mut shards: HashMap<Instrument, HashMap<EventKind, String>> = HashMap::new();
-        {
-            let mut rows = conn
-                .query(
-                    "SELECT provider, asset_class, symbol, kind_tag, shard_table FROM streams",
-                    (),
-                )
-                .await
-                .map_err(map_err)?;
-            while let Some(row) = rows.next().await.map_err(map_err)? {
-                let provider: String = row.get(0).map_err(map_err)?;
-                let asset_class: String = row.get(1).map_err(map_err)?;
-                let symbol: String = row.get(2).map_err(map_err)?;
-                let kind_tag_s: String = row.get(3).map_err(map_err)?;
-                let shard_table: String = row.get(4).map_err(map_err)?;
-                let (Some(asset), Some(kind)) = (
-                    asset_class_from_tag(&asset_class),
-                    kind_from_tag(&kind_tag_s),
-                ) else {
-                    continue;
-                };
-                if !is_valid_shard_name(&shard_table) {
-                    tracing::warn!(provider = %provider, symbol = %symbol,
-                        shard_table = %shard_table,
-                        "skipping streams row whose shard_table is not a generated tap_N name");
-                    continue;
-                }
-                let instrument = Instrument::new(ProviderId::new(provider), asset, &symbol);
-                shards
-                    .entry(instrument)
-                    .or_default()
-                    .insert(kind, insert_sql(&shard_table, kind));
-            }
-            // `while let ... = rows.next()` above already drains to `None`.
+        for (instrument, kind, shard_table) in load_registry(&conn).await? {
+            shards
+                .entry(instrument)
+                .or_default()
+                .insert(kind, insert_sql(&shard_table, kind));
         }
 
         let next_shard = recompute_next_shard(&conn, next_shard).await?;
@@ -610,43 +605,14 @@ impl ReplaySource for TursoTapReplaySource {
         let conn = connect(&self.db).await?;
 
         // Registry scan, filtered in memory (few streams).
-        let mut regs: Vec<(Instrument, EventKind, String)> = Vec::new();
-        {
-            let mut rows = conn
-                .query(
-                    "SELECT provider, asset_class, symbol, kind_tag, shard_table FROM streams",
-                    (),
-                )
-                .await
-                .map_err(map_err)?;
-            while let Some(row) = rows.next().await.map_err(map_err)? {
-                let provider: String = row.get(0).map_err(map_err)?;
-                let asset_class: String = row.get(1).map_err(map_err)?;
-                let symbol: String = row.get(2).map_err(map_err)?;
-                let kind_tag_s: String = row.get(3).map_err(map_err)?;
-                let shard_table: String = row.get(4).map_err(map_err)?;
-                let (Some(asset), Some(kind)) = (
-                    asset_class_from_tag(&asset_class),
-                    kind_from_tag(&kind_tag_s),
-                ) else {
-                    continue;
-                };
-                if !is_valid_shard_name(&shard_table) {
-                    tracing::warn!(provider = %provider, symbol = %symbol,
-                        shard_table = %shard_table,
-                        "skipping streams row whose shard_table is not a generated tap_N name");
-                    continue;
-                }
-                let instrument = Instrument::new(ProviderId::new(provider), asset, &symbol);
-                if !request.instruments.is_empty() && !request.instruments.contains(&instrument) {
-                    continue;
-                }
-                if !request.kinds.is_empty() && !request.kinds.contains(&kind) {
-                    continue;
-                }
-                regs.push((instrument, kind, shard_table));
-            }
-        }
+        let regs: Vec<(Instrument, EventKind, String)> = load_registry(&conn)
+            .await?
+            .into_iter()
+            .filter(|(instrument, kind, _)| {
+                (request.instruments.is_empty() || request.instruments.contains(instrument))
+                    && (request.kinds.is_empty() || request.kinds.contains(kind))
+            })
+            .collect();
 
         // Per-shard windowed scans; each is an ord-sorted run, merged below
         // by one global sort (ord is unique across shards and lifetimes).
@@ -654,98 +620,101 @@ impl ReplaySource for TursoTapReplaySource {
         for (instrument, kind, shard) in regs {
             match kind {
                 EventKind::Trade => {
-                    let mut rows = conn
-                        .query(
+                    all.extend(
+                        query_rows(
+                            &conn,
                             &format!(
                                 "SELECT ord, seq, source_ts, rx_ts, price_raw, size_raw \
                                  FROM {shard} WHERE source_ts >= ?1 AND source_ts < ?2 \
                                  ORDER BY ord ASC"
                             ),
                             (from, to),
+                            |row| {
+                                let ord: i64 = row.get(0)?;
+                                let seq: i64 = row.get(1)?;
+                                let size_raw: i64 = row.get(5)?;
+                                Ok((
+                                    ord.cast_unsigned(),
+                                    MarketEvent::Trade(Trade {
+                                        instrument: instrument.clone(),
+                                        source_ts: Timestamp(row.get(2)?),
+                                        rx_ts: Timestamp(row.get(3)?),
+                                        seq: Seq(seq.cast_unsigned()),
+                                        price: Price::from_raw(row.get(4)?),
+                                        size: Quantity::from_raw(size_raw.cast_unsigned()),
+                                    }),
+                                ))
+                            },
                         )
-                        .await
-                        .map_err(map_err)?;
-                    while let Some(row) = rows.next().await.map_err(map_err)? {
-                        let ord: i64 = row.get(0).map_err(map_err)?;
-                        let seq: i64 = row.get(1).map_err(map_err)?;
-                        let size_raw: i64 = row.get(5).map_err(map_err)?;
-                        all.push((
-                            ord.cast_unsigned(),
-                            MarketEvent::Trade(Trade {
-                                instrument: instrument.clone(),
-                                source_ts: Timestamp(row.get(2).map_err(map_err)?),
-                                rx_ts: Timestamp(row.get(3).map_err(map_err)?),
-                                seq: Seq(seq.cast_unsigned()),
-                                price: Price::from_raw(row.get(4).map_err(map_err)?),
-                                size: Quantity::from_raw(size_raw.cast_unsigned()),
-                            }),
-                        ));
-                    }
+                        .await?,
+                    );
                 }
                 EventKind::Quote => {
-                    let mut rows = conn
-                        .query(
+                    all.extend(
+                        query_rows(
+                            &conn,
                             &format!(
                                 "SELECT ord, seq, source_ts, rx_ts, bid_raw, bid_size_raw, \
                                  ask_raw, ask_size_raw FROM {shard} \
                                  WHERE source_ts >= ?1 AND source_ts < ?2 ORDER BY ord ASC"
                             ),
                             (from, to),
+                            |row| {
+                                let ord: i64 = row.get(0)?;
+                                let seq: i64 = row.get(1)?;
+                                let bid_size: i64 = row.get(5)?;
+                                let ask_size: i64 = row.get(7)?;
+                                Ok((
+                                    ord.cast_unsigned(),
+                                    MarketEvent::Quote(Quote {
+                                        instrument: instrument.clone(),
+                                        source_ts: Timestamp(row.get(2)?),
+                                        rx_ts: Timestamp(row.get(3)?),
+                                        seq: Seq(seq.cast_unsigned()),
+                                        bid: Price::from_raw(row.get(4)?),
+                                        bid_size: Quantity::from_raw(bid_size.cast_unsigned()),
+                                        ask: Price::from_raw(row.get(6)?),
+                                        ask_size: Quantity::from_raw(ask_size.cast_unsigned()),
+                                    }),
+                                ))
+                            },
                         )
-                        .await
-                        .map_err(map_err)?;
-                    while let Some(row) = rows.next().await.map_err(map_err)? {
-                        let ord: i64 = row.get(0).map_err(map_err)?;
-                        let seq: i64 = row.get(1).map_err(map_err)?;
-                        let bid_size: i64 = row.get(5).map_err(map_err)?;
-                        let ask_size: i64 = row.get(7).map_err(map_err)?;
-                        all.push((
-                            ord.cast_unsigned(),
-                            MarketEvent::Quote(Quote {
-                                instrument: instrument.clone(),
-                                source_ts: Timestamp(row.get(2).map_err(map_err)?),
-                                rx_ts: Timestamp(row.get(3).map_err(map_err)?),
-                                seq: Seq(seq.cast_unsigned()),
-                                bid: Price::from_raw(row.get(4).map_err(map_err)?),
-                                bid_size: Quantity::from_raw(bid_size.cast_unsigned()),
-                                ask: Price::from_raw(row.get(6).map_err(map_err)?),
-                                ask_size: Quantity::from_raw(ask_size.cast_unsigned()),
-                            }),
-                        ));
-                    }
+                        .await?,
+                    );
                 }
                 EventKind::Bar(interval) => {
-                    let mut rows = conn
-                        .query(
+                    all.extend(
+                        query_rows(
+                            &conn,
                             &format!(
                                 "SELECT ord, seq, source_ts, rx_ts, open_raw, high_raw, \
                                  low_raw, close_raw, volume_raw FROM {shard} \
                                  WHERE source_ts >= ?1 AND source_ts < ?2 ORDER BY ord ASC"
                             ),
                             (from, to),
+                            |row| {
+                                let ord: i64 = row.get(0)?;
+                                let seq: i64 = row.get(1)?;
+                                let volume_raw: i64 = row.get(8)?;
+                                Ok((
+                                    ord.cast_unsigned(),
+                                    MarketEvent::Bar(Bar {
+                                        instrument: instrument.clone(),
+                                        interval,
+                                        source_ts: Timestamp(row.get(2)?),
+                                        rx_ts: Timestamp(row.get(3)?),
+                                        seq: Seq(seq.cast_unsigned()),
+                                        open: Price::from_raw(row.get(4)?),
+                                        high: Price::from_raw(row.get(5)?),
+                                        low: Price::from_raw(row.get(6)?),
+                                        close: Price::from_raw(row.get(7)?),
+                                        volume: Quantity::from_raw(volume_raw.cast_unsigned()),
+                                    }),
+                                ))
+                            },
                         )
-                        .await
-                        .map_err(map_err)?;
-                    while let Some(row) = rows.next().await.map_err(map_err)? {
-                        let ord: i64 = row.get(0).map_err(map_err)?;
-                        let seq: i64 = row.get(1).map_err(map_err)?;
-                        let volume_raw: i64 = row.get(8).map_err(map_err)?;
-                        all.push((
-                            ord.cast_unsigned(),
-                            MarketEvent::Bar(Bar {
-                                instrument: instrument.clone(),
-                                interval,
-                                source_ts: Timestamp(row.get(2).map_err(map_err)?),
-                                rx_ts: Timestamp(row.get(3).map_err(map_err)?),
-                                seq: Seq(seq.cast_unsigned()),
-                                open: Price::from_raw(row.get(4).map_err(map_err)?),
-                                high: Price::from_raw(row.get(5).map_err(map_err)?),
-                                low: Price::from_raw(row.get(6).map_err(map_err)?),
-                                close: Price::from_raw(row.get(7).map_err(map_err)?),
-                                volume: Quantity::from_raw(volume_raw.cast_unsigned()),
-                            }),
-                        ));
-                    }
+                        .await?,
+                    );
                 }
             }
         }
@@ -765,7 +734,7 @@ mod tests {
     };
 
     use super::super::turso::{TursoCache, TursoCacheConfig};
-    use super::super::turso_common::{DbLocation, connect, open_database};
+    use super::super::turso_common::{DbLocation, connect, open_database, query_rows};
     use super::{TursoTapLog, TursoTapLogConfig};
 
     fn inst() -> Instrument {
@@ -822,16 +791,17 @@ mod tests {
 
         let db = open_database(&DbLocation::File(path)).await.unwrap();
         let conn = connect(&db).await.unwrap();
-        let mut rows = conn
-            .query(
-                "SELECT name FROM sqlite_master WHERE name IN ('meta', 'streams')",
-                (),
-            )
-            .await
-            .unwrap();
+        let leaked: Vec<String> = query_rows(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE name IN ('meta', 'streams')",
+            (),
+            |row| row.get(0),
+        )
+        .await
+        .unwrap();
         assert!(
-            rows.next().await.unwrap().is_none(),
-            "tap-log DDL leaked into a cache file"
+            leaked.is_empty(),
+            "tap-log DDL leaked into a cache file: {leaked:?}"
         );
     }
 
@@ -876,19 +846,14 @@ mod tests {
 
         let db = open_database(&DbLocation::File(path)).await.unwrap();
         let conn = connect(&db).await.unwrap();
-        let mut rows = conn
-            .query(
-                "SELECT kind_tag, shard_table FROM streams ORDER BY kind_tag",
-                (),
-            )
-            .await
-            .unwrap();
-        let mut seen = Vec::new();
-        while let Some(row) = rows.next().await.unwrap() {
-            let kind_tag: String = row.get(0).unwrap();
-            let shard: String = row.get(1).unwrap();
-            seen.push((kind_tag, shard));
-        }
+        let seen: Vec<(String, String)> = query_rows(
+            &conn,
+            "SELECT kind_tag, shard_table FROM streams ORDER BY kind_tag",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             seen,
             vec![
