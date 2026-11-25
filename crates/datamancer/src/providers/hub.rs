@@ -442,7 +442,9 @@ impl LiveHandle for SharedLiveHandle {
         // the provider, not any one session.
         let state = std::mem::replace(&mut *self.state.lock().await, HandleState::Closed);
         if let HandleState::Routed { pair, .. } = state {
-            let _ = self.send_unsubscribe(pair).await;
+            self.send_unsubscribe(pair).await?;
+        } else if self.cmd_tx.is_closed() {
+            return Err(Error::SessionClosed);
         }
         Ok(())
     }
@@ -2180,9 +2182,31 @@ pub(super) mod tests {
         );
     }
 
+    /// A close after a refused unsubscribe sends the removal again, and a
+    /// second refusal is the close's answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_after_a_refused_unsubscribe_answers_the_second_refusal() {
+        let (_hub, hub) = ConnectedHub::on(
+            FakeUpstream {
+                refuse_remove: Some(Refused(StreamFailure::Transient)),
+                ..FakeUpstream::idle()
+            },
+            vec![],
+        )
+        .await;
+        assert!(matches!(
+            hub.handle.unsubscribe(aapl(), EventKind::Trade).await,
+            Err(Error::Provider { .. })
+        ));
+        assert!(matches!(
+            hub.handle.close().await,
+            Err(Error::Provider { .. })
+        ));
+    }
+
     /// A session that closes while the connected upstream refuses its
-    /// unsubscribe still leaves the set once its sink is gone: the next
-    /// connect subscribes nothing for it.
+    /// unsubscribe hears the refusal from its close, and still leaves the set
+    /// once its sink is gone: the next connect subscribes nothing for it.
     #[tokio::test(start_paused = true)]
     async fn a_closed_session_whose_unsubscribe_was_refused_leaves_the_set() {
         let next = FakeUpstream::idle();
@@ -2202,7 +2226,7 @@ pub(super) mod tests {
             connects,
             ..
         } = hub;
-        handle.close().await.expect("close answers Ok");
+        assert!(matches!(handle.close().await, Err(Error::Provider { .. })));
         drop(rx);
 
         settings_tx.send(Some(())).unwrap();
@@ -2289,6 +2313,34 @@ pub(super) mod tests {
         .await;
         assert!(ended.is_ok(), "the session's stream ended");
         drop(handle);
+    }
+
+    /// A hub that panicked has closed every handle it had: a handle that
+    /// was routed and one that held nothing both answer a close with
+    /// `SessionClosed`, as the `LiveHandle::close` contract says.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_after_the_hub_panicked_answers_session_closed() {
+        let (settings_tx, sources) = with_watched_settings(static_sources());
+        let connector = FakeConnector::scripted(vec![Ok(FakeUpstream {
+            panics_on_shut_down: true,
+            ..FakeUpstream::idle()
+        })]);
+        let (hub, cmd_tx) = spawn_hub(connector, sources);
+        let (sink, _rx) = mpsc::channel(8);
+        let routed = Box::new(SharedLiveHandle::new(cmd_tx.clone(), sink));
+        routed
+            .subscribe(aapl(), EventKind::Trade)
+            .await
+            .expect("subscribes on the first connection");
+        let (idle_sink, _idle_rx) = mpsc::channel(8);
+        let idle = Box::new(SharedLiveHandle::new(cmd_tx, idle_sink));
+
+        settings_tx.send(Some(())).unwrap();
+        assert!(hub.await.expect_err("the hub panicked").is_panic());
+        let routed = routed.close().await;
+        assert!(matches!(routed, Err(Error::SessionClosed)), "{routed:?}");
+        let idle = idle.close().await;
+        assert!(matches!(idle, Err(Error::SessionClosed)), "{idle:?}");
     }
 
     /// Credentials cleared while connected end the connection as

@@ -30,7 +30,10 @@ pub enum Error {
     #[error("this configuration requires persistence but none is configured")]
     PersistenceRequired,
 
-    /// The session has already been closed.
+    /// The session has already been closed, or, from
+    /// [`LiveHandle::unsubscribe`](crate::LiveHandle::unsubscribe) or
+    /// [`LiveHandle::close`](crate::LiveHandle::close), the handle or its
+    /// provider has.
     #[error("session closed")]
     SessionClosed,
 

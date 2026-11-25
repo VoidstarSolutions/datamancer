@@ -2559,11 +2559,7 @@ impl Controller {
         // blocked sending into it go, so it can hear the unsubscribe.
         drop(provider_rx);
         if let Some(h) = live.lock().await.take() {
-            self.accounting.record_unsubscribe();
-            let _ = h
-                .unsubscribe(self.inner.instrument.clone(), self.inner.kind)
-                .await;
-            let _ = h.close().await;
+            release_live(h, &self.inner.instrument, self.inner.kind, &self.accounting).await;
         }
         if let Some(log) = &self.tap_log {
             let _ = log.flush().await;
@@ -3289,10 +3285,50 @@ async fn confirmed_window(
     match BackfillWindow::of(scope, edge) {
         Ok(backfill) => Ok((live, backfill)),
         Err(e) => {
-            accounting.record_unsubscribe();
-            let _ = live.unsubscribe(instrument.clone(), kind).await;
-            let _ = live.close().await;
+            release_live(live, instrument, kind, accounting).await;
             Err(e)
+        }
+    }
+}
+
+/// Unsubscribe `live` from the pair and close it, with one warning for
+/// whatever of the two the provider refused.
+async fn release_live(
+    live: Box<dyn LiveHandle>,
+    instrument: &Instrument,
+    kind: EventKind,
+    accounting: &ProviderAccounting,
+) {
+    accounting.record_unsubscribe();
+    let refused = |step: &str, result: Result<()>| match result {
+        Ok(()) => None,
+        Err(Error::SessionClosed) => {
+            tracing::debug!(%instrument, ?kind, step, "release step after the provider closed");
+            None
+        }
+        Err(error) => Some(error),
+    };
+    let unsubscribe = refused(
+        "unsubscribe",
+        live.unsubscribe(instrument.clone(), kind).await,
+    );
+    let close = refused("close", live.close().await);
+    match (unsubscribe, close) {
+        (None, None) => {}
+        (Some(error), None) => {
+            tracing::warn!(%instrument, ?kind, %error, "provider refused an unsubscribe");
+        }
+        (None, Some(error)) => {
+            tracing::warn!(%instrument, ?kind, %error, "provider refused a close");
+        }
+        (Some(unsubscribe), Some(close)) => {
+            tracing::warn!(
+                %instrument,
+                ?kind,
+                %unsubscribe,
+                %close,
+                "provider refused an unsubscribe and the close after it"
+            );
         }
     }
 }
@@ -3782,6 +3818,9 @@ mod backfill_window_tests {
     struct UndoLive {
         unsubscribed: Arc<AtomicU64>,
         closed: Arc<AtomicU64>,
+        refuse_unsubscribe: bool,
+        refuse_close: bool,
+        already_closed: bool,
     }
 
     #[async_trait]
@@ -3791,10 +3830,28 @@ mod backfill_window_tests {
         }
         async fn unsubscribe(&self, _: Instrument, _: EventKind) -> Result<()> {
             self.unsubscribed.fetch_add(1, Ordering::SeqCst);
+            if self.already_closed {
+                return Err(Error::SessionClosed);
+            }
+            if self.refuse_unsubscribe {
+                return Err(Error::Provider {
+                    provider: "p".to_string(),
+                    message: "venue said no".to_string(),
+                });
+            }
             Ok(())
         }
         async fn close(self: Box<Self>) -> Result<()> {
             self.closed.fetch_add(1, Ordering::SeqCst);
+            if self.already_closed {
+                return Err(Error::SessionClosed);
+            }
+            if self.refuse_close {
+                return Err(Error::Provider {
+                    provider: "p".to_string(),
+                    message: "venue kept the pair".to_string(),
+                });
+            }
             Ok(())
         }
     }
@@ -3803,9 +3860,9 @@ mod backfill_window_tests {
         Instrument::new(ProviderId::from_static("p"), AssetClass::Equity, "AAPL")
     }
 
-    #[tokio::test]
-    async fn a_window_that_cannot_exist_undoes_the_subscribe() {
-        let live = UndoLive::default();
+    /// Runs `live` through a window that cannot exist, checking the undo
+    /// unsubscribed and closed it once.
+    async fn undo(live: UndoLive) -> ProviderAccounting {
         let (unsubscribed, closed) = (live.unsubscribed.clone(), live.closed.clone());
         let accounting = ProviderAccounting::default();
         let refused = confirmed_window(
@@ -3820,7 +3877,171 @@ mod backfill_window_tests {
         assert!(matches!(refused, Err(Error::BackfillFromNotInPast { .. })));
         assert_eq!(unsubscribed.load(Ordering::SeqCst), 1);
         assert_eq!(closed.load(Ordering::SeqCst), 1);
-        assert_eq!(accounting.unsubscribes(), 1);
+        accounting
+    }
+
+    #[tokio::test]
+    async fn a_window_that_cannot_exist_undoes_the_subscribe() {
+        assert_eq!(undo(UndoLive::default()).await.unsubscribes(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_undo_the_provider_refuses_still_closes_and_records_no_error() {
+        let live = UndoLive {
+            refuse_unsubscribe: true,
+            ..UndoLive::default()
+        };
+        assert_eq!(undo(live).await.last_error(), None);
+    }
+
+    #[tokio::test]
+    async fn an_undo_whose_unsubscribe_and_close_are_refused_records_no_error() {
+        let live = UndoLive {
+            refuse_unsubscribe: true,
+            refuse_close: true,
+            ..UndoLive::default()
+        };
+        assert_eq!(undo(live).await.last_error(), None);
+    }
+
+    /// One logged event: its level, its message, and its other fields.
+    #[derive(Debug)]
+    struct Logged {
+        level: tracing::Level,
+        message: String,
+        fields: String,
+    }
+
+    /// Collects every event logged on the thread it is the default for.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<Logged>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logs {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Visit {
+                message: String,
+                fields: String,
+            }
+            use std::fmt::Write as _;
+            impl tracing::field::Visit for Visit {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    } else {
+                        let _ = write!(self.fields, "{}={value:?} ", field.name());
+                    }
+                }
+            }
+            let mut visit = Visit::default();
+            event.record(&mut visit);
+            self.0.lock().unwrap().push(Logged {
+                level: *event.metadata().level(),
+                message: visit.message,
+                fields: visit.fields,
+            });
+        }
+    }
+
+    /// Releases `live` and returns what the release logged at debug and
+    /// above.
+    async fn release_logs(live: UndoLive) -> Vec<Logged> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = Logs::default();
+        let _default =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        release_live(
+            Box::new(live),
+            &pair(),
+            EventKind::Trade,
+            &ProviderAccounting::default(),
+        )
+        .await;
+        let mut logged = std::mem::take(&mut *logs.0.lock().unwrap());
+        logged.retain(|event| event.level <= tracing::Level::DEBUG);
+        logged
+    }
+
+    /// The messages of the events in `logged` at exactly `level`.
+    fn at(logged: &[Logged], level: tracing::Level) -> Vec<&str> {
+        logged
+            .iter()
+            .filter(|event| event.level == level)
+            .map(|event| event.message.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_release_nothing_refuses_logs_nothing() {
+        assert!(release_logs(UndoLive::default()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_unsubscribe_is_one_warning() {
+        let live = UndoLive {
+            refuse_unsubscribe: true,
+            ..UndoLive::default()
+        };
+        assert_eq!(
+            at(&release_logs(live).await, tracing::Level::WARN),
+            ["provider refused an unsubscribe"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_close_is_one_warning() {
+        let live = UndoLive {
+            refuse_close: true,
+            ..UndoLive::default()
+        };
+        assert_eq!(
+            at(&release_logs(live).await, tracing::Level::WARN),
+            ["provider refused a close"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_unsubscribe_and_close_are_one_warning_naming_both() {
+        let live = UndoLive {
+            refuse_unsubscribe: true,
+            refuse_close: true,
+            ..UndoLive::default()
+        };
+        let logged = release_logs(live).await;
+        assert_eq!(
+            at(&logged, tracing::Level::WARN),
+            ["provider refused an unsubscribe and the close after it"]
+        );
+        assert!(logged[0].fields.contains("venue said no"), "{logged:?}");
+        assert!(
+            logged[0].fields.contains("venue kept the pair"),
+            "{logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_release_after_the_provider_closed_logs_only_at_debug() {
+        let live = UndoLive {
+            already_closed: true,
+            ..UndoLive::default()
+        };
+        let logged = release_logs(live).await;
+        assert!(at(&logged, tracing::Level::WARN).is_empty(), "{logged:?}");
+        assert_eq!(
+            at(&logged, tracing::Level::DEBUG),
+            [
+                "release step after the provider closed",
+                "release step after the provider closed"
+            ]
+        );
     }
 
     #[tokio::test]
