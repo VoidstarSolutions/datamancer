@@ -1986,6 +1986,34 @@ pub(super) mod tests {
             .expect("the retry connected");
     }
 
+    /// Watched credentials whose sender goes away while the hub waits for
+    /// their first value can never arrive: the park goes on, rather than
+    /// giving way to a backoff as a rejected pair does.
+    #[tokio::test(start_paused = true)]
+    async fn a_park_on_missing_credentials_goes_on_once_the_sender_goes() {
+        let (creds_tx, creds_rx) = watch::channel(None);
+        let sources = HubSources {
+            credentials: CredentialsSource::Watch(creds_rx),
+            ..static_sources()
+        };
+        let (_hub, cmd_tx) = spawn_hub(FakeConnector::never_connects(), sources);
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        drop(creds_tx);
+        // Inside the first backoff a hub that had given way would answer as
+        // reconnecting.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (sink, _rx) = mpsc::channel(8);
+        let handle = SharedLiveHandle::new(cmd_tx, sink);
+        let refused = handle.subscribe(aapl(), EventKind::Trade).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::Unauthenticated { ref message, .. }) if message == "waiting for credentials"
+            ),
+            "{refused:?}"
+        );
+    }
+
     /// A rotation that landed before its sender went away is a rotation the
     /// hub has: a rejection then reconnects with it at once, rather than
     /// sleeping a backoff for a pair it already holds.
