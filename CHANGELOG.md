@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/VoidstarSolutions/datamancer/compare/v0.11.0...v0.11.1) - 2026-11-27
+
+### Fixed
+
+- *(providers)* answer a hub close with the removal it resends
+- *(session)* log an unsubscribe or close the provider refuses at teardown
+- *(storage)* add a turso read helper that drains before decoding
+
+### Other
+
+- *(clippy)* disallow raw turso queries outside query_rows
+- *(storage)* route every turso read through query_rows
+
 ## [0.11.0](https://github.com/VoidstarSolutions/datamancer/compare/v0.10.0...v0.11.0) - 2026-11-24
 
 ### Added
