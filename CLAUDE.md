@@ -120,7 +120,13 @@ These are load-bearing design rules — violating them breaks downstream consume
 
 ## Scope reminders
 
-Datamancer produces events; it is **not** an analysis framework, time-series store, or cross-venue reconciler. Persistence is wired: historical read-through cache, live tap-log
+Datamancer receives market data from any brokerage, gives it one common shape, serves it to consumer applications on request, and displays it. It reads only: it places no orders and controls nothing. It is **not** an analysis framework, time-series store, or cross-venue reconciler, and it does not process data. Anything it computes for display must be plain arithmetic on one instrument's own numbers with nothing to tune (spread, mid, change from the prior close, day range, age): no period, window, threshold or model. Indicators, signals, scores, rankings by a formula, cross-instrument ratios and pattern detection belong to consumers. Sorting and filtering by a shown column are display, not processing.
+
+Sources are shown, never reconciled. "Source-agnostic output" (above) is about an event's shape and meaning, not about hiding where it came from: every `Instrument` carries its provider. Brokerages adjust and standardise price history differently, so every price the UI shows names the provider it came from, and every historical price names its `Adjustment`. Where providers differ for the same instrument, the UI shows the values side by side and marks the difference; it never blends them, corrects one from another, or picks a winner.
+
+The data UI is datamancer's own and lives in this repo. Its views are for looking across instruments: any served field can be added to a view, every shown column sorts and filters, and a user's arrangement is kept.
+
+Persistence is wired: historical read-through cache, live tap-log
 write-through, and the resume primitive (multi-shot `take_events`,
 historical→live backfill seam) are implemented. The tap log persists the
 source `seq` verbatim (no longer mints its own; appends are strictly
