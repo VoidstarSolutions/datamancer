@@ -54,9 +54,7 @@ enum Disconnected {
     Disabled,
     /// Parked until a watched credential source delivers its first value.
     MissingCredentials,
-    /// Parked until a watched credential source rotates a rejected key pair;
-    /// if that source's sender goes away the park ends and the hub backs off
-    /// ([`Reconnecting`](Self::Reconnecting)).
+    /// Parked until a watched credential source rotates a rejected key pair.
     RejectedCredentials,
     /// Sleeping out a backoff of this length before the next connect.
     Reconnecting(Duration),
@@ -86,6 +84,15 @@ impl Disconnected {
     /// Whether a credentials rotation ends the wait in this state.
     const fn wakes_on_rotation(self) -> bool {
         matches!(self, Self::MissingCredentials | Self::RejectedCredentials)
+    }
+
+    /// What ends the wait in this state once the watched credential source's
+    /// sender goes; `None` where nothing does.
+    const fn on_credentials_gone(self) -> Option<Next> {
+        match self {
+            Self::RejectedCredentials => Some(Next::BackOff),
+            Self::Disabled | Self::MissingCredentials | Self::Reconnecting(_) => None,
+        }
     }
 
     /// What the routes are told on entering this state, once, unless they
@@ -843,11 +850,8 @@ impl<C: Connector> Hub<C> {
                     if creds.is_some() {
                         return Next::Reconnect;
                     }
-                    // No rotation can come any more. A rejected pair is then
-                    // retried like a static one, since a rejection may yet
-                    // clear on its own; missing credentials stay missing.
-                    if matches!(why, Disconnected::RejectedCredentials) {
-                        return Next::BackOff;
+                    if let Some(next) = why.on_credentials_gone() {
+                        return next;
                     }
                 }
                 _ = self.settings_rx.changed() => return Next::Reconnect,
@@ -1980,6 +1984,34 @@ pub(super) mod tests {
             .subscribe(aapl(), EventKind::Trade)
             .await
             .expect("the retry connected");
+    }
+
+    /// Watched credentials whose sender goes away while the hub waits for
+    /// their first value can never arrive: the park goes on, rather than
+    /// giving way to a backoff as a rejected pair does.
+    #[tokio::test(start_paused = true)]
+    async fn a_park_on_missing_credentials_goes_on_once_the_sender_goes() {
+        let (creds_tx, creds_rx) = watch::channel(None);
+        let sources = HubSources {
+            credentials: CredentialsSource::Watch(creds_rx),
+            ..static_sources()
+        };
+        let (_hub, cmd_tx) = spawn_hub(FakeConnector::never_connects(), sources);
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        drop(creds_tx);
+        // Inside the first backoff a hub that had given way would answer as
+        // reconnecting.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (sink, _rx) = mpsc::channel(8);
+        let handle = SharedLiveHandle::new(cmd_tx, sink);
+        let refused = handle.subscribe(aapl(), EventKind::Trade).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::Unauthenticated { ref message, .. }) if message == "waiting for credentials"
+            ),
+            "{refused:?}"
+        );
     }
 
     /// A rotation that landed before its sender went away is a rotation the
